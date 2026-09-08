@@ -1,0 +1,23 @@
+/target
+
+# Machine-local agent configuration and private working notes.
+/.codex/
+/AGENTS.override.md
+/.env
+/.env.*
+/docs/hotkeys-tray-short-words.md
+/docs/input-pipeline-audit-fix.md
+/docs/privacy-word-skips.md
+/docs/frameless-tray.md
+
+# Runtime profiles, diagnostic output and compiled artifacts.
+*.log
+*.dmp
+*.exe
+*.pdb
+/config.ini
+/settings.ini
+/user_dictionary.txt
+/word_exclusions.txt
+/exclusions.txt
+/notepad-uia-probe-result.json

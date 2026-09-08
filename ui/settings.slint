@@ -1,0 +1,337 @@
+import { Button, CheckBox, Palette, ScrollView, TextEdit } from "std-widgets.slint";
+
+component NavigationItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback activated;
+
+    height: 42px;
+    border-radius: 7px;
+    background: selected ? Palette.accent-background : touch.has-hover ? Palette.control-background : transparent;
+
+    Text {
+        x: 14px;
+        width: parent.width - 28px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? Palette.accent-foreground : Palette.foreground;
+        vertical-alignment: center;
+        font-size: 14px;
+        font-weight: root.selected ? 600 : 400;
+    }
+
+    touch := TouchArea {
+        clicked => { root.activated(); }
+    }
+}
+
+component SectionTitle inherits VerticalLayout {
+    in property <string> title;
+    in property <string> description;
+    spacing: 5px;
+
+    Text {
+        text: root.title;
+        color: Palette.foreground;
+        font-size: 28px;
+        font-weight: 600;
+    }
+    Text {
+        text: root.description;
+        color: Palette.foreground;
+        opacity: 0.68;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+}
+
+component SettingsCard inherits Rectangle {
+    background: Palette.control-background;
+    border-color: Palette.border;
+    border-width: 1px;
+    border-radius: 9px;
+}
+
+export component SettingsWindow inherits Window {
+    title: "AutoKeyboardLayot — Настройки";
+    preferred-width: 1080px;
+    preferred-height: 760px;
+    min-width: 900px;
+    min-height: 620px;
+    background: Palette.background;
+
+    in-out property <int> current-page: 0;
+    in-out property <string> status-text: "";
+    in-out property <bool> status-error: false;
+
+    in-out property <bool> automatic-conversion-on-startup;
+    in-out property <bool> hotkey-enabled;
+    in-out property <bool> offer-word-exclusion-after-undo;
+    in-out property <bool> offer-dictionary-after-force;
+    in-out property <bool> recheck-first-word-after-erasing;
+    in-out property <bool> physical-fallback;
+    in-out property <bool> diagnostics-enabled;
+
+    in-out property <bool> suppress-after-backspace;
+    in-out property <bool> suppress-after-delete;
+    in-out property <bool> suppress-after-left;
+    in-out property <bool> suppress-after-right;
+    in-out property <bool> suppress-after-up;
+    in-out property <bool> suppress-after-down;
+    in-out property <bool> suppress-after-home-end;
+    in-out property <bool> suppress-after-manual-layout;
+
+    in-out property <bool> enable-english;
+    in-out property <bool> enable-russian;
+    in-out property <bool> enable-estonian;
+
+    in-out property <string> user-dictionary-text;
+    in-out property <string> word-exclusions-text;
+    in-out property <string> process-exclusions-text;
+    in-out property <string> backend-rules-text;
+
+    in-out property <int> hotkey-key-code;
+    in-out property <int> hotkey-modifier-bits;
+    in-out property <string> hotkey-label;
+    in-out property <bool> hotkey-recording: false;
+    in-out property <string> hotkey-capture-hint: "Изменения вступят в силу после нажатия «Применить».";
+
+    in property <[string]> running-processes;
+    in-out property <bool> process-picker-visible: false;
+
+    callback save-requested(bool);
+    callback cancel-requested;
+    callback browse-executable;
+    callback refresh-processes;
+    callback add-running-process(string);
+    callback open-log;
+    callback record-hotkey;
+    callback cancel-hotkey-recording;
+    callback reset-hotkey;
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            width: 252px;
+            background: Palette.alternate-background;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 7px;
+
+                Text {
+                    text: "AutoKeyboardLayot";
+                    color: Palette.foreground;
+                    font-size: 19px;
+                    font-weight: 700;
+                    height: 42px;
+                }
+
+                nav-general := NavigationItem { label: "Общие"; selected: root.current-page == 0; activated => { root.current-page = 0; } }
+                nav-rules := NavigationItem { label: "Правила переключения"; selected: root.current-page == 1; activated => { root.current-page = 1; } }
+                nav-languages := NavigationItem { label: "Языки"; selected: root.current-page == 2; activated => { root.current-page = 2; } }
+                nav-dictionary := NavigationItem { label: "Пользовательский словарь"; selected: root.current-page == 3; activated => { root.current-page = 3; } }
+                nav-words := NavigationItem { label: "Исключения слов"; selected: root.current-page == 4; activated => { root.current-page = 4; } }
+                nav-processes := NavigationItem { label: "Программы-исключения"; selected: root.current-page == 5; activated => { root.current-page = 5; } }
+                nav-backends := NavigationItem { label: "Методы замены"; selected: root.current-page == 6; activated => { root.current-page = 6; } }
+                nav-diagnostics := NavigationItem { label: "Диагностика"; selected: root.current-page == 7; activated => { root.current-page = 7; } }
+
+                Rectangle { vertical-stretch: 1; }
+
+                nav-about := NavigationItem { label: "О программе"; selected: root.current-page == 8; activated => { root.current-page = 8; } }
+            }
+        }
+
+        VerticalLayout {
+            padding-left: 30px;
+            padding-right: 30px;
+            padding-top: 24px;
+            padding-bottom: 18px;
+            spacing: 16px;
+
+            if root.current-page == 0: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Общие настройки"; description: "Правый клик по значку — меню. Левый — настройки. Зелёная рамка: автоматика включена; красная: выключена."; }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: 12px;
+                        SettingsCard {
+                            height: 214px;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 8px;
+                                CheckBox { text: "Автоконвертация при запуске"; checked <=> root.automatic-conversion-on-startup; }
+                                CheckBox { text: "Физическая замена, если безопасный UIA недоступен"; checked <=> root.physical-fallback; }
+                                CheckBox { text: "Повторно проверять первое слово после полного удаления"; checked <=> root.recheck-first-word-after-erasing; }
+                                CheckBox { text: "Предлагать исключение после отмены"; checked <=> root.offer-word-exclusion-after-undo; }
+                                CheckBox { text: "Предлагать добавить слово после принудительной конвертации"; checked <=> root.offer-dictionary-after-force; }
+                            }
+                        }
+                        SettingsCard {
+                            height: 276px;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 9px;
+                                CheckBox { text: "Использовать горячую клавишу"; checked <=> root.hotkey-enabled; }
+                                HorizontalLayout {
+                                    height: 48px;
+                                    spacing: 12px;
+                                    Text { text: "Назначено:"; color: Palette.foreground; vertical-alignment: center; }
+                                    Rectangle {
+                                        border-width: 1px; border-color: Palette.border; border-radius: 6px;
+                                        background: Palette.background; horizontal-stretch: 1;
+                                        Text { x: 12px; width: parent.width - 24px; height: parent.height; vertical-alignment: center; font-size: 20px; font-weight: 600; color: Palette.foreground; text: root.hotkey-recording ? "Нажмите сочетание…" : root.hotkey-label; }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Button { text: root.hotkey-recording ? "Отменить назначение" : "Нажать сочетание…"; enabled: root.hotkey-enabled; clicked => { if root.hotkey-recording { root.cancel-hotkey-recording(); } else { root.record-hotkey(); } } }
+                                    Button { text: "Вернуть Pause/Break"; enabled: root.hotkey-enabled; clicked => { root.reset-hotkey(); } }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                Text { text: root.hotkey-capture-hint; color: Palette.foreground; opacity: 0.75; font-size: 12px; wrap: word-wrap; }
+                                Text { text: "Исправить: наберите слово без завершающего пробела и нажмите сочетание.\nОтменить: нажмите его сразу после автоконвертации.\nЕсли есть Ctrl / Alt / Shift / Win, действие выполняется после отпускания клавиш."; color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.current-page == 1: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Правила переключения"; description: "Если правило включено, текущее слово не исправляется после соответствующего действия."; }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: 12px;
+                        SettingsCard {
+                            height: 330px;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 8px;
+                                CheckBox { text: "После Backspace"; checked <=> root.suppress-after-backspace; }
+                                CheckBox { text: "После Delete"; checked <=> root.suppress-after-delete; }
+                                CheckBox { text: "После стрелки влево"; checked <=> root.suppress-after-left; }
+                                CheckBox { text: "После стрелки вправо"; checked <=> root.suppress-after-right; }
+                                CheckBox { text: "После стрелки вверх"; checked <=> root.suppress-after-up; }
+                                CheckBox { text: "После стрелки вниз"; checked <=> root.suppress-after-down; }
+                                CheckBox { text: "После Home / End"; checked <=> root.suppress-after-home-end; }
+                                CheckBox { text: "После ручной смены раскладки"; checked <=> root.suppress-after-manual-layout; }
+                            }
+                        }
+                        SettingsCard {
+                            height: 80px;
+                            VerticalLayout {
+                                padding: 16px;
+                                CheckBox { text: "Не конвертировать по Tab / Enter (обязательная защита текущей версии)"; checked: true; enabled: false; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.current-page == 2: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Языки"; description: "Для автоконвертации должны оставаться включёнными хотя бы два языка."; }
+                SettingsCard {
+                    height: 224px;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 12px;
+                        CheckBox { text: "English — en-US"; checked <=> root.enable-english; }
+                        CheckBox { text: "Русский — ru-RU"; checked <=> root.enable-russian; }
+                        CheckBox { text: "Eesti — et-EE"; checked <=> root.enable-estonian; }
+                        CheckBox { text: "日本語 — ja-JP (ожидает безопасный IME-адаптер)"; checked: false; enabled: false; }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            if root.current-page == 3: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Пользовательский словарь"; description: "Одна запись на строку: en-US: firefox, ru-RU: слово или et-EE: tere."; }
+                TextEdit { text <=> root.user-dictionary-text; wrap: no-wrap; vertical-stretch: 1; }
+            }
+
+            if root.current-page == 4: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Исключения слов"; description: "Эти слова никогда не будут исправляться автоматически."; }
+                TextEdit { text <=> root.word-exclusions-text; wrap: no-wrap; vertical-stretch: 1; }
+            }
+
+            if root.current-page == 5: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Программы-исключения"; description: "Встроенная защита системных окон и менеджеров паролей остаётся активной всегда."; }
+                TextEdit { text <=> root.process-exclusions-text; wrap: no-wrap; vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Обзор…"; clicked => { root.browse-executable(); } }
+                    Button { text: root.process-picker-visible ? "Скрыть запущенные" : "Выбрать из запущенных…"; clicked => { root.process-picker-visible = !root.process-picker-visible; if root.process-picker-visible { root.refresh-processes(); } } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.process-picker-visible: SettingsCard {
+                    height: 210px;
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            for process-name in root.running-processes: Button {
+                                text: process-name;
+                                clicked => { root.add-running-process(process-name); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.current-page == 6: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Методы замены"; description: "Правила выполняются сверху по точному имени или пути; '*' задаёт общий маршрут. Privacy-проверки нельзя отключить этим списком."; }
+                TextEdit { text <=> root.backend-rules-text; wrap: no-wrap; vertical-stretch: 1; }
+                Text { text: "Доступно: capability-probe, protected-paste, physical-replay, observe-only"; color: Palette.foreground; opacity: 0.68; font-size: 12px; }
+            }
+
+            if root.current-page == 7: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "Диагностика"; description: "Локальный журнал содержит только этапы, счётчики, PID, языки и длины — без набранного текста, URL и clipboard."; }
+                SettingsCard {
+                    height: 132px;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 12px;
+                        CheckBox { text: "Включить локальную диагностику"; checked <=> root.diagnostics-enabled; }
+                        HorizontalLayout { Button { text: "Открыть журнал…"; clicked => { root.open-log(); } } Rectangle { horizontal-stretch: 1; } }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            if root.current-page == 8: VerticalLayout {
+                spacing: 14px;
+                SectionTitle { title: "О программе"; description: "AutoKeyboardLayot — локальный агент автоматической коррекции раскладки."; }
+                SettingsCard {
+                    height: 210px;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 10px;
+                        Text { text: "Автоматические языки: EN / RU / ET"; color: Palette.foreground; font-size: 14px; }
+                        Text { text: "Японский пакет зарегистрирован; IME-конвертация пока отключена."; color: Palette.foreground; opacity: 0.72; font-size: 13px; }
+                        Text { text: "Интерфейс создан с помощью Slint (Fluent 2)."; color: Palette.foreground; opacity: 0.72; font-size: 13px; }
+                        Text { text: "Slint © SixtyFPS GmbH — используется по Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0."; color: Palette.foreground; opacity: 0.72; font-size: 12px; wrap: word-wrap; }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            Rectangle { height: 1px; background: Palette.border; }
+            HorizontalLayout {
+                height: 40px;
+                spacing: 10px;
+                Text { text: root.status-text; color: root.status-error ? #c42b1c : Palette.foreground; opacity: root.status-text == "" ? 0 : 0.75; vertical-alignment: center; horizontal-stretch: 1; }
+                Button { text: "Отмена"; clicked => { root.cancel-requested(); } }
+                Button { text: "Применить"; clicked => { root.save-requested(false); } }
+                Button { text: "OK"; primary: true; clicked => { root.save-requested(true); } }
+            }
+        }
+    }
+}
