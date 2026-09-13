@@ -44,7 +44,7 @@ impl Default for Settings {
     fn default() -> Self {
         let hotkey = crate::Hotkey::default();
         Self {
-            automatic_conversion_on_startup: false,
+            automatic_conversion_on_startup: true,
             pause_break_undo: true,
             offer_word_exclusion_after_undo: true,
             offer_dictionary_after_forced_conversion: true,
@@ -429,9 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_remain_fail_closed_for_startup_conversion() {
+    fn defaults_enable_startup_conversion_but_keep_hotkey_and_safety_defaults() {
         let settings = Settings::default();
-        assert!(!settings.automatic_conversion_on_startup);
+        assert!(settings.automatic_conversion_on_startup);
         assert!(settings.pause_break_undo);
         assert!(settings.offer_word_exclusion_after_undo);
         assert!(settings.offer_dictionary_after_forced_conversion);

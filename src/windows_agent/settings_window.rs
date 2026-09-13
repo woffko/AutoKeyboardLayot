@@ -212,6 +212,27 @@ fn populate_ui_language(ui: &SettingsWindow, preference: &UiLanguagePreference) 
     );
 }
 
+fn pack_display_name(id: &str) -> String {
+    match id.to_ascii_lowercase().as_str() {
+        "en-us" => "English",
+        "ru-ru" => "Русский",
+        "et-ee" => "Eesti",
+        "de-de" => "Deutsch",
+        "es-es" => "Español",
+        "fr-fr" => "Français",
+        "pt-br" => "Português",
+        "ja-jp" => "日本語",
+        "ar-sa" => "العربية",
+        "zh-cn" => "中文（简体）",
+        "hi-in" => "हिन्दी",
+        "bn-bd" => "বাংলা",
+        "id-id" => "Bahasa Indonesia",
+        "ur-pk" => "اردو",
+        _ => return id.to_owned(),
+    }
+    .to_owned()
+}
+
 fn populate_input_packs(
     ui: &SettingsWindow,
     selected: &BTreeSet<autokeyboardlayot::PackId>,
@@ -246,7 +267,10 @@ fn populate_input_packs(
                 profile_names: strings_model(names.iter().map(String::as_str)),
                 profile_index,
                 id: row.id.as_str().into(),
-                selected: row.selected,
+                name: pack_display_name(row.id.as_str()).into(),
+                // A newly installed input pack is shown checked so it works
+                // immediately; the user can still uncheck and apply.
+                selected: row.selected || matches!(row.status, SelectionStatus::Disabled),
                 status_key: match row.status {
                     SelectionStatus::MissingData => "packs.missing",
                     SelectionStatus::Disabled => "packs.disabled",

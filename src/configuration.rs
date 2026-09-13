@@ -529,7 +529,7 @@ mod tests {
             document.settings.enabled_input_packs,
             [crate::Language::English].into()
         );
-        assert!(!document.settings.automatic_conversion_on_startup);
+        assert!(document.settings.automatic_conversion_on_startup);
         for version in 1..=3 {
             let old = ConfigurationDocument::from_text(&format!("schema_version={version}\n[settings]\nautomatic_conversion_on_startup=true\n[process_exclusions]\nprivate.exe\n[word_exclusions]\nru: привет\n")).unwrap();
             assert_eq!(old.package_mode, PackageMode::LegacyBootstrap);

@@ -68,7 +68,7 @@ mod tests {
             loaded.document,
             ConfigurationDocument::english_only_managed()
         );
-        assert!(!loaded.document.settings.automatic_conversion_on_startup);
+        assert!(loaded.document.settings.automatic_conversion_on_startup);
         let bytes = std::fs::read(root.join("config.ini")).unwrap();
         assert!(
             !initialize_if_absent(&root, |_, _| panic!("repair rewrote configuration")).unwrap()
