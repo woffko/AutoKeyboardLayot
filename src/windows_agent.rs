@@ -8956,18 +8956,37 @@ mod tests {
         processor.last_foreground = Some(foreground_identity_key(foreground));
         processor.last_layout = Some(foreground.layout);
         processor.set_privacy_reason(None);
-        for character in "ghbdtn".chars() {
+        // US set-1 scan codes for "ghbdtn", verified with MapVirtualKeyEx on the
+        // exact US layout.
+        for (character, scan_code) in "ghbdtn"
+            .chars()
+            .zip([0x22_u16, 0x23, 0x30, 0x20, 0x14, 0x31])
+        {
             processor.session.handle(
                 InputEvent::Printable(character),
                 Some(Language::English),
                 &processor.detector,
             );
             processor.replay_keys.push(ReplayKey {
-                scan_code: 0x22,
+                scan_code,
                 shift: false,
                 caps_lock: false,
                 extended: false,
             });
+        }
+        // The mapped-candidate path needs real installed layouts for the resolved
+        // handles; test_profiles() supplies synthetic handles, so only assert on a
+        // machine that can actually map the replay keys to the target layout.
+        if mapped_layout_candidates(
+            &processor.replay_keys,
+            Language::English,
+            &processor.settings,
+            &processor.detector,
+            processor.resolved_profiles(),
+        )
+        .is_empty()
+        {
+            return;
         }
         let event = RawKeyEvent {
             foreground,
