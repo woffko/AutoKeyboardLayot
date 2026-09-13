@@ -192,7 +192,7 @@ mod tests {
             br#"{
             "format":1,"pack_id":"en-US","windows_keyboard_profiles":[
                 {"profile":"0409:00000409","required_capabilities":[
-                    "physical-key-v1","altgr-v1","dead-key-v1","ime-v1","future-v9"
+                    "physical-key-v1","altgr-v1","dead-key-v1","ime-v1","composition-guard-v1","future-v9"
                 ]}
             ]}"#,
         )
@@ -201,10 +201,16 @@ mod tests {
         assert_eq!(
             assess_profile_implementation(*profile, requirements),
             ProfileImplementation::MissingCapabilities(
-                ["altgr-v1", "dead-key-v1", "ime-v1", "future-v9"]
-                    .map(str::to_owned)
-                    .into_iter()
-                    .collect()
+                [
+                    "altgr-v1",
+                    "dead-key-v1",
+                    "ime-v1",
+                    "composition-guard-v1",
+                    "future-v9"
+                ]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
             )
         );
     }

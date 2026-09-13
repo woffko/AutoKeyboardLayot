@@ -1,6 +1,6 @@
 //! In-memory input session and suppression policy.
 
-use crate::{Detection, Detector, Language};
+use crate::{CompositionState, Detection, Detector, Language};
 
 const DEFAULT_MAX_WORD_CHARACTERS: usize = 64;
 
@@ -14,6 +14,7 @@ pub enum ResetReason {
     LayoutChanged,
     Shortcut,
     UnsupportedInput,
+    Composition,
     QueueOverflow,
 }
 
@@ -161,6 +162,20 @@ impl InputSession {
 
     pub const fn is_suppressed(&self) -> bool {
         self.suppressed_until_boundary
+    }
+
+    /// Apply an observed composition state from the platform adapter.
+    ///
+    /// Fail-closed: `Active` and `Indeterminate` clear the tracked word and
+    /// suppress conversion until the next trusted boundary, so no edit is
+    /// produced for text that may belong to a composition. `Inactive` leaves the
+    /// current word untouched, preserving ordinary physical-key typing.
+    pub fn observe_composition(&mut self, state: CompositionState) -> SessionAction {
+        if state.requires_suppression() {
+            self.reset(ResetReason::Composition, true)
+        } else {
+            SessionAction::None
+        }
     }
 
     pub fn set_recheck_first_word_after_erasing(&mut self, enabled: bool) {
@@ -338,6 +353,64 @@ mod tests {
         };
         assert_eq!(detection.replacement, "привет");
         assert_eq!(session.buffered_character_count(), 0);
+    }
+
+    #[test]
+    fn active_or_unknown_composition_suppresses_until_a_trusted_boundary() {
+        let detector = crate::test_support::detector();
+        for state in [CompositionState::Active, CompositionState::Indeterminate] {
+            let mut session = InputSession::default();
+            for character in "ghbdtn".chars() {
+                assert_eq!(
+                    session.handle(
+                        InputEvent::Printable(character),
+                        Some(Language::English),
+                        &detector
+                    ),
+                    SessionAction::None
+                );
+            }
+            assert_eq!(
+                session.observe_composition(state),
+                SessionAction::Reset(ResetReason::Composition)
+            );
+            assert_eq!(session.buffered_character_count(), 0);
+            assert!(session.is_suppressed());
+            assert_eq!(
+                session.handle(InputEvent::Boundary, Some(Language::English), &detector),
+                SessionAction::None
+            );
+            assert!(!session.is_suppressed());
+            assert!(matches!(
+                type_word(&mut session, "ghbdtn", Language::English, &detector),
+                SessionAction::Candidate(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn inactive_composition_preserves_ordinary_conversion() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        for character in "ghbdtn".chars() {
+            assert_eq!(
+                session.handle(
+                    InputEvent::Printable(character),
+                    Some(Language::English),
+                    &detector
+                ),
+                SessionAction::None
+            );
+        }
+        assert_eq!(
+            session.observe_composition(CompositionState::Inactive),
+            SessionAction::None
+        );
+        assert_eq!(session.buffered_character_count(), 6);
+        assert!(matches!(
+            session.handle(InputEvent::Boundary, Some(Language::English), &detector),
+            SessionAction::Candidate(_)
+        ));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 pub mod backend_rules;
 pub mod bounded_probe;
+pub mod composition;
 pub mod configuration;
 pub mod conversion;
 pub mod detector;
@@ -46,6 +47,7 @@ pub mod user_lexicon;
 pub mod windows_input_profiles;
 
 pub use backend_rules::{BackendRuleError, BackendRules, BackendStrategy};
+pub use composition::{COMPOSITION_GUARD_CAPABILITY, CompositionState, suppress_conversion};
 pub use configuration::{CONFIGURATION_SCHEMA_VERSION, ConfigurationDocument, ConfigurationError};
 pub use conversion::{ConversionTransaction, TextEdit};
 pub use detector::{Detection, Detector, DetectorConfig};

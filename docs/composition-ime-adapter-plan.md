@@ -1,8 +1,9 @@
 # Composition/IME adapter plan
 
-Status: design. No composition-aware adapter is implemented yet. This document
-separates verified facts from unknowns so the first implementation slice does not
-guess Windows composition behavior.
+Status: first bounded slice implemented (portable fail-closed state contract and
+session suppression); the native Windows composition source is not wired yet and
+remains gated on the `UNKNOWN` items below. No pack may report composition
+readiness from this slice.
 
 ## Goal and non-goals
 
@@ -77,6 +78,22 @@ closed rather than assume composition is inactive.
    bounded provider pattern.
 5. Verify natively on Windows: EN/RU/ET typing still converts; typing while an
    IME composition is active does not mutate or capture composition text.
+
+## Implemented in the first slice
+
+- `src/composition.rs`: `CompositionState` (`Inactive`, `Active`,
+  `Indeterminate`), the code-owned `COMPOSITION_GUARD_CAPABILITY`, and the
+  fail-closed `suppress_conversion` decision, with unit tests.
+- `InputSession::observe_composition` clears the tracked word and suppresses
+  conversion until the next trusted boundary for `Active`/`Indeterminate`, and
+  leaves ordinary typing untouched for `Inactive`, with session tests.
+- `input_capabilities` treats `composition-guard-v1` as a missing capability, so
+  a pack requiring it stays closed until the native adapter exists.
+
+Verified with Linux `cargo test --lib` (265 passed), strict Clippy for Linux and
+`x86_64-pc-windows-msvc`, and `cargo fmt --check`. The native query that produces
+`CompositionState` is not implemented; nothing calls `observe_composition` from
+the Windows worker yet.
 
 ## Later slices
 
