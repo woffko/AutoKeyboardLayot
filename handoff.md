@@ -106,7 +106,11 @@ composition/IME and grapheme adapters are unimplemented, and physical typing
 acceptance is interactive and outside the no-global-input-automation boundary.
 `tools/notepad-uia-probe.ps1` is a TextPattern capability check, not a typing or
 conversion test. Stage 5 and Stage 6 therefore need product direction and human
-or interactive acceptance before they can be completed.
+or interactive acceptance before they can be completed. The user chose the
+composition/IME adapter first and will run the manual checklist
+`docs/physical-input-acceptance.md`; the first-slice design and verified/UNKNOWN
+facts are in `docs/composition-ime-adapter-plan.md`. The offline-import work and
+harnesses were committed as `1f8f8c1`.
 
 ## Immediate user-visible issue
 
