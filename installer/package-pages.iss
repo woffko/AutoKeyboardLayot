@@ -138,11 +138,11 @@ begin
       if (Id = '') or (Size < 1) then RaiseException('Invalid package row');
       PackageIds[I] := Id;
       PackageBytes[I] := Size;
-      Caption := Id + ' — ' + FmtMessage(CustomMessage('AkPackageRow'), [GetIniString(Section, 'revision', '', FileName), IntToStr(Size), GetIniString(Section, 'ui_locale', '', FileName)]);
+      Caption := Id;
       if GetIniString(Section, 'input', '0', FileName) = '1' then Caption := Caption + ' ' + CustomMessage('AkPackageInput');
       Enabled := GetIniString(Section, 'compatible', '0', FileName) = '1';
       if not Enabled then Caption := Caption + ' ' + CustomMessage('AkPackageUnavailable');
-      PackageList.AddCheckBox(Caption, '', 0, GetIniString(Section, 'selected', '0', FileName) = '1', Enabled, False, False, nil);
+      PackageList.AddCheckBox(Caption, '', 0, Enabled, Enabled, False, False, nil);
     end;
     PackageListClick(PackageList);
   end;
@@ -161,16 +161,19 @@ begin
     end;
     PackageReviewList.ItemIndex := 0;
     PackageReviewClick(PackageReviewList);
-    PackageStatus.Caption := FmtMessage(CustomMessage('AkPackageReview'), [IntToStr(PackageCount), IntToStr(PackageTotal)]);
+    PackageStatus.Caption := CustomMessage('AkPackageBusy');
+    if not PackageComplete then
+      PackageInstalling := PackageSend('{"action":"confirm_install","view":' + IntToStr(PackageView) + '}', 'install');
   end;
   if PackageAfterSelect and (PackagePhase = 'selecting') then begin
     PackageAfterSelect := False;
-    if MsgBox(FmtMessage(CustomMessage('AkPackageTotal'), [IntToStr(PackageCount), IntToStr(PackageTotal)]), mbConfirmation, MB_YESNO) = IDYES then begin
-      Restart := False;
-      ErrorText := PrepareToInstall(Restart);
-      if ErrorText <> '' then MsgBox(ErrorText, mbError, MB_OK)
-      else if not PackageSend('{"action":"confirm_download","view":' + IntToStr(PackageView) + '}', 'download') then PackageFailed;
-    end;
+    Restart := False;
+    ErrorText := PrepareToInstall(Restart);
+    if ErrorText <> '' then begin
+      PackageStatus.Caption := ErrorText;
+      PackageFailed;
+    end
+    else if not PackageSend('{"action":"confirm_download","view":' + IntToStr(PackageView) + '}', 'download') then PackageFailed;
   end;
   if PackageInstalling and not PackageBusy and (PackagePhase = 'idle') and (ResultText = 'ok') then begin
     PackageInstalling := False;
@@ -293,7 +296,6 @@ end;
 
 procedure PackageInstallClick(Sender: TObject);
 begin
-  if MsgBox(FmtMessage(CustomMessage('AkPackageReview'), [IntToStr(PackageCount), IntToStr(PackageTotal)]), mbConfirmation, MB_YESNO) <> IDYES then Exit;
   PackageInstalling := PackageSend('{"action":"confirm_install","view":' + IntToStr(PackageView) + '}', 'install');
 end;
 
@@ -314,11 +316,12 @@ begin
   PackageLocal := PackageButton(PackagePage, CustomMessage('AkPackageLocal'), Width + ScaleX(6), 0, Width, @PackageLocalClick);
   PackageDownload := PackageButton(PackagePage, CustomMessage('AkPackageDownload'), 2 * (Width + ScaleX(6)), 0, Width, @PackageDownloadClick);
   PackageList := TNewCheckListBox.Create(WizardForm); PackageList.Parent := PackagePage.Surface;
-  PackageList.SetBounds(0, ScaleY(32), PackagePage.SurfaceWidth, PackagePage.SurfaceHeight - ScaleY(105));
+  PackageList.SetBounds(0, 0, PackagePage.SurfaceWidth, PackagePage.SurfaceHeight - ScaleY(70));
   PackageList.OnClickCheck := @PackageListClick;
   PackageStatus := TNewStaticText.Create(WizardForm); PackageStatus.Parent := PackagePage.Surface;
   PackageStatus.SetBounds(0, PackagePage.SurfaceHeight - ScaleY(67), PackagePage.SurfaceWidth, ScaleY(65));
   PackageStatus.AutoSize := False; PackageStatus.WordWrap := True; PackageStatus.Caption := CustomMessage('AkPackageIntro');
+  PackageCheck.Visible := False; PackageLocal.Visible := False; PackageDownload.Visible := False;
   PackageReviewList := TNewComboBox.Create(WizardForm); PackageReviewList.Parent := PackageReviewPage.Surface;
   PackageReviewList.SetBounds(0, 0, PackageReviewPage.SurfaceWidth, ScaleY(24)); PackageReviewList.Style := csDropDownList;
   PackageReviewList.OnChange := @PackageReviewClick;
@@ -327,6 +330,7 @@ begin
   PackageLicense.ReadOnly := True; PackageLicense.ScrollBars := ssVertical;
   PackageInstall := PackageButton(PackageReviewPage, CustomMessage('AkPackageInstall'), 0, PackageReviewPage.SurfaceHeight - ScaleY(28), PackageReviewPage.SurfaceWidth div 2 - ScaleX(4), @PackageInstallClick);
   PackageCancel := PackageButton(PackageReviewPage, CustomMessage('AkPackageCancel'), PackageReviewPage.SurfaceWidth div 2 + ScaleX(4), PackageReviewPage.SurfaceHeight - ScaleY(28), PackageReviewPage.SurfaceWidth div 2 - ScaleX(4), @PackageCancelClick);
+  PackageInstall.Visible := False; PackageCancel.Visible := False;
   PackageControls;
   PackageTimer := PackageSetTimer(0, 0, 200, CreateCallback(@PackageTimerProc));
 end;
@@ -334,13 +338,30 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := not PackageFault and not PackageBusy and (PackageAwaiting < 0);
-  if (CurPageID = PackagePage.ID) and (PackageCount > 0) and not PackageComplete then Result := Result and (PackagePhase = 'reviewing');
-  if (CurPageID = PackageReviewPage.ID) and (PackageCount > 0) then Result := Result and PackageComplete;
+  if CurPageID = PackagePage.ID then begin
+    if PackageComplete then begin Result := True; Exit; end;
+    if PackagePhase = 'checking' then begin Result := False; Exit; end;
+    if (PackageCount > 0) and (PackagePhase = 'selecting') then begin
+      // One action: install the selected languages and continue.
+      PackageDownloadClick(nil);
+      Result := False;
+      Exit;
+    end;
+    if (PackagePhase = 'downloading') or (PackagePhase = 'installing') then begin Result := False; Exit; end;
+    Result := True;
+    Exit;
+  end;
   if not Result then MsgBox(CustomMessage('AkPackagePending'), mbInformation, MB_OK);
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
-begin Result := (PageID = PackageReviewPage.ID) and (PackageCount = 0); end;
+begin Result := PageID = PackageReviewPage.ID; end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = PackagePage.ID) and not PackageStarted then
+    PackageStart('{"action":"check_catalog"}');
+end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
 begin
