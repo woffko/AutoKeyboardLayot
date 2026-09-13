@@ -18,7 +18,7 @@ mod windows_probe {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::Ime::{
         GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, ImmGetCompositionStringW, ImmGetContext,
-        ImmIsIME, ImmReleaseContext,
+        ImmGetDefaultIMEWnd, ImmGetIMEFileNameW, ImmIsIME, ImmReleaseContext,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -96,10 +96,13 @@ mod windows_probe {
             };
             let layout = GetKeyboardLayout(input_thread);
             let is_ime = ImmIsIME(layout).as_bool();
+            let ime_window = ImmGetDefaultIMEWnd(hwnd);
+            let ime_window_present = usize::from(!ime_window.0.is_null());
+            let ime_file_len = ImmGetIMEFileNameW(layout, None);
             let top = probe_context(hwnd);
             let focused = probe_context(focus);
             println!(
-                "COMPOSITION_PROBE={{\"process_id\":{},\"foreground_thread\":{},\"input_thread\":{},\"gui_info\":{},\"focus_present\":{},\"layout\":{},\"is_ime\":{},\"gui_flags\":{},\"context_top_attached\":{},\"context_focus_attached\":{},\"composition_bytes\":{},\"result_bytes\":{},\"cursor\":{}}}",
+                "COMPOSITION_PROBE={{\"process_id\":{},\"foreground_thread\":{},\"input_thread\":{},\"gui_info\":{},\"focus_present\":{},\"layout\":{},\"is_ime\":{},\"gui_flags\":{},\"context_top_attached\":{},\"context_focus_attached\":{},\"composition_bytes\":{},\"result_bytes\":{},\"cursor\":{},\"ime_window_present\":{},\"ime_file_len\":{}}}",
                 process_id,
                 foreground_thread,
                 input_thread,
@@ -113,6 +116,8 @@ mod windows_probe {
                 focused.composition_bytes.max(top.composition_bytes),
                 focused.result_bytes.max(top.result_bytes),
                 focused.cursor.max(top.cursor),
+                ime_window_present,
+                ime_file_len,
             );
         }
     }

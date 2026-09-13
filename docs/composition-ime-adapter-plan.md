@@ -59,11 +59,19 @@ Interpretation:
   from this single reading.
 - The probe did not run with a real composition active, so `composition_bytes`
   and `result_bytes` are not evidence about composition detection.
+- An extended run added `ime_window_present` and `ime_file_len`:
+  `ime_window_present=1` (so `ImmGetDefaultIMEWnd` returned a non-null IME window
+  handle cross-process for this foreground) but `ime_file_len=0`
+  (`ImmGetIMEFileNameW` reported no IME file name). The non-null IME window is a
+  fact to use, not yet a composition signal; `IMEFileName` length alone cannot
+  distinguish an active composition. Receipt
+  `target/composition-probe-20260913-01/extended-idle.txt`.
 
 Next steps for the probe: run it on the reviewed test machine with Notepad and a
 browser focused, with and without an active composition; compare `layout`,
-`is_ime`, `gui_flags` and context attachment; and test a UIA `TextPattern`-based
-signal. Only then choose and wire a native source.
+`is_ime`, `gui_flags`, `ime_window_present`, `ime_file_len` and context
+attachment; and test a UIA `TextPattern`-based signal. Only then choose and wire a
+native source.
 
 ## Unknowns that must not be guessed (`UNKNOWN`)
 
