@@ -2,35 +2,43 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::Language;
+use crate::{Language, PackId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserLexicon {
-    words: HashMap<Language, HashSet<String>>,
+    words: HashMap<PackId, HashSet<String>>,
 }
 
 impl UserLexicon {
     pub fn from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Self {
         let mut lexicon = Self::default();
         for line in lines {
-            if let Some((language, word)) = Self::normalize_entry(line) {
-                lexicon.insert(language, word);
+            if let Some((id, word)) = Self::normalize_pack_entry(line) {
+                lexicon.insert_pack(id, word);
             }
         }
         lexicon
     }
 
     pub fn contains(&self, language: Language, word: &str) -> bool {
+        self.contains_pack(&language, word)
+    }
+
+    pub fn contains_pack(&self, id: &PackId, word: &str) -> bool {
         self.words
-            .get(&language)
+            .get(id)
             .is_some_and(|words| words.contains(&word.to_lowercase()))
     }
 
     pub fn insert(&mut self, language: Language, word: impl AsRef<str>) -> bool {
+        self.insert_pack(language, word)
+    }
+
+    pub fn insert_pack(&mut self, id: PackId, word: impl AsRef<str>) -> bool {
         let Some(word) = normalize_word(word.as_ref()) else {
             return false;
         };
-        self.words.entry(language).or_default().insert(word)
+        self.words.entry(id).or_default().insert(word)
     }
 
     pub fn len(&self) -> usize {
@@ -46,12 +54,23 @@ impl UserLexicon {
     }
 
     pub fn normalize_entry(line: &str) -> Option<(Language, String)> {
-        let (language, word) = parse_entry(line)?;
-        Some((language, normalize_word(word)?))
+        let (id, word) = Self::normalize_pack_entry(line)?;
+        Some((id, word))
+    }
+
+    /// Persistent overlays are not filtered by installed or enabled packs.
+    pub fn normalize_pack_entry(line: &str) -> Option<(PackId, String)> {
+        let (id, word) = parse_entry(line)?;
+        Some((id, normalize_word(word)?))
+    }
+
+    pub fn format_pack_entry(id: &PackId, word: &str) -> Option<String> {
+        let label = id.id();
+        normalize_word(word).map(|word| format!("{label}: {word}\n"))
     }
 }
 
-fn parse_entry(line: &str) -> Option<(Language, &str)> {
+fn parse_entry(line: &str) -> Option<(PackId, &str)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -103,9 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn ignores_comments_invalid_languages_and_multiword_entries() {
-        let lexicon =
-            UserLexicon::from_lines(["# en: hidden", "xx: unknown", "en-US two words", "ru-RU:"]);
+    fn ignores_comments_invalid_ids_and_multiword_entries() {
+        let lexicon = UserLexicon::from_lines([
+            "# en: hidden",
+            "../xx: unknown",
+            "en-US two words",
+            "ru-RU:",
+        ]);
         assert!(lexicon.is_empty());
     }
 

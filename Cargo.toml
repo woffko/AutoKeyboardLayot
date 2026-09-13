@@ -2,6 +2,15 @@
 name = "AutoKeyboardLayot"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+
+[features]
+# Transitional portable/development builds keep the existing EN/RU/ET data.
+# The modular installer base is built with --no-default-features.
+default = ["legacy-bundled-input"]
+legacy-bundled-input = []
+signing-tools = ["dep:zeroize", "windows/Win32_Security_Cryptography"]
+installer-tools = []
 
 [lib]
 name = "autokeyboardlayot"
@@ -11,8 +20,49 @@ path = "src/lib.rs"
 name = "AutoKeyboardLayot"
 path = "src/main.rs"
 
+[[example]]
+name = "audit_embedded_dictionaries"
+required-features = ["legacy-bundled-input"]
+
+[[bin]]
+name = "sign-language-package"
+path = "src/bin/sign_language_package.rs"
+required-features = ["signing-tools"]
+
+[[bin]]
+name = "installer-package-helper"
+path = "src/bin/installer_package_helper.rs"
+required-features = ["installer-tools"]
+
+[[example]]
+name = "export_input_sources"
+required-features = ["legacy-bundled-input"]
+
+[[example]]
+name = "prepare_language_package"
+required-features = ["signing-tools"]
+
+[[example]]
+name = "prepare_release_catalog"
+required-features = ["signing-tools"]
+
 [dependencies]
+zeroize = { version = "=1.9.0", optional = true }
+ed25519-dalek = "=3.0.0"
 fst = "0.4.7"
+sha2 = "=0.11.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-segmentation = "=1.13.3"
+unicode-general-category = "=1.1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+flate2 = "1.1.2"
+tempfile = "3"
+unicode-script = "=0.5.8"
 
 [build-dependencies]
 flate2 = "1.1.2"
@@ -20,9 +70,12 @@ fst = "0.4.7"
 slint-build = "=1.17.1"
 
 [target.'cfg(windows)'.dependencies]
+i-slint-backend-winit = { version = "=1.17.1", default-features = false, features = ["renderer-femtovg"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
@@ -32,11 +85,13 @@ windows = { version = "0.62.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Ime",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

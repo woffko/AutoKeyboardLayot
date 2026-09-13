@@ -13,7 +13,7 @@ $previousLocalAppData = $env:LOCALAPPDATA
 $receipt = [ordered]@{state='running'; started_utc=[DateTime]::UtcNow.ToString('o'); tests=@(); error=$null}
 try {
     $env:LOCALAPPDATA = $testProfile
-    foreach ($entry in @(@{name='core';file=$CoreExecutable;expected=68}, @{name='adapter';file=$AdapterExecutable;expected=75})) {
+    foreach ($entry in @(@{name='core';file=$CoreExecutable;expected=208}, @{name='adapter';file=$AdapterExecutable;expected=100})) {
         $executable = Join-Path $TestDirectory $entry.file
         $hash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
         $stdout = Join-Path $LogDirectory ($entry.name + '.stdout.log')

@@ -1,13 +1,8 @@
 //! Language-pack metadata and direct keyboard-layout mappings.
 
-/// Stable language identity used by detector decisions and Windows routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Language {
-    English,
-    Russian,
-    Estonian,
-    Japanese,
-}
+/// Compatibility name for stable pack identity. An ID does not imply that an
+/// input profile, dictionary or adapter is installed or ready.
+pub type Language = crate::dictionary_registry::PackId;
 
 /// Input model required by a language pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,72 +75,68 @@ const LANGUAGE_PACKS: &[LanguagePack] = &[
     },
 ];
 
-const ENGLISH_TARGETS: &[Language] = &[Language::Russian, Language::Estonian];
-const RUSSIAN_TARGETS: &[Language] = &[Language::English, Language::Estonian];
-const ESTONIAN_TARGETS: &[Language] = &[Language::English, Language::Russian];
-const NO_AUTOMATIC_TARGETS: &[Language] = &[];
-
 impl Language {
+    #[allow(non_upper_case_globals)]
+    pub const English: Self = Self::from_valid_ascii("en-US");
+    #[allow(non_upper_case_globals)]
+    pub const Russian: Self = Self::from_valid_ascii("ru-RU");
+    #[allow(non_upper_case_globals)]
+    pub const Estonian: Self = Self::from_valid_ascii("et-EE");
+    #[allow(non_upper_case_globals)]
+    pub const Japanese: Self = Self::from_valid_ascii("ja-JP");
+
     pub fn from_id(id: &str) -> Option<Self> {
         match id.trim().to_ascii_lowercase().as_str() {
             "en" | "en-us" | "eng" => Some(Self::English),
             "ru" | "ru-ru" | "rus" => Some(Self::Russian),
             "et" | "et-ee" | "est" => Some(Self::Estonian),
             "ja" | "ja-jp" | "jpn" => Some(Self::Japanese),
-            _ => None,
+            _ => Self::parse(id.trim()).ok(),
         }
     }
 
-    pub const fn pack(self) -> &'static LanguagePack {
-        match self {
-            Self::English => &LANGUAGE_PACKS[0],
-            Self::Russian => &LANGUAGE_PACKS[1],
-            Self::Estonian => &LANGUAGE_PACKS[2],
-            Self::Japanese => &LANGUAGE_PACKS[3],
-        }
+    pub fn pack(self) -> Option<&'static LanguagePack> {
+        LANGUAGE_PACKS.iter().find(|pack| pack.language == self)
     }
 
     /// BCP-47 identifier used by settings and diagnostics.
-    pub const fn id(self) -> &'static str {
-        self.pack().id
+    pub fn id(&self) -> &str {
+        self.pack().map_or(self.as_str(), |pack| pack.id)
     }
 
     /// Short label suitable for a tooltip or larger tray icon.
-    pub const fn display_code(self) -> &'static str {
-        self.pack().display_code
+    pub fn display_code(&self) -> &str {
+        self.pack().map_or(self.as_str(), |pack| pack.display_code)
     }
 
     /// Compact label that remains legible in a 16 by 16 tray icon.
-    pub const fn tray_code(self) -> &'static str {
-        self.pack().tray_code
+    pub fn tray_code(self) -> &'static str {
+        self.pack().map_or("??", |pack| pack.tray_code)
     }
 
-    /// Direct-layout targets that may be evaluated for this current language.
-    pub const fn automatic_targets(self) -> &'static [Language] {
-        match self {
-            Self::English => ENGLISH_TARGETS,
-            Self::Russian => RUSSIAN_TARGETS,
-            Self::Estonian => ESTONIAN_TARGETS,
-            Self::Japanese => NO_AUTOMATIC_TARGETS,
-        }
+    /// Legacy catalog metadata only. Runtime code must use
+    /// `Detector::automatic_targets`, which validates the active snapshot.
+    pub fn automatic_targets(self) -> impl Iterator<Item = Language> {
+        self.pack()
+            .into_iter()
+            .flat_map(|source| automatic_targets_in(source, LANGUAGE_PACKS))
     }
+}
 
-    pub(crate) fn accepts_character(self, character: char) -> bool {
-        match self {
-            Self::English => character.is_ascii_alphabetic(),
-            Self::Russian => matches!(character, 'А'..='я' | 'Ё' | 'ё'),
-            Self::Estonian => {
-                character.is_ascii_alphabetic()
-                    || matches!(
-                        character,
-                        'Õ' | 'õ' | 'Ä' | 'ä' | 'Ö' | 'ö' | 'Ü' | 'ü' | 'Š' | 'š' | 'Ž' | 'ž'
-                    )
-            }
-            Self::Japanese => {
-                matches!(character, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}')
-            }
-        }
-    }
+/// Capability metadata, not dictionary presence, controls adapter eligibility.
+/// Installed/enabled selection is checked separately by the runtime snapshot.
+fn automatic_targets_in<'a>(
+    source: &'a LanguagePack,
+    packs: &'a [LanguagePack],
+) -> impl Iterator<Item = Language> + 'a {
+    let ready = |pack: &LanguagePack| {
+        pack.kind == PackKind::DirectKeyboardLayout
+            && pack.automatic_correction == AutomaticCorrection::Enabled
+    };
+    packs
+        .iter()
+        .filter(move |target| ready(source) && ready(target) && source.language != target.language)
+        .map(|target| target.language)
 }
 
 pub const fn language_packs() -> &'static [LanguagePack] {
@@ -179,15 +170,7 @@ pub fn transpose_word(word: &str, from: Language, to: Language) -> Option<String
         .collect()
 }
 
-pub(crate) fn can_extend_word(character: char, from: Language) -> bool {
-    from.accepts_character(character)
-        || from.automatic_targets().iter().copied().any(|target| {
-            transpose_character(character, from, target)
-                .is_some_and(|mapped| target.accepts_character(mapped))
-        })
-}
-
-fn transpose_character(character: char, from: Language, to: Language) -> Option<char> {
+pub(crate) fn transpose_character(character: char, from: Language, to: Language) -> Option<char> {
     let (source_lower, target_lower, source_upper, target_upper) = match (from, to) {
         (Language::English, Language::Russian) => {
             (ENGLISH_LOWER, RUSSIAN_LOWER, ENGLISH_UPPER, RUSSIAN_UPPER)
@@ -212,6 +195,45 @@ fn find_mapped(character: char, source: &str, target: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_identity_is_stable_without_a_builtin_descriptor() {
+        let id = Language::from_id("DE-de").unwrap();
+        assert_eq!(id, crate::PackId::parse("de-DE").unwrap());
+        assert_eq!(id.id(), "de-de");
+        assert!(id.pack().is_none());
+        assert_eq!(id.tray_code(), "??");
+        assert_eq!(id.display_code(), "de-de");
+        assert!(id.automatic_targets().next().is_none());
+        assert_eq!(Language::from_id("eng"), Some(Language::English));
+        assert_eq!(Language::from_id("EN-us"), Some(Language::English));
+        assert!(Language::from_id("../de-DE").is_none());
+        assert_eq!(std::mem::size_of::<Language>(), 64);
+    }
+
+    #[test]
+    fn automatic_targets_follow_descriptor_capabilities() {
+        for source in language_packs() {
+            let targets: Vec<_> = source.language.automatic_targets().collect();
+            if source.kind == PackKind::ImeRomaji {
+                assert!(targets.is_empty());
+            } else {
+                assert_eq!(targets.len(), 2);
+                assert!(!targets.contains(&source.language));
+                assert!(!targets.contains(&Language::Japanese));
+            }
+        }
+        let mut packs = language_packs().to_vec();
+        packs[1].automatic_correction = AutomaticCorrection::NeedsPhysicalKeyMapper;
+        packs[2].dictionary_embedded = false;
+        assert_eq!(
+            automatic_targets_in(&packs[0], &packs).collect::<Vec<_>>(),
+            vec![Language::Estonian]
+        );
+        assert!(automatic_targets_in(&packs[1], &packs).next().is_none());
+        packs[2].kind = PackKind::ImeRomaji;
+        assert!(automatic_targets_in(&packs[0], &packs).next().is_none());
+    }
 
     #[test]
     fn transposes_common_words_in_both_directions() {
@@ -259,21 +281,22 @@ mod tests {
         assert_eq!(Language::Estonian.id(), "et-EE");
         assert_eq!(Language::Estonian.tray_code(), "ET");
         assert_eq!(
-            Language::Estonian.pack().automatic_correction,
+            Language::Estonian.pack().unwrap().automatic_correction,
             AutomaticCorrection::Enabled
         );
-        assert_eq!(Language::Japanese.pack().kind, PackKind::ImeRomaji);
+        assert_eq!(Language::Japanese.pack().unwrap().kind, PackKind::ImeRomaji);
         assert_eq!(
-            Language::Japanese.pack().automatic_correction,
+            Language::Japanese.pack().unwrap().automatic_correction,
             AutomaticCorrection::NeedsImeAdapter
         );
     }
 
     #[test]
     fn russian_letter_keys_are_not_forced_to_be_word_boundaries() {
+        let detector = crate::test_support::detector();
         for character in [',', '.', '[', ']', ';', '\''] {
-            assert!(can_extend_word(character, Language::English));
+            assert!(detector.can_extend_word(character, Language::English));
         }
-        assert!(!can_extend_word('/', Language::English));
+        assert!(!detector.can_extend_word('/', Language::English));
     }
 }

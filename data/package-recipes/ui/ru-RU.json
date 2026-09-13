@@ -1,0 +1,10 @@
+{
+  "package_id": "ru-RU",
+  "revision": 1,
+  "ui_locale": "ru",
+  "components": {
+    "ui": "../../package-locales/ru.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

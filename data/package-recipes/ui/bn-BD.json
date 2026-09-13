@@ -1,0 +1,10 @@
+{
+  "package_id": "bn-BD",
+  "revision": 1,
+  "ui_locale": "bn",
+  "components": {
+    "ui": "../../package-locales/bn.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

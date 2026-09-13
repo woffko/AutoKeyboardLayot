@@ -285,8 +285,52 @@ mod tests {
     }
 
     #[test]
+    fn current_word_limit_stays_64_characters_independent_of_dictionary_storage() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        for _ in 0..64 {
+            assert_eq!(
+                session.handle(
+                    InputEvent::Printable('a'),
+                    Some(Language::English),
+                    &detector
+                ),
+                SessionAction::None
+            );
+        }
+        assert_eq!(session.buffered_character_count(), 64);
+        assert_eq!(
+            session.handle(
+                InputEvent::Printable('a'),
+                Some(Language::English),
+                &detector
+            ),
+            SessionAction::Reset(ResetReason::UnsupportedInput)
+        );
+        assert_eq!(session.buffered_character_count(), 0);
+        assert!(session.is_suppressed());
+        for _ in 0..256 {
+            session.handle(
+                InputEvent::Printable('a'),
+                Some(Language::English),
+                &detector,
+            );
+            assert_eq!(session.buffered_character_count(), 0);
+        }
+        assert_eq!(
+            session.handle(InputEvent::Boundary, Some(Language::English), &detector),
+            SessionAction::None
+        );
+        assert!(!session.is_suppressed());
+        assert!(matches!(
+            type_word(&mut session, "ghbdtn", Language::English, &detector),
+            SessionAction::Candidate(_)
+        ));
+    }
+
+    #[test]
     fn reports_candidate_only_at_a_boundary() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         let action = type_word(&mut session, "ghbdtn", Language::English, &detector);
         let SessionAction::Candidate(detection) = action else {
@@ -298,7 +342,7 @@ mod tests {
 
     #[test]
     fn keeps_target_layout_letters_that_look_like_source_punctuation() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         let action = type_word(&mut session, "gthtrk.xtybt", Language::English, &detector);
         let SessionAction::Candidate(detection) = action else {
@@ -309,7 +353,7 @@ mod tests {
 
     #[test]
     fn platform_candidates_use_the_same_boundary_and_clear_the_buffer() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         for character in "t;re".chars() {
             assert_eq!(
@@ -335,7 +379,7 @@ mod tests {
 
     #[test]
     fn force_conversion_consumes_a_short_word_without_a_boundary() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         for character in "yt".chars() {
             session.handle(
@@ -361,7 +405,7 @@ mod tests {
 
     #[test]
     fn ctrl_backspace_can_rearm_a_tracked_first_word_after_enter() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.mark_line_start();
         for character in "ghbdtn".chars() {
@@ -378,7 +422,7 @@ mod tests {
 
     #[test]
     fn extra_backspace_at_empty_line_stays_fail_closed() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.mark_line_start();
         session.handle(
@@ -394,7 +438,7 @@ mod tests {
 
     #[test]
     fn backspace_suppresses_the_edited_word_until_its_boundary() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         for character in "ghb".chars() {
             session.handle(
@@ -423,7 +467,7 @@ mod tests {
 
     #[test]
     fn erasing_the_entire_tracked_word_allows_a_fresh_word_immediately() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         for character in "abc".chars() {
             session.handle(
@@ -446,7 +490,7 @@ mod tests {
 
     #[test]
     fn typing_during_backspace_recovery_keeps_the_word_suppressed() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         for character in "abc".chars() {
             session.handle(
@@ -474,7 +518,7 @@ mod tests {
 
     #[test]
     fn manual_layout_change_suppresses_the_current_word() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.handle(
             InputEvent::Printable('g'),
@@ -494,7 +538,7 @@ mod tests {
 
     #[test]
     fn focus_change_starts_a_fresh_context_without_blocking_the_next_word() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.handle(
             InputEvent::Printable('x'),
@@ -511,7 +555,7 @@ mod tests {
 
     #[test]
     fn mouse_click_starts_a_fresh_context_without_blocking_the_next_word() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.handle(
             InputEvent::Printable('x'),
@@ -531,7 +575,7 @@ mod tests {
 
     #[test]
     fn injected_input_does_not_change_the_buffer() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.handle(
             InputEvent::Printable('g'),
@@ -547,7 +591,7 @@ mod tests {
 
     #[test]
     fn mid_word_uncertainty_suppresses_the_tail_until_its_boundary() {
-        let detector = Detector::default();
+        let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         for character in "ghb".chars() {
             session.handle(

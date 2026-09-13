@@ -1,0 +1,8 @@
+{
+  "format": 1,
+  "ranges": [["a", "z"]],
+  "vowels": "aeiouy",
+  "bigrams": ["al", "an", "ar", "as", "at", "ca", "ch", "co", "de", "ea", "ed", "el", "en", "er", "es", "ha", "he", "hi", "ic", "in", "io", "is", "it", "le", "li", "ll", "lo", "me", "nd", "ne", "ng", "nt", "of", "on", "or", "ou", "ra", "re", "ri", "ro", "se", "st", "te", "th", "ti", "to", "ve"],
+  "trigrams": ["and", "ati", "ell", "ent", "ere", "for", "hat", "hel", "her", "ing", "ion", "lay", "ter", "tha", "the", "tio", "ver", "win"],
+  "rare": ["bd", "dt", "hb", "tn", "wq", "zx"]
+}

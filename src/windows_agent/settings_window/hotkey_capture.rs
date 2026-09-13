@@ -1,6 +1,7 @@
 //! Explicit, short-lived keyboard capture owned by the settings window.
 //! Starts only with every keyboard key released; consumed modifier downs and
 //! ups stay paired. No synthetic input, text log or global persistent recorder.
+use super::super::ui_localization::{tr, tr_format};
 use super::super::{current_foreground_context, hotkey_modifier_bit};
 use super::{Hotkey, SettingsWindow, set_ui_hotkey};
 use slint::ComponentHandle;
@@ -134,7 +135,7 @@ pub(super) fn start(ui: &SettingsWindow) {
     stop();
     ABORT_CAPTURE.with(|flag| flag.set(false));
     if !owns_foreground() || !keyboard_released() {
-        ui.set_hotkey_capture_hint("Отпустите клавиши и снова нажмите «Нажать сочетание».".into());
+        ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into());
         return;
     }
     let hook = unsafe {
@@ -148,9 +149,7 @@ pub(super) fn start(ui: &SettingsWindow) {
         })
     };
     let Ok(hook) = hook else {
-        ui.set_hotkey_capture_hint(
-            "Не удалось начать назначение. Можно выбрать кнопку «Вернуть Pause/Break».".into(),
-        );
+        ui.set_hotkey_capture_hint(tr("hotkey.start_failed").into());
         return;
     };
     // Close the small installation race before taking ownership of key-ups.
@@ -158,7 +157,7 @@ pub(super) fn start(ui: &SettingsWindow) {
         unsafe {
             let _ = UnhookWindowsHookEx(hook);
         }
-        ui.set_hotkey_capture_hint("Отпустите клавиши и повторите назначение.".into());
+        ui.set_hotkey_capture_hint(tr("hotkey.release_repeat").into());
         return;
     }
     let timer = slint::Timer::default();
@@ -177,10 +176,7 @@ pub(super) fn start(ui: &SettingsWindow) {
         })
     });
     ui.set_hotkey_recording(true);
-    ui.set_hotkey_capture_hint(
-        "Нажмите Pause/Break, F-клавишу или сочетание с Ctrl / Alt / Shift / Win. Esc — отмена."
-            .into(),
-    );
+    ui.set_hotkey_capture_hint(tr("hotkey.record_hint").into());
 }
 
 pub(super) fn stop() {
@@ -193,7 +189,7 @@ pub(super) fn stop() {
     }
 }
 
-fn cancel(message: &str) {
+fn cancel(message: impl AsRef<str>) {
     let ui = CAPTURE.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -201,7 +197,7 @@ fn cancel(message: &str) {
     });
     stop();
     if let Some(ui) = ui {
-        ui.set_hotkey_capture_hint(message.into());
+        ui.set_hotkey_capture_hint(message.as_ref().into());
     }
 }
 
@@ -229,17 +225,25 @@ fn process_pending_update() {
         || ui.get_current_page() != 0
         || !ui.get_hotkey_enabled()
     {
-        cancel("Назначение отменено; прежнее сочетание сохранено.");
+        cancel(tr("hotkey.cancelled"));
         return;
     }
     match update {
         Some(Update::Chosen(hotkey, finished)) => {
-            ui.set_hotkey_capture_hint(format!("Выбрано {}. Отпустите клавиши и нажмите «Применить».", hotkey.display_name()).into());
-            if finished { set_ui_hotkey(&ui, hotkey); stop(); }
+            ui.set_hotkey_capture_hint(
+                tr_format("hotkey.selected", &[("hotkey", &hotkey.display_name())]).into(),
+            );
+            if finished {
+                set_ui_hotkey(&ui, hotkey);
+                stop();
+            }
         }
-        Some(Update::Finished(hotkey)) => { set_ui_hotkey(&ui, hotkey); stop(); }
-        Some(Update::Cancel) => cancel("Назначение отменено; прежнее сочетание сохранено."),
-        Some(Update::Invalid) => ui.set_hotkey_capture_hint("Для буквы или цифры удерживайте Ctrl, Alt, Shift или Win. Также подходят Pause/Break и F1–F24.".into()),
+        Some(Update::Finished(hotkey)) => {
+            set_ui_hotkey(&ui, hotkey);
+            stop();
+        }
+        Some(Update::Cancel) => cancel(tr("hotkey.cancelled")),
+        Some(Update::Invalid) => ui.set_hotkey_capture_hint(tr("hotkey.modifier_required").into()),
         Some(Update::Pending) | None => {}
     }
 }

@@ -1,0 +1,1327 @@
+{
+  "version": "6.7.3",
+  "sha256": "42a5f6f7dbbddf26cc278f67db5d894235ce1d126a6856702e31bd02023a1316",
+  "messages": {
+    "SetupAppTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "SetupWindowTitle": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallAppTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "UninstallAppFullTitle": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "InformationTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "ConfirmTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "SetupLdrStartupMessage": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "LdrCannotCreateTemp": {
+      "required": true,
+      "parameters": {}
+    },
+    "LdrCannotExecTemp": {
+      "required": true,
+      "parameters": {}
+    },
+    "HelpTextNote": {
+      "required": false,
+      "parameters": {}
+    },
+    "LastErrorMessage": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1,
+        "%3": 1
+      }
+    },
+    "SetupFileMissing": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "SetupFileCorrupt": {
+      "required": true,
+      "parameters": {}
+    },
+    "SetupFileCorruptOrWrongVer": {
+      "required": true,
+      "parameters": {}
+    },
+    "InvalidParameter": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "SetupAlreadyRunning": {
+      "required": true,
+      "parameters": {}
+    },
+    "WindowsVersionNotSupported": {
+      "required": true,
+      "parameters": {}
+    },
+    "WindowsServicePackRequired": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "NotOnThisPlatform": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "OnlyOnThisPlatform": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "OnlyOnTheseArchitectures": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "WinVersionTooLowError": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "WinVersionTooHighError": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "AdminPrivilegesRequired": {
+      "required": true,
+      "parameters": {}
+    },
+    "PowerUserPrivilegesRequired": {
+      "required": true,
+      "parameters": {}
+    },
+    "SetupAppRunningError": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallAppRunningError": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "PrivilegesRequiredOverrideTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "PrivilegesRequiredOverrideInstruction": {
+      "required": true,
+      "parameters": {}
+    },
+    "PrivilegesRequiredOverrideText1": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "PrivilegesRequiredOverrideText2": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "PrivilegesRequiredOverrideAllUsers": {
+      "required": true,
+      "parameters": {}
+    },
+    "PrivilegesRequiredOverrideAllUsersRecommended": {
+      "required": true,
+      "parameters": {}
+    },
+    "PrivilegesRequiredOverrideCurrentUser": {
+      "required": true,
+      "parameters": {}
+    },
+    "PrivilegesRequiredOverrideCurrentUserRecommended": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorCreatingDir": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ErrorTooManyFilesInDir": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ExitSetupTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExitSetupMessage": {
+      "required": true,
+      "parameters": {}
+    },
+    "AboutSetupMenuItem": {
+      "required": true,
+      "parameters": {}
+    },
+    "AboutSetupTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "AboutSetupMessage": {
+      "required": true,
+      "parameters": {
+        "%1": 2,
+        "%2": 1,
+        "%3": 1,
+        "%4": 1
+      }
+    },
+    "AboutSetupNote": {
+      "required": false,
+      "parameters": {}
+    },
+    "TranslatorNote": {
+      "required": false,
+      "parameters": {}
+    },
+    "ButtonBack": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonNext": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonInstall": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonOK": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonCancel": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonYes": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonYesToAll": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonNo": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonNoToAll": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonFinish": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonBrowse": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonWizardBrowse": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonNewFolder": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectLanguageTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectLanguageLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "ClickNext": {
+      "required": true,
+      "parameters": {}
+    },
+    "BeveledLabel": {
+      "required": false,
+      "parameters": {}
+    },
+    "BrowseDialogTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "BrowseDialogLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "NewFolderName": {
+      "required": true,
+      "parameters": {}
+    },
+    "WelcomeLabel1": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "WelcomeLabel2": {
+      "required": true,
+      "parameters": {
+        "[name/ver]": 1
+      }
+    },
+    "WizardPassword": {
+      "required": true,
+      "parameters": {}
+    },
+    "PasswordLabel1": {
+      "required": true,
+      "parameters": {}
+    },
+    "PasswordLabel3": {
+      "required": true,
+      "parameters": {}
+    },
+    "PasswordEditLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "IncorrectPassword": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardLicense": {
+      "required": true,
+      "parameters": {}
+    },
+    "LicenseLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "LicenseLabel3": {
+      "required": true,
+      "parameters": {}
+    },
+    "LicenseAccepted": {
+      "required": true,
+      "parameters": {}
+    },
+    "LicenseNotAccepted": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardInfoBefore": {
+      "required": true,
+      "parameters": {}
+    },
+    "InfoBeforeLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "InfoBeforeClickLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardInfoAfter": {
+      "required": true,
+      "parameters": {}
+    },
+    "InfoAfterLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "InfoAfterClickLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardUserInfo": {
+      "required": true,
+      "parameters": {}
+    },
+    "UserInfoDesc": {
+      "required": true,
+      "parameters": {}
+    },
+    "UserInfoName": {
+      "required": true,
+      "parameters": {}
+    },
+    "UserInfoOrg": {
+      "required": true,
+      "parameters": {}
+    },
+    "UserInfoSerial": {
+      "required": true,
+      "parameters": {}
+    },
+    "UserInfoNameRequired": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardSelectDir": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectDirDesc": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "SelectDirLabel3": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "SelectDirBrowseLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "DiskSpaceGBLabel": {
+      "required": true,
+      "parameters": {
+        "[gb]": 1
+      }
+    },
+    "DiskSpaceMBLabel": {
+      "required": true,
+      "parameters": {
+        "[mb]": 1
+      }
+    },
+    "CannotInstallToNetworkDrive": {
+      "required": true,
+      "parameters": {}
+    },
+    "CannotInstallToUNCPath": {
+      "required": true,
+      "parameters": {}
+    },
+    "InvalidPath": {
+      "required": true,
+      "parameters": {}
+    },
+    "InvalidDrive": {
+      "required": true,
+      "parameters": {}
+    },
+    "DiskSpaceWarningTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "DiskSpaceWarning": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "DirNameTooLong": {
+      "required": true,
+      "parameters": {}
+    },
+    "InvalidDirName": {
+      "required": true,
+      "parameters": {}
+    },
+    "BadDirName32": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "DirExistsTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "DirExists": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "DirDoesntExistTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "DirDoesntExist": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "WizardSelectComponents": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectComponentsDesc": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectComponentsLabel2": {
+      "required": true,
+      "parameters": {}
+    },
+    "FullInstallation": {
+      "required": true,
+      "parameters": {}
+    },
+    "CompactInstallation": {
+      "required": true,
+      "parameters": {}
+    },
+    "CustomInstallation": {
+      "required": true,
+      "parameters": {}
+    },
+    "NoUninstallWarningTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "NoUninstallWarning": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ComponentSize1": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ComponentSize2": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ComponentsDiskSpaceGBLabel": {
+      "required": true,
+      "parameters": {
+        "[gb]": 1
+      }
+    },
+    "ComponentsDiskSpaceMBLabel": {
+      "required": true,
+      "parameters": {
+        "[mb]": 1
+      }
+    },
+    "WizardSelectTasks": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectTasksDesc": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectTasksLabel2": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "WizardSelectProgramGroup": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectStartMenuFolderDesc": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectStartMenuFolderLabel3": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectStartMenuFolderBrowseLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "MustEnterGroupName": {
+      "required": true,
+      "parameters": {}
+    },
+    "GroupNameTooLong": {
+      "required": true,
+      "parameters": {}
+    },
+    "InvalidGroupName": {
+      "required": true,
+      "parameters": {}
+    },
+    "BadGroupName": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "NoProgramGroupCheck2": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardReady": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyLabel1": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "ReadyLabel2a": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyLabel2b": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyMemoUserInfo": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyMemoDir": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyMemoType": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyMemoComponents": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyMemoGroup": {
+      "required": true,
+      "parameters": {}
+    },
+    "ReadyMemoTasks": {
+      "required": true,
+      "parameters": {}
+    },
+    "DownloadingLabel2": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonStopDownload": {
+      "required": true,
+      "parameters": {}
+    },
+    "StopDownload": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorDownloadAborted": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorDownloadFailed": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorDownloadSizeFailed": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorProgress": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorFileSize": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ExtractingLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "ButtonStopExtraction": {
+      "required": true,
+      "parameters": {}
+    },
+    "StopExtraction": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorExtractionAborted": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorExtractionFailed": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ArchiveIncorrectPassword": {
+      "required": true,
+      "parameters": {}
+    },
+    "ArchiveIsCorrupted": {
+      "required": true,
+      "parameters": {}
+    },
+    "ArchiveUnsupportedFormat": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardPreparing": {
+      "required": true,
+      "parameters": {}
+    },
+    "PreparingDesc": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "PreviousInstallNotCompleted": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "CannotContinue": {
+      "required": true,
+      "parameters": {}
+    },
+    "ApplicationsFound": {
+      "required": true,
+      "parameters": {}
+    },
+    "ApplicationsFound2": {
+      "required": true,
+      "parameters": {}
+    },
+    "CloseApplications": {
+      "required": true,
+      "parameters": {}
+    },
+    "DontCloseApplications": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorCloseApplications": {
+      "required": true,
+      "parameters": {}
+    },
+    "PrepareToInstallNeedsRestart": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "WizardInstalling": {
+      "required": true,
+      "parameters": {}
+    },
+    "InstallingLabel": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "FinishedHeadingLabel": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "FinishedLabelNoIcons": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "FinishedLabel": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "ClickFinish": {
+      "required": true,
+      "parameters": {}
+    },
+    "FinishedRestartLabel": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "FinishedRestartMessage": {
+      "required": true,
+      "parameters": {
+        "[name]": 1
+      }
+    },
+    "ShowReadmeCheck": {
+      "required": true,
+      "parameters": {}
+    },
+    "YesRadio": {
+      "required": true,
+      "parameters": {}
+    },
+    "NoRadio": {
+      "required": true,
+      "parameters": {}
+    },
+    "RunEntryExec": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "RunEntryShellExec": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ChangeDiskTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "SelectDiskLabel2": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "PathLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileNotInDir2": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "SelectDirectoryLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "SetupAborted": {
+      "required": true,
+      "parameters": {}
+    },
+    "AbortRetryIgnoreSelectAction": {
+      "required": true,
+      "parameters": {}
+    },
+    "AbortRetryIgnoreRetry": {
+      "required": true,
+      "parameters": {}
+    },
+    "AbortRetryIgnoreIgnore": {
+      "required": true,
+      "parameters": {}
+    },
+    "AbortRetryIgnoreCancel": {
+      "required": true,
+      "parameters": {}
+    },
+    "RetryCancelSelectAction": {
+      "required": true,
+      "parameters": {}
+    },
+    "RetryCancelRetry": {
+      "required": true,
+      "parameters": {}
+    },
+    "RetryCancelCancel": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusClosingApplications": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusCreateDirs": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusExtractFiles": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusDownloadFiles": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusCreateIcons": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusCreateIniEntries": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusCreateRegistryEntries": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusRegisterFiles": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusSavingUninstall": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusRunProgram": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusRestartingApplications": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusRollback": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorInternal2": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ErrorFunctionFailedNoCode": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ErrorFunctionFailed": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorFunctionFailedWithMessage": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1,
+        "%3": 1
+      }
+    },
+    "ErrorExecutingProgram": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ErrorRegOpenKey": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorRegCreateKey": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorRegWriteKey": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "ErrorIniEntry": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "FileAbortRetryIgnoreSkipNotRecommended": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileAbortRetryIgnoreIgnoreNotRecommended": {
+      "required": true,
+      "parameters": {}
+    },
+    "SourceIsCorrupted": {
+      "required": true,
+      "parameters": {}
+    },
+    "SourceDoesntExist": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "SourceVerificationFailed": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "VerificationSignatureDoesntExist": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "VerificationSignatureInvalid": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "VerificationKeyNotFound": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "VerificationFileNameIncorrect": {
+      "required": true,
+      "parameters": {}
+    },
+    "VerificationFileTagIncorrect": {
+      "required": true,
+      "parameters": {}
+    },
+    "VerificationFileSizeIncorrect": {
+      "required": true,
+      "parameters": {}
+    },
+    "VerificationFileHashIncorrect": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileReadOnly2": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileReadOnlyRetry": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileReadOnlyKeepExisting": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorReadingExistingDest": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileExistsSelectAction": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileExists2": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileExistsOverwriteExisting": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileExistsKeepExisting": {
+      "required": true,
+      "parameters": {}
+    },
+    "FileExistsOverwriteOrKeepAll": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileNewerSelectAction": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileNewer2": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileNewerOverwriteExisting": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileNewerKeepExisting": {
+      "required": true,
+      "parameters": {}
+    },
+    "ExistingFileNewerOverwriteOrKeepAll": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorChangingAttr": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorCreatingTemp": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorReadingSource": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorCopying": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorDownloading": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorExtracting": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorReplacingExistingFile": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorRestartReplace": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorRenamingTemp": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorRegisterServer": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ErrorRegSvr32Failed": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ErrorRegisterTypeLib": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallDisplayNameMark": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1
+      }
+    },
+    "UninstallDisplayNameMarks": {
+      "required": true,
+      "parameters": {
+        "%1": 1,
+        "%2": 1,
+        "%3": 1
+      }
+    },
+    "UninstallDisplayNameMark32Bit": {
+      "required": true,
+      "parameters": {}
+    },
+    "UninstallDisplayNameMark64Bit": {
+      "required": true,
+      "parameters": {}
+    },
+    "UninstallDisplayNameMarkAllUsers": {
+      "required": true,
+      "parameters": {}
+    },
+    "UninstallDisplayNameMarkCurrentUser": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorOpeningReadme": {
+      "required": true,
+      "parameters": {}
+    },
+    "ErrorRestartingComputer": {
+      "required": true,
+      "parameters": {}
+    },
+    "UninstallNotFound": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallOpenError": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallUnsupportedVer": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallUnknownEntry": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ConfirmUninstall": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallOnlyOnWin64": {
+      "required": true,
+      "parameters": {}
+    },
+    "OnlyAdminCanUninstall": {
+      "required": true,
+      "parameters": {}
+    },
+    "UninstallStatusLabel": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstalledAll": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstalledMost": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstalledAndNeedsRestart": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "UninstallDataCorrupted": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ConfirmDeleteSharedFileTitle": {
+      "required": true,
+      "parameters": {}
+    },
+    "ConfirmDeleteSharedFile2": {
+      "required": true,
+      "parameters": {}
+    },
+    "SharedFileNameLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "SharedFileLocationLabel": {
+      "required": true,
+      "parameters": {}
+    },
+    "WizardUninstalling": {
+      "required": true,
+      "parameters": {}
+    },
+    "StatusUninstalling": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ShutdownBlockReasonInstallingApp": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    },
+    "ShutdownBlockReasonUninstallingApp": {
+      "required": true,
+      "parameters": {
+        "%1": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "package_id": "hi-IN",
+  "revision": 1,
+  "ui_locale": "hi",
+  "components": {
+    "ui": "../../package-locales/hi.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

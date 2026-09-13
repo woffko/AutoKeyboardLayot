@@ -1,0 +1,10 @@
+{
+  "package_id": "zh-CN",
+  "revision": 1,
+  "ui_locale": "zh-Hans",
+  "components": {
+    "ui": "../../package-locales/zh-Hans.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

@@ -1,5 +1,9 @@
 /target
 
+# Signing private material belongs outside this repository, even when encrypted.
+*.pkcs8
+*.dpapi
+
 # Machine-local agent configuration and private working notes.
 /.codex/
 /AGENTS.override.md

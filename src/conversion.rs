@@ -1,6 +1,7 @@
 //! Platform-independent text replacement and one-step undo model.
 
 use crate::{Detection, Language};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// One caret-local edit expressed as Backspace count plus Unicode insertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,15 +42,19 @@ impl ConversionTransaction {
             return None;
         }
 
-        let original_characters = detection.original.chars().count();
-        let replacement_characters = detection.replacement.chars().count();
-        let delimiter_characters = usize::from(delimiter.is_some());
         let mut forward_text = detection.replacement.clone();
         let mut undo_text = detection.original.clone();
         if let Some(delimiter) = delimiter {
             forward_text.push(delimiter);
             undo_text.push(delimiter);
         }
+        // The existing adapter issues individual Backspace keystrokes. Never
+        // infer a scalar erase count for a multi-scalar grapheme (including a
+        // delimiter that combines with the word). Both forward and undo must
+        // be representable before either edit may be issued. Composition-aware
+        // replacement needs a separate, host-validated edit protocol.
+        let original_characters = conservative_erase_units(&undo_text)?;
+        let replacement_characters = conservative_erase_units(&forward_text)?;
 
         Some(Self {
             source_language: detection.source_language,
@@ -58,15 +63,28 @@ impl ConversionTransaction {
             replacement: detection.replacement.clone(),
             delimiter,
             forward: TextEdit {
-                erase_characters: original_characters + delimiter_characters,
+                erase_characters: original_characters,
                 insert_text: forward_text,
             },
             undo: TextEdit {
-                erase_characters: replacement_characters + delimiter_characters,
+                erase_characters: replacement_characters,
                 insert_text: undo_text,
             },
         })
     }
+}
+
+fn conservative_erase_units(text: &str) -> Option<usize> {
+    let mut units = 0;
+    for grapheme in text.graphemes(true) {
+        let mut scalars = grapheme.chars();
+        let scalar = scalars.next()?;
+        if scalars.next().is_some() || scalar.len_utf16() != 1 {
+            return None;
+        }
+        units += 1;
+    }
+    Some(units)
 }
 
 #[cfg(test)]
@@ -123,5 +141,35 @@ mod tests {
             ConversionTransaction::new(&detection("", "привет"), ' '),
             None
         );
+    }
+
+    #[test]
+    fn scalar_backspace_edits_reject_composite_text_in_both_directions() {
+        // Unicode Alphabetic includes some marks. Model range validation
+        // therefore cannot substitute for edit-unit validation.
+        for mark in ['\u{0345}', '\u{093e}', '\u{09be}'] {
+            assert!(mark.is_alphabetic());
+            assert!(mark.to_lowercase().eq(std::iter::once(mark)));
+        }
+        for text in [
+            "e\u{301}",
+            "a\u{0345}",
+            "क\u{093e}",
+            "ক\u{09be}",
+            "\u{1100}\u{1161}",
+            "\u{1f1ea}\u{1f1ea}",
+            "\u{20000}",
+        ] {
+            assert!(
+                ConversionTransaction::new(&detection(text, "word"), ' ').is_none(),
+                "source {text:?}"
+            );
+            assert!(
+                ConversionTransaction::without_delimiter(&detection("word", text)).is_none(),
+                "undo {text:?}"
+            );
+        }
+        assert!(ConversionTransaction::new(&detection("test", "word"), '\u{301}').is_none());
+        assert!(ConversionTransaction::without_delimiter(&detection("õun", "ёжик")).is_some());
     }
 }

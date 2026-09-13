@@ -1,0 +1,10 @@
+{
+  "package_id": "id-ID",
+  "revision": 1,
+  "ui_locale": "id",
+  "components": {
+    "ui": "../../package-locales/id.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

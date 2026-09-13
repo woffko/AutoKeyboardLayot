@@ -1,0 +1,10 @@
+{
+  "package_id": "es-ES",
+  "revision": 1,
+  "ui_locale": "es",
+  "components": {
+    "ui": "../../package-locales/es.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

@@ -76,7 +76,7 @@ and exposes a technical failure counter in the tray status.
 
 ## Validated so far
 
-- Linux formatting, 68 deterministic core/state-machine/configuration tests,
+- Linux formatting, 210 deterministic core/state-machine/configuration/localization tests,
   and strict Clippy checks;
 - Windows target check, strict Clippy, and a native release build for the
   Fluent candidate;
@@ -251,9 +251,18 @@ cargo build --locked --release
 .\target\release\AutoKeyboardLayot.exe
 ```
 
-The desktop settings UI currently uses Russian labels. Repository documentation
-is in English; dictionary data and language-specific test fixtures retain their
-original languages.
+The in-development localization layer embeds English and selects translations
+using the Windows display language, independently of the keyboard layout.
+External UI catalogs are validated against the embedded messages; missing
+translations fall back to English. Thirteen external catalog drafts cover the
+planned language set with all 141 current message keys each, including the new
+input-package status messages. Strict completeness and placeholder validation
+pass. Chinese uses an explicit Simplified-script catalog with regional
+aliases; Arabic and Urdu require RTL layout acceptance. Linguistic/UI acceptance and
+the input-plugin manager are still in progress; see
+[the implementation plan](docs/localization-and-language-packs.md).
+Repository documentation is English; dictionary data and language-specific
+test fixtures retain their original languages.
 
 ```bash
 cargo fmt --all -- --check

@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "pack_id": "et-EE",
+  "windows_keyboard_profiles": [
+    { "profile": "0425:00000425", "required_capabilities": ["physical-key-v1", "altgr-v1", "dead-key-v1"] }
+  ]
+}

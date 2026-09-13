@@ -1,0 +1,8 @@
+{
+  "format": 1,
+  "algorithm": "Ed25519",
+  "signer": "pkg-20260912-01",
+  "public_key_hex": "ed32cc8fc0341647aab1b7b2b691056f831b512529f4344497cacc4e05aca77d",
+  "fingerprint_sha256": "5700a261650fc5edd9dc18b5e3e3dd3ecea3aae6614f997b43679ff0f259ca11",
+  "repository": "woffko/AutoKeyboardLayot"
+}

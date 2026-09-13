@@ -16,14 +16,22 @@ use std::{
 };
 
 use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
+use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
+use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
+use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
+use ui_localization::{tr, tr_format};
+
+mod ui_localization;
 use autokeyboardlayot::{
     BackendRules, BackendStrategy, ConfigurationDocument, ConversionTransaction, Detector,
     ExclusionPolicy, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN, Hotkey,
     InputEvent, InputSession, Language, PrivacyBlockReason, SessionAction, Settings, UserLexicon,
 };
 
+mod installer_lifecycle;
 mod settings_window;
+pub use installer_lifecycle::{initialize_installation, prepare_upgrade};
 use windows::{
     Win32::{
         Foundation::{
@@ -66,13 +74,13 @@ use windows::{
                 UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_TextPatternId,
             },
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList,
-                GetKeyboardState, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK_EX,
-                MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_BACK, VK_CAPITAL,
-                VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT,
-                VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-                VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+                GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL, INPUT,
+                INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+                KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx,
+                VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_F24,
+                VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
+                VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+                VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -91,10 +99,10 @@ use windows::{
                 SMTO_ERRORONEXIT, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
                 SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu,
                 TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-                WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-                WM_MBUTTONDOWN, WM_NULL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-                WM_XBUTTONDOWN, WNDCLASSW,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+                WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
+                WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSW,
             },
         },
     },
@@ -171,23 +179,37 @@ const BACKEND_SELECTION_UNSUPPORTED: u8 = 7;
 const INJECTED_EVENT_MARKER: usize = 0x414B_4C59_5458_0001;
 const DRAINED_EVENT_MARKER: usize = 0x414B_4C59_5458_0002;
 const GATE_FENCE_MARKER_BASE: usize = 0x414B_4C59_5458_8000;
-const CONFIGURATION_MAX_BYTES: u64 = 1024 * 1024;
 const LEXICON_OFFER_SECONDS: u64 = 120;
 const MAX_UIA_EDITABLE_ANCESTOR_DEPTH: usize = 32;
 const DIAGNOSTIC_QUEUE_CAPACITY: usize = 256;
 const DIAGNOSTIC_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
-struct InstanceGuard(HANDLE);
+const AGENT_MUTEX: PCWSTR = w!("Local\\AutoKeyboardLayot.Agent");
+
+struct InstanceGuard {
+    handle: HANDLE,
+    _installation_fence: std::fs::File,
+}
 
 impl InstanceGuard {
     fn acquire() -> Result<Option<Self>> {
+        let Some(fence) = autokeyboardlayot::installation_fence::shared_for_current_user()
+            .map_err(|error| {
+                windows::core::Error::new(windows::Win32::Foundation::E_FAIL, error.to_string())
+            })?
+        else {
+            return Ok(None);
+        };
         unsafe {
-            let handle = CreateMutexW(None, false, w!("Local\\AutoKeyboardLayot.Agent"))?;
+            let handle = CreateMutexW(None, false, AGENT_MUTEX)?;
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 CloseHandle(handle)?;
                 Ok(None)
             } else {
-                Ok(Some(Self(handle)))
+                Ok(Some(Self {
+                    handle,
+                    _installation_fence: fence,
+                }))
             }
         }
     }
@@ -196,7 +218,7 @@ impl InstanceGuard {
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseHandle(self.0);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -210,6 +232,8 @@ struct ObserverMetrics {
     candidates: AtomicU64,
     dropped_events: AtomicU64,
     input_epoch: AtomicU64,
+    configuration_pending: AtomicBool,
+    configuration_ack: AtomicU64,
     last_input_layout: AtomicUsize,
     privacy_reason: AtomicU8,
     auto_enabled: AtomicBool,
@@ -243,6 +267,8 @@ impl Default for ObserverMetrics {
             candidates: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
             input_epoch: AtomicU64::new(0),
+            configuration_pending: AtomicBool::new(false),
+            configuration_ack: AtomicU64::new(0),
             last_input_layout: AtomicUsize::new(0),
             privacy_reason: AtomicU8::new(PRIVACY_UNAVAILABLE),
             auto_enabled: AtomicBool::new(false),
@@ -470,11 +496,18 @@ struct DeferredDrainedConversion {
     boundary_sequence: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct QueuedInputEvent {
     epoch: u64,
     captured_at: Instant,
     event: RawInputEvent,
+    configuration: Option<Box<ConfigurationReload>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigurationReload {
+    revision: u64,
+    snapshot: RuntimeConfiguration,
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +515,7 @@ struct PendingConversion {
     transaction: ConversionTransaction,
     foreground: ForegroundContext,
     source_layout: usize,
+    profile_generation: u64,
     space_down_sequence: u64,
     replay_keys: Vec<ReplayKey>,
     forced: bool,
@@ -492,6 +526,7 @@ struct UndoRecord {
     transaction: ConversionTransaction,
     foreground: ForegroundContext,
     source_layout: usize,
+    profile_generation: u64,
     replay_keys: Vec<ReplayKey>,
     edit_strategy: EditStrategy,
 }
@@ -1229,16 +1264,6 @@ impl LayoutIndicator {
         }
     }
 
-    const fn language(self) -> Option<Language> {
-        match self {
-            Self::English => Some(Language::English),
-            Self::Russian => Some(Language::Russian),
-            Self::Estonian => Some(Language::Estonian),
-            Self::Japanese => Some(Language::Japanese),
-            Self::Other(_) | Self::Unavailable => None,
-        }
-    }
-
     const fn icon_text(self) -> &'static str {
         match self {
             Self::English => "EN",
@@ -1264,6 +1289,7 @@ impl LayoutIndicator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrayStatus {
     indicator: LayoutIndicator,
+    ui_revision: u64,
     candidates: u64,
     dropped: u64,
     privacy_reason: u8,
@@ -1279,6 +1305,7 @@ impl TrayStatus {
     const fn initial(indicator: LayoutIndicator) -> Self {
         Self {
             indicator,
+            ui_revision: 0,
             candidates: 0,
             dropped: 0,
             privacy_reason: PRIVACY_UNAVAILABLE,
@@ -1306,13 +1333,57 @@ struct AppState {
     next_privacy_refresh: Instant,
     menu_open: bool,
     settings: Settings,
+    next_configuration_revision: u64,
+    configuration_sources: autokeyboardlayot::configuration::ConfigurationSources,
+    package_source: PackageSource,
+    pending_configuration: Option<ConfigurationReload>,
+    configuration_loader: Option<RuntimeConfigurationLoader>,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
     diagnostic_sender: Option<SyncSender<String>>,
     diagnostic_worker: Option<JoinHandle<()>>,
 }
 
 impl AppState {
+    // Keep pumping window messages until the worker has actually returned: it
+    // may be waiting for a synchronous gate request handled by this window.
+    // A worker_busy snapshot alone cannot establish that it has terminated.
+    fn request_shutdown(&mut self) -> bool {
+        if self.shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.correction_gate.active
+            || has_retained_input(&self.metrics)
+            || self.metrics.worker_busy.load(Ordering::Acquire)
+            || self.metrics.configuration_pending.load(Ordering::Acquire)
+            || self.metrics.undo_hotkey_active.load(Ordering::Acquire)
+            || self
+                .metrics
+                .hotkey_waiting_for_release
+                .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.shutdown.store(true, Ordering::Release);
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        // Disconnect recv even when there is no queued event to wake it.
+        self.input_sender.take();
+        true
+    }
+
+    fn shutdown_finished(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+            && self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     fn enqueue(&self, event: RawInputEvent) -> bool {
+        self.enqueue_with_configuration(event, None)
+    }
+
+    fn enqueue_with_configuration(
+        &self,
+        event: RawInputEvent,
+        configuration: Option<Box<ConfigurationReload>>,
+    ) -> bool {
         let Some(sender) = &self.input_sender else {
             return false;
         };
@@ -1334,6 +1405,7 @@ impl AppState {
             epoch: self.metrics.input_epoch.load(Ordering::Acquire),
             captured_at: Instant::now(),
             event,
+            configuration,
         };
         match sender.try_send(queued) {
             Ok(()) => true,
@@ -1357,6 +1429,98 @@ impl AppState {
                 false
             }
         }
+    }
+
+    fn enqueue_configuration(&mut self, snapshot: RuntimeConfiguration) -> bool {
+        if self.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let previous_sources = self
+            .pending_configuration
+            .as_ref()
+            .map_or(self.configuration_sources, |pending| {
+                pending.snapshot.sources
+            });
+        if !previous_sources.accepts_reload(snapshot.sources) {
+            return false;
+        }
+        let previous_packages = self
+            .pending_configuration
+            .as_ref()
+            .map_or(self.package_source, |pending| {
+                pending.snapshot.package_source
+            });
+        if !previous_packages.accepts_reload(snapshot.package_source) {
+            return false;
+        }
+        if self.correction_gate.active
+            || has_retained_input(&self.metrics)
+            || self
+                .next_configuration_revision
+                .saturating_sub(self.metrics.configuration_ack.load(Ordering::Acquire))
+                >= 2
+        {
+            return false;
+        }
+        let Some(revision) = self.next_configuration_revision.checked_add(1) else {
+            return false;
+        };
+        let reload = ConfigurationReload { revision, snapshot };
+        self.metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        if !self.enqueue_with_configuration(
+            RawInputEvent::ReloadConfiguration,
+            Some(Box::new(reload.clone())),
+        ) {
+            // A failed newer request must not cancel an already queued reload.
+            self.metrics
+                .configuration_pending
+                .store(self.pending_configuration.is_some(), Ordering::Release);
+            return false;
+        }
+        self.next_configuration_revision = revision;
+        self.pending_configuration = Some(reload);
+        true
+    }
+
+    fn take_acknowledged_configuration(&mut self) -> Option<RuntimeConfiguration> {
+        let pending = self.pending_configuration.as_ref()?;
+        if self.metrics.configuration_ack.load(Ordering::Acquire) != pending.revision {
+            return None;
+        }
+        self.pending_configuration
+            .take()
+            .map(|pending| pending.snapshot)
+    }
+
+    fn publish_acknowledged_configuration(&mut self) -> Option<RuntimeConfiguration> {
+        let configuration = self.take_acknowledged_configuration()?;
+        let settings = &configuration.settings;
+        self.configuration_sources = configuration.sources;
+        self.package_source = configuration.package_source;
+        self.settings = settings.clone();
+        self.metrics
+            .pause_break_undo
+            .store(settings.pause_break_undo, Ordering::Release);
+        store_hotkey_configuration(&self.metrics, settings);
+        self.metrics
+            .diagnostics_enabled
+            .store(settings.diagnostics_enabled, Ordering::Release);
+        if !settings.offer_word_exclusion_after_undo
+            && !settings.offer_dictionary_after_forced_conversion
+            && let Ok(mut candidate) = self.lexicon_candidate.lock()
+        {
+            candidate.take();
+        }
+        // Main-thread publication is one non-reentrant operation. Transition
+        // input is invalidated before hooks can claim another hotkey or gate.
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
+        Some(configuration)
     }
 
     fn break_correction_gate_fail_open(&mut self, cause: GateFailureCause) {
@@ -1584,6 +1748,38 @@ impl Drop for AppState {
     }
 }
 
+fn request_shutdown(hwnd: HWND) {
+    let accepted = APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(AppState::request_shutdown)
+    });
+    if accepted {
+        finish_shutdown(hwnd);
+    } else {
+        show_tray_information(hwnd, "AutoKeyboardLayot", tr("lifecycle.close_busy"));
+    }
+}
+
+// True means shutdown owns this timer tick, including while the worker is
+// still running. Do not start a configuration reload during that interval.
+fn finish_shutdown(hwnd: HWND) -> bool {
+    let (requested, finished) = APP_STATE.with(|slot| {
+        slot.borrow().as_ref().map_or((false, false), |state| {
+            (
+                state.shutdown.load(Ordering::Acquire),
+                state.shutdown_finished(),
+            )
+        })
+    });
+    if finished {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+    requested
+}
+
 fn take_app_state() -> Option<AppState> {
     APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
@@ -1621,11 +1817,9 @@ fn arm_input_recovery(hwnd: HWND) {
             && unsafe {
                 MessageBoxW(
                     Some(hwnd),
-                    w!(
-                        "Часть задержанного ввода могла уже попасть в приложение. Повтор может дублировать текст или сочетания клавиш. Подготовить повтор всё равно?"
-                    ),
+                    &HSTRING::from(tr("recovery.repeat_warning")),
                     WINDOW_TITLE,
-                    MB_YESNO | MB_ICONINFORMATION,
+                    ui_localization::message_box_style(MB_YESNO | MB_ICONINFORMATION),
                 )
             } != IDYES
         {
@@ -1654,9 +1848,10 @@ fn arm_input_recovery(hwnd: HWND) {
         }
         show_tray_information(
             hwnd,
-            "Подготовлено восстановление ввода",
-            &format!(
-                "Сохранено событий клавиатуры: {edges}. Вернитесь в исходное поле, поставьте курсор в нужную позицию и нажмите {hotkey}."
+            tr("recovery.ready_title"),
+            tr_format(
+                "recovery.ready_body",
+                &[("count", &edges.to_string()), ("hotkey", &hotkey)],
             ),
         );
     }
@@ -1666,9 +1861,9 @@ fn discard_retained_input(hwnd: HWND) {
     let confirmed = unsafe {
         MessageBoxW(
             Some(hwnd),
-            w!("Удалить задержанные клавиши из памяти? После этого восстановить их нельзя."),
+            &HSTRING::from(tr("recovery.discard_warning")),
             WINDOW_TITLE,
-            MB_YESNO | MB_ICONINFORMATION,
+            ui_localization::message_box_style(MB_YESNO | MB_ICONINFORMATION),
         )
     };
     if confirmed != IDYES {
@@ -1688,8 +1883,8 @@ fn discard_retained_input(hwnd: HWND) {
     });
     show_tray_information(
         hwnd,
-        "Задержанный ввод удалён",
-        "Клавиши удалены из памяти по вашему запросу; восстановление больше невозможно.",
+        tr("recovery.discarded_title"),
+        tr("recovery.discarded_body"),
     );
 }
 
@@ -1716,36 +1911,7 @@ fn toggle_auto_enabled() {
     }
 }
 
-fn apply_main_thread_settings(settings: Settings) {
-    APP_STATE.with(|slot| {
-        if let Some(state) = slot.borrow_mut().as_mut() {
-            state.settings = settings;
-            state
-                .metrics
-                .pause_break_undo
-                .store(settings.pause_break_undo, Ordering::Release);
-            store_hotkey_configuration(&state.metrics, settings);
-            state
-                .metrics
-                .diagnostics_enabled
-                .store(settings.diagnostics_enabled, Ordering::Release);
-            if !settings.pause_break_undo {
-                state
-                    .metrics
-                    .undo_hotkey_active
-                    .store(false, Ordering::Release);
-            }
-            if !settings.offer_word_exclusion_after_undo
-                && !settings.offer_dictionary_after_forced_conversion
-                && let Ok(mut candidate) = state.lexicon_candidate.lock()
-            {
-                candidate.take();
-            }
-        }
-    });
-}
-
-fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: Settings) {
+fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: &Settings) {
     let hotkey = settings.force_hotkey();
     metrics
         .force_hotkey_virtual_key
@@ -1759,19 +1925,78 @@ fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: Settings) {
         .store(false, Ordering::Release);
 }
 
-fn enqueue_configuration_reload() {
+fn enqueue_configuration_reload(configuration: RuntimeConfiguration) -> bool {
     APP_STATE.with(|slot| {
-        if let Some(state) = slot.borrow().as_ref() {
-            let _ = state.enqueue(RawInputEvent::ReloadConfiguration);
-        }
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(|state| state.enqueue_configuration(configuration))
+    })
+}
+
+fn finish_configuration_reload(hwnd: HWND) {
+    let configuration = APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(AppState::publish_acknowledged_configuration)
     });
+    let Some(configuration) = configuration else {
+        return;
+    };
+    ui_localization::apply_installed(
+        &configuration.ui_language,
+        configuration.package_catalogs.as_deref(),
+    );
+    refresh_tray_state();
+    show_tray_information(hwnd, "AutoKeyboardLayot", tr("settings.reloaded"));
 }
 
 fn reload_configuration_from_disk(hwnd: HWND) {
-    let configuration = load_runtime_configuration();
-    apply_main_thread_settings(configuration.settings);
-    enqueue_configuration_reload();
-    show_tray_information(hwnd, "AutoKeyboardLayot", "Настройки и списки перечитаны.");
+    let requested = APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|state| state.configuration_loader.as_mut())
+            .is_some_and(RuntimeConfigurationLoader::request)
+    });
+    if !requested {
+        show_configuration_error(
+            hwnd,
+            &tr_format(
+                "error.read_config",
+                &[("error", "configuration_loader_unavailable")],
+            ),
+        );
+    }
+}
+
+fn finish_configuration_load(hwnd: HWND) {
+    let result = APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|state| state.configuration_loader.as_mut())
+            .and_then(RuntimeConfigurationLoader::poll)
+    });
+    let Some(result) = result else {
+        return;
+    };
+    let configuration = match result {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            show_configuration_error(
+                hwnd,
+                &tr_format("error.read_config", &[("error", &error.to_string())]),
+            );
+            return;
+        }
+    };
+    if !enqueue_configuration_reload(configuration) {
+        show_configuration_error(
+            hwnd,
+            &tr_format(
+                "error.read_config",
+                &[("error", "configuration_handoff_unavailable")],
+            ),
+        );
+    }
 }
 
 fn show_configuration_error(hwnd: HWND, message: &str) {
@@ -1780,8 +2005,8 @@ fn show_configuration_error(hwnd: HWND, message: &str) {
         MessageBoxW(
             Some(hwnd),
             &message,
-            w!("AutoKeyboardLayot — настройки"),
-            MB_OK | MB_ICONERROR,
+            &HSTRING::from(tr("window.settings")),
+            ui_localization::message_box_style(MB_OK | MB_ICONERROR),
         );
     }
 }
@@ -1812,12 +2037,15 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
     };
     if let Err(error) = persist_lexicon_candidate(&candidate) {
         let destination = match candidate.target {
-            LexiconOfferTarget::UserDictionary => "пользовательский словарь",
-            LexiconOfferTarget::WordExclusions => "исключения",
+            LexiconOfferTarget::UserDictionary => tr("dictionary.destination"),
+            LexiconOfferTarget::WordExclusions => tr("word_exclusions.destination"),
         };
         show_configuration_error(
             hwnd,
-            &format!("Не удалось добавить слово в {destination}: {error}"),
+            &tr_format(
+                "error.add_word",
+                &[("destination", &destination), ("error", &error.to_string())],
+            ),
         );
         return;
     }
@@ -1828,10 +2056,10 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
             stored.take();
         }
     });
-    enqueue_configuration_reload();
+    reload_configuration_from_disk(hwnd);
     let message = match candidate.target {
-        LexiconOfferTarget::UserDictionary => "Слово добавлено в пользовательский словарь.",
-        LexiconOfferTarget::WordExclusions => "Слово добавлено в исключения конвертации.",
+        LexiconOfferTarget::UserDictionary => tr("dictionary.added"),
+        LexiconOfferTarget::WordExclusions => tr("word_exclusions.added"),
     };
     show_tray_information(hwnd, "AutoKeyboardLayot", message);
 }
@@ -1879,6 +2107,7 @@ fn refresh_tray_state() {
         let state = borrowed.as_mut()?;
         let status = TrayStatus {
             indicator,
+            ui_revision: ui_localization::revision(),
             candidates: state.metrics.candidates.load(Ordering::Relaxed),
             dropped: state.metrics.dropped_events.load(Ordering::Relaxed),
             privacy_reason: state.metrics.privacy_reason.load(Ordering::Acquire),
@@ -1916,10 +2145,10 @@ fn refresh_tray_state() {
     if updated && notify_failure {
         show_tray_information(
             window,
-            "Автоконвертация приостановлена",
-            &format!(
-                "Операция не подтверждена ({}). Проверьте текст. Подробности — в диагностике; включение — через меню правой кнопкой.",
-                conversion_failure_label(status.failure_reason)
+            tr("conversion.paused_title"),
+            tr_format(
+                "conversion.paused_body",
+                &[("reason", conversion_failure_label(status.failure_reason))],
             ),
         );
     }
@@ -2024,6 +2253,16 @@ impl Drop for TrayIcon {
 }
 
 pub fn run() -> Result<()> {
+    let initial_configuration = load_runtime_configuration().map_err(|error| {
+        Error::new(
+            windows::core::HRESULT(0x8007000Du32 as i32),
+            tr_format("error.read_config", &[("error", &error.to_string())]),
+        )
+    })?;
+    ui_localization::initialize(
+        &initial_configuration.ui_language,
+        initial_configuration.package_catalogs.as_deref(),
+    );
     let Some(_instance_guard) = InstanceGuard::acquire()? else {
         return Ok(());
     };
@@ -2059,8 +2298,8 @@ pub fn run() -> Result<()> {
         let initial_indicator = current_foreground_context()
             .map(|context| LayoutIndicator::from_layout(context.layout))
             .unwrap_or(LayoutIndicator::Unavailable);
+        installer_lifecycle::advertise_safe_close(hwnd);
         let tray = TrayIcon::add(hwnd, initial_indicator)?;
-        let initial_configuration = load_runtime_configuration();
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(
             initial_configuration
@@ -2072,7 +2311,7 @@ pub fn run() -> Result<()> {
             initial_configuration.settings.pause_break_undo,
             Ordering::Release,
         );
-        store_hotkey_configuration(&metrics, initial_configuration.settings);
+        store_hotkey_configuration(&metrics, &initial_configuration.settings);
         metrics.diagnostics_enabled.store(
             initial_configuration.settings.diagnostics_enabled,
             Ordering::Release,
@@ -2088,6 +2327,7 @@ pub fn run() -> Result<()> {
         let worker_lexicon_candidate = Arc::clone(&lexicon_candidate);
         let worker_diagnostic_sender = diagnostic_sender.clone();
         let gate_window = hwnd.0 as usize;
+        let worker_configuration = initial_configuration.clone();
         let worker = thread::spawn(move || {
             input_worker(
                 input_receiver,
@@ -2096,6 +2336,7 @@ pub fn run() -> Result<()> {
                 gate_window,
                 worker_lexicon_candidate,
                 worker_diagnostic_sender,
+                worker_configuration,
             );
         });
 
@@ -2114,6 +2355,11 @@ pub fn run() -> Result<()> {
                 next_privacy_refresh: Instant::now(),
                 menu_open: false,
                 settings: initial_configuration.settings,
+                next_configuration_revision: 0,
+                configuration_sources: initial_configuration.sources,
+                package_source: initial_configuration.package_source,
+                pending_configuration: None,
+                configuration_loader: RuntimeConfigurationLoader::spawn().ok(),
                 lexicon_candidate,
                 diagnostic_sender: Some(diagnostic_sender),
                 diagnostic_worker: Some(diagnostic_worker),
@@ -2180,8 +2426,8 @@ pub fn show_fatal_error(message: &str) {
         MessageBoxW(
             None,
             &text,
-            w!("AutoKeyboardLayot failed to start"),
-            MB_OK | MB_ICONERROR,
+            &HSTRING::from(tr("error.startup_title")),
+            ui_localization::message_box_style(MB_OK | MB_ICONERROR),
         );
     }
 }
@@ -2192,8 +2438,23 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if matches!(
+        message,
+        WM_COMMAND | TRAY_CALLBACK_MESSAGE | SETTINGS_APPLIED_MESSAGE
+    ) && APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|state| state.shutdown.load(Ordering::Acquire))
+    }) {
+        return LRESULT(0);
+    }
     match message {
         WM_TIMER if wparam.0 == LAYOUT_TIMER_ID => {
+            if finish_shutdown(hwnd) {
+                return LRESULT(0);
+            }
+            finish_configuration_load(hwnd);
+            finish_configuration_reload(hwnd);
             expire_correction_gate();
             expire_lexicon_candidate();
             refresh_tray_state();
@@ -2207,7 +2468,8 @@ unsafe extern "system" fn window_proc(
                 let Some(state) = borrowed.as_mut() else {
                     return false;
                 };
-                if token == 0
+                if state.shutdown.load(Ordering::Acquire)
+                    || token == 0
                     || foreground.is_none()
                     || state.correction_gate.active
                     || has_retained_input(&state.metrics)
@@ -2262,14 +2524,12 @@ unsafe extern "system" fn window_proc(
         LEXICON_OFFER_MESSAGE => {
             if let Some(candidate) = valid_lexicon_candidate() {
                 let (title, message) = match candidate.target {
-                    LexiconOfferTarget::UserDictionary => (
-                        "Принудительная конвертация выполнена",
-                        "Через меню можно добавить исправленное слово в пользовательский словарь.",
-                    ),
-                    LexiconOfferTarget::WordExclusions => (
-                        "Отмена выполнена",
-                        "Через меню можно запретить конвертацию последнего отменённого слова.",
-                    ),
+                    LexiconOfferTarget::UserDictionary => {
+                        (tr("conversion.forced_title"), tr("conversion.forced_body"))
+                    }
+                    LexiconOfferTarget::WordExclusions => {
+                        (tr("conversion.undone_title"), tr("conversion.undone_body"))
+                    }
                 };
                 show_tray_information(hwnd, title, message);
             }
@@ -2287,8 +2547,8 @@ unsafe extern "system" fn window_proc(
             }) {
                 show_tray_information(
                     hwnd,
-                    "Ввод сохранён в памяти",
-                    "Автоконвертация приостановлена. В меню доступно восстановление задержанных клавиш. Ничего не записано в файл или буфер обмена.",
+                    tr("recovery.retained_title"),
+                    tr("recovery.retained_body"),
                 );
             }
             LRESULT(0)
@@ -2311,14 +2571,17 @@ unsafe extern "system" fn window_proc(
                 MENU_RECOVER_INPUT_ID => arm_input_recovery(hwnd),
                 MENU_DISCARD_INPUT_ID => discard_retained_input(hwnd),
                 MENU_SETTINGS_ID => settings_window::show(hwnd),
-                MENU_EXIT_ID => unsafe {
-                    let _ = DestroyWindow(hwnd);
-                },
+                MENU_EXIT_ID => request_shutdown(hwnd),
                 _ => {}
             }
             LRESULT(0)
         }
+        WM_CLOSE => {
+            request_shutdown(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            installer_lifecycle::remove_safe_close(hwnd);
             drop(take_app_state());
             unsafe {
                 PostQuitMessage(0);
@@ -2395,6 +2658,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     }
 
                     let drained = event.dwExtraInfo == DRAINED_EVENT_MARKER;
+                    if state.shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
                     drained_event = drained;
                     if event.flags.contains(LLKHF_INJECTED) && !drained {
                         state.break_correction_gate_fail_open(GateFailureCause::ExternalInjection);
@@ -2526,6 +2792,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         state.correction_gate.active,
                         shortcut_modifiers_released(),
                     ) && !has_retained_input(&state.metrics)
+                        && !state.metrics.configuration_pending.load(Ordering::Acquire)
                     {
                         state.correction_gate.activate(sequence);
                         state.correction_gate.origin = Some(foreground);
@@ -3498,13 +3765,114 @@ fn process_integrity_level(process_id: u32) -> Option<u32> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+// One dedicated loader; package signature checks/FST compilation must never
+// block the thread that services WH_KEYBOARD_LL and the tray window messages.
+struct RuntimeConfigurationLoader {
+    requests: SyncSender<()>,
+    replies: Receiver<std::io::Result<RuntimeConfiguration>>,
+    in_flight: bool,
+    refresh_again: bool,
+}
+impl RuntimeConfigurationLoader {
+    fn spawn() -> std::io::Result<Self> {
+        let (requests, receive) = sync_channel(1);
+        let (reply, replies) = sync_channel(1);
+        thread::Builder::new()
+            .name("autokey-package-loader".into())
+            .spawn(move || {
+                while receive.recv().is_ok() {
+                    if reply.send(load_runtime_configuration()).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests,
+            replies,
+            in_flight: false,
+            refresh_again: false,
+        })
+    }
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.refresh_again = true;
+            return true;
+        }
+        if self.requests.try_send(()).is_err() {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+    fn poll(&mut self) -> Option<std::io::Result<RuntimeConfiguration>> {
+        if !self.in_flight {
+            return None;
+        }
+        let result = match self.replies.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                Err(std::io::Error::other("configuration_loader_disconnected"))
+            }
+        };
+        self.in_flight = false;
+        if std::mem::take(&mut self.refresh_again) {
+            // A later explicit save/reload supersedes this result (even errors).
+            // Coalesce repeated requests and read the latest files only once more.
+            if self.request() {
+                return None;
+            }
+            return Some(Err(std::io::Error::other(
+                "configuration_loader_unavailable",
+            )));
+        }
+        Some(result)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeConfiguration {
+    package_source: PackageSource,
+    package_catalogs: Option<Arc<autokeyboardlayot::localization::CatalogRegistry>>,
+    input_profiles: autokeyboardlayot::input_profile_selection::InputProfileSelections,
+    sources: autokeyboardlayot::configuration::ConfigurationSources,
     settings: Settings,
+    ui_language: autokeyboardlayot::localization::UiLanguagePreference,
     user_dictionary: UserLexicon,
     word_exclusions: UserLexicon,
     process_exclusions: ExclusionPolicy,
     backend_rules: BackendRules,
+    dictionaries: Arc<autokeyboardlayot::DictionaryRegistry>,
+}
+
+impl Default for RuntimeConfiguration {
+    fn default() -> Self {
+        let settings = Settings::default();
+        let dictionaries = dictionary_snapshot(&settings);
+        Self {
+            package_source: PackageSource::LegacyBootstrap,
+            package_catalogs: None,
+            input_profiles: Default::default(),
+            sources: Default::default(),
+            settings,
+            ui_language: Default::default(),
+            user_dictionary: Default::default(),
+            word_exclusions: Default::default(),
+            process_exclusions: Default::default(),
+            backend_rules: Default::default(),
+            dictionaries,
+        }
+    }
+}
+
+// Transitional schema-1 selection bridge. Snapshot construction happens before
+// enqueueing; the worker never loads or compiles dictionaries during a reload.
+fn dictionary_snapshot(settings: &Settings) -> Arc<autokeyboardlayot::DictionaryRegistry> {
+    let mut registry = autokeyboardlayot::DictionaryRegistry::embedded();
+    registry
+        .set_enabled(settings.enabled_input_packs.iter().cloned())
+        .expect("validated selections are bounded");
+    Arc::new(registry)
 }
 
 fn configuration_directory() -> Option<PathBuf> {
@@ -3517,80 +3885,54 @@ fn configuration_path() -> Option<PathBuf> {
     configuration_directory().map(|directory| directory.join("config.ini"))
 }
 
-fn read_small_configuration_file(path: &Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
-    if metadata.len() > CONFIGURATION_MAX_BYTES {
-        return None;
-    }
-    fs::read_to_string(path).ok()
-}
-
-fn load_configuration_document() -> ConfigurationDocument {
-    try_load_configuration_document().unwrap_or_default()
-}
-
 fn try_load_configuration_document() -> std::io::Result<ConfigurationDocument> {
+    load_configuration_snapshot().map(|loaded| loaded.document)
+}
+
+fn load_configuration_snapshot()
+-> std::io::Result<autokeyboardlayot::configuration::LoadedConfiguration> {
     let directory = configuration_directory().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
     })?;
-    let unified_path = directory.join("config.ini");
-    if unified_path.exists() {
-        let contents = read_small_configuration_file(&unified_path).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "config.ini is unreadable or too large",
-            )
-        })?;
-        return ConfigurationDocument::from_text(&contents)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-    }
-    let settings = read_small_configuration_file(&directory.join("settings.ini"))
-        .map_or_else(Settings::default, |contents| Settings::from_text(&contents));
-    let user_dictionary =
-        read_small_configuration_file(&directory.join("user_dictionary.txt")).unwrap_or_default();
-    let word_exclusions =
-        read_small_configuration_file(&directory.join("word_exclusions.txt")).unwrap_or_default();
-    let process_exclusions =
-        read_small_configuration_file(&directory.join("exclusions.txt")).unwrap_or_default();
-    Ok(ConfigurationDocument::from_legacy(
-        settings,
-        &user_dictionary,
-        &word_exclusions,
-        &process_exclusions,
-    ))
+    autokeyboardlayot::configuration::load_configuration_snapshot(&directory)
 }
 
-fn load_runtime_configuration() -> RuntimeConfiguration {
-    let document = load_configuration_document();
-    RuntimeConfiguration {
-        settings: document.settings,
+fn load_runtime_configuration() -> std::io::Result<RuntimeConfiguration> {
+    let loaded = load_configuration_snapshot()?;
+    let document = loaded.document;
+    let packages = load_installed_packages(&document)?;
+    Ok(RuntimeConfiguration {
+        package_source: packages.source,
+        package_catalogs: packages.catalogs,
+        input_profiles: document.input_profiles.clone(),
+        dictionaries: packages.dictionaries,
+        sources: loaded.sources,
+        settings: document.settings.clone(),
+        ui_language: document.ui_language.clone(),
         user_dictionary: document.user_lexicon(),
         word_exclusions: document.word_exclusion_lexicon(),
         process_exclusions: document.process_exclusion_policy(),
         backend_rules: document.backend_rules,
-    }
+    })
+}
+
+fn load_installed_packages(document: &ConfigurationDocument) -> std::io::Result<InstalledPackages> {
+    let directory = configuration_directory().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
+    })?;
+    let trust = autokeyboardlayot::language_package::PackageTrust::release()
+        .map_err(std::io::Error::other)?;
+    InstalledPackages::load(
+        &directory.join("packages"),
+        document.package_mode,
+        &trust,
+        &document.settings.enabled_input_packs,
+    )
+    .map_err(std::io::Error::other)
 }
 
 fn write_configuration_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    if contents.len() as u64 > CONFIGURATION_MAX_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Configuration exceeds the 1 MiB limit",
-        ));
-    }
-    let Some(directory) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "configuration path has no parent",
-        ));
-    };
-    fs::create_dir_all(directory)?;
-    let temporary = path.with_extension("tmp");
-    {
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
+    let temporary = autokeyboardlayot::configuration::prepare_configuration_write(path, contents)?;
     let temporary_wide = HSTRING::from(temporary.to_string_lossy().as_ref());
     let path_wide = HSTRING::from(path.to_string_lossy().as_ref());
     let result = unsafe {
@@ -3745,12 +4087,14 @@ fn input_worker(
     gate_window: usize,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
     diagnostic_sender: SyncSender<String>,
+    configuration: RuntimeConfiguration,
 ) {
     let mut processor = InputProcessor::new_with_lexicon_candidate(
         metrics,
         gate_window,
         lexicon_candidate,
         Some(diagnostic_sender),
+        configuration,
     );
     while let Ok(event) = receiver.recv() {
         if shutdown.load(Ordering::Acquire) {
@@ -3767,6 +4111,9 @@ fn input_worker(
 
 struct InputProcessor {
     detector: Detector,
+    input_profiles: KeyboardProfileCache,
+    #[cfg(test)]
+    profile_override: Option<ResolvedKeyboardProfiles>,
     session: InputSession,
     modifiers: Modifiers,
     privacy_guard: PrivacyGuard,
@@ -3790,6 +4137,7 @@ struct InputProcessor {
     last_foreground: Option<(usize, usize, u32)>,
     last_layout: Option<usize>,
     last_input_epoch: u64,
+    configuration_revision: u64,
     last_dropped_events: u64,
     metrics: Arc<ObserverMetrics>,
     gate_window: usize,
@@ -3798,7 +4146,18 @@ struct InputProcessor {
 impl InputProcessor {
     #[cfg(test)]
     fn new(metrics: Arc<ObserverMetrics>, gate_window: usize) -> Self {
-        Self::new_with_lexicon_candidate(metrics, gate_window, Arc::new(Mutex::new(None)), None)
+        let mut processor = Self::new_with_lexicon_candidate(
+            metrics,
+            gate_window,
+            Arc::new(Mutex::new(None)),
+            None,
+            RuntimeConfiguration::default(),
+        );
+        processor.profile_override = Some(tests::test_profiles());
+        processor
+            .detector
+            .set_resolved_profiles(processor.profile_override.as_ref());
+        processor
     }
 
     fn new_with_lexicon_candidate(
@@ -3806,15 +4165,20 @@ impl InputProcessor {
         gate_window: usize,
         lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
         diagnostic_sender: Option<SyncSender<String>>,
+        configuration: RuntimeConfiguration,
     ) -> Self {
-        let configuration = load_runtime_configuration();
-        let mut detector = Detector::default();
+        let mut detector = Detector::with_profile_selections(
+            Default::default(),
+            configuration.dictionaries,
+            &configuration.input_profiles,
+        );
+        detector.set_resolved_profiles(None);
         detector
             .replace_user_lexicons(configuration.user_dictionary, configuration.word_exclusions);
         metrics
             .pause_break_undo
             .store(configuration.settings.pause_break_undo, Ordering::Release);
-        store_hotkey_configuration(&metrics, configuration.settings);
+        store_hotkey_configuration(&metrics, &configuration.settings);
         metrics.diagnostics_enabled.store(
             configuration.settings.diagnostics_enabled,
             Ordering::Release,
@@ -3825,6 +4189,9 @@ impl InputProcessor {
         );
         Self {
             detector,
+            input_profiles: KeyboardProfileCache::default(),
+            #[cfg(test)]
+            profile_override: None,
             session,
             modifiers: Modifiers::default(),
             privacy_guard: PrivacyGuard::new(),
@@ -3861,10 +4228,78 @@ impl InputProcessor {
             last_foreground: None,
             last_layout: None,
             last_input_epoch: 0,
+            configuration_revision: 0,
             last_dropped_events: 0,
             metrics,
             gate_window,
         }
+    }
+
+    fn resolved_profiles(&self) -> Option<&ResolvedKeyboardProfiles> {
+        #[cfg(test)]
+        if self.profile_override.is_some() {
+            return self.profile_override.as_ref();
+        }
+        self.input_profiles.snapshot()
+    }
+
+    fn refresh_input_profiles(&mut self) {
+        #[cfg(test)]
+        if self.profile_override.is_some() {
+            return;
+        }
+        let changed = self.input_profiles.poll();
+        self.apply_profile_refresh(changed);
+    }
+
+    fn apply_profile_refresh(&mut self, changed: bool) {
+        if changed {
+            let snapshot = self.resolved_profiles().cloned();
+            self.detector.set_resolved_profiles(snapshot.as_ref());
+            self.invalidate_conversion_state();
+            if self.session.buffered_character_count() != 0 {
+                self.suppress_session();
+            }
+            self.replay_keys.clear();
+            self.layout_switch_in_flight = None;
+            self.diagnostic(
+                "input_profiles",
+                format!(
+                    "generation={} available={}",
+                    self.input_profiles.generation(),
+                    snapshot.is_some()
+                ),
+            );
+        }
+    }
+
+    fn language_for_layout(&self, layout: usize) -> Option<Language> {
+        self.detector
+            .language_for_profile(self.resolved_profiles()?.profile(layout)?)
+            .filter(|&language| self.settings.language_enabled(language))
+    }
+
+    fn profile_inventory_is_current(&self) -> bool {
+        #[cfg(test)]
+        if self.profile_override.is_some() {
+            return true;
+        }
+        self.input_profiles.inventory_is_current()
+    }
+
+    fn find_layout(&self, language: Language) -> Option<HKL> {
+        let profile = self.detector.input_profile(language)?;
+        let handle = self.resolved_profiles()?.unique_layout(profile)?;
+        Some(HKL(handle as *mut c_void))
+    }
+
+    fn pending_profiles_match(&self, pending: &PendingConversion) -> bool {
+        pending.profile_generation == self.input_profiles.generation()
+            && self.language_for_layout(pending.source_layout)
+                == Some(pending.transaction.source_language)
+            && self
+                .find_layout(pending.transaction.target_language)
+                .is_some()
     }
 
     fn diagnostic(&self, event: &'static str, details: String) {
@@ -3919,7 +4354,20 @@ impl InputProcessor {
                 .store(false, Ordering::Release);
         }
         if matches!(queued.event, RawInputEvent::ReloadConfiguration) {
-            self.reload_configuration();
+            // Configuration revisions are independent of input overflow epochs.
+            if let Some(reload) = queued.configuration
+                && reload.revision > self.configuration_revision
+            {
+                // Source monotonicity was checked against active AND pending
+                // state before enqueue. This private FIFO carries only accepted
+                // snapshots; adding another rejection path here would require
+                // a negative-ack protocol.
+                self.apply_configuration_reload(Ok(reload.snapshot));
+                self.configuration_revision = reload.revision;
+                self.metrics
+                    .configuration_ack
+                    .store(reload.revision, Ordering::Release);
+            }
             return;
         }
         let current_epoch = self.metrics.input_epoch.load(Ordering::Acquire);
@@ -3950,6 +4398,13 @@ impl InputProcessor {
             return;
         }
 
+        if self.metrics.configuration_pending.load(Ordering::Acquire) {
+            self.invalidate_conversion_state();
+            self.session.clear();
+            self.replay_keys.clear();
+            return;
+        }
+
         match queued.event {
             RawInputEvent::Mouse => {
                 self.invalidate_conversion_state();
@@ -3972,6 +4427,7 @@ impl InputProcessor {
                 if self.metrics.active_gate_token.load(Ordering::Acquire) != 0 {
                     return;
                 }
+                self.refresh_input_profiles();
                 if foreground_identity_matches(foreground) {
                     self.evaluate_privacy(foreground);
                 } else {
@@ -3983,11 +4439,29 @@ impl InputProcessor {
         }
     }
 
-    fn reload_configuration(&mut self) {
-        let configuration = load_runtime_configuration();
+    fn apply_configuration_reload(&mut self, result: std::io::Result<RuntimeConfiguration>) {
         self.invalidate_conversion_state();
         self.session.clear();
         self.replay_keys.clear();
+        let configuration = match result {
+            Ok(configuration) => configuration,
+            Err(_) => {
+                // Retain the last validated policy, including every exclusion.
+                // Discard in-flight input without logging user configuration.
+                self.diagnostic(
+                    "configuration",
+                    "result=read_failed retained=last_known_good".to_owned(),
+                );
+                return;
+            }
+        };
+        self.detector = Detector::with_profile_selections(
+            Default::default(),
+            configuration.dictionaries,
+            &configuration.input_profiles,
+        );
+        let profiles = self.resolved_profiles().cloned();
+        self.detector.set_resolved_profiles(profiles.as_ref());
         self.detector
             .replace_user_lexicons(configuration.user_dictionary, configuration.word_exclusions);
         self.exclusion_policy = configuration.process_exclusions;
@@ -3995,13 +4469,8 @@ impl InputProcessor {
         self.settings = configuration.settings;
         self.session
             .set_recheck_first_word_after_erasing(self.settings.recheck_first_word_after_erasing);
-        self.metrics
-            .pause_break_undo
-            .store(self.settings.pause_break_undo, Ordering::Release);
-        store_hotkey_configuration(&self.metrics, self.settings);
-        self.metrics
-            .diagnostics_enabled
-            .store(self.settings.diagnostics_enabled, Ordering::Release);
+        // Hook-side settings are published by the main thread only after this
+        // snapshot is acknowledged; an older reload must not overwrite them.
         if !self.settings.offer_word_exclusion_after_undo
             && !self.settings.offer_dictionary_after_forced_conversion
             && let Ok(mut candidate) = self.lexicon_candidate.lock()
@@ -4176,10 +4645,11 @@ impl InputProcessor {
     }
 
     fn process_key(&mut self, event: RawKeyEvent) {
+        if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
+            self.refresh_input_profiles();
+        }
         let foreground_key = foreground_identity_key(event.foreground);
-        let language = LayoutIndicator::from_layout(event.foreground.layout)
-            .language()
-            .filter(|language| self.settings.language_enabled(*language));
+        let language = self.language_for_layout(event.foreground.layout);
         if self.last_foreground != Some(foreground_key) {
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -4351,6 +4821,7 @@ impl InputProcessor {
                         transaction,
                         foreground: event.foreground,
                         source_layout: event.foreground.layout,
+                        profile_generation: self.input_profiles.generation(),
                         space_down_sequence: event.sequence,
                         replay_keys,
                         forced: false,
@@ -4455,7 +4926,15 @@ impl InputProcessor {
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
         let candidates = language
-            .map(|language| mapped_layout_candidates(&replay_keys, language, self.settings))
+            .map(|language| {
+                mapped_layout_candidates(
+                    &replay_keys,
+                    language,
+                    &self.settings,
+                    &self.detector,
+                    self.resolved_profiles(),
+                )
+            })
             .unwrap_or_default();
         let transaction = if self.privacy_reason.is_none() {
             if let SessionAction::Candidate(detection) = self
@@ -4525,7 +5004,13 @@ impl InputProcessor {
             self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
         }
-        let candidates = mapped_layout_candidates(&self.replay_keys, language, self.settings);
+        let candidates = mapped_layout_candidates(
+            &self.replay_keys,
+            language,
+            &self.settings,
+            &self.detector,
+            self.resolved_profiles(),
+        );
         let SessionAction::Candidate(detection) = self.session.force_current_word_with_candidates(
             Some(language),
             &self.detector,
@@ -4571,6 +5056,7 @@ impl InputProcessor {
             transaction,
             foreground: event.foreground,
             source_layout: event.foreground.layout,
+            profile_generation: self.input_profiles.generation(),
             space_down_sequence: event.sequence,
             replay_keys,
             forced: true,
@@ -4725,6 +5211,7 @@ impl InputProcessor {
         }
         if (!pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire))
             || self.privacy_reason.is_some()
+            || !self.pending_profiles_match(&pending)
             || !self.pre_forward_guard_is_current(pending.foreground, boundary_sequence)
         {
             return;
@@ -4750,7 +5237,11 @@ impl InputProcessor {
                 return;
             }
         }
-        let Some(target_layout) = find_layout(pending.transaction.target_language) else {
+        let target_layout = self
+            .profile_inventory_is_current()
+            .then(|| self.find_layout(pending.transaction.target_language))
+            .flatten();
+        let Some(target_layout) = target_layout else {
             self.diagnostic(
                 "layout",
                 format!(
@@ -4909,6 +5400,7 @@ impl InputProcessor {
             transaction: pending.transaction,
             foreground: pending.foreground,
             source_layout: pending.source_layout,
+            profile_generation: pending.profile_generation,
             replay_keys: pending.replay_keys,
             edit_strategy,
         });
@@ -5128,11 +5620,19 @@ impl InputProcessor {
         };
         if !self.input_sequence_is_current(pause_sequence)
             || self.privacy_reason.is_some()
+            || record.profile_generation != self.input_profiles.generation()
+            || self.language_for_layout(record.source_layout)
+                != Some(record.transaction.source_language)
+            || !self.profile_inventory_is_current()
             || !physical_modifiers_released()
         {
             return;
         }
-        if !foreground_identity_matches(record.foreground) {
+        if !foreground_identity_matches(record.foreground)
+            || current_foreground_context()
+                .and_then(|current| self.language_for_layout(current.layout))
+                != Some(record.transaction.target_language)
+        {
             return;
         }
         if !self.arm_correction_gate(pause_sequence) {
@@ -5734,6 +6234,24 @@ fn contextual_hotkey_action(
     virtual_key: u16,
     modifiers: u8,
 ) -> UndoHotkeyAction {
+    if metrics.configuration_pending.load(Ordering::Acquire) {
+        let configured_key = metrics.force_hotkey_virtual_key.load(Ordering::Acquire) as u16;
+        let configured = Hotkey {
+            virtual_key: configured_key,
+            modifiers: 0,
+        };
+        if configured.matches_key(virtual_key) && metrics.undo_hotkey_active.load(Ordering::Acquire)
+        {
+            if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
+                metrics.undo_hotkey_active.store(false, Ordering::Release);
+                metrics
+                    .hotkey_waiting_for_release
+                    .store(false, Ordering::Release);
+            }
+            return UndoHotkeyAction::Swallow;
+        }
+        return UndoHotkeyAction::PassThrough;
+    }
     if !metrics.pause_break_undo.load(Ordering::Acquire)
         && !metrics.recovery_armed.load(Ordering::Acquire)
         && !metrics.undo_hotkey_active.load(Ordering::Acquire)
@@ -5810,10 +6328,11 @@ fn contextual_hotkey_action(
 }
 
 fn gate_request_enabled(metrics: &ObserverMetrics, token: u64) -> bool {
-    metrics.auto_enabled.load(Ordering::Acquire)
-        || (token != 0
-            && metrics.pause_break_undo.load(Ordering::Acquire)
-            && metrics.explicit_hotkey_sequence.load(Ordering::Acquire) == token)
+    !metrics.configuration_pending.load(Ordering::Acquire)
+        && (metrics.auto_enabled.load(Ordering::Acquire)
+            || (token != 0
+                && metrics.pause_break_undo.load(Ordering::Acquire)
+                && metrics.explicit_hotkey_sequence.load(Ordering::Acquire) == token))
 }
 
 const fn should_arm_space_decision_gate(
@@ -5832,26 +6351,6 @@ const fn should_arm_space_decision_gate(
         && privacy_reason == PRIVACY_ALLOWED
         && !gate_active
         && shortcut_modifiers_released
-}
-
-fn find_layout(language: Language) -> Option<HKL> {
-    unsafe {
-        let count = GetKeyboardLayoutList(None);
-        if count <= 0 {
-            return None;
-        }
-        let mut layouts = vec![HKL::default(); usize::try_from(count).ok()?];
-        let returned = GetKeyboardLayoutList(Some(&mut layouts));
-        if returned <= 0 {
-            return None;
-        }
-        layouts
-            .into_iter()
-            .take(usize::try_from(returned).ok()?)
-            .find(|layout| {
-                LayoutIndicator::from_layout(layout.0 as usize).language() == Some(language)
-            })
-    }
 }
 
 fn post_layout_switch(expected: ForegroundContext, target_layout: HKL) -> bool {
@@ -5929,15 +6428,28 @@ fn map_replay_key_to_layout(key: ReplayKey, layout: HKL) -> Option<char> {
 fn mapped_layout_candidates(
     replay_keys: &[ReplayKey],
     current_language: Language,
-    settings: Settings,
+    settings: &Settings,
+    detector: &Detector,
+    profiles: Option<&ResolvedKeyboardProfiles>,
 ) -> Vec<(Language, String)> {
-    current_language
-        .automatic_targets()
-        .iter()
-        .filter(|&&target_language| settings.language_enabled(target_language))
-        .filter_map(|&target_language| {
-            let layout = find_layout(target_language)?;
-            let replacement = map_replay_keys_to_layout(replay_keys, layout)?;
+    mapped_layout_candidates_with(current_language, settings, detector, |target_language| {
+        let handle = profiles?.unique_layout(detector.input_profile(target_language)?)?;
+        let layout = HKL(handle as *mut c_void);
+        map_replay_keys_to_layout(replay_keys, layout)
+    })
+}
+
+fn mapped_layout_candidates_with(
+    current_language: Language,
+    settings: &Settings,
+    detector: &Detector,
+    mut map_target: impl FnMut(Language) -> Option<String>,
+) -> Vec<(Language, String)> {
+    detector
+        .automatic_targets(current_language)
+        .filter(|&target_language| settings.language_enabled(target_language))
+        .filter_map(|target_language| {
+            let replacement = map_target(target_language)?;
             Some((target_language, replacement))
         })
         .collect()
@@ -6377,16 +6889,19 @@ fn set_tooltip(data: &mut NOTIFYICONDATAW, text: &str) {
 fn set_wide_text<const N: usize>(buffer: &mut [u16; N], text: &str) {
     buffer.fill(0);
     let maximum_units = buffer.len().saturating_sub(1);
-    for (destination, source) in buffer
-        .iter_mut()
-        .take(maximum_units)
-        .zip(text.encode_utf16())
-    {
-        *destination = source;
+    let mut written = 0;
+    for character in text.chars() {
+        let mut units = [0u16; 2];
+        let encoded = character.encode_utf16(&mut units);
+        if written + encoded.len() > maximum_units {
+            break;
+        }
+        buffer[written..written + encoded.len()].copy_from_slice(encoded);
+        written += encoded.len();
     }
 }
 
-fn show_tray_information(hwnd: HWND, title: &str, message: &str) {
+fn show_tray_information(hwnd: HWND, title: impl AsRef<str>, message: impl AsRef<str>) {
     let icon = APP_STATE.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -6399,8 +6914,8 @@ fn show_tray_information(hwnd: HWND, title: &str, message: &str) {
     let mut data = notify_icon_data(hwnd, icon);
     data.uFlags = NIF_INFO;
     data.dwInfoFlags = NIIF_INFO;
-    set_wide_text(&mut data.szInfoTitle, title);
-    set_wide_text(&mut data.szInfo, message);
+    set_wide_text(&mut data.szInfoTitle, title.as_ref());
+    set_wide_text(&mut data.szInfo, message.as_ref());
     unsafe {
         data.Anonymous.uTimeout = 5_000;
         let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
@@ -6465,43 +6980,50 @@ fn tray_visual_state(status: TrayStatus) -> TrayVisual {
 
 fn tray_tooltip(status: TrayStatus) -> String {
     let mode = match tray_visual_state(status) {
-        TrayVisual::Active => "Автоконвертация включена".to_owned(),
-        TrayVisual::Disabled => "Автоконвертация выключена".to_owned(),
-        TrayVisual::SafetyPaused => format!(
-            "Защитная пауза: {}",
-            conversion_failure_label(status.failure_reason)
+        TrayVisual::Active => tr("tray.active"),
+        TrayVisual::Disabled => tr("tray.disabled"),
+        TrayVisual::SafetyPaused => tr_format(
+            "tray.safety_pause",
+            &[("reason", conversion_failure_label(status.failure_reason))],
         ),
     };
-    let mut tooltip = if status.dropped == 0 {
-        format!(
-            "{mode} — {}; candidates: {}",
-            status.indicator.tooltip_code(),
-            status.candidates,
+    let mut tooltip = format!(
+        "{mode} — {}; {}",
+        status.indicator.tooltip_code(),
+        tr_format(
+            "tray.candidates",
+            &[("count", &status.candidates.to_string())]
         )
-    } else {
-        format!(
-            "{mode} — {}; candidates: {}; dropped: {}",
-            status.indicator.tooltip_code(),
-            status.candidates,
-            status.dropped,
-        )
-    };
-    if let Some(label) = privacy_reason_label(status.privacy_reason) {
-        tooltip.push_str("; privacy paused (");
-        tooltip.push_str(label);
-        tooltip.push(')');
+    );
+    if status.dropped > 0 {
+        tooltip.push_str("; ");
+        tooltip.push_str(&tr_format(
+            "tray.dropped",
+            &[("count", &status.dropped.to_string())],
+        ));
     }
-    tooltip.push_str("; backend: ");
-    tooltip.push_str(backend_status_label(status.backend_status));
+    if let Some(label) = privacy_reason_label(status.privacy_reason) {
+        tooltip.push_str("; ");
+        tooltip.push_str(&tr_format("tray.privacy_paused", &[("reason", label)]));
+    }
+    tooltip.push_str("; ");
+    tooltip.push_str(&tr_format(
+        "tray.backend",
+        &[("backend", backend_status_label(status.backend_status))],
+    ));
     if status.undo_available {
-        tooltip.push_str("; undo ready");
+        tooltip.push_str("; ");
+        tooltip.push_str(&tr("tray.undo_ready"));
     }
     if status.failures > 0 {
-        tooltip.push_str("; conversion failures: ");
-        tooltip.push_str(&status.failures.to_string());
-        tooltip.push_str(" (last: ");
-        tooltip.push_str(conversion_failure_label(status.failure_reason));
-        tooltip.push(')');
+        tooltip.push_str("; ");
+        tooltip.push_str(&tr_format(
+            "tray.failures",
+            &[
+                ("count", &status.failures.to_string()),
+                ("reason", conversion_failure_label(status.failure_reason)),
+            ],
+        ));
     }
     tooltip
 }
@@ -6601,6 +7123,7 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             let state = state.as_ref()?;
             Some(TrayStatus {
                 indicator: state.last_tray_status.indicator,
+                ui_revision: ui_localization::revision(),
                 candidates: state.metrics.candidates.load(Ordering::Relaxed),
                 dropped: state.metrics.dropped_events.load(Ordering::Relaxed),
                 privacy_reason: state.metrics.privacy_reason.load(Ordering::Acquire),
@@ -6623,9 +7146,9 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
                 MF_UNCHECKED
             };
         let auto_label = HSTRING::from(if status.auto_enabled {
-            "Автоконвертация: ВКЛ"
+            tr("menu.auto_on")
         } else {
-            "Автоконвертация: ВЫКЛ"
+            tr("menu.auto_off")
         });
         let retained_count = APP_STATE.with(|slot| {
             slot.borrow().as_ref().and_then(|state| {
@@ -6654,13 +7177,16 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
                 menu,
                 MF_STRING,
                 MENU_RECOVER_INPUT_ID,
-                &HSTRING::from(format!("Восстановить задержанный ввод ({count} событий)…")),
+                &HSTRING::from(tr_format(
+                    "menu.recover_input",
+                    &[("count", &count.to_string())],
+                )),
             )?;
             AppendMenuW(
                 menu,
                 MF_STRING,
                 MENU_DISCARD_INPUT_ID,
-                w!("Удалить задержанный ввод…"),
+                &HSTRING::from(tr("menu.discard_input")),
             )?;
         }
         let lexicon_candidate = valid_lexicon_candidate();
@@ -6672,20 +7198,26 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             };
         let recent_label =
             HSTRING::from(match lexicon_candidate.map(|candidate| candidate.target) {
-                Some(LexiconOfferTarget::UserDictionary) => {
-                    "Добавить последнее исправленное слово в словарь"
-                }
-                Some(LexiconOfferTarget::WordExclusions) => {
-                    "Не исправлять последнее отменённое слово"
-                }
-                None => "Нет предложения для словаря",
+                Some(LexiconOfferTarget::UserDictionary) => tr("menu.dictionary_add"),
+                Some(LexiconOfferTarget::WordExclusions) => tr("menu.exclude_word"),
+                None => tr("menu.no_dictionary_offer"),
             });
         AppendMenuW(menu, recent_flags, MENU_ADD_LEXICON_ENTRY_ID, &recent_label)?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
 
-        AppendMenuW(menu, MF_STRING, MENU_SETTINGS_ID, w!("Настройки…"))?;
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_SETTINGS_ID,
+            &HSTRING::from(tr("menu.settings")),
+        )?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
-        AppendMenuW(menu, MF_STRING, MENU_EXIT_ID, w!("Выход"))?;
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_EXIT_ID,
+            &HSTRING::from(tr("menu.exit")),
+        )?;
 
         let point = if let Some(point) = interaction_point {
             point
@@ -6695,7 +7227,15 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             point
         };
         let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, Some(0), hwnd, None);
+        let _ = TrackPopupMenu(
+            menu,
+            ui_localization::popup_menu_style(TPM_RIGHTBUTTON),
+            point.x,
+            point.y,
+            Some(0),
+            hwnd,
+            None,
+        );
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         DestroyMenu(menu)?;
         Ok(())
@@ -6705,6 +7245,576 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn test_profiles() -> ResolvedKeyboardProfiles {
+        use autokeyboardlayot::profile_resolver::{
+            KeyboardProfileProbe, resolve_keyboard_profiles,
+        };
+        struct Fixture(usize);
+        impl KeyboardProfileProbe for Fixture {
+            fn loaded_layouts(&mut self) -> Option<Vec<usize>> {
+                Some(vec![0x0409, 0x0419, 0x0425, 0xf0020409])
+            }
+            fn current_layout(&mut self) -> Option<usize> {
+                Some(self.0)
+            }
+            fn is_ime(&mut self, _: usize) -> bool {
+                false
+            }
+            fn activate_layout(&mut self, layout: usize) -> Option<usize> {
+                Some(std::mem::replace(&mut self.0, layout))
+            }
+            fn current_layout_name(&mut self) -> Option<[u16; 9]> {
+                let name = match self.0 {
+                    0x0409 => "00000409",
+                    0x0419 => "00000419",
+                    0x0425 => "00000425",
+                    0xf0020409 => "00020409",
+                    _ => return None,
+                };
+                let mut result = [0; 9];
+                for (slot, value) in result.iter_mut().zip(name.encode_utf16()) {
+                    *slot = value;
+                }
+                Some(result)
+            }
+        }
+        resolve_keyboard_profiles(&mut Fixture(0x0409)).unwrap()
+    }
+
+    #[test]
+    fn profile_refresh_preserves_unchanged_words_and_suppresses_only_an_invalidated_tail() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.apply_profile_refresh(true);
+        for character in "hello".chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+        }
+        assert_eq!(processor.session.buffered_character_count(), 5);
+        processor.apply_profile_refresh(false);
+        assert_eq!(processor.session.buffered_character_count(), 5);
+        processor.apply_profile_refresh(true);
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        for character in "tail".chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+        }
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        processor.session.handle(
+            InputEvent::Boundary,
+            Some(Language::English),
+            &processor.detector,
+        );
+        for character in "word".chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+        }
+        assert_eq!(processor.session.buffered_character_count(), 4);
+    }
+
+    #[test]
+    fn pending_conversion_is_bound_to_profile_generation_source_and_target() {
+        let processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let detection = processor
+            .detector
+            .detect("ghbdtn", Language::English)
+            .unwrap();
+        let mut pending = PendingConversion {
+            transaction: ConversionTransaction::without_delimiter(&detection).unwrap(),
+            foreground: test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground,
+            source_layout: 0x0409,
+            profile_generation: processor.input_profiles.generation(),
+            space_down_sequence: 7,
+            replay_keys: Vec::new(),
+            forced: false,
+        };
+        assert!(processor.pending_profiles_match(&pending));
+        pending.profile_generation = pending.profile_generation.wrapping_add(1);
+        assert!(!processor.pending_profiles_match(&pending));
+        pending.profile_generation = processor.input_profiles.generation();
+        pending.source_layout = 0xf0020409;
+        assert!(!processor.pending_profiles_match(&pending));
+        pending.source_layout = 0x0409;
+        pending.transaction.target_language = Language::Japanese;
+        assert!(!processor.pending_profiles_match(&pending));
+    }
+
+    #[test]
+    fn worker_resolves_exact_profiles_without_primary_language_fallback() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        assert_eq!(
+            processor.language_for_layout(0x0409),
+            Some(Language::English)
+        );
+        assert_eq!(
+            processor.language_for_layout(0x0419),
+            Some(Language::Russian)
+        );
+        assert_eq!(
+            processor.language_for_layout(0x0425),
+            Some(Language::Estonian)
+        );
+        assert_eq!(processor.language_for_layout(0xf0020409), None);
+        assert_eq!(processor.language_for_layout(4), None);
+        assert_eq!(
+            processor.find_layout(Language::English).unwrap().0 as usize,
+            0x0409
+        );
+        processor.profile_override = None;
+        assert_eq!(processor.language_for_layout(0x0409), None);
+        assert!(processor.find_layout(Language::English).is_none());
+    }
+
+    #[test]
+    fn candidate_mapping_obeys_runtime_requirements_before_invoking_platform_mapper() {
+        let mut registry = autokeyboardlayot::DictionaryRegistry::embedded();
+        registry.remove(&Language::English).unwrap();
+        registry
+            .insert(
+                autokeyboardlayot::DictionaryPack::from_words(Language::English, ["hello"], [])
+                    .unwrap(),
+            )
+            .unwrap();
+        let detector = Detector::with_registry(Default::default(), Arc::new(registry));
+        let settings = Settings {
+            enabled_input_packs: [Language::English, Language::Russian].into_iter().collect(),
+            ..Default::default()
+        };
+        for source in [Language::English, Language::Russian] {
+            assert!(
+                mapped_layout_candidates_with(source, &settings, &detector, |_| {
+                    panic!("incompatible or disabled pack reached platform mapper")
+                })
+                .is_empty()
+            );
+        }
+        let detector = Detector::default();
+        let mut calls = Vec::new();
+        let candidates =
+            mapped_layout_candidates_with(Language::English, &settings, &detector, |target| {
+                calls.push(target);
+                Some("привет".to_owned())
+            });
+        assert_eq!(calls, [Language::Russian]);
+        assert_eq!(candidates, [(Language::Russian, "привет".to_owned())]);
+    }
+
+    fn test_reload_snapshot(name: &str) -> RuntimeConfiguration {
+        let mut configuration = RuntimeConfiguration::default();
+        configuration.process_exclusions.extend_lines([name]);
+        configuration.settings.diagnostics_enabled = true;
+        configuration
+    }
+
+    #[test]
+    fn configuration_loader_coalesces_requests_and_never_blocks_the_caller() {
+        let (requests, receive) = sync_channel(1);
+        let (reply, replies) = sync_channel(1);
+        let mut loader = RuntimeConfigurationLoader {
+            requests,
+            replies,
+            in_flight: false,
+            refresh_again: false,
+        };
+        assert!(loader.poll().is_none());
+        assert!(loader.request());
+        receive.try_recv().unwrap();
+        assert!(loader.poll().is_none()); // no reply: no blocking wait
+        assert!(loader.request());
+        assert!(loader.request());
+        assert!(receive.try_recv().is_err()); // coalesced, not queued again yet
+        reply.send(Ok(test_reload_snapshot("older.exe"))).unwrap();
+        assert!(loader.poll().is_none()); // superseded snapshot is not adopted
+        receive.try_recv().unwrap();
+        assert!(receive.try_recv().is_err());
+        let latest = test_reload_snapshot("latest.exe");
+        let policy = latest.process_exclusions.clone();
+        reply.send(Ok(latest)).unwrap();
+        assert_eq!(loader.poll().unwrap().unwrap().process_exclusions, policy);
+        assert!(!loader.in_flight);
+        assert!(loader.request());
+        receive.try_recv().unwrap();
+        drop(reply);
+        assert!(loader.poll().unwrap().is_err());
+        assert!(loader.poll().is_none());
+    }
+
+    #[test]
+    fn managed_package_source_is_guarded_against_active_and_pending_reload() {
+        let (mut state, receiver) = test_gate_state(2);
+        let source = PackageSource::Managed {
+            generation: 2,
+            state_sha256: [1; 32],
+        };
+        let mut snapshot = test_reload_snapshot("private.exe");
+        snapshot.package_source = source;
+        assert!(state.enqueue_configuration(snapshot));
+        assert!(!state.enqueue_configuration(test_reload_snapshot("lost-store.exe")));
+        let mut fork = test_reload_snapshot("fork.exe");
+        fork.package_source = PackageSource::Managed {
+            generation: 2,
+            state_sha256: [2; 32],
+        };
+        assert!(!state.enqueue_configuration(fork));
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.process(receiver.try_recv().unwrap());
+        let published = state.publish_acknowledged_configuration().unwrap();
+        assert_eq!(published.package_source, source);
+        assert_eq!(state.package_source, source);
+        assert!(!state.enqueue_configuration(test_reload_snapshot("lost-store.exe")));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn worker_keeps_managed_base_and_policy_when_a_read_fails() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(metrics, 0);
+        let mut snapshot = test_reload_snapshot("private.exe");
+        snapshot.package_source = PackageSource::Managed {
+            generation: 1,
+            state_sha256: [1; 32],
+        };
+        snapshot.dictionaries = Arc::new(autokeyboardlayot::DictionaryRegistry::english_base());
+        let policy = snapshot.process_exclusions.clone();
+        processor.apply_configuration_reload(Ok(snapshot));
+        assert!(
+            processor
+                .detector
+                .detect("ghbdtn", Language::English)
+                .is_none()
+        );
+        processor.apply_configuration_reload(Err(std::io::Error::other("store read failed")));
+        assert_eq!(processor.exclusion_policy, policy);
+        assert!(
+            processor
+                .detector
+                .detect("ghbdtn", Language::English)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn worker_reload_applies_exact_profile_choices_and_retains_them_on_read_error() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        assert!(
+            processor
+                .detector
+                .input_profile(Language::English)
+                .is_some()
+        );
+        let mut configuration = test_reload_snapshot("private.exe");
+        configuration.input_profiles =
+            autokeyboardlayot::input_profile_selection::InputProfileSelections::parse([(
+                "en-US",
+                "0409:00020409",
+            )])
+            .unwrap();
+        processor.apply_configuration_reload(Ok(configuration));
+        assert_eq!(processor.detector.input_profile(Language::English), None);
+        assert!(processor.exclusion_policy.is_excluded("private.exe"));
+        processor.apply_configuration_reload(Err(std::io::Error::other("test read failure")));
+        assert_eq!(processor.detector.input_profile(Language::English), None);
+        assert!(processor.exclusion_policy.is_excluded("private.exe"));
+        processor.apply_configuration_reload(Ok(test_reload_snapshot("private.exe")));
+        assert!(
+            processor
+                .detector
+                .input_profile(Language::English)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn worker_dictionary_snapshot_follows_validated_selection_and_reload() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        assert!(
+            processor
+                .detector
+                .detect("ghbdtn", Language::English)
+                .is_some()
+        );
+        let mut snapshot = test_reload_snapshot("private.exe");
+        snapshot
+            .settings
+            .set_pack_enabled(autokeyboardlayot::PackId::parse("ru-RU").unwrap(), false);
+        snapshot.dictionaries = dictionary_snapshot(&snapshot.settings);
+        processor.apply_configuration_reload(Ok(snapshot));
+        assert!(
+            processor
+                .detector
+                .detect("ghbdtn", Language::English)
+                .is_none()
+        );
+        assert!(
+            processor
+                .detector
+                .force_mapped_candidates(
+                    "ghbdtn",
+                    Language::English,
+                    &[(Language::Russian, "привет".to_owned())]
+                )
+                .is_none()
+        );
+        processor.apply_configuration_reload(Err(std::io::Error::other("invalid configuration")));
+        assert!(
+            processor
+                .detector
+                .detect("ghbdtn", Language::English)
+                .is_none()
+        );
+        for selected in [vec!["ru-RU"], vec!["de-DE"], vec!["en", "ru-RU"]] {
+            let mut snapshot = test_reload_snapshot("private.exe");
+            snapshot.settings.enabled_input_packs = selected
+                .into_iter()
+                .map(|id| autokeyboardlayot::PackId::parse(id).unwrap())
+                .collect();
+            snapshot.dictionaries = dictionary_snapshot(&snapshot.settings);
+            assert_eq!(
+                snapshot
+                    .dictionaries
+                    .enabled_ids()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                snapshot.settings.enabled_input_packs
+            );
+            processor.apply_configuration_reload(Ok(snapshot));
+            assert!(
+                processor
+                    .detector
+                    .detect("ghbdtn", Language::English)
+                    .is_none()
+            );
+            assert!(
+                processor
+                    .detector
+                    .detect("руддщ", Language::Russian)
+                    .is_none()
+            );
+            assert!(processor.exclusion_policy.is_excluded("private.exe"));
+        }
+        processor.apply_configuration_reload(Ok(test_reload_snapshot("private.exe")));
+        assert!(
+            processor
+                .detector
+                .detect("ghbdtn", Language::English)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn missing_sources_cannot_replace_active_or_pending_configuration() {
+        use autokeyboardlayot::configuration::ConfigurationSources;
+        for pending in [false, true] {
+            let (mut state, receiver) = test_gate_state(2);
+            if pending {
+                let mut snapshot = test_reload_snapshot("private.exe");
+                snapshot.sources = ConfigurationSources::UNIFIED;
+                assert!(state.enqueue_configuration(snapshot));
+            } else {
+                state.configuration_sources = ConfigurationSources::UNIFIED;
+            }
+            let previous_revision = state.next_configuration_revision;
+            assert!(!state.enqueue_configuration(RuntimeConfiguration::default()));
+            assert_eq!(state.next_configuration_revision, previous_revision);
+            assert_eq!(
+                state.metrics.configuration_pending.load(Ordering::Acquire),
+                pending
+            );
+            if pending {
+                let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+                processor.process(receiver.try_recv().unwrap());
+                assert!(state.publish_acknowledged_configuration().is_some());
+                assert_eq!(state.configuration_sources, ConfigurationSources::UNIFIED);
+                assert!(processor.exclusion_policy.is_excluded("private.exe"));
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn input_overflow_does_not_cancel_a_queued_configuration() {
+        let (mut state, receiver) = test_gate_state(1);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        assert!(state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        let queued_epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        assert!(!state.enqueue(RawInputEvent::Mouse));
+        assert!(state.metrics.input_epoch.load(Ordering::Acquire) > queued_epoch);
+        assert!(!state.settings.diagnostics_enabled);
+        processor.process(receiver.try_recv().unwrap());
+        assert!(processor.exclusion_policy.is_excluded("new-policy.exe"));
+        assert_eq!(state.metrics.configuration_ack.load(Ordering::Acquire), 1);
+        assert!(
+            state
+                .take_acknowledged_configuration()
+                .unwrap()
+                .settings
+                .diagnostics_enabled
+        );
+        // Worker acknowledgement alone must not publish hook settings.
+        assert!(!state.metrics.diagnostics_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_failed_newer_reload_keeps_the_previous_pending_snapshot() {
+        let (mut state, receiver) = test_gate_state(1);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        assert!(state.enqueue_configuration(test_reload_snapshot("first.exe")));
+        assert!(!state.enqueue_configuration(test_reload_snapshot("second.exe")));
+        assert!(state.metrics.configuration_pending.load(Ordering::Acquire));
+        processor.process(receiver.try_recv().unwrap());
+        let acknowledged = state.take_acknowledged_configuration().unwrap();
+        assert!(acknowledged.process_exclusions.is_excluded("first.exe"));
+        assert!(!acknowledged.process_exclusions.is_excluded("second.exe"));
+    }
+
+    #[test]
+    fn disconnected_reload_queue_does_not_publish_or_stay_pending() {
+        let (mut state, receiver) = test_gate_state(1);
+        drop(receiver);
+        let original = state.settings.clone();
+        assert!(!state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(state.settings, original);
+        assert!(state.pending_configuration.is_none());
+        assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rapid_reloads_require_latest_ack_and_bound_outstanding_snapshots() {
+        let (mut state, receiver) = test_gate_state(4);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        assert!(state.enqueue_configuration(test_reload_snapshot("first.exe")));
+        assert!(state.enqueue_configuration(test_reload_snapshot("second.exe")));
+        assert!(!state.enqueue_configuration(test_reload_snapshot("third.exe")));
+        let first = receiver.try_recv().unwrap();
+        processor.process(first.clone());
+        assert!(state.take_acknowledged_configuration().is_none());
+        processor.process(receiver.try_recv().unwrap());
+        assert!(
+            state
+                .take_acknowledged_configuration()
+                .unwrap()
+                .process_exclusions
+                .is_excluded("second.exe")
+        );
+        processor.process(first);
+        assert_eq!(state.metrics.configuration_ack.load(Ordering::Acquire), 2);
+        assert!(processor.exclusion_policy.is_excluded("second.exe"));
+        assert!(!processor.exclusion_policy.is_excluded("first.exe"));
+    }
+
+    #[test]
+    fn pending_configuration_passes_hotkeys_and_suppresses_worker_buffering() {
+        let (mut state, receiver) = test_gate_state(2);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        assert!(state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            contextual_hotkey_action(&state.metrics, WM_KEYDOWN, VK_PAUSE.0, 0),
+            UndoHotkeyAction::PassThrough
+        );
+        assert!(!gate_request_enabled(&state.metrics, 1));
+        processor.process(receiver.try_recv().unwrap());
+        assert!(state.enqueue(RawInputEvent::Key(test_raw_key(
+            WM_KEYDOWN,
+            VIRTUAL_KEY(0x41),
+            1,
+            0
+        ))));
+        processor.process(receiver.try_recv().unwrap());
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert!(state.metrics.configuration_pending.load(Ordering::Acquire));
+        let transition_epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        assert!(state.publish_acknowledged_configuration().is_some());
+        assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+        assert!(state.metrics.diagnostics_enabled.load(Ordering::Acquire));
+        assert!(state.settings.diagnostics_enabled);
+        assert!(state.metrics.input_epoch.load(Ordering::Acquire) > transition_epoch);
+        assert!(gate_request_enabled(&state.metrics, 1));
+        assert!(state.publish_acknowledged_configuration().is_none());
+    }
+
+    #[test]
+    fn an_active_gate_prevents_configuration_handoff_without_losing_held_state() {
+        let (mut state, receiver) = test_gate_state(2);
+        state.correction_gate.activate(9);
+        assert!(!state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert!(state.correction_gate.active);
+        assert_eq!(state.correction_gate.token, 9);
+        assert!(receiver.try_recv().is_err());
+        assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_reload_without_a_snapshot_cannot_acknowledge_configuration() {
+        let (state, receiver) = test_gate_state(1);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        state
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        assert!(state.enqueue(RawInputEvent::ReloadConfiguration));
+        processor.process(receiver.try_recv().unwrap());
+        assert_eq!(state.metrics.configuration_ack.load(Ordering::Acquire), 0);
+        assert_eq!(processor.configuration_revision, 0);
+        assert!(state.metrics.configuration_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn initial_worker_configuration_is_the_supplied_snapshot() {
+        let mut configuration = RuntimeConfiguration::default();
+        configuration.settings.diagnostics_enabled = true;
+        configuration
+            .process_exclusions
+            .extend_lines(["private-test.exe"]);
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new_with_lexicon_candidate(
+            Arc::clone(&metrics),
+            0,
+            Arc::new(Mutex::new(None)),
+            None,
+            configuration.clone(),
+        );
+        assert_eq!(processor.settings, configuration.settings);
+        assert_eq!(processor.exclusion_policy, configuration.process_exclusions);
+        assert_eq!(processor.backend_rules, configuration.backend_rules);
+        assert!(metrics.diagnostics_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_worker_reload_preserves_policy_and_clears_pending_input() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor
+            .exclusion_policy
+            .extend_lines(["private-test.exe"]);
+        processor.settings.diagnostics_enabled = true;
+        let old_settings = processor.settings.clone();
+        let old_policy = processor.exclusion_policy.clone();
+        let old_rules = processor.backend_rules.clone();
+        processor.session.handle(
+            InputEvent::Printable('a'),
+            Some(Language::English),
+            &processor.detector,
+        );
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        processor.apply_configuration_reload(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "test failure",
+        )));
+        assert_eq!(processor.settings, old_settings);
+        assert_eq!(processor.exclusion_policy, old_policy);
+        assert_eq!(processor.backend_rules, old_rules);
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert!(processor.pending_conversion.is_none());
+        assert!(processor.undo_record.is_none());
+    }
 
     fn test_raw_key(
         message: u32,
@@ -6749,11 +7859,80 @@ mod tests {
             next_privacy_refresh: Instant::now(),
             menu_open: false,
             settings: Settings::default(),
+            next_configuration_revision: 0,
+            configuration_sources: autokeyboardlayot::configuration::ConfigurationSources::default(
+            ),
+            package_source: PackageSource::LegacyBootstrap,
+            pending_configuration: None,
+            configuration_loader: None,
             lexicon_candidate: Arc::new(Mutex::new(None)),
             diagnostic_sender: None,
             diagnostic_worker: None,
         };
         (state, receiver)
+    }
+
+    #[test]
+    fn graceful_shutdown_refuses_input_and_configuration_operations() {
+        let (mut state, _receiver) = test_gate_state(4);
+        state.correction_gate.activate(10);
+        assert!(!state.request_shutdown());
+        assert!(state.correction_gate.active);
+        state.correction_gate.active = false;
+        let retained_key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        *state.metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: retained_key.foreground,
+            events: vec![retained_key],
+            delivery_uncertain: false,
+        });
+        assert!(!state.request_shutdown());
+        assert_eq!(
+            state
+                .metrics
+                .retained_input
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        state.metrics.retained_input.lock().unwrap().take();
+        for index in 0..4 {
+            let metrics = Arc::clone(&state.metrics);
+            let flag = [
+                &metrics.worker_busy,
+                &metrics.configuration_pending,
+                &metrics.undo_hotkey_active,
+                &metrics.hotkey_waiting_for_release,
+            ][index];
+            flag.store(true, Ordering::Release);
+            assert!(!state.request_shutdown());
+            assert!(flag.load(Ordering::Acquire));
+            assert!(!state.shutdown.load(Ordering::Acquire));
+            assert!(state.input_sender.is_some());
+            flag.store(false, Ordering::Release);
+        }
+        assert!(state.request_shutdown());
+        assert!(state.request_shutdown());
+        assert!(state.shutdown_finished());
+        assert!(state.input_sender.is_none());
+    }
+
+    #[test]
+    fn graceful_shutdown_waits_for_actual_worker_return() {
+        let (mut state, _receiver) = test_gate_state(4);
+        let (release, wait) = sync_channel::<()>(1);
+        state.worker = Some(thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        }));
+        assert!(state.request_shutdown());
+        assert!(!state.shutdown_finished());
+        release.send(()).unwrap();
+        state.worker.take().unwrap().join().unwrap();
+        assert!(state.shutdown_finished());
     }
 
     #[test]
@@ -6998,6 +8177,7 @@ mod tests {
         metrics.input_epoch.store(7, Ordering::Release);
         let mut processor = InputProcessor::new(metrics, 0);
         processor.process(QueuedInputEvent {
+            configuration: None,
             captured_at: Instant::now(),
             epoch: 7,
             event: RawInputEvent::Mouse,
@@ -7171,6 +8351,7 @@ mod tests {
     fn tray_tooltip_exposes_privacy_pause_without_text_content() {
         let paused = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
+            ui_revision: 0,
             candidates: 2,
             dropped: 0,
             privacy_reason: PRIVACY_PASSWORD,
@@ -7183,6 +8364,7 @@ mod tests {
         });
         let active = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
+            ui_revision: 0,
             candidates: 2,
             dropped: 0,
             privacy_reason: PRIVACY_ALLOWED,
@@ -7195,6 +8377,7 @@ mod tests {
         });
         let failed = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
+            ui_revision: 0,
             candidates: 11,
             dropped: 0,
             privacy_reason: PRIVACY_ALLOWED,
@@ -7208,9 +8391,9 @@ mod tests {
         assert!(paused.contains("privacy paused (password)"));
         assert!(!active.contains("privacy paused"));
         assert!(paused.contains("candidates: 2"));
-        assert!(active.starts_with("Автоконвертация включена"));
-        assert!(paused.starts_with("Автоконвертация выключена"));
-        assert!(failed.starts_with("Защитная пауза: text-commit"));
+        assert!(active.starts_with("Automatic conversion is on"));
+        assert!(paused.starts_with("Automatic conversion is off"));
+        assert!(failed.starts_with("Safety pause: text-commit"));
         assert!(active.contains("undo ready"));
         assert!(paused.contains("backend: unsupported"));
         assert!(active.contains("backend: uia-paste"));
@@ -7220,6 +8403,30 @@ mod tests {
             conversion_failure_label(ConversionFailureReason::ClipboardEdit as u8),
             "clipboard-edit"
         );
+    }
+
+    #[test]
+    fn localized_tray_text_never_truncates_half_a_surrogate_pair() {
+        let mut short = [42u16; 3];
+        set_wide_text(&mut short, "A😀");
+        assert_eq!(short, [b'A' as u16, 0, 0]);
+        let mut complete = [0u16; 4];
+        set_wide_text(&mut complete, "A😀B");
+        assert_eq!(String::from_utf16(&complete[..3]).unwrap(), "A😀");
+        assert_eq!(complete[3], 0);
+        set_wide_text(&mut [0u16; 0], "text");
+    }
+
+    #[test]
+    fn ui_language_revision_invalidates_an_otherwise_unchanged_tray_status() {
+        let before = TrayStatus::initial(LayoutIndicator::English);
+        let after = TrayStatus {
+            ui_revision: 1,
+            ..before
+        };
+        assert_ne!(before, after);
+        assert_eq!(tray_visual_state(before), tray_visual_state(after));
+        assert!(!should_notify_conversion_failure(before, after));
     }
 
     #[test]
@@ -7351,10 +8558,22 @@ mod tests {
 
     #[test]
     fn maps_buffered_scan_codes_through_a_windows_layout_with_caps_toggle() {
-        let Some(english) = find_layout(Language::English) else {
-            // SSH service sessions can legitimately have no user HKLs loaded.
+        // This mapping test is read-only and only runs for an exact US layout
+        // already current on its own thread. Resolver activation is tested by
+        // the separate explicit diagnostic, not hidden in this unit fixture.
+        let english = unsafe { GetKeyboardLayout(0) };
+        let mut name = [0u16; 9];
+        if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutNameW(&mut name) }
+            .is_err()
+        {
+            return;
+        }
+        let Ok(name) = String::from_utf16(&name[..8]) else {
             return;
         };
+        if format!("{:04X}:{name}", english.0 as usize & 0xffff) != "0409:00000409" {
+            return;
+        }
         let hello = [0x23_u16, 0x12, 0x26, 0x26, 0x18].map(|scan_code| ReplayKey {
             scan_code,
             shift: false,
@@ -7778,6 +8997,7 @@ mod tests {
         });
 
         processor.process(QueuedInputEvent {
+            configuration: None,
             captured_at: Instant::now(),
             epoch: 1,
             event: RawInputEvent::GateDrainReady {
@@ -8053,6 +9273,7 @@ mod tests {
         );
 
         processor.process(QueuedInputEvent {
+            configuration: None,
             captured_at: Instant::now(),
             epoch: 0,
             event: RawInputEvent::GateDrainReady {
@@ -8272,6 +9493,7 @@ mod tests {
             transaction,
             foreground,
             source_layout: 1,
+            profile_generation: processor.input_profiles.generation(),
             replay_keys: vec![ReplayKey {
                 scan_code: 0x22,
                 shift: false,
@@ -8283,6 +9505,7 @@ mod tests {
         metrics.undo_available.store(true, Ordering::Release);
 
         processor.process(QueuedInputEvent {
+            configuration: None,
             captured_at: Instant::now(),
             epoch: 0,
             event: RawInputEvent::ExternalInjection,

@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "pack_id": "ru-RU",
+  "windows_keyboard_profiles": [
+    { "profile": "0419:00000419", "required_capabilities": ["physical-key-v1"] }
+  ]
+}

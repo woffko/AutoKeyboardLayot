@@ -1,15 +1,194 @@
-import { Button, CheckBox, Palette, ScrollView, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, Palette, ScrollView } from "std-widgets.slint";
+
+component UiText inherits Text {
+    horizontal-alignment: Localization.rtl ? right : left;
+    wrap: word-wrap;
+}
+
+component DirectionalRow inherits Rectangle {
+    in property <length> spacing: 10px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+}
+
+component DirectionalButtonPair inherits DirectionalRow {
+    in property <string> first-text;
+    in property <string> second-text;
+    in property <bool> enabled: true;
+    callback first-clicked;
+    callback second-clicked;
+    private property <bool> stacked: first.preferred-width + second.preferred-width + root.spacing > root.width;
+    height: root.stacked ? first.height + root.spacing + second.height : max(first.height, second.height);
+
+    first := Button {
+        text: root.first-text;
+        enabled: root.enabled;
+        width: min(self.preferred-width, parent.width);
+        height: self.preferred-height;
+        x: Localization.rtl ? parent.width - self.width : 0px;
+        clicked => { root.first-clicked(); }
+    }
+    second := Button {
+        text: root.second-text;
+        enabled: root.enabled;
+        width: min(self.preferred-width, parent.width);
+        height: self.preferred-height;
+        x: root.stacked ? (Localization.rtl ? parent.width - self.width : 0px)
+            : (Localization.rtl ? first.x - root.spacing - self.width : first.width + root.spacing);
+        y: root.stacked ? first.height + root.spacing : 0px;
+        clicked => { root.second-clicked(); }
+    }
+}
+
+// Keep the standard accessible/toggle control; only its label placement and
+// wrapping are owned here. There is one accessible checkbox, not two controls.
+component DirectionalCheckBox inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    callback toggled;
+    forward-focus: box;
+    min-height: max(24px, label.preferred-height);
+    preferred-height: self.min-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+
+    box := CheckBox {
+        x: Localization.rtl ? parent.width - self.width : 0px;
+        y: (parent.height - self.height) / 2;
+        width: 24px;
+        height: 24px;
+        text: "";
+        accessible-label: root.text;
+        enabled: root.enabled;
+        checked <=> root.checked;
+        toggled => { root.toggled(); }
+    }
+    label := UiText {
+        x: Localization.rtl ? 0px : 32px;
+        width: max(0px, parent.width - 32px);
+        height: parent.height;
+        text: root.text;
+        color: Palette.foreground;
+        opacity: root.enabled ? 1 : 0.5;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    TouchArea {
+        x: label.x;
+        width: label.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => {
+            box.focus();
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+}
+
+// Application-owned menu labels, composed entirely from public Slint primitives.
+// TextInput remains responsible for IME, selection, undo and clipboard operations.
+// The menu is an ancestor of the editor, so Menu/Shift+F10 reaches it as well.
+component LocalizedTextEdit inherits Rectangle {
+    in-out property <string> text;
+    in property <string> accessible-name;
+    in property <TextWrap> wrap: no-wrap;
+    in property <bool> enabled: true;
+    in property <bool> read-only: false;
+    in property <bool> single-line: false;
+    in property <length> font-size: 14px;
+    private property <length> caret-margin: max(20px, root.font-size * 1.5);
+
+    forward-focus: editor;
+    horizontal-stretch: 1;
+    vertical-stretch: 1;
+    min-height: root.single-line ? 32px : 96px;
+    background: Palette.control-background;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: editor.has-focus ? Palette.accent-background : Palette.border;
+
+    ContextMenuArea {
+        enabled: root.enabled;
+        Menu {
+            MenuItem {
+                title: Localization.text("edit.cut", Localization.revision);
+                enabled: root.enabled && !root.read-only;
+                activated => { editor.cut(); }
+            }
+            MenuItem {
+                title: Localization.text("edit.copy", Localization.revision);
+                enabled: root.enabled && !root.text.is-empty;
+                activated => { editor.copy(); }
+            }
+            MenuItem {
+                title: Localization.text("edit.paste", Localization.revision);
+                enabled: root.enabled && !root.read-only;
+                activated => { editor.paste(); }
+            }
+            MenuItem {
+                title: Localization.text("edit.select_all", Localization.revision);
+                enabled: root.enabled && !root.text.is-empty;
+                activated => { editor.select-all(); }
+            }
+        }
+
+        scroll := ScrollView {
+            x: 12px;
+            y: 12px;
+            width: parent.width - 24px;
+            height: parent.height - 24px;
+            viewport-width: root.wrap == TextWrap.no-wrap ? max(self.visible-width, editor.preferred-width) : self.visible-width;
+            viewport-height: max(self.visible-height, editor.preferred-height);
+
+            editor := TextInput {
+                text <=> root.text;
+                enabled: root.enabled;
+                read-only: root.read-only;
+                single-line: root.single-line;
+                horizontal-alignment: left;
+                wrap: root.wrap;
+                font-size: root.font-size;
+                color: Palette.foreground;
+                selection-background-color: Palette.accent-background;
+                selection-foreground-color: Palette.accent-foreground;
+                page-height: scroll.visible-height;
+                accessible-label: root.accessible-name;
+
+                cursor-position-changed(position) => {
+                    // First keep the caret inside the visible rectangle, then
+                    // clamp to the content extent so scrolling leaves no gap.
+                    let target-x = min(max(scroll.viewport-x, -position.x), scroll.visible-width - position.x);
+                    let available-y = max(0px, scroll.visible-height - root.caret-margin);
+                    let target-y = min(max(scroll.viewport-y, -position.y), available-y - position.y);
+                    scroll.viewport-x = min(0px, max(scroll.visible-width - self.width, target-x));
+                    scroll.viewport-y = min(0px, max(scroll.visible-height - self.height, target-y));
+                }
+            }
+        }
+    }
+}
 
 component NavigationItem inherits Rectangle {
     in property <string> label;
     in property <bool> selected;
     callback activated;
 
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-action-default => { root.activated(); }
+
     height: 42px;
     border-radius: 7px;
+    border-width: keyboard-focus.has-focus ? 2px : 0px;
+    border-color: root.selected ? Palette.accent-foreground : Palette.foreground;
     background: selected ? Palette.accent-background : touch.has-hover ? Palette.control-background : transparent;
 
-    Text {
+    UiText {
         x: 14px;
         width: parent.width - 28px;
         height: parent.height;
@@ -18,10 +197,22 @@ component NavigationItem inherits Rectangle {
         vertical-alignment: center;
         font-size: 14px;
         font-weight: root.selected ? 600 : 400;
+        accessible-role: none;
     }
 
     touch := TouchArea {
-        clicked => { root.activated(); }
+        clicked => { keyboard-focus.focus(); root.activated(); }
+    }
+
+    keyboard-focus := FocusScope {
+        width: 0px;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
     }
 }
 
@@ -30,13 +221,13 @@ component SectionTitle inherits VerticalLayout {
     in property <string> description;
     spacing: 5px;
 
-    Text {
+    UiText {
         text: root.title;
         color: Palette.foreground;
         font-size: 28px;
         font-weight: 600;
     }
-    Text {
+    UiText {
         text: root.description;
         color: Palette.foreground;
         opacity: 0.68;
@@ -52,8 +243,34 @@ component SettingsCard inherits Rectangle {
     border-radius: 9px;
 }
 
+// The application supplies immutable catalog snapshots outside the hook.
+// Revision is an explicit binding dependency when a catalog is changed.
+export global Localization {
+    in-out property <int> revision: 0;
+    in-out property <bool> rtl: false;
+    pure callback text(string, int) -> string;
+}
+
+export struct InputPackRow {
+    id: string,
+    selected: bool,
+    status-key: string,
+    details: string,
+    profile-ids: [string],
+    profile-names: [string],
+    profile-index: int,
+}
+
+export struct DownloadRow {
+    id: string,
+    details: string,
+    has-input: bool,
+    available: bool,
+    selected: bool,
+}
+
 export component SettingsWindow inherits Window {
-    title: "AutoKeyboardLayot — Настройки";
+    title: Localization.text("window.settings", Localization.revision);
     preferred-width: 1080px;
     preferred-height: 760px;
     min-width: 900px;
@@ -63,6 +280,10 @@ export component SettingsWindow inherits Window {
     in-out property <int> current-page: 0;
     in-out property <string> status-text: "";
     in-out property <bool> status-error: false;
+    in property <[string]> ui-language-ids;
+    in property <[string]> ui-language-names;
+    in-out property <int> ui-language-index: 0;
+    in property <string> ui-language-status;
 
     in-out property <bool> automatic-conversion-on-startup;
     in-out property <bool> hotkey-enabled;
@@ -81,9 +302,47 @@ export component SettingsWindow inherits Window {
     in-out property <bool> suppress-after-home-end;
     in-out property <bool> suppress-after-manual-layout;
 
-    in-out property <bool> enable-english;
-    in-out property <bool> enable-russian;
-    in-out property <bool> enable-estonian;
+    in property <[InputPackRow]> input-packs;
+    in property <bool> package-import-allowed: false;
+    in property <bool> package-import-busy: false;
+    in property <bool> package-import-ready: false;
+    in property <string> package-import-preview;
+    in property <bool> package-removal: false;
+    in property <bool> package-rollback: false;
+    in property <bool> package-migration: false;
+    in property <string> migration-summary;
+    in property <[string]> review-package-names;
+    in-out property <int> review-package-index: 0;
+    callback prepare-migration;
+    callback preview-review-package(int);
+    in property <bool> package-online: false;
+    in property <string> online-summary;
+    in-out property <string> download-repository;
+    in property <[DownloadRow]> download-rows;
+    in property <bool> download-catalog-ready: false;
+    in property <bool> download-has-selection: false;
+    in property <string> download-summary;
+    in property <bool> download-active: false;
+    in property <bool> download-cancelling: false;
+    callback check-download-catalog;
+    callback toggle-download(string, bool);
+    callback start-selected-download;
+    callback cancel-download;
+    callback discard-download-catalog;
+    callback refresh-download-labels;
+    in property <[string]> installed-package-ids;
+    in property <[string]> installed-package-names;
+    in property <[bool]> installed-package-rollback;
+    in-out property <int> installed-package-index: 0;
+    callback refresh-packages;
+    callback prepare-package-removal;
+    callback prepare-package-rollback;
+    callback refresh-package-labels;
+    callback inspect-package;
+    callback confirm-package;
+    callback cancel-package;
+    callback toggle-input-pack(string, bool);
+    callback select-input-profile(string, int);
 
     in-out property <string> user-dictionary-text;
     in-out property <string> word-exclusions-text;
@@ -94,7 +353,7 @@ export component SettingsWindow inherits Window {
     in-out property <int> hotkey-modifier-bits;
     in-out property <string> hotkey-label;
     in-out property <bool> hotkey-recording: false;
-    in-out property <string> hotkey-capture-hint: "Изменения вступят в силу после нажатия «Применить».";
+    in-out property <string> hotkey-capture-hint: Localization.text("general.apply_hint", Localization.revision);
 
     in property <[string]> running-processes;
     in-out property <bool> process-picker-visible: false;
@@ -109,18 +368,21 @@ export component SettingsWindow inherits Window {
     callback cancel-hotkey-recording;
     callback reset-hotkey;
 
-    HorizontalLayout {
-        spacing: 0px;
+    Rectangle {
+        width: root.width;
+        height: root.height;
 
         Rectangle {
+            x: Localization.rtl ? parent.width - self.width : 0px;
             width: 252px;
+            height: parent.height;
             background: Palette.alternate-background;
 
             VerticalLayout {
                 padding: 20px;
                 spacing: 7px;
 
-                Text {
+                UiText {
                     text: "AutoKeyboardLayot";
                     color: Palette.foreground;
                     font-size: 19px;
@@ -128,22 +390,25 @@ export component SettingsWindow inherits Window {
                     height: 42px;
                 }
 
-                nav-general := NavigationItem { label: "Общие"; selected: root.current-page == 0; activated => { root.current-page = 0; } }
-                nav-rules := NavigationItem { label: "Правила переключения"; selected: root.current-page == 1; activated => { root.current-page = 1; } }
-                nav-languages := NavigationItem { label: "Языки"; selected: root.current-page == 2; activated => { root.current-page = 2; } }
-                nav-dictionary := NavigationItem { label: "Пользовательский словарь"; selected: root.current-page == 3; activated => { root.current-page = 3; } }
-                nav-words := NavigationItem { label: "Исключения слов"; selected: root.current-page == 4; activated => { root.current-page = 4; } }
-                nav-processes := NavigationItem { label: "Программы-исключения"; selected: root.current-page == 5; activated => { root.current-page = 5; } }
-                nav-backends := NavigationItem { label: "Методы замены"; selected: root.current-page == 6; activated => { root.current-page = 6; } }
-                nav-diagnostics := NavigationItem { label: "Диагностика"; selected: root.current-page == 7; activated => { root.current-page = 7; } }
+                nav-general := NavigationItem { label: Localization.text("nav.general", Localization.revision); selected: root.current-page == 0; activated => { root.current-page = 0; } }
+                nav-rules := NavigationItem { label: Localization.text("nav.rules", Localization.revision); selected: root.current-page == 1; activated => { root.current-page = 1; } }
+                nav-languages := NavigationItem { label: Localization.text("nav.languages", Localization.revision); selected: root.current-page == 2; activated => { root.current-page = 2; } }
+                nav-dictionary := NavigationItem { label: Localization.text("nav.dictionary", Localization.revision); selected: root.current-page == 3; activated => { root.current-page = 3; } }
+                nav-words := NavigationItem { label: Localization.text("nav.word_exclusions", Localization.revision); selected: root.current-page == 4; activated => { root.current-page = 4; } }
+                nav-processes := NavigationItem { label: Localization.text("nav.process_exclusions", Localization.revision); selected: root.current-page == 5; activated => { root.current-page = 5; } }
+                nav-backends := NavigationItem { label: Localization.text("nav.backends", Localization.revision); selected: root.current-page == 6; activated => { root.current-page = 6; } }
+                nav-diagnostics := NavigationItem { label: Localization.text("nav.diagnostics", Localization.revision); selected: root.current-page == 7; activated => { root.current-page = 7; } }
 
                 Rectangle { vertical-stretch: 1; }
 
-                nav-about := NavigationItem { label: "О программе"; selected: root.current-page == 8; activated => { root.current-page = 8; } }
+                nav-about := NavigationItem { label: Localization.text("nav.about", Localization.revision); selected: root.current-page == 8; activated => { root.current-page = 8; } }
             }
         }
 
         VerticalLayout {
+            x: Localization.rtl ? 0px : 252px;
+            width: parent.width - 252px;
+            height: parent.height;
             padding-left: 30px;
             padding-right: 30px;
             padding-top: 24px;
@@ -152,46 +417,81 @@ export component SettingsWindow inherits Window {
 
             if root.current-page == 0: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Общие настройки"; description: "Правый клик по значку — меню. Левый — настройки. Зелёная рамка: автоматика включена; красная: выключена."; }
+                SectionTitle { title: Localization.text("general.title", Localization.revision); description: Localization.text("general.description", Localization.revision); }
                 ScrollView {
                     VerticalLayout {
                         spacing: 12px;
                         SettingsCard {
-                            height: 214px;
+                            min-height: 126px;
                             VerticalLayout {
                                 padding: 18px;
                                 spacing: 8px;
-                                CheckBox { text: "Автоконвертация при запуске"; checked <=> root.automatic-conversion-on-startup; }
-                                CheckBox { text: "Физическая замена, если безопасный UIA недоступен"; checked <=> root.physical-fallback; }
-                                CheckBox { text: "Повторно проверять первое слово после полного удаления"; checked <=> root.recheck-first-word-after-erasing; }
-                                CheckBox { text: "Предлагать исключение после отмены"; checked <=> root.offer-word-exclusion-after-undo; }
-                                CheckBox { text: "Предлагать добавить слово после принудительной конвертации"; checked <=> root.offer-dictionary-after-force; }
+                                DirectionalRow {
+                                    spacing: 12px;
+                                    height: max(language-label.preferred-height, language-picker.preferred-height);
+                                    language-label := UiText {
+                                        text: Localization.text("ui_language.label", Localization.revision);
+                                        color: Palette.foreground; vertical-alignment: center;
+                                        width: self.preferred-width; height: parent.height;
+                                        x: Localization.rtl ? parent.width - self.width : 0px;
+                                    }
+                                    language-picker := ComboBox {
+                                        model: root.ui-language-names; current-index <=> root.ui-language-index;
+                                        x: Localization.rtl ? 0px : language-label.width + parent.spacing;
+                                        width: max(0px, parent.width - language-label.width - parent.spacing);
+                                        height: parent.height;
+                                    }
+                                }
+                                UiText { text: root.ui-language-status; color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
+                                UiText { text: Localization.text("ui_language.fallback", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
                             }
                         }
                         SettingsCard {
-                            height: 276px;
+                            min-height: 214px;
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 8px;
+                                DirectionalCheckBox { text: Localization.text("general.auto_start", Localization.revision); checked <=> root.automatic-conversion-on-startup; }
+                                DirectionalCheckBox { text: Localization.text("general.physical_fallback", Localization.revision); checked <=> root.physical-fallback; }
+                                DirectionalCheckBox { text: Localization.text("general.recheck_erased", Localization.revision); checked <=> root.recheck-first-word-after-erasing; }
+                                DirectionalCheckBox { text: Localization.text("general.offer_exclusion", Localization.revision); checked <=> root.offer-word-exclusion-after-undo; }
+                                DirectionalCheckBox { text: Localization.text("general.offer_dictionary", Localization.revision); checked <=> root.offer-dictionary-after-force; }
+                            }
+                        }
+                        SettingsCard {
+                            min-height: 276px;
                             VerticalLayout {
                                 padding: 18px;
                                 spacing: 9px;
-                                CheckBox { text: "Использовать горячую клавишу"; checked <=> root.hotkey-enabled; }
-                                HorizontalLayout {
+                                DirectionalCheckBox { text: Localization.text("hotkey.enabled", Localization.revision); checked <=> root.hotkey-enabled; }
+                                DirectionalRow {
                                     height: 48px;
                                     spacing: 12px;
-                                    Text { text: "Назначено:"; color: Palette.foreground; vertical-alignment: center; }
+                                    assigned-label := UiText {
+                                        text: Localization.text("hotkey.assigned", Localization.revision);
+                                        color: Palette.foreground; vertical-alignment: center;
+                                        width: self.preferred-width; height: parent.height;
+                                        x: Localization.rtl ? parent.width - self.width : 0px;
+                                    }
                                     Rectangle {
                                         border-width: 1px; border-color: Palette.border; border-radius: 6px;
-                                        background: Palette.background; horizontal-stretch: 1;
-                                        Text { x: 12px; width: parent.width - 24px; height: parent.height; vertical-alignment: center; font-size: 20px; font-weight: 600; color: Palette.foreground; text: root.hotkey-recording ? "Нажмите сочетание…" : root.hotkey-label; }
+                                        background: Palette.background;
+                                        x: Localization.rtl ? 0px : assigned-label.width + parent.spacing;
+                                        width: max(0px, parent.width - assigned-label.width - parent.spacing);
+                                        height: parent.height;
+                                        UiText { x: 12px; width: parent.width - 24px; height: parent.height; vertical-alignment: center; font-size: 20px; font-weight: 600; color: Palette.foreground; text: root.hotkey-recording ? Localization.text("hotkey.press", Localization.revision) : root.hotkey-label; }
                                     }
                                 }
-                                HorizontalLayout {
+                                DirectionalButtonPair {
                                     spacing: 8px;
-                                    Button { text: root.hotkey-recording ? "Отменить назначение" : "Нажать сочетание…"; enabled: root.hotkey-enabled; clicked => { if root.hotkey-recording { root.cancel-hotkey-recording(); } else { root.record-hotkey(); } } }
-                                    Button { text: "Вернуть Pause/Break"; enabled: root.hotkey-enabled; clicked => { root.reset-hotkey(); } }
-                                    Rectangle { horizontal-stretch: 1; }
+                                    enabled: root.hotkey-enabled;
+                                    first-text: root.hotkey-recording ? Localization.text("hotkey.cancel_button", Localization.revision) : Localization.text("hotkey.record_button", Localization.revision);
+                                    second-text: Localization.text("hotkey.reset_button", Localization.revision);
+                                    first-clicked => { if root.hotkey-recording { root.cancel-hotkey-recording(); } else { root.record-hotkey(); } }
+                                    second-clicked => { root.reset-hotkey(); }
                                 }
-                                Text { text: root.hotkey-capture-hint; color: Palette.foreground; opacity: 0.75; font-size: 12px; wrap: word-wrap; }
-                                Text { text: "Исправить: наберите слово без завершающего пробела и нажмите сочетание.\nОтменить: нажмите его сразу после автоконвертации.\nЕсли есть Ctrl / Alt / Shift / Win, действие выполняется после отпускания клавиш."; color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
+                                UiText { text: root.hotkey-capture-hint; color: Palette.foreground; opacity: 0.75; font-size: 12px; wrap: word-wrap; }
+                                UiText { text: Localization.text("hotkey.help", Localization.revision); color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
                             }
                         }
                     }
@@ -200,30 +500,30 @@ export component SettingsWindow inherits Window {
 
             if root.current-page == 1: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Правила переключения"; description: "Если правило включено, текущее слово не исправляется после соответствующего действия."; }
+                SectionTitle { title: Localization.text("nav.rules", Localization.revision); description: Localization.text("rules.description", Localization.revision); }
                 ScrollView {
                     VerticalLayout {
                         spacing: 12px;
                         SettingsCard {
-                            height: 330px;
+                            min-height: 330px;
                             VerticalLayout {
                                 padding: 18px;
                                 spacing: 8px;
-                                CheckBox { text: "После Backspace"; checked <=> root.suppress-after-backspace; }
-                                CheckBox { text: "После Delete"; checked <=> root.suppress-after-delete; }
-                                CheckBox { text: "После стрелки влево"; checked <=> root.suppress-after-left; }
-                                CheckBox { text: "После стрелки вправо"; checked <=> root.suppress-after-right; }
-                                CheckBox { text: "После стрелки вверх"; checked <=> root.suppress-after-up; }
-                                CheckBox { text: "После стрелки вниз"; checked <=> root.suppress-after-down; }
-                                CheckBox { text: "После Home / End"; checked <=> root.suppress-after-home-end; }
-                                CheckBox { text: "После ручной смены раскладки"; checked <=> root.suppress-after-manual-layout; }
+                                DirectionalCheckBox { text: Localization.text("rules.backspace", Localization.revision); checked <=> root.suppress-after-backspace; }
+                                DirectionalCheckBox { text: Localization.text("rules.delete", Localization.revision); checked <=> root.suppress-after-delete; }
+                                DirectionalCheckBox { text: Localization.text("rules.left", Localization.revision); checked <=> root.suppress-after-left; }
+                                DirectionalCheckBox { text: Localization.text("rules.right", Localization.revision); checked <=> root.suppress-after-right; }
+                                DirectionalCheckBox { text: Localization.text("rules.up", Localization.revision); checked <=> root.suppress-after-up; }
+                                DirectionalCheckBox { text: Localization.text("rules.down", Localization.revision); checked <=> root.suppress-after-down; }
+                                DirectionalCheckBox { text: Localization.text("rules.home_end", Localization.revision); checked <=> root.suppress-after-home-end; }
+                                DirectionalCheckBox { text: Localization.text("rules.manual_layout", Localization.revision); checked <=> root.suppress-after-manual-layout; }
                             }
                         }
                         SettingsCard {
-                            height: 80px;
+                            min-height: 80px;
                             VerticalLayout {
                                 padding: 16px;
-                                CheckBox { text: "Не конвертировать по Tab / Enter (обязательная защита текущей версии)"; checked: true; enabled: false; }
+                                DirectionalCheckBox { text: Localization.text("rules.no_enter_tab", Localization.revision); checked: true; enabled: false; }
                             }
                         }
                     }
@@ -232,42 +532,126 @@ export component SettingsWindow inherits Window {
 
             if root.current-page == 2: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Языки"; description: "Для автоконвертации должны оставаться включёнными хотя бы два языка."; }
-                SettingsCard {
-                    height: 224px;
+                SectionTitle { title: Localization.text("nav.languages", Localization.revision); description: Localization.text("languages.description", Localization.revision); }
+                ScrollView {
                     VerticalLayout {
                         padding: 20px;
                         spacing: 12px;
-                        CheckBox { text: "English — en-US"; checked <=> root.enable-english; }
-                        CheckBox { text: "Русский — ru-RU"; checked <=> root.enable-russian; }
-                        CheckBox { text: "Eesti — et-EE"; checked <=> root.enable-estonian; }
-                        CheckBox { text: "日本語 — ja-JP (ожидает безопасный IME-адаптер)"; checked: false; enabled: false; }
+                UiText { text: Localization.text("packs.notice", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                if !root.package-import-allowed: UiText { text: Localization.text("import.legacy", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                if !root.package-import-allowed: Button {
+                    text: Localization.text("migration.choose", Localization.revision);
+                    enabled: !root.package-import-busy;
+                    clicked => { root.prepare-migration(); }
+                }
+                Button {
+                    text: Localization.text("import.choose", Localization.revision);
+                    enabled: root.package-import-allowed && !root.package-import-busy;
+                    clicked => { root.inspect-package(); }
+                }
+                if root.package-import-busy: UiText { text: Localization.text("import.busy", Localization.revision); color: Palette.foreground; }
+                if root.package-import-allowed: VerticalLayout {
+                    spacing: 6px;
+                    Button { text: Localization.text("remove.refresh", Localization.revision); enabled: !root.package-import-busy; clicked => { root.refresh-packages(); } }
+                    ComboBox { model: root.installed-package-names; current-index <=> root.installed-package-index; enabled: !root.package-import-busy && !root.package-import-ready; }
+                    Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
+                }
+                if root.package-import-allowed : Button {
+                    text: Localization.text("rollback.choose", Localization.revision);
+                    enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-index >= 0 && root.installed-package-index < root.installed-package-rollback.length && root.installed-package-rollback[root.installed-package-index];
+                    clicked => { root.prepare-package-rollback(); }
+                }
+                if root.package-import-ready: VerticalLayout {
+                    spacing: 6px;
+                    if root.package-migration || root.package-online: VerticalLayout {
+                        spacing: 6px;
+                        UiText { text: root.package-migration ? root.migration-summary : root.online-summary; wrap: word-wrap; color: Palette.foreground; }
+                        ComboBox {
+                            model: root.review-package-names;
+                            current-index <=> root.review-package-index;
+                            enabled: !root.package-import-busy;
+                            selected(value) => { root.preview-review-package(self.current-index); }
+                        }
+                    }
+                    LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 180px; accessible-name: Localization.text(root.package-migration ? "migration.confirm" : root.package-online ? "download.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); }
+                    HorizontalLayout {
+                        Button { text: Localization.text(root.package-migration ? "migration.confirm" : root.package-online ? "download.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); enabled: !root.package-import-busy; clicked => { root.confirm-package(); } }
+                        Button { text: Localization.text("button.cancel", Localization.revision); enabled: !root.package-import-busy; clicked => { root.cancel-package(); } }
                     }
                 }
-                Rectangle { vertical-stretch: 1; }
+                if root.package-import-allowed: VerticalLayout {
+                    spacing: 8px;
+                    UiText { text: Localization.text("download.repository", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                    LocalizedTextEdit {
+                        text <=> root.download-repository; single-line: true; height: 36px;
+                        read-only: root.package-import-busy || root.download-catalog-ready || root.package-import-ready;
+                        accessible-name: Localization.text("download.repository", Localization.revision);
+                    }
+                    Button { text: Localization.text("download.check", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready; clicked => { root.check-download-catalog(); } }
+                    if root.download-active: Button {
+                        text: Localization.text(root.download-cancelling ? "download.cancelling" : "download.cancel", Localization.revision);
+                        enabled: !root.download-cancelling;
+                        clicked => { root.cancel-download(); }
+                    }
+                    if root.download-catalog-ready: VerticalLayout {
+                        spacing: 8px;
+                        for row in root.download-rows: VerticalLayout {
+                            DirectionalCheckBox {
+                                text: row.id; checked: row.selected;
+                                enabled: row.available && !root.package-import-busy && !root.package-import-ready;
+                                toggled => { root.toggle-download(row.id, self.checked); }
+                            }
+                            UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; }
+                            if row.has-input: UiText { text: Localization.text("download.input_component", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                            if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                        }
+                        UiText { text: root.download-summary; wrap: word-wrap; color: Palette.foreground; }
+                        Button { text: Localization.text("download.start", Localization.revision); enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready; clicked => { root.start-selected-download(); } }
+                        Button { text: Localization.text("download.discard", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready; clicked => { root.discard-download-catalog(); } }
+                    }
+                }
+                        for row in root.input-packs: VerticalLayout {
+                            spacing: 4px;
+                            DirectionalCheckBox {
+                                text: row.id;
+                                checked: row.selected;
+                                toggled => { root.toggle-input-pack(row.id, self.checked); }
+                            }
+                            UiText { text: Localization.text(row.status-key, Localization.revision); wrap: word-wrap; color: Palette.foreground; opacity: 0.75; }
+                            UiText { text: Localization.text("packs.profile", Localization.revision); color: Palette.foreground; }
+                            ComboBox {
+                                model: row.profile-names;
+                                current-index: row.profile-index;
+                                selected(value) => { root.select-input-profile(row.id, self.current-index); }
+                            }
+                            if row.details != "": UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; opacity: 0.7; }
+                        }
+                    }
+                }
             }
 
             if root.current-page == 3: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Пользовательский словарь"; description: "Одна запись на строку: en-US: firefox, ru-RU: слово или et-EE: tere."; }
-                TextEdit { text <=> root.user-dictionary-text; wrap: no-wrap; vertical-stretch: 1; }
+                SectionTitle { title: Localization.text("nav.dictionary", Localization.revision); description: Localization.text("dictionary.description", Localization.revision); }
+                LocalizedTextEdit { text <=> root.user-dictionary-text; accessible-name: Localization.text("nav.dictionary", Localization.revision); }
             }
 
             if root.current-page == 4: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Исключения слов"; description: "Эти слова никогда не будут исправляться автоматически."; }
-                TextEdit { text <=> root.word-exclusions-text; wrap: no-wrap; vertical-stretch: 1; }
+                SectionTitle { title: Localization.text("nav.word_exclusions", Localization.revision); description: Localization.text("word_exclusions.description", Localization.revision); }
+                LocalizedTextEdit { text <=> root.word-exclusions-text; accessible-name: Localization.text("nav.word_exclusions", Localization.revision); }
             }
 
             if root.current-page == 5: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Программы-исключения"; description: "Встроенная защита системных окон и менеджеров паролей остаётся активной всегда."; }
-                TextEdit { text <=> root.process-exclusions-text; wrap: no-wrap; vertical-stretch: 1; }
-                HorizontalLayout {
+                SectionTitle { title: Localization.text("nav.process_exclusions", Localization.revision); description: Localization.text("process_exclusions.description", Localization.revision); }
+                LocalizedTextEdit { text <=> root.process-exclusions-text; accessible-name: Localization.text("nav.process_exclusions", Localization.revision); }
+                DirectionalButtonPair {
                     spacing: 10px;
-                    Button { text: "Обзор…"; clicked => { root.browse-executable(); } }
-                    Button { text: root.process-picker-visible ? "Скрыть запущенные" : "Выбрать из запущенных…"; clicked => { root.process-picker-visible = !root.process-picker-visible; if root.process-picker-visible { root.refresh-processes(); } } }
-                    Rectangle { horizontal-stretch: 1; }
+                    first-text: Localization.text("process_exclusions.browse", Localization.revision);
+                    second-text: root.process-picker-visible ? Localization.text("process_exclusions.hide_running", Localization.revision) : Localization.text("process_exclusions.choose_running", Localization.revision);
+                    first-clicked => { root.browse-executable(); }
+                    second-clicked => { root.process-picker-visible = !root.process-picker-visible; if root.process-picker-visible { root.refresh-processes(); } }
                 }
                 if root.process-picker-visible: SettingsCard {
                     height: 210px;
@@ -286,21 +670,29 @@ export component SettingsWindow inherits Window {
 
             if root.current-page == 6: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Методы замены"; description: "Правила выполняются сверху по точному имени или пути; '*' задаёт общий маршрут. Privacy-проверки нельзя отключить этим списком."; }
-                TextEdit { text <=> root.backend-rules-text; wrap: no-wrap; vertical-stretch: 1; }
-                Text { text: "Доступно: capability-probe, protected-paste, physical-replay, observe-only"; color: Palette.foreground; opacity: 0.68; font-size: 12px; }
+                SectionTitle { title: Localization.text("nav.backends", Localization.revision); description: Localization.text("backends.description", Localization.revision); }
+                LocalizedTextEdit { text <=> root.backend-rules-text; accessible-name: Localization.text("nav.backends", Localization.revision); }
+                UiText { text: Localization.text("backends.available", Localization.revision); color: Palette.foreground; opacity: 0.68; font-size: 12px; }
             }
 
             if root.current-page == 7: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "Диагностика"; description: "Локальный журнал содержит только этапы, счётчики, PID, языки и длины — без набранного текста, URL и clipboard."; }
+                SectionTitle { title: Localization.text("nav.diagnostics", Localization.revision); description: Localization.text("diagnostics.description", Localization.revision); }
                 SettingsCard {
-                    height: 132px;
+                    min-height: 132px;
                     VerticalLayout {
                         padding: 18px;
                         spacing: 12px;
-                        CheckBox { text: "Включить локальную диагностику"; checked <=> root.diagnostics-enabled; }
-                        HorizontalLayout { Button { text: "Открыть журнал…"; clicked => { root.open-log(); } } Rectangle { horizontal-stretch: 1; } }
+                        DirectionalCheckBox { text: Localization.text("diagnostics.enabled", Localization.revision); checked <=> root.diagnostics-enabled; }
+                        DirectionalRow {
+                            height: log-button.preferred-height;
+                            log-button := Button {
+                                text: Localization.text("diagnostics.open", Localization.revision);
+                                width: self.preferred-width; height: parent.height;
+                                x: Localization.rtl ? parent.width - self.width : 0px;
+                                clicked => { root.open-log(); }
+                            }
+                        }
                     }
                 }
                 Rectangle { vertical-stretch: 1; }
@@ -308,29 +700,52 @@ export component SettingsWindow inherits Window {
 
             if root.current-page == 8: VerticalLayout {
                 spacing: 14px;
-                SectionTitle { title: "О программе"; description: "AutoKeyboardLayot — локальный агент автоматической коррекции раскладки."; }
+                SectionTitle { title: Localization.text("nav.about", Localization.revision); description: Localization.text("about.description", Localization.revision); }
                 SettingsCard {
-                    height: 210px;
+                    min-height: 210px;
                     VerticalLayout {
                         padding: 20px;
                         spacing: 10px;
-                        Text { text: "Автоматические языки: EN / RU / ET"; color: Palette.foreground; font-size: 14px; }
-                        Text { text: "Японский пакет зарегистрирован; IME-конвертация пока отключена."; color: Palette.foreground; opacity: 0.72; font-size: 13px; }
-                        Text { text: "Интерфейс создан с помощью Slint (Fluent 2)."; color: Palette.foreground; opacity: 0.72; font-size: 13px; }
-                        Text { text: "Slint © SixtyFPS GmbH — используется по Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0."; color: Palette.foreground; opacity: 0.72; font-size: 12px; wrap: word-wrap; }
+                        UiText { text: Localization.text("packs.notice", Localization.revision); color: Palette.foreground; font-size: 14px; wrap: word-wrap; }
+                        UiText { text: Localization.text("about.ui_framework", Localization.revision); color: Palette.foreground; opacity: 0.72; font-size: 13px; }
+                        UiText { text: Localization.text("about.slint_license", Localization.revision); color: Palette.foreground; opacity: 0.72; font-size: 12px; wrap: word-wrap; }
                     }
                 }
                 Rectangle { vertical-stretch: 1; }
             }
 
             Rectangle { height: 1px; background: Palette.border; }
-            HorizontalLayout {
+            DirectionalRow {
                 height: 40px;
                 spacing: 10px;
-                Text { text: root.status-text; color: root.status-error ? #c42b1c : Palette.foreground; opacity: root.status-text == "" ? 0 : 0.75; vertical-alignment: center; horizontal-stretch: 1; }
-                Button { text: "Отмена"; clicked => { root.cancel-requested(); } }
-                Button { text: "Применить"; clicked => { root.save-requested(false); } }
-                Button { text: "OK"; primary: true; clicked => { root.save-requested(true); } }
+                UiText {
+                    text: root.status-text; color: root.status-error ? #c42b1c : Palette.foreground;
+                    opacity: root.status-text == "" ? 0 : 0.75; vertical-alignment: center;
+                    x: Localization.rtl ? cancel-button.x + cancel-button.width + parent.spacing : 0px;
+                    width: max(0px, parent.width - cancel-button.width - apply-button.width - ok-button.width - 3 * parent.spacing);
+                    height: parent.height; wrap: no-wrap; overflow: elide;
+                }
+                cancel-button := Button {
+                    enabled: !root.package-import-busy;
+                    text: Localization.text("button.cancel", Localization.revision);
+                    width: self.preferred-width; height: parent.height;
+                    x: Localization.rtl ? apply-button.x + apply-button.width + parent.spacing : apply-button.x - parent.spacing - self.width;
+                    clicked => { root.cancel-requested(); }
+                }
+                apply-button := Button {
+                    enabled: !root.package-import-busy;
+                    text: Localization.text("button.apply", Localization.revision);
+                    width: self.preferred-width; height: parent.height;
+                    x: Localization.rtl ? ok-button.width + parent.spacing : ok-button.x - parent.spacing - self.width;
+                    clicked => { root.save-requested(false); }
+                }
+                ok-button := Button {
+                    enabled: !root.package-import-busy;
+                    text: Localization.text("button.ok", Localization.revision); primary: true;
+                    width: self.preferred-width; height: parent.height;
+                    x: Localization.rtl ? 0px : parent.width - self.width;
+                    clicked => { root.save-requested(true); }
+                }
             }
         }
     }

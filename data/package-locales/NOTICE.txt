@@ -1,0 +1,14 @@
+AutoKeyboardLayot optional UI translations
+Copyright (c) 2026 AutoKeyboardLayot contributors
+License: MIT (see the accompanying LICENSE text).
+
+These project-authored translation drafts were consolidated into the main
+AutoKeyboardLayot repository from the local language-packs source tree on
+2026-09-12. They contain UI text only: no dictionary, executable code or input
+conversion adapter is included in a UI-only package.
+
+Structural and placeholder validation does not establish linguistic quality,
+native layout, right-to-left layout, font or accessibility acceptance. Those
+checks remain pending. Installing a UI translation does not enable input
+conversion for that language. Third-party data, if distributed separately,
+retains its own license and attribution requirements.

@@ -1,0 +1,10 @@
+{
+  "package_id": "ja-JP",
+  "revision": 1,
+  "ui_locale": "ja",
+  "components": {
+    "ui": "../../package-locales/ja.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

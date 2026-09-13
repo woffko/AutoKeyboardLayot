@@ -1,0 +1,10 @@
+{
+  "package_id": "ar-SA",
+  "revision": 1,
+  "ui_locale": "ar",
+  "components": {
+    "ui": "../../package-locales/ar.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}

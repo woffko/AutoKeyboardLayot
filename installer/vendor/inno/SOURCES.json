@@ -1,0 +1,54 @@
+{
+  "repository": "https://github.com/jrsoftware/issrc",
+  "revision": "1ae7bf81dc0d2013235dfe4bb0b6f4e4a0b6b25c",
+  "reference_version": "6.7.3",
+  "normalization": "UTF-8 text with LF line endings; upstream comments retained",
+  "files": [
+    {
+      "file": "ChineseSimplified.isl",
+      "upstream_path": "Files/Languages/ChineseSimplified.isl",
+      "upstream_sha256": "e0b0b350e2245f3c5e65586dfe43d574f6e7f06f2261149aba284954b3fc9a8d",
+      "sha256": "bf0751fa176569c6faa2f6e17ed2734617bef325d5cc06eae030fdd0258ee778",
+      "upstream_status": "official"
+    },
+    {
+      "file": "Indonesian.isl",
+      "upstream_path": "Files/Languages/Unofficial/Indonesian.isl",
+      "upstream_sha256": "06232efff765902ddf7be78e39f1c5471b7e35f4c7c537deeb76692f3b5e208d",
+      "sha256": "ccf77cf658228e8952b1d6d2cc0fe5b19d60699ff62f088b061bed15642f343a",
+      "upstream_status": "unofficial"
+    },
+    {
+      "file": "Urdu.isl",
+      "upstream_path": "Files/Languages/Unofficial/Urdu.isl",
+      "upstream_sha256": "19cafb4af9a6514ca79690e676ffba0f3fbefeb9e4ee8a91260f1e94a2849b2e",
+      "sha256": "f6319df4c207a6924e884fbeba16d1c986a0e79e7f6b97837d2941a0abbc4e27",
+      "upstream_status": "unofficial; locally adapted",
+      "modifications": "Added 23 messages for 6.7.3; removed three obsolete messages; native language label and RTL enabled. Translation quality and visual acceptance remain pending."
+    },
+    {
+      "file": "Estonian.isl",
+      "upstream_path": "Files/Languages/Unofficial/Estonian.isl",
+      "upstream_sha256": "e9eee82e5bf3a8b94b4135f1a7dfa3b3a29f57cf80ccb97238aedfc9b181157e",
+      "sha256": "2f3a4205975a48471b9d57174ef535554c3c595c5d45823ffca3b3aa3e8ba532",
+      "upstream_status": "unofficial; locally adapted",
+      "modifications": "Decoded CP1257 into UTF-8; added 66 messages from estonian-additions.json; removed seven obsolete messages. Translation quality and visual acceptance remain pending."
+    },
+    {
+      "file": "Hindi.isl",
+      "upstream_path": "Files/Languages/Unofficial/Hindi.islu",
+      "upstream_sha256": "fbb1045f3b25842bb926bdd5400d07875f4c8572b04ffab14bb7add9882cc19b",
+      "sha256": "05db413f5a2514d0b9543857ec1d79db662f00b18f7d3cebd2b40a32b8621b44",
+      "upstream_status": "unofficial; locally adapted",
+      "modifications": "Added 66 messages and corrected six existing meanings/parameters via hindi-updates.json; removed seven obsolete message keys and two ignored font options; native language label. Linguistic and visual acceptance pending."
+    },
+    {
+      "file": "Bengali.isl",
+      "upstream_path": "Files/Languages/Unofficial/Bengali.islu",
+      "upstream_sha256": "6af0743c2a77d730e84c9699bfb065c7190de9236ccdf9b14439e486decb1b52",
+      "sha256": "b15e633a0312ba5e91b460baa25411868e5f6a8919349f7b49a95f0d2dbcdbfb",
+      "upstream_status": "unofficial; locally adapted",
+      "modifications": "Added 66 messages from bengali-updates.json; removed seven obsolete messages and two ignored font options; native language label. Valid parameter repetitions retained. Linguistic and visual acceptance pending."
+    }
+  ]
+}

@@ -64,7 +64,12 @@ impl DictionaryInput {
 
 fn main() {
     let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LEGACY_BUNDLED_INPUT");
+    let legacy = std::env::var_os("CARGO_FEATURE_LEGACY_BUNDLED_INPUT").is_some();
     for pack in PACKS {
+        if !legacy && !matches!(pack.id, "en-US" | "en-US-short") {
+            continue;
+        }
         println!("cargo:rerun-if-changed={}", pack.path);
         build_dictionary(*pack, &output);
     }

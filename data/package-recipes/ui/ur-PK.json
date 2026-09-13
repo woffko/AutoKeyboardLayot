@@ -1,0 +1,10 @@
+{
+  "package_id": "ur-PK",
+  "revision": 1,
+  "ui_locale": "ur",
+  "components": {
+    "ui": "../../package-locales/ur.json",
+    "license": "../../../LICENSE",
+    "notice": "../../package-locales/NOTICE.txt"
+  }
+}
