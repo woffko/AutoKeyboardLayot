@@ -47,6 +47,26 @@ begin
     if PackageList.Checked[I] then Result := Result + PackageBytes[I];
 end;
 
+function PackageName(Id: String): String;
+begin
+  Id := Lowercase(Id);
+  if Id = 'en-us' then Result := 'English'
+  else if Id = 'ru-ru' then Result := 'Русский'
+  else if Id = 'et-ee' then Result := 'Eesti'
+  else if Id = 'de-de' then Result := 'Deutsch'
+  else if Id = 'es-es' then Result := 'Español'
+  else if Id = 'fr-fr' then Result := 'Français'
+  else if Id = 'pt-br' then Result := 'Português'
+  else if Id = 'ja-jp' then Result := '日本語'
+  else if Id = 'ar-sa' then Result := 'العربية'
+  else if Id = 'zh-cn' then Result := '中文（简体）'
+  else if Id = 'hi-in' then Result := 'हिन्दी'
+  else if Id = 'bn-bd' then Result := 'বাংলা'
+  else if Id = 'id-id' then Result := 'Bahasa Indonesia'
+  else if Id = 'ur-pk' then Result := 'اردو'
+  else Result := Id;
+end;
+
 procedure PackageControls;
 var Available, Seen: Boolean; I: Integer;
 begin
@@ -59,6 +79,12 @@ begin
   Seen := Length(PackageSeen) > 0;
   for I := 0 to GetArrayLength(PackageSeen) - 1 do Seen := Seen and PackageSeen[I];
   PackageInstall.Enabled := Available and (PackagePhase = 'reviewing') and Seen;
+  if PackagePhase = 'selecting' then
+    WizardForm.NextButton.Enabled := PackageCount > 0
+  else if PackageFault or (PackagePhase = 'idle') or PackageComplete then
+    WizardForm.NextButton.Enabled := True
+  else
+    WizardForm.NextButton.Enabled := False;
 end;
 
 function PackageSend(Command, Action: String): Boolean;
@@ -92,7 +118,7 @@ end;
 
 procedure PackageListClick(Sender: TObject);
 begin
-  PackageStatus.Caption := FmtMessage(CustomMessage('AkPackageTotal'), [IntToStr(PackageCount), IntToStr(PackageTotal)]);
+  PackageStatus.Caption := CustomMessage('AkPackageIntro');
   PackageControls;
 end;
 
@@ -138,11 +164,11 @@ begin
       if (Id = '') or (Size < 1) then RaiseException('Invalid package row');
       PackageIds[I] := Id;
       PackageBytes[I] := Size;
-      Caption := Id;
+      Caption := PackageName(Id);
       if GetIniString(Section, 'input', '0', FileName) = '1' then Caption := Caption + ' ' + CustomMessage('AkPackageInput');
       Enabled := GetIniString(Section, 'compatible', '0', FileName) = '1';
       if not Enabled then Caption := Caption + ' ' + CustomMessage('AkPackageUnavailable');
-      PackageList.AddCheckBox(Caption, '', 0, Enabled, Enabled, False, False, nil);
+      PackageList.AddCheckBox(Caption, '', 0, False, Enabled, False, False, nil);
     end;
     PackageListClick(PackageList);
   end;
@@ -170,8 +196,9 @@ begin
     Restart := False;
     ErrorText := PrepareToInstall(Restart);
     if ErrorText <> '' then begin
+      PackageFault := True;
       PackageStatus.Caption := ErrorText;
-      PackageFailed;
+      PackageControls;
     end
     else if not PackageSend('{"action":"confirm_download","view":' + IntToStr(PackageView) + '}', 'download') then PackageFailed;
   end;
@@ -348,6 +375,7 @@ begin
       Exit;
     end;
     if (PackagePhase = 'downloading') or (PackagePhase = 'installing') then begin Result := False; Exit; end;
+    if PackagePhase = 'selecting' then begin Result := False; Exit; end;
     Result := True;
     Exit;
   end;
