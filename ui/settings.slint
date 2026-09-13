@@ -426,21 +426,14 @@ export component SettingsWindow inherits Window {
                             VerticalLayout {
                                 padding: 18px;
                                 spacing: 8px;
-                                DirectionalRow {
-                                    spacing: 12px;
-                                    height: max(language-label.preferred-height, language-picker.preferred-height);
-                                    language-label := UiText {
-                                        text: Localization.text("ui_language.label", Localization.revision);
-                                        color: Palette.foreground; vertical-alignment: center;
-                                        width: self.preferred-width; height: parent.height;
-                                        x: Localization.rtl ? parent.width - self.width : 0px;
-                                    }
-                                    language-picker := ComboBox {
-                                        model: root.ui-language-names; current-index <=> root.ui-language-index;
-                                        x: Localization.rtl ? 0px : language-label.width + parent.spacing;
-                                        width: max(0px, parent.width - language-label.width - parent.spacing);
-                                        height: parent.height;
-                                    }
+                                UiText {
+                                    text: Localization.text("ui_language.label", Localization.revision);
+                                    color: Palette.foreground;
+                                }
+                                for name[index] in root.ui-language-names : DirectionalCheckBox {
+                                    text: name;
+                                    checked: root.ui-language-index == index;
+                                    toggled => { if (self.checked) { root.ui-language-index = index; } }
                                 }
                                 UiText { text: root.ui-language-status; color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
                                 UiText { text: Localization.text("ui_language.fallback", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
@@ -618,12 +611,6 @@ export component SettingsWindow inherits Window {
                                 toggled => { root.toggle-input-pack(row.id, self.checked); }
                             }
                             UiText { text: Localization.text(row.status-key, Localization.revision); wrap: word-wrap; color: Palette.foreground; opacity: 0.75; }
-                            UiText { text: Localization.text("packs.profile", Localization.revision); color: Palette.foreground; }
-                            ComboBox {
-                                model: row.profile-names;
-                                current-index: row.profile-index;
-                                selected(value) => { root.select-input-profile(row.id, self.current-index); }
-                            }
                             if row.details != "": UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; opacity: 0.7; }
                         }
                     }
