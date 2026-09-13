@@ -7321,6 +7321,8 @@ mod tests {
         assert_eq!(processor.session.buffered_character_count(), 4);
     }
 
+    // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn pending_conversion_is_bound_to_profile_generation_source_and_target() {
         let processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
@@ -7348,6 +7350,8 @@ mod tests {
         assert!(!processor.pending_profiles_match(&pending));
     }
 
+    // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn worker_resolves_exact_profiles_without_primary_language_fallback() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
@@ -7374,6 +7378,8 @@ mod tests {
         assert!(processor.find_layout(Language::English).is_none());
     }
 
+    // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn candidate_mapping_obeys_runtime_requirements_before_invoking_platform_mapper() {
         let mut registry = autokeyboardlayot::DictionaryRegistry::embedded();
@@ -7533,6 +7539,8 @@ mod tests {
         );
     }
 
+    // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn worker_dictionary_snapshot_follows_validated_selection_and_reload() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
@@ -8199,6 +8207,8 @@ mod tests {
         assert!(processor.privacy_needs_check);
     }
 
+    // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn privacy_recovery_never_converts_a_partial_word_but_allows_the_next_word() {
         let metrics = Arc::new(ObserverMetrics::default());
