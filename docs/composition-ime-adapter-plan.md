@@ -34,13 +34,49 @@ that is not implemented and physically accepted.
   (`docs/localization-and-language-packs.md`, "Isolated exact-profile
   provider").
 
+## Probe results (2026-09-13)
+
+`examples/probe_composition.rs` is a read-only diagnostic that reports counts,
+flags and handle presence only. Built for Windows and run once on the primary
+host with a non-interactive PowerShell process; receipt
+`target/composition-probe-20260913-01/idle-window.txt`.
+
+Observed, single run:
+
+```json
+{"process_id":31872,"foreground_thread":31876,"input_thread":31876,"gui_info":true,"focus_present":1,"layout":67699721,"is_ime":1,"gui_flags":0,"context_top_attached":0,"context_focus_attached":0,"composition_bytes":-1,"result_bytes":-1,"cursor":-1}
+```
+
+Interpretation:
+
+- `ImmGetContext` returned no context for either the top-level or the focused
+  window from this process (`context_*_attached=0`). This resolves the earlier
+  unknown for this configuration: cross-process `ImmGetContext` did not attach,
+  so an `ImmGetCompositionStringW`-based guard cannot rely on it.
+- `is_ime` was `1` for `layout = 67699721` (`0x04090409`). That HKL looks like an
+  en-US-style identity, so `ImmIsIME == true` here must not be treated as
+  "an IME composition is active" without further evidence. Do not wire a policy
+  from this single reading.
+- The probe did not run with a real composition active, so `composition_bytes`
+  and `result_bytes` are not evidence about composition detection.
+
+Next steps for the probe: run it on the reviewed test machine with Notepad and a
+browser focused, with and without an active composition; compare `layout`,
+`is_ime`, `gui_flags` and context attachment; and test a UIA `TextPattern`-based
+signal. Only then choose and wire a native source.
+
 ## Unknowns that must not be guessed (`UNKNOWN`)
 
 - Whether `GetKeyboardLayout(input_thread_id)` plus `ImmIsIME` is sufficient to
   detect an active composition for the focused control, or whether per-window
-  `ImmGetContext`/`ImmGetCompositionString` state or TSF is required.
+  `ImmGetContext`/`ImmGetCompositionString` state or TSF is required. Partly
+  resolved: the 2026-09-13 probe showed `ImmGetContext` did not attach
+  cross-process on the tested host, so that path is not usable as-is; `ImmIsIME`
+  alone is not a composition signal.
 - The thread affinity and cleanup contract of `ImmGetContext`/`ImmReleaseContext`
-  when the focused window belongs to another process.
+  when the focused window belongs to another process. Partly resolved: the probe
+  returned no context for another process's window, so the release path is not
+  reached there.
 - Which Win32 messages or UIA properties reliably indicate "composing" for
   Notepad, Windows Terminal and browser text fields on the target build.
 - Whether reading composition flags can block or be re-entered inside the
