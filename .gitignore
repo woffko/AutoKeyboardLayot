@@ -25,3 +25,7 @@
 /word_exclusions.txt
 /exclusions.txt
 /notepad-uia-probe-result.json
+
+# Python bytecode caches.
+__pycache__/
+*.pyc

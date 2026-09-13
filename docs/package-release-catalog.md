@@ -82,3 +82,15 @@ inventory, ownership checks, high-water marks, import/update/removal and migrati
 are covered by the [store](package-store.md). Exact cache lookup is integrated;
 cache repair and explicit rollback still require work.
 No live download has been performed or verified by these planning tests.
+
+## Local catalog source (no network)
+
+A catalog may be loaded from an explicitly chosen local `.aklc` file. In that
+case the authenticated metadata is bound to a local source directory, and every
+selected artifact must resolve from that same directory by its validated `asset`
+name (a single `.aklp` path segment). A local source never falls back to the
+network. All pinned checks still apply: exact byte length, SHA-256, Ed25519
+signature, package ID, revision, input participation and UI locale. Symlinked or
+non-regular paths, separators, non-`.aklp` names, and oversized or empty files
+are rejected before decoding. Online and local flows stay distinct in the UI;
+network catalogs keep the pinned GitHub URL.

@@ -143,6 +143,53 @@ fn leases() -> std::result::Result<Vec<Handle>, InstallError> {
     Ok(handles)
 }
 
+/// Coarse, path-free failure code for asynchronous worker results. It never
+/// includes paths, URLs, secrets or raw error text.
+fn poll_reason(error: &SessionError) -> &'static str {
+    match error {
+        SessionError::WrongState => "state",
+        SessionError::Exhausted => "exhausted",
+        SessionError::Install(InstallError::Store(StoreError::Busy)) => "store_busy",
+        SessionError::Install(InstallError::Store(_)) => "store",
+        SessionError::Install(InstallError::Download(DownloadError::HttpStatus(_))) => {
+            "download_http"
+        }
+        SessionError::Install(InstallError::Download(DownloadError::LocalRead)) => "local_read",
+        SessionError::Install(InstallError::Download(DownloadError::Verification(_))) => {
+            "verification"
+        }
+        SessionError::Install(InstallError::Download(DownloadError::Cancelled)) => {
+            "download_cancelled"
+        }
+        SessionError::Install(InstallError::Download(_)) => "download",
+        SessionError::Install(InstallError::Catalog(_)) => "catalog",
+        SessionError::Install(InstallError::Inventory(_)) => "inventory",
+        SessionError::Install(_) => "install",
+    }
+}
+
+/// Coarse, path-free failure code for a rejected synchronous command.
+fn reject_reason(text: &str) -> &'static str {
+    let text = text.to_ascii_lowercase();
+    if text.starts_with("check:") || text.contains("catalog") {
+        "catalog"
+    } else if text.contains("selection") {
+        "selection"
+    } else if text.contains("approval") || text.contains("stale") || text.contains("busy") {
+        "state"
+    } else if text.starts_with("download:") || text.contains("download") {
+        "download"
+    } else if text.starts_with("install:") || text.contains("install") {
+        "install"
+    } else if text.contains("protocol") {
+        "protocol"
+    } else if text.contains("parent") || text.contains("session") {
+        "session"
+    } else {
+        "rejected"
+    }
+}
+
 pub fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() != 4 {
@@ -192,15 +239,25 @@ pub fn run() -> Result<()> {
         let mut sequence = 1u64;
         let mut last_activity = Instant::now();
         let mut outcome = "none";
+        let mut reason = "none";
         loop {
             if let Some(result) = worker.poll(&mut session) {
-                outcome = match result {
-                    Ok(()) => "ok",
+                match result {
+                    Ok(()) => {
+                        outcome = "ok";
+                        reason = "none";
+                    }
                     Err(SessionError::Install(InstallError::Store(
                         StoreError::CommitUncertain,
-                    ))) => "commit_uncertain",
-                    Err(_) => "failed",
-                };
+                    ))) => {
+                        outcome = "commit_uncertain";
+                        reason = "commit_uncertain";
+                    }
+                    Err(error) => {
+                        outcome = "failed";
+                        reason = poll_reason(&error);
+                    }
+                }
             }
             if unsafe { WaitForSingleObject(parent.0, 0) } != WAIT_TIMEOUT
                 || last_activity.elapsed() > Duration::from_secs(300)
@@ -245,11 +302,18 @@ pub fn run() -> Result<()> {
                         worker
                             .start_catalog(&mut session, move |cancel| {
                                 if let Some(path) = local_file {
-                                    let raw = read_bounded(Path::new(&path), 1024 * 1024)
+                                    let path = Path::new(&path);
+                                    let raw = read_bounded(path, 1024 * 1024)
                                         .map_err(|_| StoreError::InvalidFile)?;
-                                    PreparedCatalog::from_bytes(
+                                    let directory = path
+                                        .parent()
+                                        .map(Path::to_path_buf)
+                                        .ok_or(StoreError::InvalidFile)?;
+                                    plain_path(&directory).map_err(|_| StoreError::InvalidFile)?;
+                                    PreparedCatalog::from_local_bytes(
                                         raw,
                                         DEFAULT_PACKAGE_REPOSITORY,
+                                        directory,
                                         &store.load(&trust)?,
                                         &trust,
                                         clock()?,
@@ -338,13 +402,20 @@ pub fn run() -> Result<()> {
                 }
                 Ok(())
             })();
+            if let Err(error) = &operation {
+                reason = reject_reason(&error.to_string());
+                if matches!(outcome, "none" | "pending") {
+                    outcome = "failed";
+                }
+            }
             let mut reply = format!(
-                "[helper]\r\nformat=1\r\nsession={identity}\r\nsequence={sequence}\r\nview={}\r\nstate={}\r\nbusy={}\r\nresult={}\r\noperation={}\r\n",
+                "[helper]\r\nformat=1\r\nsession={identity}\r\nsequence={sequence}\r\nview={}\r\nstate={}\r\nbusy={}\r\nresult={}\r\noperation={}\r\nreason={}\r\n",
                 session.view(),
                 session.phase(),
                 u8::from(worker.busy()),
                 outcome,
-                if operation.is_ok() { "ok" } else { "rejected" }
+                if operation.is_ok() { "ok" } else { "rejected" },
+                reason
             );
             if let Ok(selection) = session.selection() {
                 reply.push_str(&selection.page_data()?);

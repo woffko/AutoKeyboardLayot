@@ -22,6 +22,7 @@ pub enum DownloadError {
     Network(i32),
     Header,
     Length,
+    LocalRead,
     Cancelled,
     Deadline,
     Clock,

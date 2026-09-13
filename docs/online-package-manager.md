@@ -81,3 +81,21 @@ The application now explicitly uses `PackageTrust::release()` with the generated
 `pkg-20260912-01` public key embedded at build time. Empty default trust is retained
 for explicit untrusted/test contexts. Provisioning is not live publication or
 end-to-end acceptance; the installer and real signed-asset workflow remain open.
+
+## Local catalog and offline import
+
+The installer's "Open local catalog..." action loads an explicitly chosen signed
+`.aklc` and binds that session to the catalog's directory. Selected artifacts are
+read only from that directory (never the network), then authenticated against the
+pinned record exactly like a download: exact length, SHA-256, Ed25519 signature,
+package ID, revision, input participation and UI locale. Placing the `.aklp`
+files beside the catalog is therefore sufficient for an offline install; no
+published release is required. A local source has no silent network fallback.
+
+Failures now report a coarse, path-free reason code next to `AkPackageFailed`
+(for example `download_http`, `local_read`, `verification`, `store_busy`) so the
+installing operator can distinguish a missing asset from a network or store
+problem without exposing paths, URLs or secrets. The settings application's
+per-file `.aklp` import and multi-file `.aklp` migration remain the local flows
+outside the installer.
+

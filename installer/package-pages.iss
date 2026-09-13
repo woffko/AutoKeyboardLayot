@@ -10,7 +10,7 @@ var
   PackageIds, PackageReviewFiles: TArrayOfString;
   PackageBytes: array of Integer;
   PackageSeen: array of Boolean;
-  PackageDir, PackageIdentity, PackagePhase, PackageQueued, PackagePendingAction: String;
+  PackageDir, PackageIdentity, PackagePhase, PackageQueued, PackagePendingAction, PackageReason: String;
   PackageSequence, PackageAwaiting, PackageView, PackageSerial: Integer;
   PackageStartTick: DWORD;
   PackageTimer: UINT_PTR;
@@ -81,7 +81,10 @@ end;
 
 procedure PackageFailed;
 begin
-  PackageStatus.Caption := CustomMessage('AkPackageFailed');
+  if PackageReason <> '' then
+    PackageStatus.Caption := CustomMessage('AkPackageFailed') + ' [' + PackageReason + ']'
+  else
+    PackageStatus.Caption := CustomMessage('AkPackageFailed');
   PackageAfterSelect := False;
   PackageInstalling := False;
   PackageComplete := False;
@@ -115,6 +118,7 @@ begin
   PackagePhase := GetIniString('helper', 'state', '', FileName);
   PackageBusy := GetIniString('helper', 'busy', '1', FileName) = '1';
   ResultText := GetIniString('helper', 'result', '', FileName);
+  PackageReason := GetIniString('helper', 'reason', '', FileName);
   if (GetIniString('helper', 'operation', '', FileName) <> 'ok') or
      (ResultText = 'failed') or (ResultText = 'commit_uncertain') then begin
     PackageFailed;
@@ -237,6 +241,7 @@ procedure PackageStart(Command: String);
 var Code: Integer; StoreRoot: String;
 begin
   PackageComplete := False;
+  PackageReason := '';
   SetArrayLength(PackageReviewFiles, 0); SetArrayLength(PackageSeen, 0);
   if PackageReady then begin PackageSend(Command, 'check'); Exit; end;
   Inc(PackageSerial);

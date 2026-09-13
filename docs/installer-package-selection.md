@@ -124,3 +124,15 @@ to repaint the owned window before capture.
 This does not establish production network/installation, the actual license
 review page, every language/RTL/fonts, crashes, upgrade/repair/uninstall, signing
 of the installer executable, dependency-notice completeness or physical typing.
+
+## Local catalog artifacts
+
+`Command::CheckCatalog` may carry a `local_file`. The session then uses a local
+catalog source: selected artifacts are read from the catalog's directory by the
+validated asset name and pass the same pinned hash/length/signature checks as a
+network download. The network fetch closure is never invoked for a local source,
+so copying `.aklp` files next to the `.aklc` supports an explicit offline install
+without any published release. Failure replies carry a coarse, path-free reason
+code (for example `download_http`, `local_read`, `verification`) that the Inno
+page appends to its generic failure caption.
+

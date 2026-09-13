@@ -131,6 +131,7 @@ pub struct PinnedPackage {
     bytes: u64,
     sha256: [u8; 32],
     url: String,
+    asset: String,
     runtime_api: u32,
     input: bool,
     ui_locale: Option<String>,
@@ -152,6 +153,11 @@ impl PinnedPackage {
     }
     pub fn url(&self) -> &str {
         &self.url
+    }
+    /// Exact authenticated asset file name from the release catalog. It is a
+    /// single safe path segment validated during catalog verification.
+    pub fn asset(&self) -> &str {
+        &self.asset
     }
     pub const fn includes_input(&self) -> bool {
         self.input
@@ -352,6 +358,7 @@ impl VerifiedReleaseCatalog {
                     "https://github.com/{repository}/releases/download/{}/{}",
                     entry.tag, entry.asset
                 ),
+                asset: entry.asset,
                 runtime_api: entry.runtime_api,
                 input: entry.input,
                 ui_locale,
@@ -1055,6 +1062,97 @@ mod tests {
             ready.confirm(&store, &trust(), 100).unwrap().state_sha256(),
             installed.state_sha256()
         );
+    }
+
+    #[test]
+    fn local_catalog_resolves_adjacent_artifact_without_network() {
+        use crate::{package_install::PreparedCatalog, package_store::PackageStore};
+        use std::sync::atomic::AtomicBool;
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+        let empty = store.load(&trust()).unwrap();
+        let (doc, package) = downloadable_fixture();
+        let catalog_dir = directory.path().join("catalogs with spaces");
+        std::fs::create_dir(&catalog_dir).unwrap();
+        std::fs::write(catalog_dir.join("ru-RU.aklp"), &package).unwrap();
+        let catalog = PreparedCatalog::from_local_bytes(
+            signed(&doc),
+            "example/language-packs",
+            catalog_dir,
+            &empty,
+            &trust(),
+            100,
+        )
+        .unwrap();
+        let ready = catalog
+            .select(&ids(&["ru-RU"]), &trust(), 100)
+            .unwrap()
+            .accept_and_download_with(
+                &store,
+                &trust(),
+                &AtomicBool::new(false),
+                || Ok(100),
+                |_| panic!("a local catalog must never fetch over the network"),
+            )
+            .unwrap();
+        assert_eq!(ready.packages().len(), 1);
+        let installed = ready.confirm(&store, &trust(), 100).unwrap();
+        assert_eq!(installed.inventory().packages().count(), 1);
+        assert!(matches!(
+            PreparedCatalog::from_local_bytes(
+                signed(&doc),
+                "example/language-packs",
+                std::path::PathBuf::from("relative"),
+                &empty,
+                &trust(),
+                100,
+            ),
+            Err(crate::package_install::InstallError::Catalog(
+                ReleaseError::InvalidData
+            ))
+        ));
+    }
+
+    #[test]
+    fn local_catalog_refuses_missing_tampered_or_substituted_artifacts() {
+        use crate::package_install::PreparedCatalog;
+        use crate::package_store::PackageStore;
+        use std::sync::atomic::AtomicBool;
+        let (doc, package) = downloadable_fixture();
+        // Each attempt needs a fresh store: accepting a download persists the
+        // catalog receipt even when artifact retrieval fails.
+        let run = |contents: Option<&[u8]>| -> bool {
+            let directory = tempfile::tempdir().unwrap();
+            let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+            let empty = store.load(&trust()).unwrap();
+            if let Some(contents) = contents {
+                std::fs::write(directory.path().join("ru-RU.aklp"), contents).unwrap();
+            }
+            PreparedCatalog::from_local_bytes(
+                signed(&doc),
+                "example/language-packs",
+                directory.path().to_path_buf(),
+                &empty,
+                &trust(),
+                100,
+            )
+            .unwrap()
+            .select(&ids(&["ru-RU"]), &trust(), 100)
+            .unwrap()
+            .accept_and_download_with(
+                &store,
+                &trust(),
+                &AtomicBool::new(false),
+                || Ok(100),
+                |_| panic!("local source must not fetch"),
+            )
+            .is_ok()
+        };
+        assert!(!run(None), "missing artifact must fail closed");
+        let mut tampered = package.clone();
+        tampered.push(0);
+        assert!(!run(Some(&tampered)), "tampered bytes must fail the pin");
+        assert!(run(Some(&package)), "correct bytes must install");
     }
 
     #[test]

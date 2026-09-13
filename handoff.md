@@ -14,6 +14,100 @@ Main repository: `woffko/AutoKeyboardLayot`. Project Memory key:
 build outputs and acceptance receipts are intentionally not part of this source
 snapshot. A remote clone alone cannot reproduce the existing test equipment.
 
+## 2026-09-13 update — offline local-package import implemented
+
+This update supersedes the "not yet diagnosed" wording below for the immediate
+failure. The local-catalog failure cause is confirmed by code inspection and a
+native reproduction: a locally loaded `.aklc` populated rows, but the download
+stage used `PinnedPackage::url()` (GitHub release URLs) and never read the
+adjacent `.aklp` files, so an unpublished tag failed. The host helper reply/log
+was not retained in the Windows temp path, so the managed-store-open edge case
+was not separately observed.
+
+Implemented on top of commit `6e6863d` (uncommitted worktree):
+
+- A local catalog now binds a local source directory; selected artifacts are
+  read from that directory by the validated asset name and never fall back to
+  the network (`CatalogSource`, `PreparedCatalog::from_local_bytes`,
+  `read_local_artifact`). All pinned checks remain: length, SHA-256, Ed25519,
+  package ID, revision, input participation and UI locale.
+- The installer helper uses the local source for a `local_file` catalog and
+  reports a coarse, path-free failure reason code that the Inno page appends to
+  `AkPackageFailed`.
+- Documentation updated: `online-package-manager.md`,
+  `installer-package-selection.md`, `package-release-catalog.md`; plan saved at
+  `docs/plan-2026-09-13.md`.
+
+Verified evidence:
+
+- Linux `cargo test --lib`: 261 passed; `cargo fmt --check`; strict Clippy on
+  Linux and `x86_64-pc-windows-msvc`; 26 Python tool tests.
+- Windows cross-build checks: `tools/check_windows_base.py` and
+  `tools/check_installer_helper.py` passed (`cargo xwin` build + clippy).
+- Native Windows helper test `tools/test-installer-helper-offline.ps1` passed
+  `check_catalog(local) -> select -> confirm_download -> confirm_install` with
+  `network_used=false`, an advanced store pointer and the installed blob present
+  (receipt `target/offline-helper-native-20260913-01/result.json`).
+
+Still open: the full native `verify-windows.ps1` pipeline; a real local-catalog
+install through the actual setup UI (candidate3 below); the live simultaneous
+different-session check; and all Stage 3-6 gates. The `pkg-20260912-01` key
+handling and no-publication rules are unchanged. The user grants standing
+permission to run the Windows build pipeline at any time.
+
+Stage 2 core passed in the approved VM: the fence refused installation while a
+shared reader was held (helper code 12), then the candidate installed with the
+expected app hash and preserved profile/store/sentinel and no started agent, then
+uninstalled cleanly with the fence released
+(`target/vm-installer-fence-20260913-03/transaction-result.json`, `state=passed`).
+The fence script was fixed to discover the actual Inno uninstaller via the
+registration `UninstallString` and to retry the final fence check while the
+relayed silent uninstaller child finishes. The live different-session check is
+still separate.
+
+Installer candidate3 was built with the offline fix and the reason-code message
+(`target/installer-vm-candidate-20260913-03/`, ISCC successful compile). It is
+the artifact for Stage 3 acceptance and is not published.
+
+Stage 3 is largely passed. The native Windows helper lifecycle test
+(`tools/test-installer-helper-lifecycle.ps1`) covers zero-selection no-op,
+multiple-package install, cancel revocation, tampered-local-artifact rejection
+with the `verification` reason code, and retry
+(`target/offline-helper-lifecycle-20260913-01/result.json`). The real candidate3
+setup was then driven through its UI in the VM's interactive console session
+(user `w0w`) with a local catalog and one package: download disabled without a
+selection, 13 catalog rows, explicit RU selection, local download with no
+network, license review showing the package identity and MIT text, confirmed
+installation with the expected executable hash, normal close, and a follow-up
+uninstall that restored the baseline while preserving the profile/store
+(`target/vm-ui-offline-session-20260913-13/result.json`, `state=passed`, with
+page screenshots). A separate parent-exit scenario passed too:
+`tools/test-installer-helper-parent-exit.ps1` confirmed the helper exits with
+code 0 when its installer parent is terminated
+(`target/offline-helper-parent-exit-20260913-04/result.json`). The live
+simultaneous different-session exclusion check also passed: a session-0 holder
+kept the shared installation fence for the target user open while the setup ran
+silently as that user in the interactive session 1; it was refused with helper
+code 12 and the fence was released once the holder stopped
+(`target/vm-cross-session-20260913-08/result.json`, `state=passed`).
+
+Stage 4 (upgrade/interruption) also passed: candidate1 was installed, user data
+was added, candidate3 was installed over it with the binary changed and the
+config/store/lexicon/sentinel preserved, a later install was terminated
+mid-flight and a re-install recovered a complete install with the data intact,
+and a silent uninstall removed the app while keeping the profile/store
+(`target/vm-upgrade-20260913-01/result.json`, `state=passed`). Both builds use
+the same `0.1.0` version string, so this is a binary replacement between builds
+rather than a version-number upgrade. Stage 5 (input/physical) and Stage 6
+(language, accessibility, notices) remain, plus the full native
+`verify-windows.ps1` pipeline. Stage 5 currently has only EN/RU/ET input data and
+only the `physical-key-v1` implementation; `altgr-v1`, `dead-key-v1`,
+composition/IME and grapheme adapters are unimplemented, and physical typing
+acceptance is interactive and outside the no-global-input-automation boundary.
+`tools/notepad-uia-probe.ps1` is a TextPattern capability check, not a typing or
+conversion test. Stage 5 and Stage 6 therefore need product direction and human
+or interactive acceptance before they can be completed.
+
 ## Immediate user-visible issue
 
 The user received installer candidate2 and the entire local UI-package candidate

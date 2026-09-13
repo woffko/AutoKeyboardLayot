@@ -4,7 +4,7 @@
 
 use crate::{
     PackId,
-    language_package::PackageTrust,
+    language_package::{MAX_PACKAGE_BYTES, PackageTrust},
     package_catalog::{
         DownloadPlan, PinnedPackage, ReleaseError, VerifiedReleaseCatalog, repository_id,
     },
@@ -15,6 +15,7 @@ use crate::{
 use std::{
     collections::BTreeSet,
     fmt,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -57,9 +58,18 @@ impl From<DownloadError> for InstallError {
     }
 }
 
+/// A catalog-bound artifact source. A local catalog must never silently fall
+/// back to the network, and the network source is the only one allowed to fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogSource {
+    Network,
+    Local(PathBuf),
+}
+
 pub struct PreparedCatalog {
     raw: Vec<u8>,
     repository: String,
+    source: CatalogSource,
     expected: StoreSnapshot,
     catalog: VerifiedReleaseCatalog,
 }
@@ -90,13 +100,59 @@ impl PreparedCatalog {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| DownloadError::Clock)?
             .as_secs();
-        Self::from_bytes(raw, &repository, &expected, trust, now)
+        Self::from_bytes_inner(
+            raw,
+            &repository,
+            CatalogSource::Network,
+            &expected,
+            trust,
+            now,
+        )
     }
     /// `repository` is independently approved application/store policy, never
     /// taken from the untrusted catalog. This preparation makes no writes.
     pub fn from_bytes(
         raw: Vec<u8>,
         repository: &str,
+        expected: &StoreSnapshot,
+        trust: &PackageTrust,
+        now: u64,
+    ) -> Result<Self, InstallError> {
+        Self::from_bytes_inner(
+            raw,
+            repository,
+            CatalogSource::Network,
+            expected,
+            trust,
+            now,
+        )
+    }
+    /// An explicitly local catalog. Its selected artifacts must resolve only
+    /// from `directory`; the network is never consulted for this source.
+    pub fn from_local_bytes(
+        raw: Vec<u8>,
+        repository: &str,
+        directory: PathBuf,
+        expected: &StoreSnapshot,
+        trust: &PackageTrust,
+        now: u64,
+    ) -> Result<Self, InstallError> {
+        if !directory.is_absolute() {
+            return Err(ReleaseError::InvalidData.into());
+        }
+        Self::from_bytes_inner(
+            raw,
+            repository,
+            CatalogSource::Local(directory),
+            expected,
+            trust,
+            now,
+        )
+    }
+    fn from_bytes_inner(
+        raw: Vec<u8>,
+        repository: &str,
+        source: CatalogSource,
         expected: &StoreSnapshot,
         trust: &PackageTrust,
         now: u64,
@@ -119,6 +175,7 @@ impl PreparedCatalog {
         Ok(Self {
             raw,
             repository,
+            source,
             expected: expected.clone(),
             catalog,
         })
@@ -177,6 +234,7 @@ impl PreparedCatalog {
         Ok(SelectedDownload {
             raw: self.raw.clone(),
             repository: self.repository.clone(),
+            source: self.source.clone(),
             expected: self.expected.clone(),
             ids: ids.clone(),
             plan,
@@ -187,6 +245,7 @@ impl PreparedCatalog {
 pub struct SelectedDownload {
     raw: Vec<u8>,
     repository: String,
+    source: CatalogSource,
     expected: StoreSnapshot,
     ids: BTreeSet<PackId>,
     plan: DownloadPlan,
@@ -247,7 +306,13 @@ impl SelectedDownload {
             pin.check_current(now()?)?;
             let downloaded = match store.cached_artifact(pin)? {
                 Some(bytes) => DownloadedPackage::from_bytes(pin, bytes, trust, now()?)?,
-                None => fetch(pin)?,
+                None => match &self.source {
+                    CatalogSource::Network => fetch(pin)?,
+                    CatalogSource::Local(directory) => {
+                        let bytes = read_local_artifact(directory, pin.asset())?;
+                        DownloadedPackage::from_bytes(pin, bytes, trust, now()?)?
+                    }
+                },
             };
             check_cancel(cancel)?;
             pin.check_package(downloaded.package(), now()?)?;
@@ -315,5 +380,113 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), InstallError> {
         Err(InstallError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+/// Read exactly one catalog-selected artifact from a local directory. Catalog
+/// verification already guarantees `asset` is a single safe `.aklp` segment;
+/// this still defensively rejects separators, non-`.aklp` names, symlinks and
+/// oversized content. The caller authenticates the bytes against the pin.
+fn read_local_artifact(directory: &Path, asset: &str) -> Result<Vec<u8>, DownloadError> {
+    use std::io::Read as _;
+    if asset.is_empty()
+        || asset.len() > 128
+        || !asset.ends_with(".aklp")
+        || asset == "."
+        || asset == ".."
+        || asset.contains(['/', '\\'])
+    {
+        return Err(DownloadError::LocalRead);
+    }
+    let directory_metadata =
+        std::fs::symlink_metadata(directory).map_err(|_| DownloadError::LocalRead)?;
+    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+        return Err(DownloadError::LocalRead);
+    }
+    let path = directory.join(asset);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| DownloadError::LocalRead)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(DownloadError::LocalRead);
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_PACKAGE_BYTES as u64 {
+        return Err(DownloadError::Length);
+    }
+    let file = std::fs::File::open(&path).map_err(|_| DownloadError::LocalRead)?;
+    let mut bytes = Vec::with_capacity(metadata.len().min(1024 * 1024) as usize);
+    file.take(MAX_PACKAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DownloadError::LocalRead)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > MAX_PACKAGE_BYTES as u64 {
+        return Err(DownloadError::Length);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_artifact_reader_accepts_one_regular_bounded_file() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("ru-RU.aklp"), b"package bytes").unwrap();
+        assert_eq!(
+            read_local_artifact(directory.path(), "ru-RU.aklp").unwrap(),
+            b"package bytes"
+        );
+    }
+
+    #[test]
+    fn local_artifact_reader_refuses_unsafe_names_paths_and_types() {
+        let directory = tempfile::tempdir().unwrap();
+        for asset in [
+            "",
+            ".",
+            "..",
+            "sub/ru-RU.aklp",
+            "sub\\ru-RU.aklp",
+            "ru-RU.txt",
+            "missing.aklp",
+        ] {
+            assert_eq!(
+                read_local_artifact(directory.path(), asset),
+                Err(DownloadError::LocalRead),
+                "{asset:?}"
+            );
+        }
+        std::fs::write(directory.path().join("empty.aklp"), b"").unwrap();
+        assert_eq!(
+            read_local_artifact(directory.path(), "empty.aklp"),
+            Err(DownloadError::Length)
+        );
+        std::fs::create_dir(directory.path().join("dir.aklp")).unwrap();
+        assert_eq!(
+            read_local_artifact(directory.path(), "dir.aklp"),
+            Err(DownloadError::LocalRead)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_artifact_reader_refuses_symlinked_files_and_directories() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("ru-RU.aklp"), b"package bytes").unwrap();
+        symlink(
+            outside.path().join("ru-RU.aklp"),
+            directory.path().join("ru-RU.aklp"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_local_artifact(directory.path(), "ru-RU.aklp"),
+            Err(DownloadError::LocalRead)
+        );
+        let link = directory.path().join("linked");
+        symlink(outside.path(), &link).unwrap();
+        assert_eq!(
+            read_local_artifact(&link, "ru-RU.aklp"),
+            Err(DownloadError::LocalRead)
+        );
     }
 }
