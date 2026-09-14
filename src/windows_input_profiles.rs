@@ -85,7 +85,7 @@ pub fn spawn_keyboard_profile_resolver() -> std::io::Result<KeyboardProfileResol
     })
 }
 
-const PROFILE_MAX_AGE: Duration = Duration::from_secs(2);
+const PROFILE_MAX_AGE: Duration = Duration::from_secs(6);
 const PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const PROFILE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -122,16 +122,24 @@ impl KeyboardProfileCache {
                 self.next_refresh = now + PROFILE_REFRESH_INTERVAL;
                 changed
             }
-            // Keep the last snapshot until it is actually too old; a timeout is
-            // not a binding change.
-            Err(ProbeFailure::Timeout) => self.cache.expire(now, PROFILE_MAX_AGE),
-            failure => {
+            // A transient resolution failure does not prove the bindings changed;
+            // keep the last snapshot until it is actually too old.
+            Ok(Err(_)) => {
+                let changed = self.cache.expire(now, PROFILE_MAX_AGE);
+                self.next_refresh = now + PROFILE_RETRY_INTERVAL;
+                changed
+            }
+            Err(ProbeFailure::Disconnected) => {
                 let changed = self.cache.invalidate();
                 self.next_refresh = now + PROFILE_RETRY_INTERVAL;
-                if matches!(failure, Err(ProbeFailure::Disconnected)) {
-                    self.resolver = None;
-                }
+                self.resolver = None;
                 changed
+            }
+            // Busy/timeout/expired are transient: keep the last snapshot until it
+            // is actually too old, so a brief provider hiccup does not clear the
+            // word the user is typing.
+            Err(ProbeFailure::Timeout | ProbeFailure::Busy | ProbeFailure::Expired) => {
+                self.cache.expire(now, PROFILE_MAX_AGE)
             }
         }
     }
