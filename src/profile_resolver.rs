@@ -91,9 +91,12 @@ impl ProfileSnapshotCache {
         &mut self,
         snapshot: ResolvedKeyboardProfiles,
         now: Instant,
-        max_age: Duration,
+        _max_age: Duration,
     ) -> bool {
-        let changed = self.current(now, max_age) != Some(&snapshot);
+        // Only a real binding change invalidates buffered input. Re-accepting an
+        // identical snapshot after the age limit must not churn the generation,
+        // otherwise periodic refreshes keep clearing the current word.
+        let changed = self.snapshot.as_ref() != Some(&snapshot);
         if changed {
             self.generation = self.generation.wrapping_add(1);
         }
@@ -514,8 +517,10 @@ mod tests {
         assert!(cache.current(now + Duration::from_secs(4), ttl).is_none());
         assert!(cache.accept(changed.clone(), now + Duration::from_secs(5), ttl));
         let generation = cache.generation();
-        assert!(cache.accept(changed, now + Duration::from_secs(7), ttl));
-        assert_eq!(cache.generation(), generation + 1);
+        // An identical refresh after the age limit must not churn the generation,
+        // otherwise periodic refreshes keep clearing the current word.
+        assert!(!cache.accept(changed, now + Duration::from_secs(7), ttl));
+        assert_eq!(cache.generation(), generation);
     }
 
     #[test]

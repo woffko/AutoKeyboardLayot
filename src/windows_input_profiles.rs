@@ -110,28 +110,30 @@ impl KeyboardProfileCache {
     /// identical periodic refresh. Consumers must invalidate buffered state then.
     pub fn poll(&mut self) -> bool {
         let now = Instant::now();
-        let mut changed = self.cache.expire(now, PROFILE_MAX_AGE);
         if now < self.next_refresh {
-            return changed;
+            return false;
         }
         let Some(resolver) = self.resolver.as_mut() else {
-            return changed;
+            return self.cache.expire(now, PROFILE_MAX_AGE);
         };
         match resolver.query_result((), Duration::ZERO, PROFILE_MAX_AGE) {
             Ok(Ok(snapshot)) => {
-                changed |= self.cache.accept(snapshot, now, PROFILE_MAX_AGE);
+                let changed = self.cache.accept(snapshot, now, PROFILE_MAX_AGE);
                 self.next_refresh = now + PROFILE_REFRESH_INTERVAL;
+                changed
             }
-            Err(ProbeFailure::Timeout) => {}
+            // Keep the last snapshot until it is actually too old; a timeout is
+            // not a binding change.
+            Err(ProbeFailure::Timeout) => self.cache.expire(now, PROFILE_MAX_AGE),
             failure => {
-                changed |= self.cache.invalidate();
+                let changed = self.cache.invalidate();
                 self.next_refresh = now + PROFILE_RETRY_INTERVAL;
                 if matches!(failure, Err(ProbeFailure::Disconnected)) {
                     self.resolver = None;
                 }
+                changed
             }
         }
-        changed
     }
     pub fn generation(&self) -> u64 {
         self.cache.generation()
