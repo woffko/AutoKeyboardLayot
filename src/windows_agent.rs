@@ -24,9 +24,10 @@ use ui_localization::{tr, tr_format};
 
 mod ui_localization;
 use autokeyboardlayot::{
-    BackendRules, BackendStrategy, ConfigurationDocument, ConversionTransaction, Detector,
-    ExclusionPolicy, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN, Hotkey,
-    InputEvent, InputSession, Language, PrivacyBlockReason, SessionAction, Settings, UserLexicon,
+    BackendRules, BackendStrategy, ConfigurationDocument, ConversionTransaction, Detection,
+    Detector, ExclusionPolicy, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT,
+    HOTKEY_MOD_WIN, Hotkey, InputEvent, InputSession, Language, PrivacyBlockReason, SessionAction,
+    Settings, UserLexicon,
 };
 
 mod installer_lifecycle;
@@ -528,6 +529,16 @@ struct LastBoundary {
     delimiter: char,
     source_language: Language,
     foreground: ForegroundContext,
+}
+
+/// Forced-conversion cycle state: the manual hotkey walks the word through every
+/// enabled layout, one press per layout, independent of dictionary membership.
+struct TransposeCycle {
+    replay_keys: Vec<ReplayKey>,
+    delimiter: Option<char>,
+    foreground: ForegroundContext,
+    index: usize,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -4139,6 +4150,7 @@ struct InputProcessor {
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
     last_boundary: Option<LastBoundary>,
+    transpose_cycle: Option<TransposeCycle>,
     text_edit_backend: TextEditBackend,
     pending_conversion: Option<PendingConversion>,
     deferred_drained_conversion: Option<DeferredDrainedConversion>,
@@ -4231,6 +4243,7 @@ impl InputProcessor {
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
             last_boundary: None,
+            transpose_cycle: None,
             text_edit_backend: TextEditBackend::ObserveOnly,
             pending_conversion: None,
             deferred_drained_conversion: None,
@@ -4421,6 +4434,7 @@ impl InputProcessor {
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
                 self.last_boundary = None;
+                self.transpose_cycle = None;
                 self.session.handle(InputEvent::Mouse, None, &self.detector);
                 self.mark_privacy_dirty(false);
             }
@@ -4667,6 +4681,7 @@ impl InputProcessor {
             self.invalidate_conversion_state();
             self.replay_keys.clear();
             self.last_boundary = None;
+            self.transpose_cycle = None;
             self.session
                 .handle(InputEvent::FocusChanged, language, &self.detector);
             self.modifiers = Modifiers::default();
@@ -4688,6 +4703,7 @@ impl InputProcessor {
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
                 self.last_boundary = None;
+                self.transpose_cycle = None;
                 self.handle_switching_rule(
                     InputEvent::LayoutChanged,
                     language,
@@ -4751,6 +4767,7 @@ impl InputProcessor {
         if self.modifiers.has_shortcut_modifier() {
             self.replay_keys.clear();
             self.last_boundary = None;
+            self.transpose_cycle = None;
             if event.virtual_key as u16 == VK_BACK.0
                 && self.modifiers.control()
                 && !self.modifiers.alt()
@@ -4864,10 +4881,12 @@ impl InputProcessor {
             }
             key if key == VK_TAB.0 => {
                 self.last_boundary = None;
+                self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
             }
             key if key == VK_RETURN.0 => {
                 self.last_boundary = None;
+                self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
                 self.session.mark_line_start();
             }
@@ -4913,6 +4932,7 @@ impl InputProcessor {
                     // A new word has started; the previous word is no longer the
                     // one adjacent to the caret.
                     self.last_boundary = None;
+                    self.transpose_cycle = None;
                 }
                 let boundary = input_event == InputEvent::Boundary;
                 let buffered_before = self.session.buffered_character_count();
@@ -5031,6 +5051,7 @@ impl InputProcessor {
         suppress_until_boundary: bool,
     ) {
         self.last_boundary = None;
+        self.transpose_cycle = None;
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
@@ -5039,163 +5060,173 @@ impl InputProcessor {
     }
 
     fn execute_forced_conversion(&mut self, event: RawKeyEvent, language: Option<Language>) {
-        if self.replay_keys.is_empty() {
-            if self.try_convert_last_boundary(event) {
+        // The manual hotkey walks the word through every enabled layout, so it
+        // works even when the word is not in any dictionary.
+        let (replay_keys, delimiter, source_layout, source_language) =
+            if !self.replay_keys.is_empty() {
+                (
+                    core::mem::take(&mut self.replay_keys),
+                    None,
+                    event.foreground.layout,
+                    language,
+                )
+            } else if let Some(last) = self
+                .last_boundary
+                .as_ref()
+                .filter(|last| last.foreground == event.foreground)
+            {
+                (
+                    last.replay_keys.clone(),
+                    Some(last.delimiter),
+                    last.foreground.layout,
+                    Some(last.source_language),
+                )
+            } else {
+                self.diagnostic(
+                    "hotkey",
+                    "result=ignored reason=no-word-before-caret".to_owned(),
+                );
                 return;
-            }
-            self.diagnostic(
-                "hotkey",
-                "result=ignored reason=no-word-before-caret".to_owned(),
-            );
+            };
+        self.session.clear();
+        if !self.ensure_privacy(event.foreground) {
+            self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
         }
-        let Some(language) = language else {
+        self.advance_layout_cycle(
+            replay_keys,
+            delimiter,
+            event.foreground,
+            source_layout,
+            source_language,
+            event.sequence,
+        );
+    }
+
+    /// Convert the word to the next enabled layout on each press.
+    fn advance_layout_cycle(
+        &mut self,
+        replay_keys: Vec<ReplayKey>,
+        delimiter: Option<char>,
+        foreground: ForegroundContext,
+        source_layout: usize,
+        source_language: Option<Language>,
+        sequence: u64,
+    ) {
+        let profiles = self.resolved_profiles().cloned();
+        let order: Vec<Language> = self
+            .settings
+            .enabled_input_packs
+            .iter()
+            .copied()
+            .filter(|language| {
+                let Some(profile) = self.detector.input_profile(*language) else {
+                    return false;
+                };
+                profiles
+                    .as_ref()
+                    .and_then(|profiles| profiles.unique_layout(profile))
+                    .is_some()
+            })
+            .collect();
+        if order.len() < 2 {
+            self.diagnostic("hotkey", "result=ignored reason=single-layout".to_owned());
+            return;
+        }
+        let (index, current_text) = match self.transpose_cycle.as_ref().filter(|cycle| {
+            cycle.replay_keys == replay_keys
+                && cycle.delimiter == delimiter
+                && cycle.foreground == foreground
+        }) {
+            Some(cycle) => (cycle.index, cycle.text.clone()),
+            None => {
+                let Some(word) =
+                    map_replay_keys_to_layout(&replay_keys, HKL(source_layout as *mut c_void))
+                else {
+                    self.diagnostic(
+                        "hotkey",
+                        "result=ignored reason=no-word-before-caret".to_owned(),
+                    );
+                    return;
+                };
+                let position = source_language
+                    .and_then(|language| order.iter().position(|entry| *entry == language))
+                    .unwrap_or_else(|| order.len().saturating_sub(1));
+                (position, word)
+            }
+        };
+        let next_index = (index + 1) % order.len();
+        let target_language = order[next_index];
+        let Some(target_layout) = self.find_layout(target_language) else {
+            self.diagnostic(
+                "hotkey",
+                "result=ignored reason=layout-unavailable".to_owned(),
+            );
+            return;
+        };
+        let Some(next_text) = map_replay_keys_to_layout(&replay_keys, target_layout) else {
+            self.diagnostic("hotkey", "result=ignored reason=layout-map".to_owned());
+            return;
+        };
+        if next_text == current_text {
+            self.diagnostic("hotkey", "result=ignored reason=identical".to_owned());
+            return;
+        }
+        let Some(transaction_source_language) = self.language_for_layout(source_layout) else {
             self.diagnostic(
                 "hotkey",
                 "result=ignored reason=unsupported-layout".to_owned(),
             );
             return;
         };
-        if !self.ensure_privacy(event.foreground) {
-            self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
-            return;
-        }
-        let candidates = mapped_layout_candidates(
-            &self.replay_keys,
-            language,
-            &self.settings,
-            &self.detector,
-            self.resolved_profiles(),
-        );
-        let SessionAction::Candidate(detection) = self.session.force_current_word_with_candidates(
-            Some(language),
-            &self.detector,
-            &candidates,
-        ) else {
-            self.diagnostic(
-                "hotkey",
-                "result=ignored reason=no-unambiguous-target".to_owned(),
-            );
-            return;
+        let detection = Detection {
+            source_language: transaction_source_language,
+            target_language,
+            original: current_text,
+            replacement: next_text.clone(),
+            source_score: 0.0,
+            target_score: 1.0,
         };
-        if self.replay_keys.len() != detection.original.chars().count()
-            || self
-                .replay_keys
-                .iter()
-                .any(|key| key.caps_lock != event.caps_lock)
-        {
-            self.suppress_session();
-            return;
-        }
-        let Some(transaction) = ConversionTransaction::without_delimiter(&detection) else {
-            self.suppress_session();
+        let transaction = match delimiter {
+            Some(delimiter) => ConversionTransaction::new(&detection, delimiter),
+            None => ConversionTransaction::without_delimiter(&detection),
+        };
+        let Some(transaction) = transaction else {
+            self.diagnostic("hotkey", "result=ignored reason=edit-unit".to_owned());
             return;
         };
         self.diagnostic(
             "candidate",
             format!(
-                "forced=true source={} target={} original_chars={} replacement_chars={} mapped_targets={} route={:?}",
+                "forced=true cycle_index={next_index} source={} target={} original_chars={} replacement_chars={} route={:?}",
                 detection.source_language.id(),
                 detection.target_language.id(),
                 detection.original.chars().count(),
                 detection.replacement.chars().count(),
-                candidates.len(),
                 self.text_edit_backend,
             ),
         );
-        let replay_keys = core::mem::take(&mut self.replay_keys);
-        self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .forwarded_input_sequence
-            .fetch_max(event.sequence, Ordering::AcqRel);
-        self.pending_conversion = Some(PendingConversion {
-            transaction,
-            foreground: event.foreground,
-            source_layout: event.foreground.layout,
-            profile_generation: self.input_profiles.generation(),
-            space_down_sequence: event.sequence,
-            replay_keys,
-            forced: true,
+        self.transpose_cycle = Some(TransposeCycle {
+            replay_keys: replay_keys.clone(),
+            delimiter,
+            foreground,
+            index: next_index,
+            text: next_text,
         });
-        self.execute_pending_conversion(event.sequence);
-    }
-
-    /// Convert the most recent space-delimited word when the manual hotkey is
-    /// pressed after the space. Returns true when a conversion was started.
-    fn try_convert_last_boundary(&mut self, event: RawKeyEvent) -> bool {
-        let Some(last) = self.last_boundary.as_ref() else {
-            return false;
-        };
-        if last.foreground != event.foreground {
-            self.last_boundary = None;
-            return false;
-        }
-        let replay_keys = last.replay_keys.clone();
-        let delimiter = last.delimiter;
-        let source_language = last.source_language;
-        let source_layout = last.foreground.layout;
-        if !self.ensure_privacy(event.foreground) {
-            self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
-            return false;
-        }
-        let Some(word) = map_replay_keys_to_layout(&replay_keys, HKL(source_layout as *mut c_void))
-        else {
-            self.last_boundary = None;
-            return false;
-        };
-        let candidates = mapped_layout_candidates(
-            &replay_keys,
-            source_language,
-            &self.settings,
-            &self.detector,
-            self.resolved_profiles(),
-        );
-        let Some(detection) =
-            self.detector
-                .detect_mapped_candidates(&word, source_language, &candidates)
-        else {
-            self.diagnostic(
-                "hotkey",
-                "result=ignored reason=no-unambiguous-target".to_owned(),
-            );
-            return false;
-        };
-        if replay_keys.len() != detection.original.chars().count() {
-            self.last_boundary = None;
-            return false;
-        }
-        let Some(transaction) = ConversionTransaction::new(&detection, delimiter) else {
-            self.last_boundary = None;
-            return false;
-        };
-        self.diagnostic(
-            "candidate",
-            format!(
-                "forced=true previous=true source={} target={} original_chars={} replacement_chars={} mapped_targets={} route={:?}",
-                detection.source_language.id(),
-                detection.target_language.id(),
-                detection.original.chars().count(),
-                detection.replacement.chars().count(),
-                candidates.len(),
-                self.text_edit_backend,
-            ),
-        );
-        self.last_boundary = None;
         self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .forwarded_input_sequence
-            .fetch_max(event.sequence, Ordering::AcqRel);
+            .fetch_max(sequence, Ordering::AcqRel);
         self.pending_conversion = Some(PendingConversion {
             transaction,
-            foreground: event.foreground,
+            foreground,
             source_layout,
             profile_generation: self.input_profiles.generation(),
-            space_down_sequence: event.sequence,
+            space_down_sequence: sequence,
             replay_keys,
             forced: true,
         });
-        self.execute_pending_conversion(event.sequence);
-        true
+        self.execute_pending_conversion(sequence);
     }
 
     fn ensure_privacy(&mut self, foreground: ForegroundContext) -> bool {
