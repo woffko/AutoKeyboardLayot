@@ -453,8 +453,8 @@ export component SettingsWindow inherits Window {
                     VerticalLayout {
                         spacing: 12px;
                         SettingsCard {
-                            min-height: 126px;
-                            VerticalLayout {
+                            height: settings_card_1.preferred-height;
+                            settings_card_1 := VerticalLayout {
                                 padding: 18px;
                                 spacing: 8px;
                                 UiText {
@@ -471,8 +471,8 @@ export component SettingsWindow inherits Window {
                             }
                         }
                         SettingsCard {
-                            min-height: 214px;
-                            VerticalLayout {
+                            height: settings_card_2.preferred-height;
+                            settings_card_2 := VerticalLayout {
                                 padding: 18px;
                                 spacing: 8px;
                                 DirectionalCheckBox { text: Localization.text("general.auto_start", Localization.revision); checked <=> root.automatic-conversion-on-startup; }
@@ -483,8 +483,8 @@ export component SettingsWindow inherits Window {
                             }
                         }
                         SettingsCard {
-                            min-height: 276px;
-                            VerticalLayout {
+                            height: settings_card_3.preferred-height;
+                            settings_card_3 := VerticalLayout {
                                 padding: 18px;
                                 spacing: 9px;
                                 DirectionalCheckBox { text: Localization.text("hotkey.enabled", Localization.revision); checked <=> root.hotkey-enabled; }
@@ -529,8 +529,8 @@ export component SettingsWindow inherits Window {
                     VerticalLayout {
                         spacing: 12px;
                         SettingsCard {
-                            min-height: 330px;
-                            VerticalLayout {
+                            height: settings_card_4.preferred-height;
+                            settings_card_4 := VerticalLayout {
                                 padding: 18px;
                                 spacing: 8px;
                                 DirectionalCheckBox { text: Localization.text("rules.backspace", Localization.revision); checked <=> root.suppress-after-backspace; }
@@ -544,8 +544,8 @@ export component SettingsWindow inherits Window {
                             }
                         }
                         SettingsCard {
-                            min-height: 80px;
-                            VerticalLayout {
+                            height: settings_card_5.preferred-height;
+                            settings_card_5 := VerticalLayout {
                                 padding: 16px;
                                 DirectionalCheckBox { text: Localization.text("rules.no_enter_tab", Localization.revision); checked: true; enabled: false; }
                             }
@@ -715,8 +715,8 @@ export component SettingsWindow inherits Window {
                 spacing: 14px;
                 SectionTitle { title: Localization.text("nav.diagnostics", Localization.revision); description: Localization.text("diagnostics.description", Localization.revision); }
                 SettingsCard {
-                    min-height: 132px;
-                    VerticalLayout {
+                    height: settings_card_6.preferred-height;
+                    settings_card_6 := VerticalLayout {
                         padding: 18px;
                         spacing: 12px;
                         DirectionalCheckBox { text: Localization.text("diagnostics.enabled", Localization.revision); checked <=> root.diagnostics-enabled; }
@@ -738,8 +738,8 @@ export component SettingsWindow inherits Window {
                 spacing: 14px;
                 SectionTitle { title: Localization.text("nav.about", Localization.revision); description: Localization.text("about.description", Localization.revision); }
                 SettingsCard {
-                    min-height: 210px;
-                    VerticalLayout {
+                    height: settings_card_7.preferred-height;
+                    settings_card_7 := VerticalLayout {
                         padding: 20px;
                         spacing: 10px;
                         UiText { text: Localization.text("packs.notice", Localization.revision); color: Palette.foreground; font-size: 14px; wrap: word-wrap; }
