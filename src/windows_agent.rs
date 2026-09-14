@@ -521,6 +521,15 @@ struct PendingConversion {
     forced: bool,
 }
 
+/// The most recent space-delimited word, retained so the user can still convert
+/// it with the manual hotkey after the space has been typed.
+struct LastBoundary {
+    replay_keys: Vec<ReplayKey>,
+    delimiter: char,
+    source_language: Language,
+    foreground: ForegroundContext,
+}
+
 #[derive(Debug, Clone)]
 struct UndoRecord {
     transaction: ConversionTransaction,
@@ -4129,6 +4138,7 @@ struct InputProcessor {
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
+    last_boundary: Option<LastBoundary>,
     text_edit_backend: TextEditBackend,
     pending_conversion: Option<PendingConversion>,
     deferred_drained_conversion: Option<DeferredDrainedConversion>,
@@ -4220,6 +4230,7 @@ impl InputProcessor {
             last_process_id: None,
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
+            last_boundary: None,
             text_edit_backend: TextEditBackend::ObserveOnly,
             pending_conversion: None,
             deferred_drained_conversion: None,
@@ -4808,6 +4819,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_SPACE.0 => {
+                let last_keys = self.replay_keys.clone();
                 if let Some((transaction, replay_keys)) =
                     self.handle_boundary(language, Some(' '), false)
                     && self.metrics.auto_enabled.load(Ordering::Acquire)
@@ -4833,6 +4845,16 @@ impl InputProcessor {
                     self.deferred_drained_conversion = Some(DeferredDrainedConversion {
                         gate_token: event.drain_token,
                         boundary_sequence: event.sequence,
+                    });
+                }
+                if !last_keys.is_empty()
+                    && let Some(source_language) = language
+                {
+                    self.last_boundary = Some(LastBoundary {
+                        replay_keys: last_keys,
+                        delimiter: ' ',
+                        source_language,
+                        foreground: event.foreground,
                     });
                 }
             }
@@ -4880,6 +4902,11 @@ impl InputProcessor {
                             event.virtual_key
                         ),
                     );
+                }
+                if matches!(input_event, InputEvent::Printable(_)) {
+                    // A new word has started; the previous word is no longer the
+                    // one adjacent to the caret.
+                    self.last_boundary = None;
                 }
                 let boundary = input_event == InputEvent::Boundary;
                 let buffered_before = self.session.buffered_character_count();
@@ -5005,6 +5032,16 @@ impl InputProcessor {
     }
 
     fn execute_forced_conversion(&mut self, event: RawKeyEvent, language: Option<Language>) {
+        if self.replay_keys.is_empty() {
+            if self.try_convert_last_boundary(event) {
+                return;
+            }
+            self.diagnostic(
+                "hotkey",
+                "result=ignored reason=no-word-before-caret".to_owned(),
+            );
+            return;
+        }
         let Some(language) = language else {
             self.diagnostic(
                 "hotkey",
@@ -5012,13 +5049,6 @@ impl InputProcessor {
             );
             return;
         };
-        if self.replay_keys.is_empty() {
-            self.diagnostic(
-                "hotkey",
-                "result=ignored reason=no-word-before-caret".to_owned(),
-            );
-            return;
-        }
         if !self.ensure_privacy(event.foreground) {
             self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
@@ -5081,6 +5111,84 @@ impl InputProcessor {
             forced: true,
         });
         self.execute_pending_conversion(event.sequence);
+    }
+
+    /// Convert the most recent space-delimited word when the manual hotkey is
+    /// pressed after the space. Returns true when a conversion was started.
+    fn try_convert_last_boundary(&mut self, event: RawKeyEvent) -> bool {
+        let Some(last) = self.last_boundary.as_ref() else {
+            return false;
+        };
+        if last.foreground != event.foreground {
+            self.last_boundary = None;
+            return false;
+        }
+        let replay_keys = last.replay_keys.clone();
+        let delimiter = last.delimiter;
+        let source_language = last.source_language;
+        let source_layout = last.foreground.layout;
+        if !self.ensure_privacy(event.foreground) {
+            self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
+            return false;
+        }
+        let Some(word) = map_replay_keys_to_layout(&replay_keys, HKL(source_layout as *mut c_void))
+        else {
+            self.last_boundary = None;
+            return false;
+        };
+        let candidates = mapped_layout_candidates(
+            &replay_keys,
+            source_language,
+            &self.settings,
+            &self.detector,
+            self.resolved_profiles(),
+        );
+        let Some(detection) =
+            self.detector
+                .detect_mapped_candidates(&word, source_language, &candidates)
+        else {
+            self.diagnostic(
+                "hotkey",
+                "result=ignored reason=no-unambiguous-target".to_owned(),
+            );
+            return false;
+        };
+        if replay_keys.len() != detection.original.chars().count() {
+            self.last_boundary = None;
+            return false;
+        }
+        let Some(transaction) = ConversionTransaction::new(&detection, delimiter) else {
+            self.last_boundary = None;
+            return false;
+        };
+        self.diagnostic(
+            "candidate",
+            format!(
+                "forced=true previous=true source={} target={} original_chars={} replacement_chars={} mapped_targets={} route={:?}",
+                detection.source_language.id(),
+                detection.target_language.id(),
+                detection.original.chars().count(),
+                detection.replacement.chars().count(),
+                candidates.len(),
+                self.text_edit_backend,
+            ),
+        );
+        self.last_boundary = None;
+        self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .forwarded_input_sequence
+            .fetch_max(event.sequence, Ordering::AcqRel);
+        self.pending_conversion = Some(PendingConversion {
+            transaction,
+            foreground: event.foreground,
+            source_layout,
+            profile_generation: self.input_profiles.generation(),
+            space_down_sequence: event.sequence,
+            replay_keys,
+            forced: true,
+        });
+        self.execute_pending_conversion(event.sequence);
+        true
     }
 
     fn ensure_privacy(&mut self, foreground: ForegroundContext) -> bool {
@@ -6137,6 +6245,7 @@ impl InputProcessor {
     fn invalidate_conversion_state(&mut self) {
         self.pending_conversion = None;
         self.deferred_drained_conversion = None;
+        self.last_boundary = None;
         self.clear_undo();
     }
 
