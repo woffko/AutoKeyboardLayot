@@ -4741,7 +4741,7 @@ impl InputProcessor {
                 let cycling = self
                     .transpose_cycle
                     .as_ref()
-                    .is_some_and(|cycle| cycle.foreground == event.foreground);
+                    .is_some_and(|cycle| same_input_target(cycle.foreground, event.foreground));
                 if cycling && event.drain_token == 0 {
                     // Keep walking the word through the layouts on every press.
                     self.execute_forced_conversion(event, language);
@@ -5069,7 +5069,7 @@ impl InputProcessor {
         if let Some(cycle) = self
             .transpose_cycle
             .clone()
-            .filter(|cycle| cycle.foreground == event.foreground)
+            .filter(|cycle| same_input_target(cycle.foreground, event.foreground))
         {
             let Some(source_layout) = self.find_layout(cycle.language) else {
                 self.diagnostic(
@@ -5105,7 +5105,7 @@ impl InputProcessor {
         } else if let Some(last) = self
             .last_boundary
             .as_ref()
-            .filter(|last| last.foreground == event.foreground)
+            .filter(|last| same_input_target(last.foreground, event.foreground))
         {
             (
                 last.replay_keys.clone(),

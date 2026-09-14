@@ -258,15 +258,42 @@ component LanguageRow inherits Rectangle {
     callback toggled(bool);
     height: 40px;
     background: checked ? Palette.alternate-background : Palette.background;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    forward-focus: row-focus;
+    accessible-role: checkbox;
+    accessible-label: root.name;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => { root.toggled(!root.checked); }
+
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
-        spacing: 8px;
-        DirectionalCheckBox {
-            horizontal-stretch: 1;
+        spacing: 10px;
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            border-width: 1px;
+            border-color: root.checked ? Palette.accent-background : Palette.border;
+            border-radius: 4px;
+            background: root.checked ? Palette.accent-background : Palette.background;
+            UiText {
+                width: parent.width;
+                height: parent.height;
+                text: root.checked ? "✓" : "";
+                color: Palette.accent-foreground;
+                font-size: 13px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+        }
+        UiText {
             text: root.name;
-            checked: root.checked;
-            toggled => { root.toggled(self.checked); }
+            color: Palette.foreground;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
         }
         UiText {
             text: root.status;
@@ -274,6 +301,19 @@ component LanguageRow inherits Rectangle {
             opacity: 0.6;
             font-size: 12px;
             vertical-alignment: center;
+        }
+    }
+    TouchArea {
+        clicked => { row-focus.focus(); root.toggled(!root.checked); }
+    }
+    row-focus := FocusScope {
+        width: 0px;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.toggled(!root.checked);
+                return accept;
+            }
+            return reject;
         }
     }
     Rectangle { y: parent.height - 1px; height: 1px; background: Palette.border; }
