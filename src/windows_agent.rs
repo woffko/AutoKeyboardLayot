@@ -162,7 +162,7 @@ const TO_UNICODE_DO_NOT_CHANGE_KEYBOARD_STATE: u32 = 4;
 const PRIVACY_ALLOWED: u8 = 0;
 // Worker-only wait: the low-level hook never waits for UI Automation.
 // Give ordinary delayed replies more headroom before failing closed.
-const PRIVACY_PROBE_WAIT_MS: u64 = 100;
+const PRIVACY_PROBE_WAIT_MS: u64 = 300;
 const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
 const UIA_PROVIDER_TIMEOUT_MS: u32 = 100;
 const PRIVACY_PASSWORD: u8 = 1;

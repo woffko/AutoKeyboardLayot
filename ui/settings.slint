@@ -582,6 +582,7 @@ export component SettingsWindow inherits Window {
                                         }
                                     }
                                 }
+                                UiText { text: Localization.text("languages.interface_only_note", Localization.revision); color: Palette.foreground; opacity: 0.6; font-size: 12px; wrap: word-wrap; }
                             }
                         }
 
@@ -843,6 +844,7 @@ export component SettingsWindow inherits Window {
                                     }
                                     UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
                                     if row.has-input: UiText { text: Localization.text("download.input_component", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                    if !row.has-input: UiText { text: Localization.text("download.ui_only", Localization.revision); wrap: word-wrap; color: Palette.foreground; opacity: 0.75; font-size: 12px; }
                                     if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
                                 }
                                 HorizontalLayout {
