@@ -5079,7 +5079,7 @@ impl InputProcessor {
                 return;
             };
             self.session.clear();
-            if !self.ensure_privacy(event.foreground) {
+            if !self.forced_privacy_allows(event.foreground) {
                 self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
                 return;
             }
@@ -5131,7 +5131,7 @@ impl InputProcessor {
             );
             return;
         };
-        if !self.ensure_privacy(event.foreground) {
+        if !self.forced_privacy_allows(event.foreground) {
             self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
         }
@@ -5267,6 +5267,25 @@ impl InputProcessor {
             self.evaluate_privacy(foreground);
         }
         self.privacy_reason.is_none()
+    }
+
+    /// A user-initiated manual conversion is explicit consent, so an
+    /// unverifiable context (for example a console where UI Automation cannot
+    /// confirm the focused element) does not block it. A confirmed password
+    /// field, an excluded process or an elevated target still does.
+    fn forced_privacy_allows(&mut self, foreground: ForegroundContext) -> bool {
+        self.refresh_process_policy(foreground.process_id);
+        if self.privacy_needs_check {
+            self.evaluate_privacy(foreground);
+        }
+        !matches!(
+            self.privacy_reason,
+            Some(
+                PrivacyBlockReason::PasswordField
+                    | PrivacyBlockReason::ExcludedProcess
+                    | PrivacyBlockReason::ElevatedProcess
+            )
+        )
     }
 
     fn evaluate_privacy(&mut self, foreground: ForegroundContext) {
@@ -5406,8 +5425,13 @@ impl InputProcessor {
         {
             return;
         }
+        let privacy_blocks = match self.privacy_reason {
+            None => false,
+            Some(PrivacyBlockReason::InspectionUnavailable) => !pending.forced,
+            Some(_) => true,
+        };
         if (!pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire))
-            || self.privacy_reason.is_some()
+            || privacy_blocks
             || !self.pending_profiles_match(&pending)
             || !self.pre_forward_guard_is_current(pending.foreground, boundary_sequence)
         {
