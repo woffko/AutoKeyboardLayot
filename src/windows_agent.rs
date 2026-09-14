@@ -4845,8 +4845,18 @@ impl InputProcessor {
             }
             _ => {
                 if !self.ensure_privacy(event.foreground) {
+                    self.diagnostic(
+                        "input",
+                        format!(
+                            "result=suppressed reason=privacy pid={} route={:?}",
+                            event.foreground.process_id, self.text_edit_backend
+                        ),
+                    );
                     self.suppress_session();
                     return;
+                }
+                if language.is_none() {
+                    self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
                 let input_event = translate_printable(event, self.modifiers).map_or(
                     InputEvent::UnsupportedInput,
@@ -4862,6 +4872,15 @@ impl InputProcessor {
                         }
                     },
                 );
+                if input_event == InputEvent::UnsupportedInput {
+                    self.diagnostic(
+                        "input",
+                        format!(
+                            "result=suppressed reason=unsupported vk={}",
+                            event.virtual_key
+                        ),
+                    );
+                }
                 let boundary = input_event == InputEvent::Boundary;
                 let buffered_before = self.session.buffered_character_count();
                 let action = self.session.handle(input_event, language, &self.detector);

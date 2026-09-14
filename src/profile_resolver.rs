@@ -150,19 +150,15 @@ impl<P: KeyboardProfileProbe> Drop for RestoreGuard<'_, P> {
 /// All-or-nothing resolution. IME handles remain in the inventory but receive
 /// no keyboard-profile binding. The caller owns freshness and generation checks.
 /// This protocol does not prove that arbitrary TSF composition is inactive.
-pub fn resolve_keyboard_profiles(
+fn collect_profiles(
     probe: &mut impl KeyboardProfileProbe,
-) -> Result<ResolvedKeyboardProfiles, ProfileResolutionError> {
-    let loaded = checked_layouts(probe.loaded_layouts())?;
-    let original = probe
-        .current_layout()
-        .ok_or(ProfileResolutionError::Unavailable)?;
-    if !loaded.contains(&original) {
-        return Err(ProfileResolutionError::LayoutListChanged);
-    }
+    loaded: &BTreeSet<usize>,
+    original: usize,
+    skip_ime: bool,
+) -> Result<BTreeMap<usize, WindowsKeyboardProfile>, ProfileResolutionError> {
     let mut profiles = BTreeMap::new();
-    for &layout in &loaded {
-        if probe.is_ime(layout) {
+    for &layout in loaded {
+        if skip_ime && probe.is_ime(layout) {
             continue;
         }
         if probe.current_layout() != Some(original) {
@@ -203,6 +199,26 @@ pub fn resolve_keyboard_profiles(
             layout,
             identity.ok_or(ProfileResolutionError::IdentityUnavailable)?,
         );
+    }
+    Ok(profiles)
+}
+
+pub fn resolve_keyboard_profiles(
+    probe: &mut impl KeyboardProfileProbe,
+) -> Result<ResolvedKeyboardProfiles, ProfileResolutionError> {
+    let loaded = checked_layouts(probe.loaded_layouts())?;
+    let original = probe
+        .current_layout()
+        .ok_or(ProfileResolutionError::Unavailable)?;
+    if !loaded.contains(&original) {
+        return Err(ProfileResolutionError::LayoutListChanged);
+    }
+    // Normally skip IME handles to avoid activating them. ImmIsIME can report
+    // ordinary layouts as IMEs on some systems, which would leave the current
+    // layout unresolved; in that case resolve every loaded layout instead.
+    let mut profiles = collect_profiles(probe, &loaded, original, true)?;
+    if !profiles.contains_key(&original) {
+        profiles = collect_profiles(probe, &loaded, original, false)?;
     }
     if checked_layouts(probe.loaded_layouts())? != loaded {
         return Err(ProfileResolutionError::LayoutListChanged);
@@ -309,6 +325,19 @@ mod tests {
             }
             Some(name)
         }
+    }
+
+    #[test]
+    fn current_layout_is_resolved_even_when_reported_as_ime() {
+        // On some systems ImmIsIME reports ordinary layouts as IMEs; the current
+        // layout must still be resolved or no conversion is possible.
+        let mut fake = Fake {
+            current: IME,
+            ..Fake::default()
+        };
+        let resolved = resolve_keyboard_profiles(&mut fake).unwrap();
+        assert!(resolved.profile(IME).is_some());
+        assert_eq!(fake.current, IME);
     }
 
     #[test]
