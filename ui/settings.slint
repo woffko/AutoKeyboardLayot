@@ -336,6 +336,8 @@ export component SettingsWindow inherits Window {
     in property <bool> package-import-busy: false;
     in property <bool> package-import-ready: false;
     in property <string> package-import-preview;
+    in-out property <bool> add-language-visible: false;
+    in-out property <bool> advanced-visible: false;
     in property <bool> package-removal: false;
     in property <bool> package-rollback: false;
     in property <bool> package-migration: false;
@@ -557,92 +559,105 @@ export component SettingsWindow inherits Window {
                 SectionTitle { title: Localization.text("nav.languages", Localization.revision); description: Localization.text("languages.description", Localization.revision); }
                 ScrollView {
                     VerticalLayout {
-                        padding: 20px;
-                        spacing: 12px;
-                UiText { text: Localization.text("packs.notice", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
-                if !root.package-import-allowed: UiText { text: Localization.text("import.legacy", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
-                if !root.package-import-allowed: Button {
-                    text: Localization.text("migration.choose", Localization.revision);
-                    enabled: !root.package-import-busy;
-                    clicked => { root.prepare-migration(); }
-                }
-                Button {
-                    text: Localization.text("import.choose", Localization.revision);
-                    enabled: root.package-import-allowed && !root.package-import-busy;
-                    clicked => { root.inspect-package(); }
-                }
-                if root.package-import-busy: UiText { text: Localization.text("import.busy", Localization.revision); color: Palette.foreground; }
-                if root.package-import-allowed: VerticalLayout {
-                    spacing: 6px;
-                    Button { text: Localization.text("remove.refresh", Localization.revision); enabled: !root.package-import-busy; clicked => { root.refresh-packages(); } }
-                    ComboBox { model: root.installed-package-names; current-index <=> root.installed-package-index; enabled: !root.package-import-busy && !root.package-import-ready; }
-                    Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
-                }
-                if root.package-import-allowed : Button {
-                    text: Localization.text("rollback.choose", Localization.revision);
-                    enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-index >= 0 && root.installed-package-index < root.installed-package-rollback.length && root.installed-package-rollback[root.installed-package-index];
-                    clicked => { root.prepare-package-rollback(); }
-                }
-                if root.package-import-ready: VerticalLayout {
-                    spacing: 6px;
-                    if root.package-migration || root.package-online: VerticalLayout {
-                        spacing: 6px;
-                        UiText { text: root.package-migration ? root.migration-summary : root.online-summary; wrap: word-wrap; color: Palette.foreground; }
-                        ComboBox {
-                            model: root.review-package-names;
-                            current-index <=> root.review-package-index;
-                            enabled: !root.package-import-busy;
-                            selected(value) => { root.preview-review-package(self.current-index); }
-                        }
-                    }
-                    LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 180px; accessible-name: Localization.text(root.package-migration ? "migration.confirm" : root.package-online ? "download.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); }
-                    HorizontalLayout {
-                        Button { text: Localization.text(root.package-migration ? "migration.confirm" : root.package-online ? "download.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); enabled: !root.package-import-busy; clicked => { root.confirm-package(); } }
-                        Button { text: Localization.text("button.cancel", Localization.revision); enabled: !root.package-import-busy; clicked => { root.cancel-package(); } }
-                    }
-                }
-                if root.package-import-allowed: VerticalLayout {
-                    spacing: 8px;
-                    UiText { text: Localization.text("download.repository", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
-                    LocalizedTextEdit {
-                        text <=> root.download-repository; single-line: true; height: 36px;
-                        read-only: root.package-import-busy || root.download-catalog-ready || root.package-import-ready;
-                        accessible-name: Localization.text("download.repository", Localization.revision);
-                    }
-                    Button { text: Localization.text("download.check", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready; clicked => { root.check-download-catalog(); } }
-                    if root.download-active: Button {
-                        text: Localization.text(root.download-cancelling ? "download.cancelling" : "download.cancel", Localization.revision);
-                        enabled: !root.download-cancelling;
-                        clicked => { root.cancel-download(); }
-                    }
-                    if root.download-catalog-ready: VerticalLayout {
-                        spacing: 8px;
-                        for row in root.download-rows: VerticalLayout {
-                            DirectionalCheckBox {
-                                text: row.id; checked: row.selected;
-                                enabled: row.available && !root.package-import-busy && !root.package-import-ready;
-                                toggled => { root.toggle-download(row.id, self.checked); }
-                            }
-                            UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; }
-                            if row.has-input: UiText { text: Localization.text("download.input_component", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
-                            if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
-                        }
-                        UiText { text: root.download-summary; wrap: word-wrap; color: Palette.foreground; }
-                        Button { text: Localization.text("download.start", Localization.revision); enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready; clicked => { root.start-selected-download(); } }
-                        Button { text: Localization.text("download.discard", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready; clicked => { root.discard-download-catalog(); } }
-                    }
-                }
-                        Rectangle {
-                            border-width: 1px;
-                            border-color: Palette.border;
-                            border-radius: 6px;
-                            background: Palette.control-background;
+                        padding: 4px;
+                        spacing: 14px;
+
+                        SettingsCard {
                             VerticalLayout {
-                                for row in root.input-packs : LanguageRow {
-                                    name: row.name;
-                                    status: Localization.text(row.status-key, Localization.revision) + (row.details != "" ? " · " + row.details : "");
-                                    checked: row.selected;
-                                    toggled(checked) => { root.toggle-input-pack(row.id, checked); }
+                                padding: 18px;
+                                spacing: 8px;
+                                UiText { text: Localization.text("languages.active_title", Localization.revision); color: Palette.foreground; font-size: 16px; font-weight: 600; }
+                                UiText { text: Localization.text("languages.active_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
+                                Rectangle {
+                                    border-width: 1px;
+                                    border-color: Palette.border;
+                                    border-radius: 6px;
+                                    background: Palette.background;
+                                    VerticalLayout {
+                                        for row in root.input-packs : LanguageRow {
+                                            name: row.name;
+                                            status: Localization.text(row.status-key, Localization.revision) + (row.details != "" ? " · " + row.details : "");
+                                            checked: row.selected;
+                                            toggled(checked) => { root.toggle-input-pack(row.id, checked); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        SettingsCard {
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 8px;
+                                UiText { text: Localization.text("languages.add_title", Localization.revision); color: Palette.foreground; font-size: 16px; font-weight: 600; }
+                                UiText { text: Localization.text("languages.add_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Button {
+                                        text: Localization.text("languages.add_button", Localization.revision);
+                                        enabled: root.package-import-allowed && !root.package-import-busy;
+                                        clicked => {
+                                            root.add-language-visible = true;
+                                            if (!root.download-catalog-ready && !root.package-import-ready) { root.check-download-catalog(); }
+                                        }
+                                    }
+                                    Button {
+                                        text: Localization.text("remove.refresh", Localization.revision);
+                                        enabled: !root.package-import-busy;
+                                        clicked => { root.refresh-packages(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !root.package-import-allowed: SettingsCard {
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 8px;
+                                UiText { text: Localization.text("import.legacy", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                                Button { text: Localization.text("migration.choose", Localization.revision); enabled: !root.package-import-busy; clicked => { root.prepare-migration(); } }
+                            }
+                        }
+
+                        SettingsCard {
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 8px;
+                                DirectionalCheckBox { text: Localization.text("languages.advanced", Localization.revision); checked <=> root.advanced-visible; }
+                                if root.advanced-visible: VerticalLayout {
+                                    spacing: 8px;
+                                    UiText { text: Localization.text("languages.advanced_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
+                                    if root.package-import-allowed: Button {
+                                        text: Localization.text("import.choose", Localization.revision);
+                                        enabled: root.package-import-allowed && !root.package-import-busy;
+                                        clicked => { root.inspect-package(); }
+                                    }
+                                    if root.package-import-busy: UiText { text: Localization.text("import.busy", Localization.revision); color: Palette.foreground; }
+                                    if root.package-import-allowed: ComboBox { model: root.installed-package-names; current-index <=> root.installed-package-index; enabled: !root.package-import-busy && !root.package-import-ready; }
+                                    if root.package-import-allowed: Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
+                                    if root.package-import-allowed: Button {
+                                        text: Localization.text("rollback.choose", Localization.revision);
+                                        enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-index >= 0 && root.installed-package-index < root.installed-package-rollback.length && root.installed-package-rollback[root.installed-package-index];
+                                        clicked => { root.prepare-package-rollback(); }
+                                    }
+                                    if root.package-import-ready && !root.package-online: VerticalLayout {
+                                        spacing: 6px;
+                                        if root.package-migration: VerticalLayout {
+                                            spacing: 6px;
+                                            UiText { text: root.migration-summary; wrap: word-wrap; color: Palette.foreground; }
+                                            ComboBox {
+                                                model: root.review-package-names;
+                                                current-index <=> root.review-package-index;
+                                                enabled: !root.package-import-busy;
+                                                selected(value) => { root.preview-review-package(self.current-index); }
+                                            }
+                                        }
+                                        LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 180px; accessible-name: Localization.text(root.package-migration ? "migration.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); }
+                                        HorizontalLayout {
+                                            Button { text: Localization.text(root.package-migration ? "migration.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); enabled: !root.package-import-busy; clicked => { root.confirm-package(); } }
+                                            Button { text: Localization.text("button.cancel", Localization.revision); enabled: !root.package-import-busy; clicked => { root.cancel-package(); } }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -765,6 +780,95 @@ export component SettingsWindow inherits Window {
                     width: self.preferred-width; height: parent.height;
                     x: Localization.rtl ? 0px : parent.width - self.width;
                     clicked => { root.save-requested(true); }
+                }
+            }
+        }
+
+        if root.add-language-visible: Rectangle {
+            x: 0px;
+            y: 0px;
+            width: root.width;
+            height: root.height;
+            background: #00000066;
+            TouchArea { clicked => {} }
+
+            Rectangle {
+                width: min(700px, root.width - 60px);
+                height: min(600px, root.height - 60px);
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                background: Palette.background;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Palette.border;
+
+                VerticalLayout {
+                    padding: 22px;
+                    spacing: 12px;
+
+                    UiText { text: Localization.text("add_language.title", Localization.revision); color: Palette.foreground; font-size: 22px; font-weight: 600; }
+                    UiText { text: Localization.text("add_language.hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
+                    Rectangle { height: 1px; background: Palette.border; }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 8px;
+
+                            UiText { text: Localization.text("download.repository", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                            LocalizedTextEdit {
+                                text <=> root.download-repository; single-line: true; height: 36px;
+                                read-only: root.package-import-busy || root.download-catalog-ready || root.package-import-ready;
+                                accessible-name: Localization.text("download.repository", Localization.revision);
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Button { text: Localization.text("download.check", Localization.revision); enabled: root.package-import-allowed && !root.package-import-busy && !root.package-import-ready; clicked => { root.check-download-catalog(); } }
+                                if root.download-active: Button {
+                                    text: Localization.text(root.download-cancelling ? "download.cancelling" : "download.cancel", Localization.revision);
+                                    enabled: !root.download-cancelling;
+                                    clicked => { root.cancel-download(); }
+                                }
+                            }
+
+                            if root.download-active || root.download-catalog-ready: UiText { text: root.download-summary; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+
+                            if root.download-catalog-ready: VerticalLayout {
+                                spacing: 8px;
+                                for row in root.download-rows: VerticalLayout {
+                                    DirectionalCheckBox {
+                                        text: row.id; checked: row.selected;
+                                        enabled: row.available && !root.package-import-busy && !root.package-import-ready;
+                                        toggled => { root.toggle-download(row.id, self.checked); }
+                                    }
+                                    UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                    if row.has-input: UiText { text: Localization.text("download.input_component", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                    if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Button { text: Localization.text("download.start", Localization.revision); enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready; clicked => { root.start-selected-download(); } }
+                                    Button { text: Localization.text("download.discard", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready; clicked => { root.discard-download-catalog(); } }
+                                }
+                            }
+
+                            if root.package-import-ready && root.package-online: VerticalLayout {
+                                spacing: 6px;
+                                UiText { text: root.online-summary; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 150px; accessible-name: Localization.text("download.confirm", Localization.revision); }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Button { text: Localization.text("download.confirm", Localization.revision); enabled: !root.package-import-busy; clicked => { root.confirm-package(); } }
+                                    Button { text: Localization.text("button.cancel", Localization.revision); enabled: !root.package-import-busy; clicked => { root.cancel-package(); } }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: Localization.text("add_language.close", Localization.revision); enabled: !root.package-import-busy; clicked => { root.add-language-visible = false; } }
+                    }
                 }
             }
         }
