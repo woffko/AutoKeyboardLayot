@@ -5097,11 +5097,7 @@ impl InputProcessor {
         // The manual hotkey walks the word through every enabled layout, so it
         // works even when the word is not in any dictionary.
         let (replay_keys, delimiter, source_layout) = if !self.replay_keys.is_empty() {
-            (
-                core::mem::take(&mut self.replay_keys),
-                None,
-                event.foreground.layout,
-            )
+            (self.replay_keys.clone(), None, event.foreground.layout)
         } else if let Some(last) = self
             .last_boundary
             .as_ref()
@@ -5135,7 +5131,6 @@ impl InputProcessor {
             );
             return;
         };
-        self.session.clear();
         if !self.ensure_privacy(event.foreground) {
             self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
@@ -5190,23 +5185,30 @@ impl InputProcessor {
             );
             return;
         };
-        let next_index = (position + 1) % order.len();
-        let target_language = order[next_index];
-        let Some(target_layout) = self.find_layout(target_language) else {
-            self.diagnostic(
-                "hotkey",
-                "result=ignored reason=layout-unavailable".to_owned(),
-            );
-            return;
-        };
-        let Some(next_text) = map_replay_keys_to_layout(&replay_keys, target_layout) else {
-            self.diagnostic("hotkey", "result=ignored reason=layout-map".to_owned());
-            return;
-        };
-        if next_text == current_text {
+        // Skip enabled languages whose layout produces the same text (for
+        // example Latin Estonian keeps a Latin English word unchanged) so one
+        // press always reaches a visibly different representation when one
+        // exists.
+        let mut target = None;
+        for step in 1..order.len() {
+            let candidate_index = (position + step) % order.len();
+            let candidate_language = order[candidate_index];
+            let Some(candidate_layout) = self.find_layout(candidate_language) else {
+                continue;
+            };
+            let Some(candidate_text) = map_replay_keys_to_layout(&replay_keys, candidate_layout)
+            else {
+                continue;
+            };
+            if candidate_text != current_text {
+                target = Some((candidate_index, candidate_language, candidate_text));
+                break;
+            }
+        }
+        let Some((next_index, target_language, next_text)) = target else {
             self.diagnostic("hotkey", "result=ignored reason=identical".to_owned());
             return;
-        }
+        };
         let detection = Detection {
             source_language,
             target_language,
@@ -5234,6 +5236,8 @@ impl InputProcessor {
                 self.text_edit_backend,
             ),
         );
+        self.session.clear();
+        self.replay_keys.clear();
         self.transpose_cycle = Some(TransposeCycle {
             replay_keys: replay_keys.clone(),
             delimiter,
