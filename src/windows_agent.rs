@@ -4420,6 +4420,7 @@ impl InputProcessor {
             RawInputEvent::Mouse => {
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
+                self.last_boundary = None;
                 self.session.handle(InputEvent::Mouse, None, &self.detector);
                 self.mark_privacy_dirty(false);
             }
@@ -4665,6 +4666,7 @@ impl InputProcessor {
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
             self.replay_keys.clear();
+            self.last_boundary = None;
             self.session
                 .handle(InputEvent::FocusChanged, language, &self.detector);
             self.modifiers = Modifiers::default();
@@ -4685,6 +4687,7 @@ impl InputProcessor {
                 self.layout_switch_in_flight = None;
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
+                self.last_boundary = None;
                 self.handle_switching_rule(
                     InputEvent::LayoutChanged,
                     language,
@@ -4747,6 +4750,7 @@ impl InputProcessor {
 
         if self.modifiers.has_shortcut_modifier() {
             self.replay_keys.clear();
+            self.last_boundary = None;
             if event.virtual_key as u16 == VK_BACK.0
                 && self.modifiers.control()
                 && !self.modifiers.alt()
@@ -4859,9 +4863,11 @@ impl InputProcessor {
                 }
             }
             key if key == VK_TAB.0 => {
+                self.last_boundary = None;
                 self.handle_boundary(language, None, true);
             }
             key if key == VK_RETURN.0 => {
+                self.last_boundary = None;
                 self.handle_boundary(language, None, true);
                 self.session.mark_line_start();
             }
@@ -5024,6 +5030,7 @@ impl InputProcessor {
         language: Option<Language>,
         suppress_until_boundary: bool,
     ) {
+        self.last_boundary = None;
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
@@ -6245,7 +6252,6 @@ impl InputProcessor {
     fn invalidate_conversion_state(&mut self) {
         self.pending_conversion = None;
         self.deferred_drained_conversion = None;
-        self.last_boundary = None;
         self.clear_undo();
     }
 
