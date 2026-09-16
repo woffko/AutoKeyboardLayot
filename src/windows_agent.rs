@@ -25,9 +25,9 @@ use ui_localization::{tr, tr_format};
 mod ui_localization;
 use autokeyboardlayot::{
     BackendRules, BackendStrategy, ConfigurationDocument, ConversionTransaction, Detection,
-    Detector, ExclusionPolicy, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT,
-    HOTKEY_MOD_WIN, Hotkey, InputEvent, InputSession, Language, PrivacyBlockReason, SessionAction,
-    Settings, UserLexicon,
+    Detector, DetectorConfig, ExclusionPolicy, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL,
+    HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN, Hotkey, InputEvent, InputSession, Language,
+    PrivacyBlockReason, SessionAction, Settings, UserLexicon,
 };
 
 mod installer_lifecycle;
@@ -4190,7 +4190,10 @@ impl InputProcessor {
         configuration: RuntimeConfiguration,
     ) -> Self {
         let mut detector = Detector::with_profile_selections(
-            Default::default(),
+            DetectorConfig {
+                single_letter_words: configuration.settings.single_letter_words,
+                ..Default::default()
+            },
             configuration.dictionaries,
             &configuration.input_profiles,
         );
@@ -4482,7 +4485,10 @@ impl InputProcessor {
             }
         };
         self.detector = Detector::with_profile_selections(
-            Default::default(),
+            DetectorConfig {
+                single_letter_words: configuration.settings.single_letter_words,
+                ..Default::default()
+            },
             configuration.dictionaries,
             &configuration.input_profiles,
         );

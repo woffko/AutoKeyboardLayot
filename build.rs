@@ -93,7 +93,12 @@ fn build_dictionary(input: DictionaryInput, output: &Path) {
             InputKind::Hunspell => line.split_once('/').map_or(line, |(word, _)| word),
         };
         let normalized = surface.trim().to_lowercase();
-        if normalized.chars().count() >= 2 && normalized.chars().all(char::is_alphabetic) {
+        let minimum = if matches!(input.kind, InputKind::Plain) {
+            1
+        } else {
+            2
+        };
+        if normalized.chars().count() >= minimum && normalized.chars().all(char::is_alphabetic) {
             if matches!(input.kind, InputKind::Plain) {
                 assert!(
                     normalized.chars().count() <= 3,

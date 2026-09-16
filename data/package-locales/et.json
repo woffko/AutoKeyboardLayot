@@ -71,6 +71,7 @@
     "general.auto_start": "Automaatne teisendus käivitamisel",
     "general.physical_fallback": "Klahvide taasesitus, kui turvaline UIA-juurdepääs pole saadaval",
     "general.recheck_erased": "Kontrolli esimest sõna pärast selle täielikku kustutamist uuesti",
+    "general.single_letter_words": "Paranda ühetähelised sõnad automaatselt (näiteks z → я)",
     "general.offer_exclusion": "Paku pärast tagasivõtmist sõna välistamist",
     "general.offer_dictionary": "Paku pärast sundteisendust sõna lisamist sõnastikku",
     "hotkey.enabled": "Kasuta kiirklahvi",
@@ -186,6 +187,18 @@
     "error.ui_language": "Kasutajaliidese keele valik on vigane.",
     "lifecycle.close_busy": "Agent on hõivatud või hoiab klahvivajutusi ootel. Lõpetage toiming, taastage või kustutage selgesõnaliselt ootel sisend, kui seda on, ja proovige uuesti sulgeda.",
     "lifecycle.settings_unsaved": "Seadetes on salvestamata või vigased muudatused. Salvestage need enne sulgemist või valige Loobu, et need selgesõnaliselt hüljata.",
-    "lifecycle.settings_busy": "Enne seadete sulgemist lõpetage pooleliolev paketitoiming või faili valimine."
+    "lifecycle.settings_busy": "Enne seadete sulgemist lõpetage pooleliolev paketitoiming või faili valimine.",
+    "add_language.title": "Lisa keel",
+    "add_language.hint": "Märgi allalaaditavad keeled ja installi need. Installimine ei muuda aktiivseid keeli.",
+    "add_language.close": "Sulge",
+    "download.ui_only": "Ainult liides — see pakett ei lisa sisestuskeelt.",
+    "languages.active_title": "Aktiivsed keeled",
+    "languages.active_hint": "Märgitud keeli kasutatakse automaatseks ja käsitsi teisendamiseks. Jäta märgituks vähemalt kaks.",
+    "languages.add_title": "Lisa keel",
+    "languages.add_hint": "Ava kataloogiaken täiendavate keelepakettide allalaadimiseks. Pärast installimist ilmub keel ülalolevasse loendisse ja selle saab märkida.",
+    "languages.add_button": "Lisa keel…",
+    "languages.advanced": "Täpsemad paketitööriistad",
+    "languages.advanced_hint": "Impordi kohalik paketifail, migreeri vana install, eemalda pakett või taasta eelmine versioon.",
+    "languages.interface_only_note": "Allalaaditud keel, mida siin ei ole, avaldati ainult liidesena: see tõlgib rakenduse, kuid ei sisalda sisestusreegleid, seega ei saa seda teisendamiseks kasutada."
   }
 }

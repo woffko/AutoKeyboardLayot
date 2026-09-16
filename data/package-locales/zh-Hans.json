@@ -78,6 +78,7 @@
     "general.auto_start": "启动时开启自动转换",
     "general.physical_fallback": "无法安全访问 UIA 时，通过按键进行替换",
     "general.recheck_erased": "完全删除第一个词后重新检查",
+    "general.single_letter_words": "自动转换单字母单词（例如 z → я）",
     "general.offer_exclusion": "撤销后建议排除该词",
     "general.offer_dictionary": "强制转换后建议将词加入词典",
     "hotkey.enabled": "启用快捷键",
@@ -190,6 +191,18 @@
     "tray.failures": "转换失败：{count}（最近：{reason}）",
     "lifecycle.close_busy": "代理正在忙碌或保留了尚未发送的按键。请完成当前操作，恢复或明确删除保留的输入（如有），然后重试关闭。",
     "lifecycle.settings_unsaved": "设置中有未保存或无效的更改。请在关闭前保存，或选择“取消”以明确放弃这些更改。",
-    "lifecycle.settings_busy": "关闭设置前，请完成当前的语言包操作或文件选择。"
+    "lifecycle.settings_busy": "关闭设置前，请完成当前的语言包操作或文件选择。",
+    "add_language.title": "添加语言",
+    "add_language.hint": "勾选要下载的语言，然后安装。安装不会改变哪些语言处于活动状态。",
+    "add_language.close": "关闭",
+    "download.ui_only": "仅界面 — 此包不会添加输入语言。",
+    "languages.active_title": "活动语言",
+    "languages.active_hint": "勾选的语言用于自动和手动转换。请至少勾选两种。",
+    "languages.add_title": "添加语言",
+    "languages.add_hint": "打开目录窗口以下载更多语言包。安装后，该语言会出现在上方列表中，可以勾选。",
+    "languages.add_button": "添加语言…",
+    "languages.advanced": "高级包工具",
+    "languages.advanced_hint": "导入本地包文件、迁移旧安装、移除包或回滚到以前的版本。",
+    "languages.interface_only_note": "已下载但未出现在这里的语言仅作为界面发布：它会翻译应用，但不含输入规则，因此不能用于转换。"
   }
 }

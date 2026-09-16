@@ -12,7 +12,13 @@ tier allows unambiguous short corrections (`yt` → `не`, `рш` → `hi`) wit
 treating every abbreviation in the large spelling dictionaries as an equally
 likely word. Known common source words, user dictionary entries, explicit word
 exclusions and ambiguous target languages continue to block automatic changes.
-One-character tokens and short statistical-only guesses stay excluded.
+The short tier may hold one to three characters. One-character tokens are
+evaluated only when the `single_letter_words` setting is on, only against the
+short tier or the user dictionary, and short statistical-only guesses stay
+excluded; embedded base tiers drop one-character rows while runtime packages
+keep them.
+A specific unwanted short conversion can be suppressed with a user-dictionary
+entry, for example `en-US: vs`.
 
 ## en-US
 

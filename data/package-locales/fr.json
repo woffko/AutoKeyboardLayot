@@ -74,6 +74,7 @@
     "general.auto_start": "Conversion automatique au démarrage",
     "general.physical_fallback": "Remplacement par frappes lorsque l’accès UIA sécurisé est indisponible",
     "general.recheck_erased": "Revérifier le premier mot après son effacement complet",
+    "general.single_letter_words": "Convertir automatiquement les mots d'une lettre (par exemple z → я)",
     "general.offer_exclusion": "Proposer d’exclure un mot après l’annulation",
     "general.offer_dictionary": "Proposer d’ajouter un mot après une conversion forcée",
     "hotkey.enabled": "Activer le raccourci clavier",
@@ -186,6 +187,18 @@
     "tray.failures": "échecs de conversion : {count} (dernier : {reason})",
     "lifecycle.close_busy": "L’agent est occupé ou conserve des frappes en attente. Terminez l’opération, récupérez ou supprimez explicitement la saisie retenue, le cas échéant, puis réessayez de fermer.",
     "lifecycle.settings_unsaved": "Les paramètres contiennent des modifications non enregistrées ou non valides. Enregistrez-les avant de fermer ou choisissez Annuler pour les abandonner explicitement.",
-    "lifecycle.settings_busy": "Terminez l’opération sur les paquets ou la sélection de fichier avant de fermer les paramètres."
+    "lifecycle.settings_busy": "Terminez l’opération sur les paquets ou la sélection de fichier avant de fermer les paramètres.",
+    "add_language.title": "Ajouter une langue",
+    "add_language.hint": "Cochez les langues à télécharger, puis installez-les. L'installation ne change pas les langues actives.",
+    "add_language.close": "Fermer",
+    "download.ui_only": "Interface uniquement — ce paquet n'ajoute pas de langue de saisie.",
+    "languages.active_title": "Langues actives",
+    "languages.active_hint": "Les langues cochées servent à la conversion automatique et manuelle. Gardez-en au moins deux cochées.",
+    "languages.add_title": "Ajouter une langue",
+    "languages.add_hint": "Ouvrez la fenêtre du catalogue pour télécharger d'autres paquets de langue. Après l'installation, la langue apparaît dans la liste ci-dessus et peut être cochée.",
+    "languages.add_button": "Ajouter une langue…",
+    "languages.advanced": "Outils de paquets avancés",
+    "languages.advanced_hint": "Importer un fichier de paquet local, migrer une ancienne installation, supprimer un paquet ou revenir à une version précédente.",
+    "languages.interface_only_note": "Une langue téléchargée qui n'apparaît pas ici a été publiée en interface uniquement : elle traduit l'application mais n'a pas de règles de saisie, donc elle ne peut pas servir à la conversion."
   }
 }

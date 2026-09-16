@@ -21,6 +21,9 @@ pub struct DetectorConfig {
     pub minimum_target_score: f32,
     /// Minimum lead over the word as typed in the current layout.
     pub minimum_score_margin: f32,
+    /// Opt-in: one-character words are decided by the list-only policy in
+    /// `detect_single_letter`. Statistical thresholds never apply to them.
+    pub single_letter_words: bool,
 }
 
 impl Default for DetectorConfig {
@@ -29,6 +32,7 @@ impl Default for DetectorConfig {
             minimum_word_characters: 2,
             minimum_target_score: 12.0,
             minimum_score_margin: 5.0,
+            single_letter_words: false,
         }
     }
 }
@@ -264,6 +268,12 @@ impl Detector {
     ) -> Option<Detection> {
         self.dictionaries.active_language(current_language)?;
         let character_count = word.chars().count();
+        if character_count == 1 {
+            if !self.config.single_letter_words {
+                return None;
+            }
+            return self.detect_single_letter(word, current_language, candidates);
+        }
         if character_count < self.config.minimum_word_characters {
             return None;
         }
@@ -362,6 +372,68 @@ impl Detector {
         }
 
         dictionary_candidate.or(statistical_candidate)
+    }
+
+    /// List-only policy for one-character words. A single letter has no
+    /// statistical evidence, so membership in the target's short tier or the
+    /// user dictionary is the whole decision. The base dictionary tier is
+    /// ignored on purpose: runtime packages may list every letter there.
+    fn detect_single_letter(
+        &self,
+        word: &str,
+        current_language: Language,
+        candidates: &[(Language, String)],
+    ) -> Option<Detection> {
+        if self.word_exclusions.contains(current_language, word) {
+            return None;
+        }
+        let source_is_known = self.common_short_contains(current_language, word)
+            || self.user_dictionary.contains(current_language, word);
+        if self.accepts_word(current_language, word) && source_is_known {
+            return None;
+        }
+        let source_score = score_word(
+            word,
+            current_language,
+            &self.user_dictionary,
+            &self.dictionaries,
+        );
+        let mut chosen = None;
+        for (target_language, replacement) in
+            self.resolve_candidates(word, current_language, candidates)
+        {
+            if target_language == current_language
+                || self.dictionaries.active_language(target_language).is_none()
+                || replacement.chars().count() != 1
+                || replacement == word
+                || !self.accepts_word(target_language, &replacement)
+            {
+                continue;
+            }
+            if !(self.common_short_contains(target_language, &replacement)
+                || self.user_dictionary.contains(target_language, &replacement))
+            {
+                continue;
+            }
+            if chosen.is_some() {
+                // Ambiguous targets fail closed.
+                return None;
+            }
+            chosen = Some(Detection {
+                source_language: current_language,
+                target_language,
+                original: word.to_owned(),
+                replacement: replacement.clone(),
+                source_score,
+                target_score: score_word(
+                    &replacement,
+                    target_language,
+                    &self.user_dictionary,
+                    &self.dictionaries,
+                ),
+            });
+        }
+        chosen
     }
 
     /// Explicitly convert the current word without automatic thresholds or a
@@ -1531,11 +1603,109 @@ mod tests {
     }
 
     #[test]
+    fn single_letter_conversion_is_opt_in() {
+        let detector = crate::test_support::detector();
+        for (word, language) in [
+            ("z", Language::English),
+            ("Z", Language::English),
+            ("a", Language::English),
+            ("i", Language::English),
+            ("я", Language::Russian),
+        ] {
+            assert_eq!(detector.detect(word, language), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn single_letter_detection_uses_lists_and_fails_closed() {
+        let detector = crate::test_support::configured_detector(DetectorConfig {
+            single_letter_words: true,
+            ..Default::default()
+        });
+        for (original, language, expected) in [
+            ("z", Language::English, "я"),
+            ("Z", Language::English, "Я"),
+            ("ф", Language::Russian, "a"),
+            ("Ш", Language::Russian, "I"),
+            ("ш", Language::Russian, "i"),
+        ] {
+            let result = detector
+                .detect(original, language)
+                .unwrap_or_else(|| panic!("missing {original}"));
+            assert_eq!(result.replacement, expected, "{original}");
+        }
+        // A correctly typed single letter is never converted, and a letter that
+        // is not listed as a target stays untouched.
+        for (word, language) in [
+            ("я", Language::Russian),
+            ("a", Language::English),
+            ("I", Language::English),
+            ("b", Language::English),
+        ] {
+            assert_eq!(detector.detect(word, language), None, "{word}");
+        }
+        // An identical candidate is ignored while the listed one is chosen.
+        let candidates = [
+            (Language::Estonian, "z".to_owned()),
+            (Language::Russian, "я".to_owned()),
+        ];
+        let detection = detector
+            .detect_mapped_candidates("z", Language::English, &candidates)
+            .expect("listed russian single letter");
+        assert_eq!(detection.replacement, "я");
+        // A user-dictionary entry is enough evidence on either side.
+        let mut with_user_dictionary = crate::test_support::configured_detector(DetectorConfig {
+            single_letter_words: true,
+            ..Default::default()
+        });
+        with_user_dictionary.replace_user_lexicons(
+            UserLexicon::from_lines(["ru-RU и"]),
+            UserLexicon::default(),
+        );
+        assert_eq!(
+            with_user_dictionary
+                .detect("b", Language::English)
+                .map(|detection| detection.replacement),
+            Some("и".to_owned())
+        );
+        // An explicit word exclusion always wins.
+        let mut with_exclusion = crate::test_support::configured_detector(DetectorConfig {
+            single_letter_words: true,
+            ..Default::default()
+        });
+        with_exclusion.replace_user_lexicons(
+            UserLexicon::default(),
+            UserLexicon::from_lines(["en-US z"]),
+        );
+        assert!(with_exclusion.detect("z", Language::English).is_none());
+    }
+
+    #[test]
+    fn user_dictionary_suppresses_a_two_letter_conversion() {
+        // The two-letter tier is not curated by default; a user who dislikes a
+        // specific conversion suppresses it through the user dictionary.
+        let detector = crate::test_support::detector();
+        assert_eq!(
+            detector
+                .detect("vs", Language::English)
+                .map(|detection| detection.replacement),
+            Some("мы".to_owned())
+        );
+        let mut suppressed = crate::test_support::detector();
+        suppressed.replace_user_lexicons(
+            UserLexicon::from_lines(["en-US vs"]),
+            UserLexicon::default(),
+        );
+        assert!(suppressed.detect("vs", Language::English).is_none());
+    }
+
+    #[test]
     fn configuration_can_disable_borderline_detection() {
         let detector = crate::test_support::configured_detector(DetectorConfig {
             minimum_word_characters: 4,
             minimum_target_score: 100.0,
             minimum_score_margin: 100.0,
+            ..Default::default()
         });
         assert_eq!(detector.detect("ghbdtn", Language::English), None);
     }

@@ -45,7 +45,7 @@ missing and unrecognized components fail verification.
 | Role | Maximum decoded bytes | Requirement |
 | --- | ---: | --- |
 | `words` | 32 MiB | All four input roles required with `input_pack` |
-| `short_words` | 16 MiB | One UTF-8 word per line; empty short-word tier allowed |
+| `short_words` | 16 MiB | One UTF-8 word per line, 1-3 characters; empty short-word tier allowed |
 | `scoring` | 64 KiB | Scoring-model format 1, 2, 3 or 4; see below |
 | `input` | 16 KiB | Existing exact-profile descriptor format 1; ID must match |
 | `ui` | 512 KiB | Required with `ui_locale`; existing catalog validation |

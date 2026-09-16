@@ -69,6 +69,7 @@
     "general.auto_start": "Automatic conversion at startup",
     "general.physical_fallback": "Physical replacement when safe UIA access is unavailable",
     "general.recheck_erased": "Recheck the first word after it has been fully erased",
+    "general.single_letter_words": "Automatically convert single-letter words (for example z → я)",
     "general.offer_exclusion": "Offer a word exclusion after undo",
     "general.offer_dictionary": "Offer to add a word after forced conversion",
     "hotkey.enabled": "Enable the hotkey",

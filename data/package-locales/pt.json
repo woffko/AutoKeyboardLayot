@@ -74,6 +74,7 @@
     "general.auto_start": "Conversão automática ao iniciar",
     "general.physical_fallback": "Substituição por pressionamentos de teclas quando não houver acesso UIA seguro",
     "general.recheck_erased": "Verificar novamente a primeira palavra após apagá-la por completo",
+    "general.single_letter_words": "Converter automaticamente palavras de uma letra (por exemplo z → я)",
     "general.offer_exclusion": "Oferecer a exclusão de uma palavra após desfazer",
     "general.offer_dictionary": "Oferecer a inclusão de uma palavra após a conversão forçada",
     "hotkey.enabled": "Ativar o atalho de teclado",
@@ -186,6 +187,18 @@
     "tray.failures": "falhas de conversão: {count} (última: {reason})",
     "lifecycle.close_busy": "O agente está ocupado ou mantém teclas pendentes. Conclua a operação, recupere ou exclua explicitamente a entrada retida, se houver, e tente fechar novamente.",
     "lifecycle.settings_unsaved": "As configurações contêm alterações não salvas ou inválidas. Salve-as antes de fechar ou escolha Cancelar para descartá-las explicitamente.",
-    "lifecycle.settings_busy": "Conclua a operação de pacotes ou a seleção de arquivo antes de fechar as configurações."
+    "lifecycle.settings_busy": "Conclua a operação de pacotes ou a seleção de arquivo antes de fechar as configurações.",
+    "add_language.title": "Adicionar idioma",
+    "add_language.hint": "Marque os idiomas a transferir e instale-os. A instalação não altera os idiomas ativos.",
+    "add_language.close": "Fechar",
+    "download.ui_only": "Somente interface — este pacote não adiciona um idioma de entrada.",
+    "languages.active_title": "Idiomas ativos",
+    "languages.active_hint": "Os idiomas marcados são usados na conversão automática e manual. Mantenha ao menos dois marcados.",
+    "languages.add_title": "Adicionar um idioma",
+    "languages.add_hint": "Abra a janela do catálogo para transferir mais pacotes de idioma. Após instalar, o idioma aparece na lista acima e pode ser marcado.",
+    "languages.add_button": "Adicionar idioma…",
+    "languages.advanced": "Ferramentas avançadas de pacotes",
+    "languages.advanced_hint": "Importar um arquivo de pacote local, migrar uma instalação antiga, remover um pacote ou reverter para uma versão anterior.",
+    "languages.interface_only_note": "Um idioma transferido que não aparece aqui foi publicado somente como interface: ele traduz o aplicativo, mas não tem regras de entrada, então não pode ser usado para conversão."
   }
 }

@@ -71,6 +71,7 @@
     "general.auto_start": "起動時に自動変換を有効にする",
     "general.physical_fallback": "安全なUIAアクセスが利用できない場合にキー入力を再現する",
     "general.recheck_erased": "最初の単語を完全に消去した後、再度確認する",
+    "general.single_letter_words": "1文字の単語を自動変換する（例 z → я）",
     "general.offer_exclusion": "元に戻した後に単語の除外を提案する",
     "general.offer_dictionary": "強制変換後に辞書への単語追加を提案する",
     "hotkey.enabled": "ホットキーを使用する",
@@ -186,6 +187,18 @@
     "error.ui_language": "表示言語の選択が無効です。",
     "lifecycle.close_busy": "エージェントが処理中、または保留中のキー入力があります。現在の操作を完了し、保留中の入力があれば復元するか明示的に削除してから、もう一度終了してください。",
     "lifecycle.settings_unsaved": "設定に未保存または無効な変更があります。閉じる前に保存するか、「キャンセル」を選んで変更を明示的に破棄してください。",
-    "lifecycle.settings_busy": "設定を閉じる前に、実行中のパッケージ操作またはファイル選択を完了してください。"
+    "lifecycle.settings_busy": "設定を閉じる前に、実行中のパッケージ操作またはファイル選択を完了してください。",
+    "add_language.title": "言語を追加",
+    "add_language.hint": "ダウンロードする言語にチェックを入れ、インストールします。インストールしても有効な言語は変わりません。",
+    "add_language.close": "閉じる",
+    "download.ui_only": "インターフェースのみ — このパッケージは入力言語を追加しません。",
+    "languages.active_title": "有効な言語",
+    "languages.active_hint": "チェックした言語は自動変換と手動変換に使われます。少なくとも2つチェックしてください。",
+    "languages.add_title": "言語を追加",
+    "languages.add_hint": "カタログ画面を開いて追加の言語パッケージをダウンロードします。インストール後、上の一覧に表示されチェックできます。",
+    "languages.add_button": "言語を追加…",
+    "languages.advanced": "詳細なパッケージツール",
+    "languages.advanced_hint": "ローカルパッケージのインポート、旧インストールの移行、パッケージの削除、以前のバージョンへのロールバック。",
+    "languages.interface_only_note": "ここに表示されないダウンロード済みの言語は、インターフェース専用として公開されています。アプリは翻訳されますが入力ルールがないため、変換には使えません。"
   }
 }

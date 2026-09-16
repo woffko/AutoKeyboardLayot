@@ -74,6 +74,7 @@
     "general.auto_start": "Konversi otomatis saat aplikasi dimulai",
     "general.physical_fallback": "Penggantian melalui penekanan tombol ketika akses UIA yang aman tidak tersedia",
     "general.recheck_erased": "Periksa kembali kata pertama setelah dihapus seluruhnya",
+    "general.single_letter_words": "Konversi otomatis kata satu huruf (misalnya z → я)",
     "general.offer_exclusion": "Tawarkan pengecualian kata setelah pembatalan",
     "general.offer_dictionary": "Tawarkan penambahan kata setelah konversi paksa",
     "hotkey.enabled": "Aktifkan pintasan keyboard",
@@ -186,6 +187,18 @@
     "tray.failures": "kegagalan konversi: {count} (terakhir: {reason})",
     "lifecycle.close_busy": "Agen sedang sibuk atau menyimpan penekanan tombol tertunda. Selesaikan operasi, pulihkan atau hapus secara eksplisit masukan yang ditahan jika ada, lalu coba tutup lagi.",
     "lifecycle.settings_unsaved": "Pengaturan berisi perubahan yang belum disimpan atau tidak valid. Simpan sebelum menutup, atau pilih Batal untuk membuangnya secara eksplisit.",
-    "lifecycle.settings_busy": "Selesaikan operasi paket atau pemilihan berkas sebelum menutup pengaturan."
+    "lifecycle.settings_busy": "Selesaikan operasi paket atau pemilihan berkas sebelum menutup pengaturan.",
+    "add_language.title": "Tambah bahasa",
+    "add_language.hint": "Centang bahasa yang akan diunduh, lalu pasang. Pemasangan tidak mengubah bahasa yang aktif.",
+    "add_language.close": "Tutup",
+    "download.ui_only": "Hanya antarmuka — paket ini tidak menambah bahasa masukan.",
+    "languages.active_title": "Bahasa aktif",
+    "languages.active_hint": "Bahasa yang dicentang dipakai untuk konversi otomatis dan manual. Sisakan minimal dua yang dicentang.",
+    "languages.add_title": "Tambah bahasa",
+    "languages.add_hint": "Buka jendela katalog untuk mengunduh paket bahasa lain. Setelah dipasang, bahasa muncul di daftar di atas dan dapat dicentang.",
+    "languages.add_button": "Tambah bahasa…",
+    "languages.advanced": "Alat paket lanjutan",
+    "languages.advanced_hint": "Impor berkas paket lokal, migrasikan pemasangan lama, hapus paket, atau kembalikan ke versi sebelumnya.",
+    "languages.interface_only_note": "Bahasa yang diunduh tetapi tidak muncul di sini diterbitkan hanya sebagai antarmuka: bahasa itu menerjemahkan aplikasi, tetapi tidak punya aturan masukan, sehingga tidak dapat dipakai untuk konversi."
   }
 }

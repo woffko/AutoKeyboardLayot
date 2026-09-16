@@ -206,6 +206,12 @@ by default for new profiles and can be disabled in the settings window. A UIA
 text mismatch or password/property failure always cancels, regardless of this
 setting.
 
+Automatic conversion is considered only when a physical Space completes a
+word. The opt-in `single_letter_words` setting additionally evaluates
+one-character words, but only against the pack's short-word tier or the user
+dictionary; it is off by default and every other single-letter word stays
+opt-in through the user dictionary.
+
 Capability diagnostics expose only backend states such as `uia-paste`,
 `physical-replay`, `capability-probe`, `unsupported`, or `text-mismatch`; they
 never include the typed source or replacement.

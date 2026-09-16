@@ -74,6 +74,7 @@
     "general.auto_start": "Automatische Umwandlung beim Start",
     "general.physical_fallback": "Ersetzung durch Tastendrücke ohne sicheren UIA-Zugriff",
     "general.recheck_erased": "Erstes Wort nach vollständigem Löschen erneut prüfen",
+    "general.single_letter_words": "Einzelbuchstaben-Wörter automatisch umwandeln (zum Beispiel z → я)",
     "general.offer_exclusion": "Nach dem Rückgängigmachen eine Wortausnahme anbieten",
     "general.offer_dictionary": "Nach erzwungener Umwandlung einen Wörterbucheintrag anbieten",
     "hotkey.enabled": "Tastenkürzel aktivieren",
@@ -186,6 +187,18 @@
     "tray.failures": "Umwandlungsfehler: {count} (zuletzt: {reason})",
     "lifecycle.close_busy": "Der Agent ist beschäftigt oder hält Tasteneingaben zurück. Beenden Sie den Vorgang, stellen Sie zurückgehaltene Eingaben wieder her oder löschen Sie diese ausdrücklich, und versuchen Sie dann erneut zu schließen.",
     "lifecycle.settings_unsaved": "Die Einstellungen enthalten ungespeicherte oder ungültige Änderungen. Speichern Sie diese vor dem Schließen oder wählen Sie Abbrechen, um sie ausdrücklich zu verwerfen.",
-    "lifecycle.settings_busy": "Beenden Sie den laufenden Paketvorgang oder die Dateiauswahl, bevor Sie die Einstellungen schließen."
+    "lifecycle.settings_busy": "Beenden Sie den laufenden Paketvorgang oder die Dateiauswahl, bevor Sie die Einstellungen schließen.",
+    "add_language.title": "Sprache hinzufügen",
+    "add_language.hint": "Markieren Sie die Sprachen zum Herunterladen und installieren Sie sie. Die Installation ändert nicht, welche Sprachen aktiv sind.",
+    "add_language.close": "Schließen",
+    "download.ui_only": "Nur Oberfläche — dieses Paket fügt keine Eingabesprache hinzu.",
+    "languages.active_title": "Aktive Sprachen",
+    "languages.active_hint": "Markierte Sprachen werden für die automatische und manuelle Konvertierung verwendet. Lassen Sie mindestens zwei markiert.",
+    "languages.add_title": "Sprache hinzufügen",
+    "languages.add_hint": "Öffnen Sie das Katalogfenster, um weitere Sprachpakete herunterzuladen. Nach der Installation erscheint die Sprache in der Liste oben und kann markiert werden.",
+    "languages.add_button": "Sprache hinzufügen…",
+    "languages.advanced": "Erweiterte Paketwerkzeuge",
+    "languages.advanced_hint": "Lokale Paketdatei importieren, alte Installation migrieren, Paket entfernen oder auf eine frühere Version zurücksetzen.",
+    "languages.interface_only_note": "Eine heruntergeladene Sprache, die hier nicht erscheint, wurde nur als Oberfläche veröffentlicht: Sie übersetzt die App, enthält aber keine Eingaberegeln und kann nicht zur Konvertierung verwendet werden."
   }
 }

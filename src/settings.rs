@@ -27,6 +27,7 @@ pub struct Settings {
     pub force_hotkey_modifiers: u8,
     pub recheck_first_word_after_erasing: bool,
     pub physical_fallback_for_unsupported_apps: bool,
+    pub single_letter_words: bool,
     pub diagnostics_enabled: bool,
     pub suppress_after_backspace: bool,
     pub suppress_after_delete: bool,
@@ -52,6 +53,7 @@ impl Default for Settings {
             force_hotkey_modifiers: hotkey.modifiers,
             recheck_first_word_after_erasing: true,
             physical_fallback_for_unsupported_apps: true,
+            single_letter_words: false,
             diagnostics_enabled: false,
             suppress_after_backspace: true,
             suppress_after_delete: true,
@@ -169,6 +171,7 @@ impl Settings {
                 "physical_fallback_for_unsupported_apps" => {
                     &mut settings.physical_fallback_for_unsupported_apps
                 }
+                "single_letter_words" => &mut settings.single_letter_words,
                 "diagnostics_enabled" => &mut settings.diagnostics_enabled,
                 "suppress_after_backspace" => &mut settings.suppress_after_backspace,
                 "suppress_after_delete" => &mut settings.suppress_after_delete,
@@ -219,6 +222,7 @@ impl Settings {
              force_hotkey_modifiers={}\n\
              recheck_first_word_after_erasing={}\n\
              physical_fallback_for_unsupported_apps={}\n\
+             single_letter_words={}\n\
              diagnostics_enabled={}\n\
              suppress_after_backspace={}\n\
              suppress_after_delete={}\n\
@@ -237,6 +241,7 @@ impl Settings {
             self.force_hotkey().modifiers_text(),
             self.recheck_first_word_after_erasing,
             self.physical_fallback_for_unsupported_apps,
+            self.single_letter_words,
             self.diagnostics_enabled,
             self.suppress_after_backspace,
             self.suppress_after_delete,
@@ -438,6 +443,7 @@ mod tests {
         assert_eq!(settings.force_hotkey().display_name(), "Pause/Break");
         assert!(settings.recheck_first_word_after_erasing);
         assert!(settings.physical_fallback_for_unsupported_apps);
+        assert!(!settings.single_letter_words);
         assert!(!settings.diagnostics_enabled);
         assert!(settings.suppress_after_backspace);
         assert!(settings.suppress_after_delete);
@@ -463,6 +469,7 @@ mod tests {
              force_hotkey_modifiers=Ctrl+Shift\n\
              recheck_first_word_after_erasing=no\n\
              physical_fallback_for_unsupported_apps=on\n\
+             single_letter_words=yes\n\
              diagnostics_enabled=true\n\
              suppress_after_backspace=off\n\
              suppress_after_delete=no\n\
@@ -477,6 +484,7 @@ mod tests {
         assert_eq!(parsed.force_hotkey().display_name(), "Ctrl+Shift+F12");
         assert!(!parsed.recheck_first_word_after_erasing);
         assert!(parsed.physical_fallback_for_unsupported_apps);
+        assert!(parsed.single_letter_words);
         assert!(parsed.diagnostics_enabled);
         assert!(!parsed.suppress_after_backspace);
         assert!(!parsed.suppress_after_delete);

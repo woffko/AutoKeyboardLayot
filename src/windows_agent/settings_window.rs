@@ -165,6 +165,7 @@ fn populate_ui(
     ui.set_offer_word_exclusion_after_undo(settings.offer_word_exclusion_after_undo);
     ui.set_offer_dictionary_after_force(settings.offer_dictionary_after_forced_conversion);
     ui.set_recheck_first_word_after_erasing(settings.recheck_first_word_after_erasing);
+    ui.set_single_letter_words(settings.single_letter_words);
     ui.set_physical_fallback(settings.physical_fallback_for_unsupported_apps);
     ui.set_diagnostics_enabled(settings.diagnostics_enabled);
 
@@ -616,6 +617,7 @@ fn document_from_ui(
     settings.offer_word_exclusion_after_undo = ui.get_offer_word_exclusion_after_undo();
     settings.offer_dictionary_after_forced_conversion = ui.get_offer_dictionary_after_force();
     settings.recheck_first_word_after_erasing = ui.get_recheck_first_word_after_erasing();
+    settings.single_letter_words = ui.get_single_letter_words();
     settings.physical_fallback_for_unsupported_apps = ui.get_physical_fallback();
     settings.diagnostics_enabled = ui.get_diagnostics_enabled();
 

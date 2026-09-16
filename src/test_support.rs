@@ -52,7 +52,7 @@ pub fn registry() -> DictionaryRegistry {
                 ),
             ] {
                 let id = PackId::parse(id).unwrap();
-                let normalize = |text: &str| -> Vec<String> {
+                let normalize = |text: &str, minimum: usize| -> Vec<String> {
                     text.lines()
                         .map(|line| {
                             line.split_once('/')
@@ -61,12 +61,12 @@ pub fn registry() -> DictionaryRegistry {
                                 .to_lowercase()
                         })
                         .filter(|word| {
-                            word.chars().count() >= 2 && word.chars().all(char::is_alphabetic)
+                            word.chars().count() >= minimum && word.chars().all(char::is_alphabetic)
                         })
                         .collect()
                 };
-                let words = normalize(words);
-                let short = normalize(short);
+                let words = normalize(words, 2);
+                let short = normalize(short, 1);
                 registry
                     .insert(
                         DictionaryPack::from_words(
