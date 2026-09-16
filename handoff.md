@@ -1,4 +1,107 @@
-# AutoKeyboardLayot handoff — 2026-09-13
+# AutoKeyboardLayot handoff — 2026-09-16
+
+## Stop point and authority
+
+Local source snapshot; the worktree is clean and the latest work is committed as
+`d79456b` on `main`. The commits below are **not pushed** to
+`woffko/AutoKeyboardLayot` (no push was requested). Machine-local
+AGENTS/configuration, VM scripts, credentials, build outputs and acceptance
+receipts are intentionally not part of this source snapshot; a remote clone alone
+cannot reproduce the existing test equipment. The Ed25519 signer
+`pkg-20260912-01` private material is encrypted outside the repository — never
+regenerate, export, or commit it.
+
+## 2026-09-16 update — manual conversion, single-letter auto conversion, catalogs
+
+Current user-visible behaviour is working on the host: manual Pause conversion
+cycles a word through the enabled layouts, and opt-in single-letter automatic
+conversion (`z ` → `я `, `ф ` → `a `, `Ш ` → `I `) works after installing
+`ru-RU` revision 3.
+
+### Manual (Pause) conversion
+- `execute_forced_conversion` / `advance_layout_cycle` / `TransposeCycle` in
+  `src/windows_agent.rs` walk a word through every enabled layout, skipping any
+  layout that produces identical text (Latin Estonian vs Latin English), so one
+  press always reaches a visibly different representation.
+- Cycle matching uses `same_input_target` (ignores the layout), so the layout
+  switch performed by a conversion no longer breaks the next press.
+- A press while a manual cycle is active advances it instead of arming undo;
+  forced conversions do not offer the one-press undo. Buffered keys survive a
+  failed attempt. Commits `397ffcd`, `b3be64e`, `78e5b7f`, `fb0b845`.
+- Buffered previous word survives profile refreshes and a following space
+  (`f0da7a0`, `72c265a`).
+
+### Privacy
+- `PRIVACY_PROBE_WAIT_MS` is 300 ms.
+- A user-initiated (forced) conversion is allowed when UI Automation cannot
+  verify the context (for example a console), while a confirmed password field,
+  an excluded process or an elevated target still blocks it
+  (`forced_privacy_allows`, `privacy_blocks`); automatic conversion stays
+  fail-closed and does not run in Windows Terminal. Commit `5671504`.
+- Layout resolution no longer trusts `ImmIsIME` on ordinary layouts
+  (`c93dfc1`); transient profile-provider failures keep the last snapshot
+  (`4e07a6c`, `a274157`).
+
+### Single-letter automatic conversion (opt-in)
+- Plan and decisions: [plan-single-letter-auto-conversion](docs/plan-single-letter-auto-conversion.md).
+- `DetectorConfig::single_letter_words` (default `false`). When on, one-character
+  words use the list-only `detect_single_letter` policy: only the short-word tier
+  or the user dictionary counts, the base tier is ignored, and excluded,
+  correctly typed, identical or ambiguous cases fail closed.
+- Embedded `en-US` short tier ships `a` and `i`; `ru-RU` revision 3 adds `я`.
+- The two-letter tier is intentionally **not** curated; a specific unwanted
+  conversion is suppressed with a user-dictionary entry (for example
+  `en-US: vs`). Documented and covered by a regression test.
+- UI: `general.single_letter_words` checkbox in General; the thirteen optional
+  `data/package-locales` catalogs were backfilled with the keys the earlier
+  language UI redesign had left missing. Commit `d79456b`.
+
+### Language UI and packages
+- Input-languages page redesigned: active-language list first, an "Add language"
+  dialog for catalog downloads, advanced package tools collapsed, interface-only
+  packages labelled, content-sized settings cards and a model-driven checkmark.
+  Commits `e53982b`, `d513241`, `f0f622e`, `fb0b845`.
+
+### Published assets (GitHub releases, accepted by the running app)
+- `lang-r2-20260913`: catalog revision 2, thirteen UI-only packages plus the
+  combined `ru-RU rev2` input package.
+- `lang-r3-20260914`: catalog revision 3, adds `et-EE rev2` (input).
+- `lang-r4-20260916`: catalog revision 4, replaces `ru-RU` with **rev3** (adds
+  `я` to the short tier). Verified `releases/latest/download/catalog.aklc` sha
+  `44bdc3998a7a210e787c7b39f1c33e560bb0f937fc06aadede42aae8c7056c41`.
+- The catalog is fetched from
+  `https://github.com/<repo>/releases/latest/download/catalog.aklc`.
+- Signing tools `prepare_language_package`, `prepare_release_catalog` and
+  `sign-language-package` embed the English catalog, so they must be rebuilt
+  whenever `data/locales/en.json` changes; the current signer sha is
+  `6042c9abeac2d65b0a39bfe6d9158fdd2372fd38ccd7dbd0c369e1c187848c7b`
+  (the earlier pin `af80acd1…` is stale).
+
+### Host state
+- Config: `single_letter_words=true`, `enabled_input_packs=en-us,et-ee,ru-ru`,
+  hotkey `Pause/Break`, diagnostics on. The installed store has `et-ee rev2` and
+  `ru-ru rev2`; the accepted catalog is revision 3, so `ru-RU rev3` still needs
+  installing through "Add language" before `z ` → `я ` works.
+
+### Verification gates
+- `cargo test --lib`: 269 passed, 1 ignored; `cargo test --test
+  package_locale_sources`: passed; `cargo clippy --target x86_64-pc-windows-msvc
+  --features installer-tools --all-targets -- -D warnings`: clean;
+  `cargo check … --no-default-features --features installer-tools`: clean;
+  `examples/validate_locales --require-complete`: passes for all 14 locales.
+
+### Open items
+1. Install `ru-RU rev3` on the host and run the Slice 5 typing checklist from the
+   single-letter plan.
+2. No push; `d79456b` and the preceding local commits exist only locally.
+3. Automatic conversion in Windows Terminal remains blocked (privacy by design).
+4. Two-letter false positives remain uncurated by decision (variant C).
+5. The historical Stage 5/6 gates below (composition/IME, physical typing
+   acceptance, all-language review) are unchanged.
+
+---
+
+## Previous handoff (2026-09-13) — historical
 
 ## Stop point and authority
 
