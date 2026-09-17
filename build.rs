@@ -76,6 +76,15 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=ui/settings.slint");
         slint_build::compile("ui/settings.slint").expect("cannot compile settings UI");
+        // Embed the reviewed application icon resource into every executable
+        // target. The tray icon is drawn separately and is not affected.
+        let resource = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/app.res");
+        println!("cargo:rerun-if-changed=assets/app.res");
+        if resource.is_file() {
+            println!("cargo:rustc-link-arg-bins={}", resource.display());
+        } else {
+            println!("cargo:warning=assets/app.res is missing; executables have no icon");
+        }
     }
 }
 

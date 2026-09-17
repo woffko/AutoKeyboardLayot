@@ -255,7 +255,12 @@ component LanguageRow inherits Rectangle {
     in property <string> name;
     in property <string> status;
     in property <bool> checked;
+    in property <[string]> profile-names;
+    in property <int> profile-index: 0;
     callback toggled(bool);
+    callback profile-selected(int);
+    private property <bool> has-profile: root.profile-names.length > 1;
+    private property <length> picker-width: 180px;
     height: 40px;
     background: checked ? Palette.alternate-background : Palette.background;
     horizontal-stretch: 1;
@@ -269,7 +274,7 @@ component LanguageRow inherits Rectangle {
 
     HorizontalLayout {
         padding-left: 12px;
-        padding-right: 12px;
+        padding-right: root.has-profile ? root.picker-width + 24px : 12px;
         spacing: 10px;
         Rectangle {
             width: 20px;
@@ -304,8 +309,24 @@ component LanguageRow inherits Rectangle {
         }
     }
     TouchArea {
+        // Keep the profile picker area clickable; the row toggle covers the rest.
+        x: Localization.rtl ? root.picker-width + 24px : 0px;
+        width: parent.width - (root.has-profile ? root.picker-width + 24px : 0px);
         clicked => { row-focus.focus(); root.toggled(!root.checked); }
     }
+    // Declared after the TouchArea so the picker stays above it. The explicit
+    // resync keeps the shown index model-driven after user interaction.
+    profile-picker := ComboBox {
+        visible: root.has-profile;
+        width: root.has-profile ? root.picker-width : 0px;
+        height: 30px;
+        x: Localization.rtl ? 12px : parent.width - self.width - 12px;
+        y: (parent.height - self.height) / 2;
+        model: root.profile-names;
+        current-index: root.profile-index;
+        selected(value) => { root.profile-selected(self.current-index); }
+    }
+    changed profile-index => { profile-picker.current-index = root.profile-index; }
     row-focus := FocusScope {
         width: 0px;
         key-pressed(event) => {
@@ -340,6 +361,7 @@ export struct DownloadRow {
 
 export component SettingsWindow inherits Window {
     title: Localization.text("window.settings", Localization.revision);
+    icon: @image-url("../assets/app-256.png");
     preferred-width: 1080px;
     preferred-height: 760px;
     min-width: 900px;
@@ -620,7 +642,10 @@ export component SettingsWindow inherits Window {
                                             name: row.name;
                                             status: Localization.text(row.status-key, Localization.revision) + (row.details != "" ? " · " + row.details : "");
                                             checked: row.selected;
+                                            profile-names: row.profile-names;
+                                            profile-index: row.profile-index;
                                             toggled(checked) => { root.toggle-input-pack(row.id, checked); }
+                                            profile-selected(index) => { root.select-input-profile(row.id, index); }
                                         }
                                     }
                                 }

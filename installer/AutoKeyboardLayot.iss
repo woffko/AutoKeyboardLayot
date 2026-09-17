@@ -38,6 +38,7 @@ OutputBaseFilename=AutoKeyboardLayot-{#AppVersion}-ui-probe-NOT-FOR-INSTALLATION
 OutputBaseFilename=AutoKeyboardLayot-{#AppVersion}-setup-experimental
 #endif
 UninstallDisplayIcon={app}\AutoKeyboardLayot.exe
+SetupIconFile={#SourcePath}\..\assets\app.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
