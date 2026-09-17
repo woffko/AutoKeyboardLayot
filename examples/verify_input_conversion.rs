@@ -38,7 +38,9 @@ impl KeyboardProfileProbe for Fixture {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args_os().nth(1).ok_or("usage: verify_input_conversion PACKAGE.aklp")?;
+    let path = std::env::args_os()
+        .nth(1)
+        .ok_or("usage: verify_input_conversion PACKAGE.aklp")?;
     let trust = PackageTrust::release()?;
     let directory = tempfile::tempdir()?;
     let store = PackageStore::initialize(&directory.path().join("packages"))?;

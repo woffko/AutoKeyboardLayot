@@ -42,7 +42,6 @@
     "import.preview": "Paquete verificado: {id}\nRevisión: {revision}\nBytes: {bytes}\nSHA-256: {hash}\nEntrada: {input}\nIdioma de la interfaz: {locale}\n\nLa instalación no activa la conversión de entrada ni cambia el idioma de la interfaz.\n\nLicencia:\n",
     "import.notice": "Aviso:",
     "import.done": "Paquete instalado. La participación en la conversión de entrada y el idioma de la interfaz no han cambiado. Se envió la solicitud de recarga al agente si está en ejecución.",
-    "import.failed": "La operación del paquete falló. No se reintentará automáticamente; compruebe el estado actual de los paquetes antes de volver a intentarlo.",
     "packs.profile": "Perfil de teclado (LANGID:KLID)",
     "packs.profile_default": "Usar el único perfil declarado; si hay varios, no disponible",
     "packs.notice": "La selección es independiente del idioma de la interfaz. La conversión automática necesita dos perfiles compatibles disponibles en Windows. Los adaptadores actuales solo procesan teclas físicas normales; AltGr, las teclas muertas y la composición IME no tienen compatibilidad completa. Esta lista no comprueba la disponibilidad actual en Windows.",
@@ -199,6 +198,15 @@
     "languages.add_button": "Añadir idioma…",
     "languages.advanced": "Herramientas avanzadas de paquetes",
     "languages.advanced_hint": "Importar un archivo de paquete local, migrar una instalación antigua, eliminar un paquete o volver a una versión anterior.",
-    "languages.interface_only_note": "Un idioma descargado que no aparece aquí se publicó solo como interfaz: traduce la aplicación, pero no tiene reglas de entrada, así que no puede usarse para la conversión."
+    "languages.interface_only_note": "Un idioma descargado que no aparece aquí se publicó solo como interfaz: traduce la aplicación, pero no tiene reglas de entrada, así que no puede usarse para la conversión.",
+    "import.failure.store": "No se puede abrir el almacén de paquetes administrado. Compruebe que el directorio del perfil esté disponible y que la configuración siga usando paquetes administrados.",
+    "import.failure.snapshot": "No se puede leer el inventario actual de paquetes. Puede que lo use otra operación; reintente cuando termine.",
+    "import.failure.prepare": "No se pudo preparar o verificar el paquete. No se instaló nada.",
+    "import.failure.file": "El archivo seleccionado no es un paquete de idioma válido.",
+    "import.failure.migration": "La configuración cambió fuera de esta ventana y la migración se abortó. Abra los ajustes de nuevo e inténtelo otra vez.",
+    "import.failure.catalog": "El catálogo de paquetes ya no está disponible o la selección no es válida. Compruebe el catálogo de nuevo.",
+    "import.failure.install": "No se pudo instalar el paquete preparado. No se cambió nada.",
+    "import.failure.thread": "No se pudo iniciar la operación de paquetes. Inténtelo de nuevo.",
+    "import.failed": "La operación del paquete falló. No se reintentará automáticamente; compruebe el estado actual de los paquetes antes de volver a intentarlo."
   }
 }

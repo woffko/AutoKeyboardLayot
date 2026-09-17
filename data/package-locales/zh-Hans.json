@@ -46,7 +46,6 @@
     "import.preview": "已验证的语言包：{id}\n修订号：{revision}\n字节数：{bytes}\nSHA-256：{hash}\n输入：{input}\n界面语言：{locale}\n\n安装不会启用输入转换，也不会更改界面语言。\n\n许可证：\n",
     "import.notice": "声明：",
     "import.done": "语言包已安装。输入转换参与设置和界面语言均未更改。如果代理正在运行，已向其发送重新加载请求。",
-    "import.failed": "语言包操作失败。不会自动重试；重试前请检查语言包的当前状态。",
     "packs.profile": "键盘配置文件 (LANGID:KLID)",
     "packs.profile_default": "仅使用唯一声明的配置文件；否则不可用",
     "packs.notice": "此选择与界面语言无关。自动转换需要两个在 Windows 中可用的兼容配置文件。当前适配器仅处理普通物理按键；尚未完整支持 AltGr、死键和 IME 组合输入。此列表不会检查 Windows 中当前的可用状态。",
@@ -203,6 +202,15 @@
     "languages.add_button": "添加语言…",
     "languages.advanced": "高级包工具",
     "languages.advanced_hint": "导入本地包文件、迁移旧安装、移除包或回滚到以前的版本。",
-    "languages.interface_only_note": "已下载但未出现在这里的语言仅作为界面发布：它会翻译应用，但不含输入规则，因此不能用于转换。"
+    "languages.interface_only_note": "已下载但未出现在这里的语言仅作为界面发布：它会翻译应用，但不含输入规则，因此不能用于转换。",
+    "import.failure.store": "无法打开托管包存储。请检查配置文件目录是否可用，以及配置是否仍使用托管包。",
+    "import.failure.snapshot": "无法读取当前的包清单。可能正被其他操作使用；请在结束后重试。",
+    "import.failure.prepare": "无法准备或验证包。未安装任何内容。",
+    "import.failure.file": "所选文件不是有效的语言包。",
+    "import.failure.migration": "设置在此窗口外发生了更改，迁移已中止。请重新打开设置并重试。",
+    "import.failure.catalog": "包目录不再可用或选择无效。请重新检查目录。",
+    "import.failure.install": "安装准备好的包失败。未进行任何更改。",
+    "import.failure.thread": "无法启动包操作。请重试。",
+    "import.failed": "语言包操作失败。不会自动重试；重试前请检查语言包的当前状态。"
   }
 }

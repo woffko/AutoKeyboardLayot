@@ -42,7 +42,6 @@
     "import.preview": "Paquet vérifié : {id}\nRévision : {revision}\nOctets : {bytes}\nSHA-256 : {hash}\nSaisie : {input}\nLangue de l’interface : {locale}\n\nL’installation n’active pas la conversion de saisie et ne change pas la langue de l’interface.\n\nLicence :\n",
     "import.notice": "Avis :",
     "import.done": "Paquet installé. La participation à la conversion de saisie et la langue de l’interface restent inchangées. Une demande de rechargement a été envoyée à l’agent s’il est en cours d’exécution.",
-    "import.failed": "L’opération sur le paquet a échoué. Aucune nouvelle tentative automatique ne sera effectuée ; vérifiez l’état actuel des paquets avant de réessayer.",
     "packs.profile": "Profil de clavier (LANGID:KLID)",
     "packs.profile_default": "Utiliser le seul profil déclaré ; sinon indisponible",
     "packs.notice": "La sélection est indépendante de la langue de l’interface. La conversion automatique nécessite deux profils compatibles disponibles dans Windows. Les adaptateurs actuels ne traitent que les touches physiques ordinaires ; AltGr, les touches mortes et la composition IME ne sont pas entièrement pris en charge. Cette liste ne vérifie pas la disponibilité actuelle dans Windows.",
@@ -199,6 +198,15 @@
     "languages.add_button": "Ajouter une langue…",
     "languages.advanced": "Outils de paquets avancés",
     "languages.advanced_hint": "Importer un fichier de paquet local, migrer une ancienne installation, supprimer un paquet ou revenir à une version précédente.",
-    "languages.interface_only_note": "Une langue téléchargée qui n'apparaît pas ici a été publiée en interface uniquement : elle traduit l'application mais n'a pas de règles de saisie, donc elle ne peut pas servir à la conversion."
+    "languages.interface_only_note": "Une langue téléchargée qui n'apparaît pas ici a été publiée en interface uniquement : elle traduit l'application mais n'a pas de règles de saisie, donc elle ne peut pas servir à la conversion.",
+    "import.failure.store": "Le magasin de paquets géré ne peut pas être ouvert. Vérifiez que le répertoire du profil est disponible et que la configuration utilise toujours des paquets gérés.",
+    "import.failure.snapshot": "L'inventaire actuel des paquets ne peut pas être lu. Une autre opération l'utilise peut-être ; réessayez une fois terminée.",
+    "import.failure.prepare": "Le paquet n'a pas pu être préparé ou vérifié. Rien n'a été installé.",
+    "import.failure.file": "Le fichier sélectionné n'est pas un paquet de langue valide.",
+    "import.failure.migration": "Les paramètres ont changé en dehors de cette fenêtre ; la migration a été interrompue. Rouvrez les paramètres et réessayez.",
+    "import.failure.catalog": "Le catalogue de paquets n'est plus disponible ou la sélection est invalide. Vérifiez à nouveau le catalogue.",
+    "import.failure.install": "L'installation du paquet préparé a échoué. Rien n'a été modifié.",
+    "import.failure.thread": "L'opération de paquet n'a pas pu être démarrée. Réessayez.",
+    "import.failed": "L’opération sur le paquet a échoué. Aucune nouvelle tentative automatique ne sera effectuée ; vérifiez l’état actuel des paquets avant de réessayer."
   }
 }

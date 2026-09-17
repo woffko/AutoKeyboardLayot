@@ -1658,10 +1658,8 @@ mod tests {
             single_letter_words: true,
             ..Default::default()
         });
-        with_user_dictionary.replace_user_lexicons(
-            UserLexicon::from_lines(["ru-RU и"]),
-            UserLexicon::default(),
-        );
+        with_user_dictionary
+            .replace_user_lexicons(UserLexicon::from_lines(["ru-RU и"]), UserLexicon::default());
         assert_eq!(
             with_user_dictionary
                 .detect("b", Language::English)
@@ -1673,10 +1671,8 @@ mod tests {
             single_letter_words: true,
             ..Default::default()
         });
-        with_exclusion.replace_user_lexicons(
-            UserLexicon::default(),
-            UserLexicon::from_lines(["en-US z"]),
-        );
+        with_exclusion
+            .replace_user_lexicons(UserLexicon::default(), UserLexicon::from_lines(["en-US z"]));
         assert!(with_exclusion.detect("z", Language::English).is_none());
     }
 

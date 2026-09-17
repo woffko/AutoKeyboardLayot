@@ -42,7 +42,6 @@
     "import.preview": "Pacote verificado: {id}\nRevisão: {revision}\nBytes: {bytes}\nSHA-256: {hash}\nEntrada: {input}\nIdioma da interface: {locale}\n\nA instalação não ativa a conversão de entrada nem altera o idioma da interface.\n\nLicença:\n",
     "import.notice": "Aviso:",
     "import.done": "Pacote instalado. A participação na conversão de entrada e o idioma da interface não foram alterados. O pedido de recarregamento foi enviado ao agente, se estiver em execução.",
-    "import.failed": "A operação do pacote falhou. Não haverá nova tentativa automática; verifique o estado atual dos pacotes antes de tentar novamente.",
     "packs.profile": "Perfil de teclado (LANGID:KLID)",
     "packs.profile_default": "Usar o único perfil declarado; caso contrário, indisponível",
     "packs.notice": "A seleção é independente do idioma da interface. A conversão automática exige dois perfis compatíveis disponíveis no Windows. Os adaptadores atuais processam apenas teclas físicas comuns; AltGr, teclas mortas e composição IME não têm suporte completo. Esta lista não verifica a disponibilidade atual no Windows.",
@@ -199,6 +198,15 @@
     "languages.add_button": "Adicionar idioma…",
     "languages.advanced": "Ferramentas avançadas de pacotes",
     "languages.advanced_hint": "Importar um arquivo de pacote local, migrar uma instalação antiga, remover um pacote ou reverter para uma versão anterior.",
-    "languages.interface_only_note": "Um idioma transferido que não aparece aqui foi publicado somente como interface: ele traduz o aplicativo, mas não tem regras de entrada, então não pode ser usado para conversão."
+    "languages.interface_only_note": "Um idioma transferido que não aparece aqui foi publicado somente como interface: ele traduz o aplicativo, mas não tem regras de entrada, então não pode ser usado para conversão.",
+    "import.failure.store": "O armazenamento gerenciado de pacotes não pode ser aberto. Verifique se o diretório do perfil está disponível e se a configuração ainda usa pacotes gerenciados.",
+    "import.failure.snapshot": "O inventário atual de pacotes não pode ser lido. Outra operação pode estar usando-o; tente novamente quando terminar.",
+    "import.failure.prepare": "O pacote não pôde ser preparado ou verificado. Nada foi instalado.",
+    "import.failure.file": "O arquivo selecionado não é um pacote de idioma válido.",
+    "import.failure.migration": "As configurações mudaram fora desta janela e a migração foi abortada. Abra as configurações novamente e tente outra vez.",
+    "import.failure.catalog": "O catálogo de pacotes não está mais disponível ou a seleção é inválida. Verifique o catálogo novamente.",
+    "import.failure.install": "A instalação do pacote preparado falhou. Nada foi alterado.",
+    "import.failure.thread": "A operação de pacote não pôde ser iniciada. Tente novamente.",
+    "import.failed": "A operação do pacote falhou. Não haverá nova tentativa automática; verifique o estado atual dos pacotes antes de tentar novamente."
   }
 }

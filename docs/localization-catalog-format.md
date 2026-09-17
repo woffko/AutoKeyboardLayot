@@ -61,3 +61,17 @@ Without `--require-complete`, incomplete catalogs can pass structural validation
 and use English fallback. The strict option rejects missing keys before fallback.
 Release acceptance additionally requires checking every expected message key,
 language quality, actual UI layout, fonts and accessibility.
+
+## English message IDs are a compatibility contract
+
+A package embeds its UI catalog. Parsing an installed or downloaded catalog
+rejects any message ID that the running executable's embedded English catalog
+does not know (`UnknownMessage`). Signed packages already published keep their
+embedded catalogs, so removing or renaming an English message ID makes every
+older package unloadable; because the store is verified while the configuration
+is read, the application then fails to start with
+`package_store_Package(InvalidComponents)`.
+
+Never delete or rename an English message ID. Retire text by leaving the ID in
+place (its value may change) or by hiding it in the UI. Add new IDs freely:
+missing translations fall back to English.

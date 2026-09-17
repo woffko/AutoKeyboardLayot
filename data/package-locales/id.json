@@ -42,7 +42,6 @@
     "import.preview": "Paket terverifikasi: {id}\nRevisi: {revision}\nByte: {bytes}\nSHA-256: {hash}\nInput: {input}\nBahasa antarmuka: {locale}\n\nInstalasi tidak mengaktifkan konversi input atau mengubah bahasa antarmuka.\n\nLisensi:\n",
     "import.notice": "Pemberitahuan:",
     "import.done": "Paket terinstal. Keikutsertaan dalam konversi input dan bahasa antarmuka tidak berubah. Permintaan pemuatan ulang dikirim ke agen jika sedang berjalan.",
-    "import.failed": "Operasi paket gagal. Tidak ada percobaan ulang otomatis; periksa status paket saat ini sebelum mencoba lagi.",
     "packs.profile": "Profil papan ketik (LANGID:KLID)",
     "packs.profile_default": "Gunakan satu-satunya profil yang dinyatakan; jika tidak, tidak tersedia",
     "packs.notice": "Pilihan tidak bergantung pada bahasa antarmuka. Konversi otomatis memerlukan dua profil kompatibel yang tersedia di Windows. Adaptor saat ini hanya menangani tombol fisik biasa; AltGr, tombol mati, dan komposisi IME belum didukung sepenuhnya. Daftar ini tidak memeriksa ketersediaan saat ini di Windows.",
@@ -199,6 +198,15 @@
     "languages.add_button": "Tambah bahasa…",
     "languages.advanced": "Alat paket lanjutan",
     "languages.advanced_hint": "Impor berkas paket lokal, migrasikan pemasangan lama, hapus paket, atau kembalikan ke versi sebelumnya.",
-    "languages.interface_only_note": "Bahasa yang diunduh tetapi tidak muncul di sini diterbitkan hanya sebagai antarmuka: bahasa itu menerjemahkan aplikasi, tetapi tidak punya aturan masukan, sehingga tidak dapat dipakai untuk konversi."
+    "languages.interface_only_note": "Bahasa yang diunduh tetapi tidak muncul di sini diterbitkan hanya sebagai antarmuka: bahasa itu menerjemahkan aplikasi, tetapi tidak punya aturan masukan, sehingga tidak dapat dipakai untuk konversi.",
+    "import.failure.store": "Penyimpanan paket terkelola tidak dapat dibuka. Periksa bahwa direktori profil tersedia dan konfigurasi masih menggunakan paket terkelola.",
+    "import.failure.snapshot": "Inventaris paket saat ini tidak dapat dibaca. Mungkin sedang dipakai operasi lain; coba lagi setelah selesai.",
+    "import.failure.prepare": "Paket tidak dapat disiapkan atau diverifikasi. Tidak ada yang dipasang.",
+    "import.failure.file": "Berkas yang dipilih bukan paket bahasa yang valid.",
+    "import.failure.migration": "Pengaturan berubah di luar jendela ini sehingga migrasi dibatalkan. Buka pengaturan kembali dan coba lagi.",
+    "import.failure.catalog": "Katalog paket tidak lagi tersedia atau pilihannya tidak valid. Periksa katalog kembali.",
+    "import.failure.install": "Pemasangan paket yang disiapkan gagal. Tidak ada yang berubah.",
+    "import.failure.thread": "Operasi paket tidak dapat dimulai. Coba lagi.",
+    "import.failed": "Operasi paket gagal. Tidak ada percobaan ulang otomatis; periksa status paket saat ini sebelum mencoba lagi."
   }
 }

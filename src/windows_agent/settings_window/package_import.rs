@@ -15,6 +15,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
 mod online;
 
+/// Coarse, path-free reason codes for a failed local package operation, so the
+/// status line can name the failing stage instead of a generic message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImportFailure {
+    /// The managed store or its directory cannot be opened.
+    Store,
+    /// The current inventory snapshot cannot be loaded or trusted.
+    Snapshot,
+    /// Preparing or verifying the operation failed.
+    Prepare,
+    /// The chosen file is not a valid package.
+    File,
+    /// The settings changed outside this window; migration was aborted.
+    Migration,
+    /// The catalog state is gone or the selection is invalid.
+    Catalog,
+    /// Confirming a prepared operation failed.
+    Install,
+    /// The worker could not be started or died.
+    Thread,
+}
+
+impl ImportFailure {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Store => "import.failure.store",
+            Self::Snapshot => "import.failure.snapshot",
+            Self::Prepare => "import.failure.prepare",
+            Self::File => "import.failure.file",
+            Self::Migration => "import.failure.migration",
+            Self::Catalog => "import.failure.catalog",
+            Self::Install => "import.failure.install",
+            Self::Thread => "import.failure.thread",
+        }
+    }
+}
+
 enum Completed {
     Prepared(Box<PreparedImport>),
     Rollback(Box<PreparedRollback>),
@@ -55,7 +92,7 @@ enum Pending {
 #[derive(Default)]
 struct State {
     pending: Option<Pending>,
-    receiver: Option<mpsc::Receiver<Result<Completed, ()>>>,
+    receiver: Option<mpsc::Receiver<Result<Completed, ImportFailure>>>,
     catalog: Option<Arc<PreparedCatalog>>,
     cancel: Option<Arc<AtomicBool>>,
     progress: Option<Arc<online::Progress>>,
@@ -138,7 +175,7 @@ fn unchanged_draft(ui: &SettingsWindow, original: &ConfigurationDocument) -> boo
 fn start(
     ui: &SettingsWindow,
     state: &mut State,
-    work: impl FnOnce() -> Result<Completed, ()> + Send + 'static,
+    work: impl FnOnce() -> Result<Completed, ImportFailure> + Send + 'static,
 ) {
     let (send, receive) = mpsc::channel();
     match std::thread::Builder::new()
@@ -150,23 +187,24 @@ fn start(
             state.receiver = Some(receive);
             ui.set_package_import_busy(true);
         }
-        Err(_) => failure(ui),
+        Err(_) => failure(ui, ImportFailure::Thread),
     }
 }
 
-fn failure(ui: &SettingsWindow) {
+fn failure(ui: &SettingsWindow, reason: ImportFailure) {
     ui.set_status_error(true);
-    ui.set_status_text(tr("import.failed").into());
+    ui.set_status_text(tr(reason.key()).into());
 }
 
-fn store() -> Result<PackageStore, ()> {
+fn store() -> Result<PackageStore, ImportFailure> {
     // Recheck the persisted mode, not just the mode when settings opened.
-    let document = super::super::try_load_configuration_document().map_err(|_| ())?;
+    let document =
+        super::super::try_load_configuration_document().map_err(|_| ImportFailure::Store)?;
     if document.package_mode != PackageMode::Managed {
-        return Err(());
+        return Err(ImportFailure::Store);
     }
-    let directory = super::super::configuration_directory().ok_or(())?;
-    PackageStore::open(&directory.join("packages")).map_err(|_| ())
+    let directory = super::super::configuration_directory().ok_or(ImportFailure::Store)?;
+    PackageStore::open(&directory.join("packages")).map_err(|_| ImportFailure::Store)
 }
 
 pub(super) fn wire(
@@ -217,11 +255,15 @@ pub(super) fn wire(
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, move || {
             match store().and_then(|store| {
-                PreparedRollback::from_store(&store, id, &PackageTrust::release().map_err(|_| ())?)
-                    .map_err(|_| ())
+                PreparedRollback::from_store(
+                    &store,
+                    id,
+                    &PackageTrust::release().map_err(|_| ImportFailure::Prepare)?,
+                )
+                .map_err(|_| ImportFailure::Prepare)
             }) {
                 Ok(prepared) => Ok(Completed::Rollback(Box::new(prepared))),
-                Err(()) => Ok(Completed::RollbackUnavailable(id)),
+                Err(_) => Ok(Completed::RollbackUnavailable(id)),
             }
         });
     });
@@ -263,16 +305,17 @@ pub(super) fn wire(
         ui.set_package_import_ready(false);
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, move || {
-            let current = super::super::try_load_configuration_document().map_err(|_| ())?;
+            let current = super::super::try_load_configuration_document()
+                .map_err(|_| ImportFailure::Migration)?;
             if current != original {
-                return Err(());
+                return Err(ImportFailure::Migration);
             }
             let prepared = PreparedStoreInitialization::from_files(
                 &paths,
                 &required,
-                &PackageTrust::release().map_err(|_| ())?,
+                &PackageTrust::release().map_err(|_| ImportFailure::Prepare)?,
             )
-            .map_err(|_| ())?;
+            .map_err(|_| ImportFailure::Prepare)?;
             Ok(Completed::Migration(Box::new(Migration {
                 original,
                 prepared,
@@ -326,8 +369,8 @@ pub(super) fn wire(
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, || {
             let snapshot = store()?
-                .load(&PackageTrust::release().map_err(|_| ())?)
-                .map_err(|_| ())?;
+                .load(&PackageTrust::release().map_err(|_| ImportFailure::Snapshot)?)
+                .map_err(|_| ImportFailure::Snapshot)?;
             Ok(Completed::Listing(listing(&snapshot)))
         });
     });
@@ -357,18 +400,18 @@ pub(super) fn wire(
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, move || {
             let expected = store()?
-                .load(&PackageTrust::release().map_err(|_| ())?)
-                .map_err(|_| ())?;
+                .load(&PackageTrust::release().map_err(|_| ImportFailure::Snapshot)?)
+                .map_err(|_| ImportFailure::Snapshot)?;
             let package = expected
                 .inventory()
                 .packages()
                 .find(|p| p.id() == id)
                 .cloned()
-                .ok_or(())?;
+                .ok_or(ImportFailure::Snapshot)?;
             let candidate = expected
                 .inventory()
                 .stage_remove(&BTreeSet::from([id]))
-                .map_err(|_| ())?;
+                .map_err(|_| ImportFailure::Prepare)?;
             Ok(Completed::Removal(Box::new(Removal {
                 expected,
                 candidate,
@@ -403,11 +446,11 @@ pub(super) fn wire(
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, move || {
             let store = store()?;
-            let trust = PackageTrust::release().map_err(|_| ())?;
-            let snapshot = store.load(&trust).map_err(|_| ())?;
+            let trust = PackageTrust::release().map_err(|_| ImportFailure::Prepare)?;
+            let snapshot = store.load(&trust).map_err(|_| ImportFailure::Snapshot)?;
             PreparedImport::from_file(&path, &snapshot, &trust)
                 .map(|prepared| Completed::Prepared(Box::new(prepared)))
-                .map_err(|_| ())
+                .map_err(|_| ImportFailure::File)
         });
     });
 
@@ -437,11 +480,11 @@ pub(super) fn wire(
             return;
         }
         let Ok(selected) = selected_input_packs(&ui) else {
-            failure(&ui);
+            failure(&ui, ImportFailure::Prepare);
             return;
         };
         if selected_input_profiles(&ui).is_err() {
-            failure(&ui);
+            failure(&ui, ImportFailure::Prepare);
             return;
         }
         if let Some(Pending::Migrate(migration)) = &state.pending
@@ -457,7 +500,7 @@ pub(super) fn wire(
         ui.set_package_import_ready(false);
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, move || {
-            let trust = PackageTrust::release().map_err(|_| ())?;
+            let trust = PackageTrust::release().map_err(|_| ImportFailure::Prepare)?;
             let removed = matches!(&prepared, Pending::Remove(_));
             let rolled_back = matches!(&prepared, Pending::Rollback(_));
             let online_installed = matches!(&prepared, Pending::Online(_));
@@ -469,7 +512,11 @@ pub(super) fn wire(
                     store()?.commit(&prepared.expected, &prepared.candidate, &[], &trust)
                 }
                 Pending::Online(prepared) => {
-                    match prepared.confirm(&store()?, &trust, online::now().map_err(|_| ())?) {
+                    match prepared.confirm(
+                        &store()?,
+                        &trust,
+                        online::now().map_err(|_| ImportFailure::Install)?,
+                    ) {
                         Ok(snapshot) => Ok(snapshot),
                         Err(autokeyboardlayot::package_install::InstallError::Store(error)) => {
                             Err(error)
@@ -478,19 +525,20 @@ pub(super) fn wire(
                     }
                 }
                 Pending::Migrate(migration) => {
-                    let current =
-                        super::super::try_load_configuration_document().map_err(|_| ())?;
+                    let current = super::super::try_load_configuration_document()
+                        .map_err(|_| ImportFailure::Migration)?;
                     if current != migration.original {
-                        return Err(());
+                        return Err(ImportFailure::Migration);
                     }
-                    let directory = super::super::configuration_directory().ok_or(())?;
+                    let directory =
+                        super::super::configuration_directory().ok_or(ImportFailure::Migration)?;
                     // A first explicit save/migration may have no app directory
                     // yet. Create only that child of the existing per-user root;
                     // the store still checks its parent and never repairs it.
                     if let Err(error) = std::fs::create_dir(&directory)
                         && error.kind() != std::io::ErrorKind::AlreadyExists
                     {
-                        return Err(());
+                        return Err(ImportFailure::Migration);
                     }
                     let snapshot = migration
                         .prepared
@@ -509,9 +557,12 @@ pub(super) fn wire(
                     // Refresh, never repeat a possibly committed operation.
                     // A migration must not activate config after this error.
                     notify_agent();
-                    (store()?.load(&trust).map_err(|_| ())?, true)
+                    (
+                        store()?.load(&trust).map_err(|_| ImportFailure::Snapshot)?,
+                        true,
+                    )
                 }
-                Err(_) => return Err(()),
+                Err(_) => return Err(ImportFailure::Install),
             };
             // Even if settings closes after confirmation, notify the agent of
             // the committed store; a missing receiver must not skip this step.
@@ -519,17 +570,19 @@ pub(super) fn wire(
                 notify_agent();
             }
             let listing = listing(&snapshot);
-            let packages = InstalledPackages::from_store(&snapshot, &selected).map_err(|_| ())?;
+            let packages = InstalledPackages::from_store(&snapshot, &selected)
+                .map_err(|_| ImportFailure::Snapshot)?;
             let migrated = if let Some((original, next)) = migration_documents {
                 // Saving mode last is the activation point. Failure leaves a
                 // prepared store ignored by the old legacy configuration.
-                let directory = super::super::configuration_directory().ok_or(())?;
+                let directory =
+                    super::super::configuration_directory().ok_or(ImportFailure::Migration)?;
                 PackageStore::open(&directory.join("packages"))
-                    .map_err(|_| ())?
+                    .map_err(|_| ImportFailure::Store)?
                     .with_current_snapshot(&snapshot, &trust, || {
                         save_configuration_if_unchanged(&next, &original)
                     })
-                    .map_err(|_| ())?;
+                    .map_err(|_| ImportFailure::Install)?;
                 notify_agent();
                 Some(Box::new(next))
             } else {
@@ -564,7 +617,7 @@ pub(super) fn wire(
             let outcome = match receiver.try_recv() {
                 Ok(value) => value,
                 Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => Err(()),
+                Err(mpsc::TryRecvError::Disconnected) => Err(ImportFailure::Thread),
             };
             state.receiver = None;
             ui.set_package_import_busy(false);
@@ -757,7 +810,7 @@ pub(super) fn wire(
                     }
                     ui.set_status_text(status.into());
                 }
-                Err(()) => failure(&ui),
+                Err(reason) => failure(&ui, reason),
             }
         },
     );

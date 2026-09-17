@@ -43,7 +43,6 @@
     "import.preview": "Verified package: {id}\nRevision: {revision}\nBytes: {bytes}\nSHA-256: {hash}\nInput: {input}\nUI locale: {locale}\n\nInstallation does not enable input participation or change your interface language.\n\nLicense:\n",
     "import.notice": "Notice:",
     "import.done": "Package installed. Input participation and interface language were not changed. The reload request was sent to the agent if it is running.",
-    "import.failed": "Package operation failed. No automatic retry will be made; inspect the current package state before retrying.",
     "packs.profile": "Keyboard profile (LANGID:KLID)",
     "packs.profile_default": "Use the sole declared profile; otherwise unavailable",
     "edit.cut": "Cut",
@@ -199,6 +198,15 @@
     "tray.privacy_paused": "privacy paused ({reason})",
     "tray.backend": "backend: {backend}",
     "tray.undo_ready": "undo ready",
-    "tray.failures": "conversion failures: {count} (last: {reason})"
+    "tray.failures": "conversion failures: {count} (last: {reason})",
+    "import.failure.store": "The managed package store cannot be opened. Check that the profile directory is available and the configuration still uses managed packages.",
+    "import.failure.snapshot": "The current package inventory cannot be read. Another operation may be using it; retry after it finishes.",
+    "import.failure.prepare": "The package could not be prepared or verified. Nothing was installed.",
+    "import.failure.file": "The selected file is not a valid language package.",
+    "import.failure.migration": "The settings changed outside this window, so the migration was aborted. Reopen the settings and try again.",
+    "import.failure.catalog": "The package catalog is no longer available or the selection is invalid. Check the catalog again.",
+    "import.failure.install": "Installing the prepared package failed. Nothing was changed.",
+    "import.failure.thread": "The package operation could not be started. Try again.",
+    "import.failed": "Package operation failed. No automatic retry will be made; inspect the current package state before retrying."
   }
 }

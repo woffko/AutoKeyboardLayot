@@ -284,7 +284,7 @@ pub(super) fn wire(ui: &SettingsWindow, state: Rc<RefCell<State>>) {
             return;
         };
         let Ok(ids) = selected(&ui) else {
-            failure(&ui);
+            failure(&ui, ImportFailure::Catalog);
             return;
         };
         let total_bytes = catalog

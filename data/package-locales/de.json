@@ -42,7 +42,6 @@
     "import.preview": "Geprüftes Paket: {id}\nRevision: {revision}\nBytes: {bytes}\nSHA-256: {hash}\nEingabe: {input}\nOberflächensprache: {locale}\n\nDie Installation aktiviert keine Eingabeumwandlung und ändert nicht die Oberflächensprache.\n\nLizenz:\n",
     "import.notice": "Hinweis:",
     "import.done": "Paket installiert. Eingabeauswahl und Oberflächensprache wurden nicht geändert. Falls der Agent läuft, wurde ihm die Anforderung zum Neuladen gesendet.",
-    "import.failed": "Paketvorgang fehlgeschlagen. Es erfolgt kein automatischer Wiederholungsversuch; prüfen Sie vor einem erneuten Versuch den aktuellen Paketstatus.",
     "packs.profile": "Tastaturprofil (LANGID:KLID)",
     "packs.profile_default": "Einziges angegebenes Profil verwenden; sonst nicht verfügbar",
     "packs.notice": "Die Auswahl ist unabhängig von der Oberflächensprache. Die automatische Umwandlung benötigt zwei kompatible, in Windows verfügbare Profile. Die aktuellen Adapter verarbeiten nur normale physische Tasten; AltGr, Tottasten und IME-Komposition werden nicht vollständig unterstützt. Diese Liste prüft nicht die aktuelle Verfügbarkeit in Windows.",
@@ -199,6 +198,15 @@
     "languages.add_button": "Sprache hinzufügen…",
     "languages.advanced": "Erweiterte Paketwerkzeuge",
     "languages.advanced_hint": "Lokale Paketdatei importieren, alte Installation migrieren, Paket entfernen oder auf eine frühere Version zurücksetzen.",
-    "languages.interface_only_note": "Eine heruntergeladene Sprache, die hier nicht erscheint, wurde nur als Oberfläche veröffentlicht: Sie übersetzt die App, enthält aber keine Eingaberegeln und kann nicht zur Konvertierung verwendet werden."
+    "languages.interface_only_note": "Eine heruntergeladene Sprache, die hier nicht erscheint, wurde nur als Oberfläche veröffentlicht: Sie übersetzt die App, enthält aber keine Eingaberegeln und kann nicht zur Konvertierung verwendet werden.",
+    "import.failure.store": "Der verwaltete Paketspeicher kann nicht geöffnet werden. Prüfen Sie, ob das Profilverzeichnis verfügbar ist und die Konfiguration noch verwaltete Pakete verwendet.",
+    "import.failure.snapshot": "Das aktuelle Paketinventar kann nicht gelesen werden. Möglicherweise verwendet es ein anderer Vorgang; versuchen Sie es danach erneut.",
+    "import.failure.prepare": "Das Paket konnte nicht vorbereitet oder geprüft werden. Nichts wurde installiert.",
+    "import.failure.file": "Die ausgewählte Datei ist kein gültiges Sprachpaket.",
+    "import.failure.migration": "Die Einstellungen wurden außerhalb dieses Fensters geändert; die Migration wurde abgebrochen. Öffnen Sie die Einstellungen erneut und versuchen Sie es noch einmal.",
+    "import.failure.catalog": "Der Paketkatalog ist nicht mehr verfügbar oder die Auswahl ist ungültig. Prüfen Sie den Katalog erneut.",
+    "import.failure.install": "Das vorbereitete Paket konnte nicht installiert werden. Nichts wurde geändert.",
+    "import.failure.thread": "Der Paketvorgang konnte nicht gestartet werden. Versuchen Sie es erneut.",
+    "import.failed": "Paketvorgang fehlgeschlagen. Es erfolgt kein automatischer Wiederholungsversuch; prüfen Sie vor einem erneuten Versuch den aktuellen Paketstatus."
   }
 }

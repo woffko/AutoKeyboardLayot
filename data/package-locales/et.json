@@ -42,7 +42,6 @@
     "import.preview": "Kontrollitud pakett: {id}\nRevisjon: {revision}\nBaite: {bytes}\nSHA-256: {hash}\nSisend: {input}\nLiidese keel: {locale}\n\nPaigaldamine ei lülita sisse sisendi teisendamist ega muuda liidese keelt.\n\nLitsents:\n",
     "import.notice": "Teatis:",
     "import.done": "Pakett on paigaldatud. Sisendi teisendamise valikud ja liidese keel ei muutunud. Kui agent töötab, saadeti sellele andmete uuesti laadimise taotlus.",
-    "import.failed": "Paketitoiming ebaõnnestus. Automaatset korduskatset ei tehta; enne uuesti proovimist kontrolli pakettide praegust olekut.",
     "packs.profile": "Klaviatuuriprofiil (LANGID:KLID)",
     "packs.profile_default": "Kasuta ainsat määratud profiili; muidu pole saadaval",
     "packs.notice": "Valik ei sõltu liidese keelest. Automaatseks teisenduseks on vaja kahte Windowsis saadaolevat ühilduvat profiili. Praegused adapterid töötlevad ainult tavalisi füüsilisi klahve; AltGr, surnud klahvid ja IME koostamine pole täielikult toetatud. See loend ei kontrolli profiilide hetkeolekut Windowsis.",
@@ -199,6 +198,15 @@
     "languages.add_button": "Lisa keel…",
     "languages.advanced": "Täpsemad paketitööriistad",
     "languages.advanced_hint": "Impordi kohalik paketifail, migreeri vana install, eemalda pakett või taasta eelmine versioon.",
-    "languages.interface_only_note": "Allalaaditud keel, mida siin ei ole, avaldati ainult liidesena: see tõlgib rakenduse, kuid ei sisalda sisestusreegleid, seega ei saa seda teisendamiseks kasutada."
+    "languages.interface_only_note": "Allalaaditud keel, mida siin ei ole, avaldati ainult liidesena: see tõlgib rakenduse, kuid ei sisalda sisestusreegleid, seega ei saa seda teisendamiseks kasutada.",
+    "import.failure.store": "Paketihoidlat ei saa avada. Kontrolli, et profiili kataloog on saadaval ja konfiguratsioon kasutab endiselt hallatud pakette.",
+    "import.failure.snapshot": "Praegust paketiloendit ei saa lugeda. Võib-olla kasutab seda teine toiming; proovi pärast selle lõppu uuesti.",
+    "import.failure.prepare": "Paketti ei saanud ette valmistada ega kontrollida. Midagi ei paigaldatud.",
+    "import.failure.file": "Valitud fail ei ole kehtiv keelepakett.",
+    "import.failure.migration": "Seaded muutusid väljaspool seda akent, migratsioon katkestati. Ava seaded uuesti ja proovi veel kord.",
+    "import.failure.catalog": "Paketikataloog pole enam saadaval või valik on vigane. Kontrolli kataloogi uuesti.",
+    "import.failure.install": "Ettevalmistatud paketi paigaldamine ebaõnnestus. Midagi ei muudetud.",
+    "import.failure.thread": "Pakettioperatsiooni ei saanud käivitada. Proovi uuesti.",
+    "import.failed": "Paketitoiming ebaõnnestus. Automaatset korduskatset ei tehta; enne uuesti proovimist kontrolli pakettide praegust olekut."
   }
 }
