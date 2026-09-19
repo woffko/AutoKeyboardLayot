@@ -45,6 +45,10 @@ not sign or publish a renewal. An operator must review and publish one before
 expiry. Frozen-release package verification is separate from live-catalog
 expiry checks so historical fixtures remain useful after expiry.
 
+`.gitattributes` fixes text checkouts to LF and preserves the exact bytes of
+hash-pinned vendored catalogs and notices. CI enables Python UTF-8 mode on both
+platforms. Integrity tests compare original bytes, not normalized substitutes.
+
 ## Installer builder
 
 The reviewed builder is portable between Windows and WSL. Supply all reviewed

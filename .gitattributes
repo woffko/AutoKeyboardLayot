@@ -1,0 +1,11 @@
+# Deterministic text checkouts on Windows and Unix.
+* text=auto eol=lf
+
+# These inputs have raw-byte hashes in their provenance records.
+/installer/vendor/inno/*.isl -text
+/data/dependency-notices/** -text
+
+*.png -text
+*.ico -text
+*.res -text
+*.gz -text
