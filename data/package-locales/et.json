@@ -3,6 +3,7 @@
   "locale": "et",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "Luba käsitsi teisendamine terminalis, kui sisestusvälja kontroll pole saadaval",
     "rollback.choose": "Vaata eelmist versiooni…",
     "rollback.confirm": "Kinnita tagasipööramine",
     "rollback.preview": "Kas pöörata redaktsioon {from} tagasi redaktsioonile {to}? Vanad vead võivad taastuda. Suurim teadaolev versioon jääb ajalukku: teiste vahepealsete vanemate versioonide paigaldamine jääb keelatuks. Eelistused ja kasutajaandmed säilivad. Allpool on eelmine pakett ja selle litsents.",

@@ -1,0 +1,23 @@
+name: Published catalog expiry
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  expiry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup update stable --no-self-update
+      - run: rustup default stable
+      - name: Verify signature and at least 72 hours of remaining validity
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory=$(mktemp -d)
+          trap 'rm -rf "$directory"' EXIT
+          curl --fail --location --proto '=https' --proto-redir '=https' --max-time 120 --max-filesize 1048576 https://github.com/woffko/AutoKeyboardLayot/releases/latest/download/catalog.aklc --output "$directory/catalog.aklc"
+          cargo run --locked --no-default-features --example check_catalog_expiry -- "$directory/catalog.aklc"

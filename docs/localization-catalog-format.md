@@ -73,5 +73,12 @@ is read, the application then fails to start with
 `package_store_Package(InvalidComponents)`.
 
 Never delete or rename an English message ID. Retire text by leaving the ID in
-place (its value may change) or by hiding it in the UI. Add new IDs freely:
-missing translations fall back to English.
+place or by hiding it in the UI. Preserve placeholder sets too: old translations
+are checked against them. Adding new IDs is safe for a new consumer loading an
+old package, but not for an old consumer loading a new package. New package
+producers now declare API 2; release catalogs must retain that requirement so
+API-1 applications refuse the upgrade before changing their store.
+
+CI verifies the previously published API-1 packages with the new consumer. The
+signed-package tests retain `import.failed` as a compatibility regression. Do
+not infer compatibility merely from source-locale completeness tests.

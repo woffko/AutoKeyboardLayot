@@ -31,7 +31,12 @@ The manifest is at most 32 KiB and has these fields:
 - `package_id`: stable case-insensitive `PackId`.
 - `revision`: positive unsigned 64-bit integer; an independently versioned package
   revision, not a declaration that a downgrade is permitted.
-- `runtime_api`: 1, the exact supported package API.
+- `runtime_api`: minimum supported consumer contract. New producers emit 2;
+  current consumers accept 1 and 2. API-1 consumers reject API-2 packages before
+  installation. API 2 includes the expanded settings and error-message catalog.
+  A release catalog must copy the value from each verified package, never
+  advertise a lower requirement. Future catalog-ID/placeholder changes require
+  an explicit consumer-compatibility review before reusing an API number.
 - `input_pack`: optional stable input-pack identity; when present, it must equal
   `package_id` after canonicalization. A package cannot impersonate another input ID.
 - `ui_locale`: optional canonical UI catalog identity.

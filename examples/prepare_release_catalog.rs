@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<String>();
         packages.push(json!({"package_id":package.id().to_string(),"revision":package.revision(),
             "bytes":bytes.len(),"sha256":sha256,"tag":tag,"asset":path.file_name().and_then(|s| s.to_str()).ok_or("asset name")?,
-            "runtime_api":1,"input":package.input().is_some(),"ui_locale":package.ui_locale()}));
+            "runtime_api":package.runtime_api(),"input":package.input().is_some(),"ui_locale":package.ui_locale()}));
     }
     let catalog = json!({"format":1,"repository":DEFAULT_PACKAGE_REPOSITORY,"revision":revision,
         "issued_at":now,"expires_at":now.checked_add(7*24*60*60).ok_or("time overflow")?,"packages":packages}).to_string();

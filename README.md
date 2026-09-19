@@ -212,6 +212,13 @@ one-character words, but only against the pack's short-word tier or the user
 dictionary; it is off by default and every other single-letter word stays
 opt-in through the user dictionary.
 
+`manual_terminal_uia_fallback` is a separate, default-off permission for manual
+conversion in Windows Terminal, OpenConsole and Conhost when only the focused
+field's UIA inspection is unavailable. The process and integrity checks, current
+input epoch and target identity still have to succeed. A transport timeout,
+changed target, unreadable process or confirmed password field does not qualify.
+Routing an application to `physical-replay` alone never grants this permission.
+
 Capability diagnostics expose only backend states such as `uia-paste`,
 `physical-replay`, `capability-probe`, `unsupported`, or `text-mismatch`; they
 never include the typed source or replacement.

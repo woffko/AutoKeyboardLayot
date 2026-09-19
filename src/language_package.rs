@@ -13,7 +13,13 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 pub const MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 32 * 1024;
 pub(crate) const SIGNATURE_DOMAIN: &[u8] = b"AutoKeyboardLayot.language-package.v1\0";
-const RUNTIME_API: u32 = 1;
+/// New producers use this floor; consumers retain support for API 1.
+/// API 2 includes the expanded settings/error-message catalog contract.
+pub const RUNTIME_API: u32 = 2;
+
+pub const fn supports_runtime_api(api: u32) -> bool {
+    api >= 1 && api <= RUNTIME_API
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageError {
@@ -170,6 +176,7 @@ struct Envelope {
 pub struct VerifiedLanguagePackage {
     id: PackId,
     revision: u64,
+    runtime_api: u32,
     envelope_sha256: [u8; 32],
     envelope_bytes: u64,
     input: Option<Arc<DictionaryPack>>,
@@ -201,7 +208,7 @@ impl VerifiedLanguagePackage {
         if manifest.format != 1 {
             return Err(PackageError::UnsupportedFormat);
         }
-        if manifest.runtime_api != RUNTIME_API || manifest.revision == 0 {
+        if !supports_runtime_api(manifest.runtime_api) || manifest.revision == 0 {
             return Err(PackageError::Incompatible);
         }
         let id = PackId::parse(&manifest.package_id).map_err(|_| PackageError::InvalidData)?;
@@ -298,6 +305,7 @@ impl VerifiedLanguagePackage {
         Ok(Self {
             id,
             revision: manifest.revision,
+            runtime_api: manifest.runtime_api,
             envelope_sha256: Sha256::digest(bytes).into(),
             envelope_bytes: bytes.len() as u64,
             input,
@@ -310,6 +318,9 @@ impl VerifiedLanguagePackage {
 
     pub const fn id(&self) -> PackId {
         self.id
+    }
+    pub const fn runtime_api(&self) -> u32 {
+        self.runtime_api
     }
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -425,7 +436,7 @@ mod tests {
             "words":"hello\nworld\n", "short_words":"hi\n",
             "scoring": include_str!("../data/scoring/en-US.json"),
             "input": r#"{"format":1,"pack_id":"custom-test","windows_keyboard_profiles":[{"profile":"0409:00000409","required_capabilities":["physical-key-v1"]}]}"#,
-            "ui": r#"{"format":1,"locale":"ru","direction":"ltr","messages":{"locale.self_name":"Русский"}}"#,
+            "ui": r#"{"format":1,"locale":"ru","direction":"ltr","messages":{"locale.self_name":"Русский","import.failed":"Legacy package failure message"}}"#,
             "license":"Test fixture license only; not a distribution license.\n",
             "notice":"Synthetic dictionary and catalog fixture.\n"
         });
@@ -445,6 +456,27 @@ mod tests {
     }
     fn verify(value: &Value) -> Result<VerifiedLanguagePackage, PackageError> {
         VerifiedLanguagePackage::verify(&serde_json::to_vec(value).unwrap(), &trust())
+    }
+
+    #[test]
+    fn legacy_and_current_packages_load_but_future_consumers_are_required_explicitly() {
+        let (mut manifest, components) = fixtures();
+        for api in [1, RUNTIME_API] {
+            manifest["runtime_api"] = json!(api);
+            assert_eq!(
+                verify(&envelope(&manifest, &components))
+                    .unwrap()
+                    .runtime_api(),
+                api
+            );
+        }
+        for api in [0, RUNTIME_API + 1] {
+            manifest["runtime_api"] = json!(api);
+            assert!(matches!(
+                verify(&envelope(&manifest, &components)),
+                Err(PackageError::Incompatible)
+            ));
+        }
     }
     #[test]
     #[ignore = "full real corpus; run explicitly in the bounded release validation job"]
@@ -616,7 +648,7 @@ mod tests {
     #[test]
     fn signed_metadata_cannot_invent_compatibility_or_mix_partial_components() {
         let (manifest, components) = fixtures();
-        for (field, value) in [("runtime_api", json!(2)), ("revision", json!(0))] {
+        for (field, value) in [("runtime_api", json!(3)), ("revision", json!(0))] {
             let mut changed = manifest.clone();
             changed[field] = value;
             assert_eq!(

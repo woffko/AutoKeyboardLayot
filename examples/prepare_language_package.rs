@@ -57,7 +57,7 @@ fn prepare(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         components.insert(role, content);
     }
     let manifest = json!({"format":1,"package_id":recipe.package_id,"revision":recipe.revision,
-        "runtime_api":1,"input_pack":recipe.input_pack,"ui_locale":recipe.ui_locale,"components":integrity}).to_string();
+        "runtime_api":autokeyboardlayot::language_package::RUNTIME_API,"input_pack":recipe.input_pack,"ui_locale":recipe.ui_locale,"components":integrity}).to_string();
     let bytes =
         serde_json::to_vec(&json!({"format":1,"manifest":manifest,"components":components}))?;
     let metadata: serde_json::Value =

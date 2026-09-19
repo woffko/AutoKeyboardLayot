@@ -3,6 +3,7 @@
   "locale": "ja",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "入力欄を検査できない場合にターミナルでの手動変換を許可する",
     "rollback.choose": "前のバージョンを確認…",
     "rollback.confirm": "ロールバックを確定",
     "rollback.preview": "リビジョン {from} を {to} に戻しますか？以前の不具合が再発する可能性があります。既知の最高バージョンは記録に残り、それより古い他の中間バージョンのインストールは引き続き禁止されます。設定とユーザーデータは保持されます。以下に前のパッケージとライセンスを表示します。",

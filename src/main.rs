@@ -8,6 +8,17 @@ fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments
         .first()
+        .is_some_and(|argument| argument == "--verify-profile")
+    {
+        // Read-only startup preflight: no hook, window, repair or migration.
+        std::process::exit(if arguments.len() != 1 {
+            10
+        } else {
+            windows_agent::verify_profile()
+        });
+    }
+    if arguments
+        .first()
         .is_some_and(|argument| argument == "--verify-modular-base")
     {
         std::process::exit(if arguments.len() != 1 {

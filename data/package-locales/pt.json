@@ -3,6 +3,7 @@
   "locale": "pt",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "Permitir conversão manual em terminais quando a inspeção do campo não estiver disponível",
     "rollback.choose": "Rever a versão anterior…",
     "rollback.confirm": "Confirmar reversão",
     "rollback.preview": "Reverter a revisão {from} para {to}? Podem reaparecer falhas antigas. A versão mais elevada conhecida continuará registada: as outras versões intermédias mais antigas continuarão bloqueadas. As preferências e os dados do utilizador serão mantidos. O pacote anterior e a respetiva licença são apresentados abaixo.",

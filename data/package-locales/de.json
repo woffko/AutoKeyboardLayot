@@ -3,6 +3,7 @@
   "locale": "de",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "Manuelle Konvertierung in Terminals erlauben, wenn die Feldprüfung nicht verfügbar ist",
     "rollback.choose": "Vorherige Version prüfen…",
     "rollback.confirm": "Zurücksetzen bestätigen",
     "rollback.preview": "Revision {from} auf {to} zurücksetzen? Alte Fehler können wieder auftreten. Die höchste bekannte Version bleibt gespeichert: Andere ältere Zwischenversionen bleiben gesperrt. Einstellungen und Benutzerdaten bleiben erhalten. Das vorherige Paket und seine Lizenz werden unten angezeigt.",

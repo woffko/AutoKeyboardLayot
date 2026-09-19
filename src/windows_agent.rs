@@ -528,6 +528,8 @@ struct LastBoundary {
     replay_keys: Vec<ReplayKey>,
     delimiter: char,
     foreground: ForegroundContext,
+    epoch: u64,
+    profile_generation: u64,
 }
 
 /// Forced-conversion cycle state: the manual hotkey walks the word through every
@@ -539,6 +541,8 @@ struct TransposeCycle {
     foreground: ForegroundContext,
     language: Language,
     text: String,
+    epoch: u64,
+    profile_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2436,6 +2440,17 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// Exercise the real startup configuration/package loader without installing
+/// hooks or showing a dialog. Errors are reported as an exit code, not profile
+/// text, so automated deployment checks do not disclose user data.
+pub fn verify_profile() -> i32 {
+    if load_runtime_configuration().is_ok() {
+        0
+    } else {
+        20
+    }
+}
+
 pub fn run_settings() -> core::result::Result<(), String> {
     settings_window::run()
 }
@@ -3218,7 +3233,7 @@ impl PrivacyGuard {
         };
         unsafe {
             let Ok(element) = automation.GetFocusedElement() else {
-                return Some(PrivacyBlockReason::InspectionUnavailable);
+                return Some(PrivacyBlockReason::FieldInspectionUnavailable);
             };
             let Ok(process_id) = element.CurrentProcessId() else {
                 return Some(PrivacyBlockReason::InspectionUnavailable);
@@ -3229,7 +3244,7 @@ impl PrivacyGuard {
             match element.CurrentIsPassword() {
                 Ok(value) if value.as_bool() => Some(PrivacyBlockReason::PasswordField),
                 Ok(_) => None,
-                Err(_) => Some(PrivacyBlockReason::InspectionUnavailable),
+                Err(_) => Some(PrivacyBlockReason::FieldInspectionUnavailable),
             }
         }
     }
@@ -4770,6 +4785,10 @@ impl InputProcessor {
         }
 
         self.clear_undo();
+        // Any non-modifier, non-hotkey key can change text or caret position,
+        // including punctuation and otherwise unsupported application keys.
+        self.last_boundary = None;
+        self.transpose_cycle = None;
         if event.virtual_key as u16 != VK_SPACE.0 {
             self.pending_conversion = None;
             self.deferred_drained_conversion = None;
@@ -4855,6 +4874,20 @@ impl InputProcessor {
             key if key == VK_SPACE.0 => {
                 let last_keys = self.replay_keys.clone();
                 self.transpose_cycle = None;
+                // A second space invalidates adjacency too. Record the source
+                // before attempting an edit so a partial failure cannot restore
+                // stale boundary state after the failure path has revoked it.
+                self.last_boundary = if !last_keys.is_empty() && language.is_some() {
+                    Some(LastBoundary {
+                        replay_keys: last_keys,
+                        delimiter: ' ',
+                        foreground: event.foreground,
+                        epoch: self.last_input_epoch,
+                        profile_generation: self.input_profiles.generation(),
+                    })
+                } else {
+                    None
+                };
                 if let Some((transaction, replay_keys)) =
                     self.handle_boundary(language, Some(' '), false)
                     && self.metrics.auto_enabled.load(Ordering::Acquire)
@@ -4880,13 +4913,6 @@ impl InputProcessor {
                     self.deferred_drained_conversion = Some(DeferredDrainedConversion {
                         gate_token: event.drain_token,
                         boundary_sequence: event.sequence,
-                    });
-                }
-                if !last_keys.is_empty() && language.is_some() {
-                    self.last_boundary = Some(LastBoundary {
-                        replay_keys: last_keys,
-                        delimiter: ' ',
-                        foreground: event.foreground,
                     });
                 }
             }
@@ -5071,6 +5097,21 @@ impl InputProcessor {
     }
 
     fn execute_forced_conversion(&mut self, event: RawKeyEvent, _language: Option<Language>) {
+        let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        let generation = self.input_profiles.generation();
+        if self
+            .transpose_cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.epoch != epoch || cycle.profile_generation != generation)
+            || self
+                .last_boundary
+                .as_ref()
+                .is_some_and(|last| last.epoch != epoch || last.profile_generation != generation)
+        {
+            self.invalidate_conversion_state();
+            self.suppress_session();
+            return;
+        }
         // A press while a manual cycle is active advances it to the next layout.
         if let Some(cycle) = self
             .transpose_cycle
@@ -5084,7 +5125,6 @@ impl InputProcessor {
                 );
                 return;
             };
-            self.session.clear();
             if !self.forced_privacy_allows(event.foreground) {
                 self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
                 return;
@@ -5242,15 +5282,6 @@ impl InputProcessor {
                 self.text_edit_backend,
             ),
         );
-        self.session.clear();
-        self.replay_keys.clear();
-        self.transpose_cycle = Some(TransposeCycle {
-            replay_keys: replay_keys.clone(),
-            delimiter,
-            foreground,
-            language: target_language,
-            text: next_text,
-        });
         self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .forwarded_input_sequence
@@ -5275,22 +5306,36 @@ impl InputProcessor {
         self.privacy_reason.is_none()
     }
 
-    /// A user-initiated manual conversion is explicit consent, so an
-    /// unverifiable context (for example a console where UI Automation cannot
-    /// confirm the focused element) does not block it. A confirmed password
-    /// field, an excluded process or an elevated target still does.
+    /// Revalidate process and focus before considering the explicit terminal
+    /// exception. Cached transport failures never authorize a manual edit.
     fn forced_privacy_allows(&mut self, foreground: ForegroundContext) -> bool {
+        let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        self.last_process_id = None;
         self.refresh_process_policy(foreground.process_id);
-        if self.privacy_needs_check {
-            self.evaluate_privacy(foreground);
-        }
-        !matches!(
+        self.evaluate_privacy(foreground);
+        epoch == self.metrics.input_epoch.load(Ordering::Acquire)
+            && foreground_identity_matches(foreground)
+            && self.manual_privacy_allows_current(foreground)
+    }
+
+    fn manual_privacy_allows_current(&self, foreground: ForegroundContext) -> bool {
+        let terminal = self.process_reason.is_none()
+            && self.last_process_id == Some(foreground.process_id)
+            && self.text_edit_backend == TextEditBackend::PhysicalReplay
+            && process_image_name(foreground.process_id).is_some_and(|path| {
+                matches!(
+                    path.rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
+                )
+            });
+        autokeyboardlayot::privacy::manual_conversion_allowed(
             self.privacy_reason,
-            Some(
-                PrivacyBlockReason::PasswordField
-                    | PrivacyBlockReason::ExcludedProcess
-                    | PrivacyBlockReason::ElevatedProcess
-            )
+            self.settings.manual_terminal_uia_fallback,
+            terminal,
         )
     }
 
@@ -5431,10 +5476,10 @@ impl InputProcessor {
         {
             return;
         }
-        let privacy_blocks = match self.privacy_reason {
-            None => false,
-            Some(PrivacyBlockReason::InspectionUnavailable) => !pending.forced,
-            Some(_) => true,
+        let privacy_blocks = if pending.forced {
+            !self.manual_privacy_allows_current(pending.foreground)
+        } else {
+            self.privacy_reason.is_some()
         };
         if (!pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire))
             || privacy_blocks
@@ -5482,6 +5527,15 @@ impl InputProcessor {
         if !self.edit_guard_is_current(pending.foreground, boundary_sequence) {
             return;
         }
+        if self.text_edit_backend == TextEditBackend::ObserveOnly {
+            return;
+        }
+        // From here an edit can submit input or fail partially. Retained text
+        // must not survive an unknown outcome. Publish the next cycle only at
+        // the successful completion point below; preflight refusals keep it.
+        self.invalidate_conversion_state();
+        self.session.clear();
+        self.replay_keys.clear();
         let edit_strategy = match self.text_edit_backend {
             TextEditBackend::ObserveOnly => return,
             TextEditBackend::ProtectedPaste => {
@@ -5606,6 +5660,29 @@ impl InputProcessor {
 
         self.commit_confirmed_layout(target_layout.0 as usize);
         self.session.clear();
+        if let Some(delimiter) = pending.transaction.delimiter {
+            self.last_boundary = Some(LastBoundary {
+                replay_keys: pending.replay_keys.clone(),
+                delimiter,
+                foreground: ForegroundContext {
+                    layout: target_layout.0 as usize,
+                    ..pending.foreground
+                },
+                epoch: self.last_input_epoch,
+                profile_generation: pending.profile_generation,
+            });
+        }
+        if pending.forced {
+            self.transpose_cycle = Some(TransposeCycle {
+                replay_keys: pending.replay_keys.clone(),
+                delimiter: pending.transaction.delimiter,
+                foreground: pending.foreground,
+                language: pending.transaction.target_language,
+                text: pending.transaction.replacement.clone(),
+                epoch: self.last_input_epoch,
+                profile_generation: pending.profile_generation,
+            });
+        }
         self.diagnostic(
             "conversion",
             format!(
@@ -5937,6 +6014,17 @@ impl InputProcessor {
 
         self.commit_confirmed_layout(record.source_layout);
         self.session.clear();
+        self.transpose_cycle = None;
+        self.last_boundary = record.transaction.delimiter.map(|delimiter| LastBoundary {
+            replay_keys: record.replay_keys.clone(),
+            delimiter,
+            foreground: ForegroundContext {
+                layout: record.source_layout,
+                ..record.foreground
+            },
+            epoch: self.last_input_epoch,
+            profile_generation: record.profile_generation,
+        });
         self.diagnostic(
             "undo",
             format!(
@@ -6349,6 +6437,8 @@ impl InputProcessor {
     fn invalidate_conversion_state(&mut self) {
         self.pending_conversion = None;
         self.deferred_drained_conversion = None;
+        self.last_boundary = None;
+        self.transpose_cycle = None;
         self.clear_undo();
     }
 
@@ -6359,6 +6449,7 @@ impl InputProcessor {
     fn record_conversion_failure(&mut self, reason: ConversionFailureReason) {
         self.diagnostic("conversion", format!("result=failed reason={reason:?}"));
         self.invalidate_conversion_state();
+        self.suppress_session();
         self.layout_switch_in_flight = None;
         if !self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
             return;
@@ -7159,7 +7250,10 @@ const fn privacy_reason_code(reason: Option<PrivacyBlockReason>) -> u8 {
         Some(PrivacyBlockReason::PasswordField) => PRIVACY_PASSWORD,
         Some(PrivacyBlockReason::ExcludedProcess) => PRIVACY_EXCLUDED,
         Some(PrivacyBlockReason::ElevatedProcess) => PRIVACY_ELEVATED,
-        Some(PrivacyBlockReason::InspectionUnavailable) => PRIVACY_UNAVAILABLE,
+        Some(
+            PrivacyBlockReason::InspectionUnavailable
+            | PrivacyBlockReason::FieldInspectionUnavailable,
+        ) => PRIVACY_UNAVAILABLE,
     }
 }
 
@@ -7511,6 +7605,87 @@ mod tests {
             }
         }
         resolve_keyboard_profiles(&mut Fixture(0x0409)).unwrap()
+    }
+
+    #[test]
+    fn retained_words_are_revoked_by_uncertain_contexts_but_not_unchanged_profiles() {
+        for reset in 0..4 {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
+            processor.last_boundary = Some(LastBoundary {
+                replay_keys: Vec::new(),
+                delimiter: ' ',
+                foreground,
+                epoch: 0,
+                profile_generation: processor.input_profiles.generation(),
+            });
+            processor.transpose_cycle = Some(TransposeCycle {
+                replay_keys: Vec::new(),
+                delimiter: Some(' '),
+                foreground,
+                language: Language::English,
+                text: "hello".into(),
+                epoch: 0,
+                profile_generation: processor.input_profiles.generation(),
+            });
+            processor.apply_profile_refresh(false);
+            assert!(processor.last_boundary.is_some());
+            assert!(processor.transpose_cycle.is_some());
+            match reset {
+                0 => processor.reset_for_epoch(1),
+                1 => processor.apply_configuration_reload(Err(std::io::Error::other("test"))),
+                2 => processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField)),
+                _ => processor.invalidate_conversion_state(),
+            }
+            assert!(processor.last_boundary.is_none());
+            assert!(processor.transpose_cycle.is_none());
+        }
+    }
+
+    #[test]
+    fn rejected_transaction_does_not_publish_its_target_as_the_current_word() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
+        let detection = Detection {
+            source_language: Language::English,
+            target_language: Language::Russian,
+            original: "z".into(),
+            replacement: "я".into(),
+            source_score: 0.0,
+            target_score: 1.0,
+        };
+        processor.pending_conversion = Some(PendingConversion {
+            transaction: ConversionTransaction::without_delimiter(&detection).unwrap(),
+            foreground,
+            source_layout: foreground.layout,
+            profile_generation: processor.input_profiles.generation(),
+            space_down_sequence: 7,
+            replay_keys: Vec::new(),
+            forced: true,
+        });
+        // A mismatched boundary is rejected before touching the native target.
+        processor.execute_pending_conversion_inner(99);
+        assert!(processor.pending_conversion.is_none());
+        assert!(processor.transpose_cycle.is_none());
+    }
+
+    #[test]
+    fn another_space_revokes_the_previous_word_boundary() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let event = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0);
+        processor.last_foreground = Some(foreground_identity_key(event.foreground));
+        processor.last_layout = Some(event.foreground.layout);
+        processor.last_process_id = Some(event.foreground.process_id);
+        processor.last_boundary = Some(LastBoundary {
+            replay_keys: Vec::new(),
+            delimiter: ' ',
+            foreground: event.foreground,
+            epoch: 0,
+            profile_generation: processor.input_profiles.generation(),
+        });
+        processor.process_key(event);
+        assert!(processor.last_boundary.is_none());
+        assert!(processor.transpose_cycle.is_none());
     }
 
     #[test]

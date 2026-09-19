@@ -383,6 +383,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> recheck-first-word-after-erasing;
     in-out property <bool> physical-fallback;
     in-out property <bool> single-letter-words;
+    in-out property <bool> manual-terminal-uia-fallback;
     in-out property <bool> diagnostics-enabled;
 
     in-out property <bool> suppress-after-backspace;
@@ -542,6 +543,7 @@ export component SettingsWindow inherits Window {
                                 DirectionalCheckBox { text: Localization.text("general.physical_fallback", Localization.revision); checked <=> root.physical-fallback; }
                                 DirectionalCheckBox { text: Localization.text("general.recheck_erased", Localization.revision); checked <=> root.recheck-first-word-after-erasing; }
                                 DirectionalCheckBox { text: Localization.text("general.single_letter_words", Localization.revision); checked <=> root.single-letter-words; }
+                                DirectionalCheckBox { text: Localization.text("general.manual_terminal_uia_fallback", Localization.revision); checked <=> root.manual-terminal-uia-fallback; }
                                 DirectionalCheckBox { text: Localization.text("general.offer_exclusion", Localization.revision); checked <=> root.offer-word-exclusion-after-undo; }
                                 DirectionalCheckBox { text: Localization.text("general.offer_dictionary", Localization.revision); checked <=> root.offer-dictionary-after-force; }
                             }

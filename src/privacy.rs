@@ -8,7 +8,23 @@ pub enum PrivacyBlockReason {
     PasswordField,
     ExcludedProcess,
     ElevatedProcess,
+    /// The focused field cannot expose its password property. Process identity,
+    /// integrity and input-context checks are independent requirements.
+    FieldInspectionUnavailable,
     InspectionUnavailable,
+}
+
+/// The opt-in exception is only for a known terminal's field-inspection failure.
+/// Transport, process and context failures remain denied even for manual input.
+pub fn manual_conversion_allowed(
+    reason: Option<PrivacyBlockReason>,
+    terminal_opt_in: bool,
+    verified_terminal: bool,
+) -> bool {
+    reason.is_none()
+        || (reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
+            && terminal_opt_in
+            && verified_terminal)
 }
 
 /// Case-insensitive executable-name exclusion policy.
@@ -88,6 +104,31 @@ fn normalize_executable_name(path_or_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_exception_never_authorizes_transport_or_process_failures() {
+        for opt_in in [false, true] {
+            for terminal in [false, true] {
+                assert!(manual_conversion_allowed(None, opt_in, terminal));
+                assert_eq!(
+                    manual_conversion_allowed(
+                        Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                        opt_in,
+                        terminal
+                    ),
+                    opt_in && terminal
+                );
+                for reason in [
+                    PrivacyBlockReason::PasswordField,
+                    PrivacyBlockReason::ExcludedProcess,
+                    PrivacyBlockReason::ElevatedProcess,
+                    PrivacyBlockReason::InspectionUnavailable,
+                ] {
+                    assert!(!manual_conversion_allowed(Some(reason), opt_in, terminal));
+                }
+            }
+        }
+    }
 
     #[test]
     fn default_policy_matches_names_and_full_paths_case_insensitively() {

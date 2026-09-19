@@ -31,9 +31,9 @@ enum ImportFailure {
     Migration,
     /// The catalog state is gone or the selection is invalid.
     Catalog,
-    /// Confirming a prepared operation failed.
-    Install,
-    /// The worker could not be started or died.
+    /// A write may have happened; never advertise a safe automatic retry.
+    OutcomeUnknown,
+    /// The worker could not be started (no work was submitted).
     Thread,
 }
 
@@ -46,7 +46,7 @@ impl ImportFailure {
             Self::File => "import.failure.file",
             Self::Migration => "import.failure.migration",
             Self::Catalog => "import.failure.catalog",
-            Self::Install => "import.failure.install",
+            Self::OutcomeUnknown => "package.uncertain",
             Self::Thread => "import.failure.thread",
         }
     }
@@ -62,6 +62,7 @@ enum Completed {
     Catalog(Box<PreparedCatalog>),
     Online(Box<PreparedOnlineInstall>),
     OnlineFailure(String),
+    UncertainListing(Option<Vec<(String, String, bool)>>),
     Changed {
         packages: InstalledPackages,
         listing: Vec<(String, String, bool)>,
@@ -97,6 +98,7 @@ struct State {
     cancel: Option<Arc<AtomicBool>>,
     progress: Option<Arc<online::Progress>>,
     last_progress: Option<(usize, u64)>,
+    inspecting_uncertain: bool,
 }
 
 fn listing(snapshot: &StoreSnapshot) -> Vec<(String, String, bool)> {
@@ -205,6 +207,22 @@ fn store() -> Result<PackageStore, ImportFailure> {
     }
     let directory = super::super::configuration_directory().ok_or(ImportFailure::Store)?;
     PackageStore::open(&directory.join("packages")).map_err(|_| ImportFailure::Store)
+}
+
+// Read once after a failed write, including migration where managed mode may
+// not yet be active. Never confirm again and never activate configuration here.
+fn inspect_uncertain_write(trust: &PackageTrust) -> Completed {
+    let result = inspect_uncertain_snapshot(|| {
+        super::super::configuration_directory()
+            .and_then(|directory| PackageStore::open(&directory.join("packages")).ok())
+            .and_then(|store| store.load(trust).ok())
+    });
+    notify_agent();
+    result
+}
+
+fn inspect_uncertain_snapshot(read: impl FnOnce() -> Option<StoreSnapshot>) -> Completed {
+    Completed::UncertainListing(read().map(|snapshot| listing(&snapshot)))
 }
 
 pub(super) fn wire(
@@ -515,7 +533,7 @@ pub(super) fn wire(
                     match prepared.confirm(
                         &store()?,
                         &trust,
-                        online::now().map_err(|_| ImportFailure::Install)?,
+                        online::now().map_err(|_| ImportFailure::Prepare)?,
                     ) {
                         Ok(snapshot) => Ok(snapshot),
                         Err(autokeyboardlayot::package_install::InstallError::Store(error)) => {
@@ -558,11 +576,17 @@ pub(super) fn wire(
                     // A migration must not activate config after this error.
                     notify_agent();
                     (
-                        store()?.load(&trust).map_err(|_| ImportFailure::Snapshot)?,
+                        store()
+                            .and_then(|store| {
+                                store
+                                    .load(&trust)
+                                    .map_err(|_| ImportFailure::OutcomeUnknown)
+                            })
+                            .map_err(|_| ImportFailure::OutcomeUnknown)?,
                         true,
                     )
                 }
-                Err(_) => return Err(ImportFailure::Install),
+                Err(_) => return Ok(inspect_uncertain_write(&trust)),
             };
             // Even if settings closes after confirmation, notify the agent of
             // the committed store; a missing receiver must not skip this step.
@@ -571,18 +595,22 @@ pub(super) fn wire(
             }
             let listing = listing(&snapshot);
             let packages = InstalledPackages::from_store(&snapshot, &selected)
-                .map_err(|_| ImportFailure::Snapshot)?;
+                .map_err(|_| ImportFailure::OutcomeUnknown)?;
             let migrated = if let Some((original, next)) = migration_documents {
                 // Saving mode last is the activation point. Failure leaves a
                 // prepared store ignored by the old legacy configuration.
-                let directory =
-                    super::super::configuration_directory().ok_or(ImportFailure::Migration)?;
-                PackageStore::open(&directory.join("packages"))
-                    .map_err(|_| ImportFailure::Store)?
-                    .with_current_snapshot(&snapshot, &trust, || {
-                        save_configuration_if_unchanged(&next, &original)
-                    })
-                    .map_err(|_| ImportFailure::Install)?;
+                let activation = super::super::configuration_directory()
+                    .and_then(|directory| PackageStore::open(&directory.join("packages")).ok())
+                    .is_some_and(|store| {
+                        store
+                            .with_current_snapshot(&snapshot, &trust, || {
+                                save_configuration_if_unchanged(&next, &original)
+                            })
+                            .is_ok()
+                    });
+                if !activation {
+                    return Ok(inspect_uncertain_write(&trust));
+                }
                 notify_agent();
                 Some(Box::new(next))
             } else {
@@ -617,9 +645,11 @@ pub(super) fn wire(
             let outcome = match receiver.try_recv() {
                 Ok(value) => value,
                 Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => Err(ImportFailure::Thread),
+                Err(mpsc::TryRecvError::Disconnected) => Err(ImportFailure::OutcomeUnknown),
             };
             state.receiver = None;
+            let was_uncertain_inspection = state.inspecting_uncertain;
+            state.inspecting_uncertain = false;
             ui.set_package_import_busy(false);
             let was_network = ui.get_download_active();
             let cancelled = state
@@ -640,6 +670,16 @@ pub(super) fn wire(
                 return;
             }
             match outcome {
+                Ok(Completed::UncertainListing(rows)) => {
+                    // A failed reread is not evidence of an empty inventory.
+                    if let Some(rows) = rows {
+                        show_listing(&ui, &rows);
+                    }
+                    state.pending = None;
+                    online::clear_catalog(&ui, &mut state);
+                    ui.set_package_import_ready(false);
+                    failure(&ui, ImportFailure::OutcomeUnknown);
+                }
                 Ok(Completed::Prepared(prepared)) => {
                     ui.set_package_import_preview(package_preview(prepared.package()).into());
                     state.pending = Some(Pending::Import(*prepared));
@@ -810,6 +850,20 @@ pub(super) fn wire(
                     }
                     ui.set_status_text(status.into());
                 }
+                Err(ImportFailure::OutcomeUnknown) if !was_uncertain_inspection => {
+                    state.pending = None;
+                    ui.set_package_import_ready(false);
+                    online::clear_catalog(&ui, &mut state);
+                    start(&ui, &mut state, || {
+                        let trust =
+                            PackageTrust::release().map_err(|_| ImportFailure::OutcomeUnknown)?;
+                        Ok(inspect_uncertain_write(&trust))
+                    });
+                    state.inspecting_uncertain = state.receiver.is_some();
+                    if !state.inspecting_uncertain {
+                        failure(&ui, ImportFailure::OutcomeUnknown);
+                    }
+                }
                 Err(reason) => failure(&ui, reason),
             }
         },
@@ -890,6 +944,27 @@ fn decode_selected_files(file: &[u16], multiple: bool) -> Option<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_reread_is_once_and_does_not_turn_failure_into_an_empty_inventory() {
+        let mut reads = 0;
+        let result = inspect_uncertain_snapshot(|| {
+            reads += 1;
+            None
+        });
+        assert_eq!(reads, 1);
+        assert!(matches!(result, Completed::UncertainListing(None)));
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+        let trust = PackageTrust::release().unwrap();
+        let result = inspect_uncertain_snapshot(|| {
+            reads += 1;
+            store.load(&trust).ok()
+        });
+        assert_eq!(reads, 2);
+        assert!(matches!(result, Completed::UncertainListing(Some(rows)) if rows.is_empty()));
+        assert_eq!(ImportFailure::OutcomeUnknown.key(), "package.uncertain");
+    }
 
     #[test]
     fn native_file_selection_preserves_unicode_spaces_and_single_selection_shape() {

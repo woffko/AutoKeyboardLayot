@@ -166,7 +166,7 @@ impl PinnedPackage {
         self.ui_locale.as_deref()
     }
     pub const fn compatible(&self) -> bool {
-        self.runtime_api == 1
+        crate::language_package::supports_runtime_api(self.runtime_api)
     }
 
     /// Reject stale/incompatible selections before starting a network request.
@@ -206,6 +206,7 @@ impl PinnedPackage {
     ) -> Result<(), ReleaseError> {
         self.check_current(now)?;
         if package.id() != self.id
+            || package.runtime_api() != self.runtime_api
             || package.revision() != self.revision
             || package.envelope_bytes() != self.bytes
             || package.envelope_sha256() != self.sha256
@@ -258,6 +259,10 @@ pub struct VerifiedReleaseCatalog {
     expires_at: u64,
 }
 impl VerifiedReleaseCatalog {
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
     /// expected_repository and previous must come from trusted application/store
     /// policy. A package/catalog must never choose its own repository or receipt.
     pub fn verify(
@@ -540,7 +545,7 @@ mod tests {
             ReleaseError::MissingSelection
         );
         let mut future = document();
-        future["packages"][1]["runtime_api"] = json!(2);
+        future["packages"][1]["runtime_api"] = json!(3);
         let catalog = verify(&future, None, 100).unwrap();
         assert!(catalog.select(&ids(&["ru-RU"]), 100).is_ok());
         assert_eq!(
@@ -1393,6 +1398,7 @@ mod tests {
         );
         for (field, value) in [
             ("package_id", json!("other-pack")),
+            ("runtime_api", json!(2)),
             ("revision", json!(2)),
             ("input", json!(true)),
             ("ui_locale", json!("et")),

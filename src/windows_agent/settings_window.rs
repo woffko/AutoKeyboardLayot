@@ -166,6 +166,7 @@ fn populate_ui(
     ui.set_offer_dictionary_after_force(settings.offer_dictionary_after_forced_conversion);
     ui.set_recheck_first_word_after_erasing(settings.recheck_first_word_after_erasing);
     ui.set_single_letter_words(settings.single_letter_words);
+    ui.set_manual_terminal_uia_fallback(settings.manual_terminal_uia_fallback);
     ui.set_physical_fallback(settings.physical_fallback_for_unsupported_apps);
     ui.set_diagnostics_enabled(settings.diagnostics_enabled);
 
@@ -234,21 +235,17 @@ fn pack_display_name(id: &str) -> String {
     .to_owned()
 }
 
-fn populate_input_packs(
-    ui: &SettingsWindow,
+fn input_pack_rows(
     selected: &BTreeSet<autokeyboardlayot::PackId>,
     profiles: &autokeyboardlayot::input_profile_selection::InputProfileSelections,
     registry: &autokeyboardlayot::DictionaryRegistry,
-) {
+) -> Result<Vec<InputPackRow>, String> {
     use autokeyboardlayot::input_pack_selection::{SelectionStatus, selection_rows_with_profiles};
     // All callbacks use the immutable installed snapshot loaded on opening.
     // These rows do not assert live OS readiness or read package files.
-    let Ok(rows) = selection_rows_with_profiles(registry, selected, profiles) else {
-        ui.set_status_error(true);
-        ui.set_status_text(tr("error.pack_selection").into());
-        return;
-    };
-    let mut rows: Vec<InputPackRow> = rows
+    let rows = selection_rows_with_profiles(registry, selected, profiles)
+        .map_err(|_| tr("error.pack_selection"))?;
+    let rows: Vec<InputPackRow> = rows
         .into_iter()
         .map(|row| {
             let mut ids = vec![String::new()];
@@ -269,9 +266,8 @@ fn populate_input_packs(
                 profile_index,
                 id: row.id.as_str().into(),
                 name: pack_display_name(row.id.as_str()).into(),
-                // A newly installed input pack is shown checked so it works
-                // immediately; the user can still uncheck and apply.
-                selected: row.selected || matches!(row.status, SelectionStatus::Disabled),
+                // Projection must never activate an installed but disabled pack.
+                selected: row.selected,
                 status_key: match row.status {
                     SelectionStatus::MissingData => "packs.missing",
                     SelectionStatus::Disabled => "packs.disabled",
@@ -283,6 +279,23 @@ fn populate_input_packs(
             }
         })
         .collect();
+    Ok(rows)
+}
+
+fn populate_input_packs(
+    ui: &SettingsWindow,
+    selected: &BTreeSet<autokeyboardlayot::PackId>,
+    profiles: &autokeyboardlayot::input_profile_selection::InputProfileSelections,
+    registry: &autokeyboardlayot::DictionaryRegistry,
+) {
+    let mut rows = match input_pack_rows(selected, profiles, registry) {
+        Ok(rows) => rows,
+        Err(error) => {
+            ui.set_status_error(true);
+            ui.set_status_text(error.into());
+            return;
+        }
+    };
     // Keep a deselected missing row visible for the remainder of this window,
     // so the user can undo that choice before saving.
     for mut previous in ui.get_input_packs().iter() {
@@ -618,6 +631,7 @@ fn document_from_ui(
     settings.offer_dictionary_after_forced_conversion = ui.get_offer_dictionary_after_force();
     settings.recheck_first_word_after_erasing = ui.get_recheck_first_word_after_erasing();
     settings.single_letter_words = ui.get_single_letter_words();
+    settings.manual_terminal_uia_fallback = ui.get_manual_terminal_uia_fallback();
     settings.physical_fallback_for_unsupported_apps = ui.get_physical_fallback();
     settings.diagnostics_enabled = ui.get_diagnostics_enabled();
 
@@ -815,6 +829,40 @@ fn focus_existing_window() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_and_saved_selection_do_not_reenable_an_unchecked_language() {
+        let registry = autokeyboardlayot::DictionaryRegistry::embedded();
+        let mut selected = registry.installed_ids().copied().collect::<BTreeSet<_>>();
+        selected.remove(&autokeyboardlayot::Language::English);
+        for _ in 0..3 {
+            let rows = input_pack_rows(&selected, &Default::default(), &registry).unwrap();
+            let english = rows.iter().find(|row| row.id == "en-us").unwrap();
+            assert!(!english.selected);
+            assert_eq!(english.status_key, "packs.disabled");
+            selected = autokeyboardlayot::input_pack_selection::parse_selection(
+                rows.iter().map(|row| (row.id.to_string(), row.selected)),
+            )
+            .unwrap();
+        }
+        let saved = autokeyboardlayot::Settings {
+            enabled_input_packs: selected,
+            ..Default::default()
+        };
+        let reopened = autokeyboardlayot::Settings::from_text(&saved.to_text());
+        assert!(
+            !input_pack_rows(
+                &reopened.enabled_input_packs,
+                &Default::default(),
+                &registry
+            )
+            .unwrap()
+            .iter()
+            .find(|row| row.id == "en-us")
+            .unwrap()
+            .selected
+        );
+    }
 
     #[test]
     fn normal_close_requires_valid_unchanged_settings() {

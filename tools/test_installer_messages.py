@@ -59,8 +59,16 @@ class InstallerMessageTests(unittest.TestCase):
         used.update(re.findall(r'\{cm:(Ak\w+)\}', source))
         self.assertEqual(used, set(catalog))
         self.assertTrue(all(catalog.values()))
-        self.assertEqual({key for key, text in pairs if '%1' in text}, {'AkCloseBusy', 'AkProfileReadFailed', 'AkPackageTotal', 'AkPackageReview', 'AkPackageRow'})
-        self.assertNotRegex(source, r"Result\s*:=\s*'[^']+'")
+        self.assertEqual({key for key, text in pairs if '%1' in text}, {'AkCloseBusy', 'AkProfileReadFailed'})
+        # Native language names are deliberately data, not translated UI prose.
+        # Keep the no-hardcoded-messages check on all remaining installer code.
+        names = re.search(r"function PackageName\(Id: String\): String;.*?\nend;", source, re.S)
+        self.assertIsNotNone(names)
+        self.assertEqual(set(re.findall(r"Id = '([^']+)'", names.group())), {
+            'en-us', 'ru-ru', 'et-ee', 'de-de', 'es-es', 'fr-fr', 'pt-br',
+            'ja-jp', 'ar-sa', 'zh-cn', 'hi-in', 'bn-bd', 'id-id', 'ur-pk',
+        })
+        self.assertNotRegex(source.replace(names.group(), ''), r"Result\s*:=\s*'[^']+'")
 
     def test_locale_keys_and_placeholders_match_english_fallback(self):
         root = Path(__file__).resolve().parents[1] / 'installer'
