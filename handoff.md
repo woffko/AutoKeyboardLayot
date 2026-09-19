@@ -28,16 +28,29 @@ The owner subsequently approved the Russian single-letter targets
 Default two/three-letter policy is unchanged. English user-dictionary entries
 such as `en-US: b` and `en-US: c` protect intentionally typed letter labels.
 
-`ru-RU-r4.aklp` (runtime API 2) was prepared and signed locally from the expanded
-short tier. SHA-256:
+`ru-RU-r4.aklp` (runtime API 2) was prepared and signed from the expanded
+short tier, and is now published in catalog revision 5. SHA-256:
 `cc5b4b845e555df17ec7a8b13f061cabc3d6b6e262e42478c260c8fa80267992`.
 Local build directory: `target/input-package-ru-r4-20260919-01/`.
 It passed `verify_input_conversion PACKAGE --single-letters`, including all eight
 targets, uppercase, known-source protection and English exceptions, using an
-isolated temporary store. It is not part of the currently published catalog r4
-(`lang-r4-20260916`, which still distributes Russian package revision 3).
-Install the new signed file explicitly using the local package import UI; source
-push alone does not update an already installed managed dictionary.
+isolated temporary store. The current release is
+[lang-r5-20260919](https://github.com/woffko/AutoKeyboardLayot/releases/tag/lang-r5-20260919),
+containing all 13 packages, signed `catalog.aklc` and an updated Windows x64
+experimental installer built from source `2fce927`.
+
+The owner explicitly approved making `woffko/AutoKeyboardLayot` public after
+anonymous downloads returned 404 while the repository was private. The public
+latest-catalog endpoint and all package URLs were then downloaded without
+credentials and verified again with the release trust. Catalog r5 expires at
+2026-09-26 19:57:03 UTC; SHA-256:
+`b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503`.
+
+Upgrade Russian through **Input languages -> Add language** (refresh the catalog,
+select `ru-ru`, download and confirm installation). API-1 applications must first
+install the updated application from this release; they correctly mark the new
+API-2 Russian package incompatible. This source push/release does not itself
+install the package in the user's existing profile.
 
 The audit-fixed application was deployed after graceful shutdown and read-only
 profile verification (`--verify-profile`, exit 0). Physical typing acceptance is
