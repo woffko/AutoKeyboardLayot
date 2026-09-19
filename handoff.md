@@ -1,4 +1,50 @@
-# AutoKeyboardLayot handoff — 2026-09-16
+# AutoKeyboardLayot handoff — 2026-09-19
+
+## Current update — audit remediation and expanded Russian single-letter tier
+
+This section supersedes historical operational statements below.
+
+- Input epochs/profile generations now bind retained word boundaries and manual
+  cycles. External input and uncertain context revoke them. A cycle's target is
+  published after completion, not before an edit; physical replay remains
+  explicitly text-unverified.
+- Language-row projection no longer re-enables deselected installed packs.
+- Manual terminal UIA fallback is a separate default-off setting. The host has
+  explicitly opted in. Only field inspection unavailability qualifies; transport,
+  process/integrity and context failures still block. See
+  [audit remediation](docs/audit-remediation.md).
+- Post-write package failures and worker loss report uncertain outcomes and
+  inspect the store without re-confirming writes. Legacy message IDs are retained.
+- New package producers declare runtime API 2; consumers accept API 1 and 2,
+  and catalog pins must match the package's authenticated API requirement.
+- CI definitions cover Linux/Windows, native tests, locale completeness,
+  Python tool tests, dependency advisories and historical signed packages.
+  A separate daily gate checks signed-catalog expiry (72-hour warning).
+- The portable installer builder takes explicit ISCC/notice inputs; other
+  machine-local VM scripts remain outside the source change set.
+
+The owner subsequently approved the Russian single-letter targets
+`а, и, в, к, о, с, у, я`, explicitly excluding `э`. The setting remains opt-in.
+Default two/three-letter policy is unchanged. English user-dictionary entries
+such as `en-US: b` and `en-US: c` protect intentionally typed letter labels.
+
+`ru-RU-r4.aklp` (runtime API 2) was prepared and signed locally from the expanded
+short tier. SHA-256:
+`cc5b4b845e555df17ec7a8b13f061cabc3d6b6e262e42478c260c8fa80267992`.
+Local build directory: `target/input-package-ru-r4-20260919-01/`.
+It passed `verify_input_conversion PACKAGE --single-letters`, including all eight
+targets, uppercase, known-source protection and English exceptions, using an
+isolated temporary store. It is not part of the currently published catalog r4
+(`lang-r4-20260916`, which still distributes Russian package revision 3).
+Install the new signed file explicitly using the local package import UI; source
+push alone does not update an already installed managed dictionary.
+
+The audit-fixed application was deployed after graceful shutdown and read-only
+profile verification (`--verify-profile`, exit 0). Physical typing acceptance is
+distinct from unit tests and successful input submission. The source expansion
+does not itself prove a live package upgrade occurred.
+
+## Historical handoff (2026-09-16 and earlier)
 
 ## Stop point and authority
 

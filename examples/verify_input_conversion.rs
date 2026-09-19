@@ -38,9 +38,12 @@ impl KeyboardProfileProbe for Fixture {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or("usage: verify_input_conversion PACKAGE.aklp")?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.is_empty() || args.len() > 2 || (args.len() == 2 && args[1] != "--single-letters") {
+        return Err("usage: verify_input_conversion PACKAGE.aklp [--single-letters]".into());
+    }
+    let path = &args[0];
+    let single_letters = args.len() == 2;
     let trust = PackageTrust::release()?;
     let directory = tempfile::tempdir()?;
     let store = PackageStore::initialize(&directory.path().join("packages"))?;
@@ -52,7 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|id| PackId::parse(id).unwrap())
         .collect();
     let installed = InstalledPackages::from_store(&snapshot, &selected)?;
-    let mut detector = Detector::with_registry(DetectorConfig::default(), installed.dictionaries);
+    let mut detector = Detector::with_registry(
+        DetectorConfig {
+            single_letter_words: single_letters,
+            ..Default::default()
+        },
+        installed.dictionaries,
+    );
     let profiles = resolve_keyboard_profiles(&mut Fixture(0x0409))?;
     detector.set_resolved_profiles(Some(&profiles));
     let detection = detector
@@ -64,5 +73,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         detection.replacement,
         detection.target_language.id()
     );
+    if single_letters {
+        for (source, target) in [
+            ("f", "а"),
+            ("b", "и"),
+            ("d", "в"),
+            ("r", "к"),
+            ("j", "о"),
+            ("c", "с"),
+            ("e", "у"),
+            ("z", "я"),
+        ] {
+            for (source, target) in [
+                (source.to_owned(), target.to_owned()),
+                (source.to_uppercase(), target.to_uppercase()),
+            ] {
+                let converted = detector
+                    .detect(&source, Language::English)
+                    .ok_or("missing single-letter candidate")?;
+                if converted.replacement != target
+                    || detector.detect(&target, Language::Russian).is_some()
+                {
+                    return Err("single-letter conversion or known-source protection failed".into());
+                }
+            }
+        }
+        if detector.detect("'", Language::English).is_some() {
+            return Err("apostrophe must not be converted to an interjection".into());
+        }
+        detector.replace_user_lexicons(
+            autokeyboardlayot::UserLexicon::from_lines(["en-US: b", "en-US: c"]),
+            Default::default(),
+        );
+        if detector.detect("b", Language::English).is_some()
+            || detector.detect("C", Language::English).is_some()
+        {
+            return Err("English letter exceptions were not respected".into());
+        }
+        println!(
+            "EXPANDED_SINGLE_LETTER_PACKAGE_VERIFIED eight_targets case_preserved exclusions_respected no_apostrophe"
+        );
+    }
     Ok(())
 }

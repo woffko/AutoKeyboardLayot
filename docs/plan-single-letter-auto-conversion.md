@@ -1,5 +1,16 @@
 # Plan: opt-in automatic conversion of single-letter words
 
+## Subsequent owner decision — expanded Russian tier
+
+The initial minimum list below is retained as historical design context. The
+owner subsequently approved `а, и, в, к, о, с, у, я`, and explicitly removed
+`э` from the proposed expansion. New Russian packages and the legacy embedded
+tier use these eight words. The opt-in setting, source-word protection, case
+preservation and user-dictionary exceptions are unchanged. Earlier negative
+checks for `b/c/d/r` now apply only with the setting off or with explicit English
+user-dictionary entries. An unlisted `q→й` pair remains useful for testing
+user-added single-letter evidence.
+
 Project: AutoKeyboardLayot (`/home/w0w/AutoKeyboardLayot`, branch `main`).
 Owner decisions recorded 2026-09-15.
 

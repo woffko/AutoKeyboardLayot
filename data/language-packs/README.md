@@ -6,7 +6,7 @@ read-only FST sets embedded in the executable. Typed text is never added to
 these files.
 
 Each direct-layout pack also includes a small, project-maintained
-`common-short-words.txt` containing common two/three-letter words. These lists
+`common-short-words.txt` containing curated one/two/three-letter words. These lists
 are language data, not source-to-target replacement rules. Their separate FST
 tier allows unambiguous short corrections (`yt` → `не`, `рш` → `hi`) without
 treating every abbreviation in the large spelling dictionaries as an equally
@@ -19,6 +19,18 @@ excluded; embedded base tiers drop one-character rows while runtime packages
 keep them.
 A specific unwanted short conversion can be suppressed with a user-dictionary
 entry, for example `en-US: vs`.
+
+The optional Russian single-letter tier contains `а, и, в, к, о, с, у, я`.
+The interjection `э` is intentionally not included: its US-keyboard source is
+an apostrophe. With single-letter conversion enabled, the shipped pairs are
+`f→а`, `b→и`, `d→в`, `r→к`, `j→о`, `c→с`, `e→у`, `z→я`; case is preserved.
+Correctly typed listed Russian words remain unchanged. A user who intentionally
+types English letter labels (for example `plan b` or `vitamin c`) can protect
+them with `en-US: b` and `en-US: c` in the user dictionary. English `a` and `i`
+remain protected by their own short tier. The setting is still off by default.
+
+Managed installations obtain Russian data from the signed package, not from a
+source-file edit: install the updated Russian package to use the expanded tier.
 
 ## en-US
 

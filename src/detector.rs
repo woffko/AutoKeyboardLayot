@@ -1608,6 +1608,13 @@ mod tests {
         for (word, language) in [
             ("z", Language::English),
             ("Z", Language::English),
+            ("f", Language::English),
+            ("b", Language::English),
+            ("d", Language::English),
+            ("r", Language::English),
+            ("j", Language::English),
+            ("c", Language::English),
+            ("e", Language::English),
             ("a", Language::English),
             ("i", Language::English),
             ("я", Language::Russian),
@@ -1625,6 +1632,13 @@ mod tests {
         for (original, language, expected) in [
             ("z", Language::English, "я"),
             ("Z", Language::English, "Я"),
+            ("f", Language::English, "а"),
+            ("b", Language::English, "и"),
+            ("d", Language::English, "в"),
+            ("r", Language::English, "к"),
+            ("j", Language::English, "о"),
+            ("c", Language::English, "с"),
+            ("e", Language::English, "у"),
             ("ф", Language::Russian, "a"),
             ("Ш", Language::Russian, "I"),
             ("ш", Language::Russian, "i"),
@@ -1640,7 +1654,15 @@ mod tests {
             ("я", Language::Russian),
             ("a", Language::English),
             ("I", Language::English),
-            ("b", Language::English),
+            ("q", Language::English),
+            ("'", Language::English),
+            ("и", Language::Russian),
+            ("в", Language::Russian),
+            ("а", Language::Russian),
+            ("с", Language::Russian),
+            ("к", Language::Russian),
+            ("о", Language::Russian),
+            ("у", Language::Russian),
         ] {
             assert_eq!(detector.detect(word, language), None, "{word}");
         }
@@ -1659,12 +1681,12 @@ mod tests {
             ..Default::default()
         });
         with_user_dictionary
-            .replace_user_lexicons(UserLexicon::from_lines(["ru-RU и"]), UserLexicon::default());
+            .replace_user_lexicons(UserLexicon::from_lines(["ru-RU й"]), UserLexicon::default());
         assert_eq!(
             with_user_dictionary
-                .detect("b", Language::English)
+                .detect("q", Language::English)
                 .map(|detection| detection.replacement),
-            Some("и".to_owned())
+            Some("й".to_owned())
         );
         // An explicit word exclusion always wins.
         let mut with_exclusion = crate::test_support::configured_detector(DetectorConfig {
@@ -1674,6 +1696,46 @@ mod tests {
         with_exclusion
             .replace_user_lexicons(UserLexicon::default(), UserLexicon::from_lines(["en-US z"]));
         assert!(with_exclusion.detect("z", Language::English).is_none());
+    }
+
+    #[test]
+    fn expanded_single_letters_preserve_case_and_english_user_exceptions() {
+        let config = DetectorConfig {
+            single_letter_words: true,
+            ..Default::default()
+        };
+        let mut detector = crate::test_support::configured_detector(config);
+        for (source, target) in [
+            ("F", "А"),
+            ("B", "И"),
+            ("D", "В"),
+            ("R", "К"),
+            ("J", "О"),
+            ("C", "С"),
+            ("E", "У"),
+            ("Z", "Я"),
+        ] {
+            assert_eq!(
+                detector
+                    .detect(source, Language::English)
+                    .unwrap()
+                    .replacement,
+                target
+            );
+            assert!(detector.detect(target, Language::Russian).is_none());
+        }
+        detector.replace_user_lexicons(
+            UserLexicon::from_lines(["en-US b", "en-US c"]),
+            UserLexicon::default(),
+        );
+        for source in ["b", "B", "c", "C"] {
+            assert!(detector.detect(source, Language::English).is_none());
+        }
+        // An exception for one letter must not disable all single-letter targets.
+        assert_eq!(
+            detector.detect("d", Language::English).unwrap().replacement,
+            "в"
+        );
     }
 
     #[test]
