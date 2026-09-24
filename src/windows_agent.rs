@@ -4164,6 +4164,9 @@ struct InputProcessor {
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
+    // Field-inspection fallback authorizes manual input only. Recovery of UIA
+    // must not promote a word captured under that exception to automatic input.
+    manual_only_word: bool,
     last_boundary: Option<LastBoundary>,
     transpose_cycle: Option<TransposeCycle>,
     text_edit_backend: TextEditBackend,
@@ -4260,6 +4263,7 @@ impl InputProcessor {
             last_process_id: None,
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
+            manual_only_word: false,
             last_boundary: None,
             transpose_cycle: None,
             text_edit_backend: TextEditBackend::ObserveOnly,
@@ -4928,7 +4932,9 @@ impl InputProcessor {
                 self.session.mark_line_start();
             }
             _ => {
-                if !self.ensure_privacy(event.foreground) {
+                if !self.ensure_privacy(event.foreground)
+                    && !self.manual_privacy_allows_current(event.foreground)
+                {
                     self.diagnostic(
                         "input",
                         format!(
@@ -4973,6 +4979,12 @@ impl InputProcessor {
                 }
                 let boundary = input_event == InputEvent::Boundary;
                 let buffered_before = self.session.buffered_character_count();
+                if matches!(input_event, InputEvent::Printable(_)) && buffered_before == 0 {
+                    // Bind the manual-only mark to the word being started. Resets
+                    // such as focus, mouse or layout changes discard the previous
+                    // word without passing through a boundary or suppression.
+                    self.manual_only_word = self.privacy_reason.is_some();
+                }
                 let action = self.session.handle(input_event, language, &self.detector);
                 match action {
                     SessionAction::Candidate(_) => {
@@ -5034,6 +5046,7 @@ impl InputProcessor {
         may_change_focus: bool,
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
+        let manual_only = core::mem::take(&mut self.manual_only_word);
         let candidates = language
             .map(|language| {
                 mapped_layout_candidates(
@@ -5045,7 +5058,7 @@ impl InputProcessor {
                 )
             })
             .unwrap_or_default();
-        let transaction = if self.privacy_reason.is_none() {
+        let transaction = if self.privacy_reason.is_none() && !manual_only {
             if let SessionAction::Candidate(detection) = self
                 .session
                 .finish_boundary_with_candidates(language, &self.detector, &candidates)
@@ -5157,7 +5170,10 @@ impl InputProcessor {
         } else {
             self.diagnostic(
                 "hotkey",
-                "result=ignored reason=no-word-before-caret".to_owned(),
+                format!(
+                    "result=ignored reason=no-word-before-caret suppressed={} privacy={:?} manual_only={}",
+                    self.session.is_suppressed(), self.privacy_reason, self.manual_only_word,
+                ),
             );
             return;
         };
@@ -5319,6 +5335,14 @@ impl InputProcessor {
     }
 
     fn manual_privacy_allows_current(&self, foreground: ForegroundContext) -> bool {
+        self.manual_privacy_allows_reason(self.privacy_reason, foreground)
+    }
+
+    fn manual_privacy_allows_reason(
+        &self,
+        reason: Option<PrivacyBlockReason>,
+        foreground: ForegroundContext,
+    ) -> bool {
         let terminal = self.process_reason.is_none()
             && self.last_process_id == Some(foreground.process_id)
             && self.text_edit_backend == TextEditBackend::PhysicalReplay
@@ -5333,7 +5357,7 @@ impl InputProcessor {
                 )
             });
         autokeyboardlayot::privacy::manual_conversion_allowed(
-            self.privacy_reason,
+            reason,
             self.settings.manual_terminal_uia_fallback,
             terminal,
         )
@@ -5388,7 +5412,9 @@ impl InputProcessor {
             );
         }
         self.privacy_needs_check = false;
-        self.set_privacy_reason(reason);
+        let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
+            && self.manual_privacy_allows_reason(reason, foreground);
+        self.set_privacy_reason_with_manual_exception(reason, manual_exception);
     }
 
     fn refresh_process_policy(&mut self, process_id: u32) {
@@ -5446,18 +5472,36 @@ impl InputProcessor {
     }
 
     fn set_privacy_reason(&mut self, reason: Option<PrivacyBlockReason>) {
+        self.set_privacy_reason_with_manual_exception(reason, false);
+    }
+
+    // Only evaluate_privacy supplies an exception after validating the input
+    // context, process policy and explicit terminal opt-in. Other callers deny.
+    fn set_privacy_reason_with_manual_exception(
+        &mut self,
+        reason: Option<PrivacyBlockReason>,
+        manual_exception: bool,
+    ) {
         self.privacy_reason = reason;
         self.metrics
             .privacy_reason
             .store(privacy_reason_code(reason), Ordering::Release);
         if reason.is_some() {
-            self.invalidate_conversion_state();
-            self.suppress_session();
+            if manual_exception && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) {
+                self.manual_only_word = true;
+                self.pending_conversion = None;
+                self.deferred_drained_conversion = None;
+                self.clear_undo();
+            } else {
+                self.invalidate_conversion_state();
+                self.suppress_session();
+            }
         }
     }
 
     fn suppress_session(&mut self) {
         self.replay_keys.clear();
+        self.manual_only_word = false;
         self.session
             .handle(InputEvent::UnsupportedInput, None, &self.detector);
     }
@@ -9866,6 +9910,121 @@ mod tests {
             foreground_identity_key(first),
             foreground_identity_key(second)
         );
+    }
+
+    #[test]
+    fn terminal_field_failure_keeps_manual_cycle_and_next_word_available() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
+        processor.set_privacy_reason(None);
+        processor.transpose_cycle = Some(TransposeCycle {
+            replay_keys: Vec::new(),
+            delimiter: None,
+            foreground,
+            language: Language::English,
+            text: "hello".into(),
+            epoch: 0,
+            profile_generation: processor.input_profiles.generation(),
+        });
+
+        processor.set_privacy_reason_with_manual_exception(
+            Some(PrivacyBlockReason::FieldInspectionUnavailable),
+            true,
+        );
+        assert!(processor.transpose_cycle.is_some());
+        assert!(!processor.session.is_suppressed());
+
+        // Successive words, including a one-letter word, remain bufferable
+        // without a trailing Space. A periodic field failure may occur midway.
+        for word in ["a", "hello", "ghbdtn"] {
+            processor.handle_boundary(Some(Language::English), Some(' '), false);
+            for character in word.chars() {
+                processor.session.handle(
+                    InputEvent::Printable(character),
+                    Some(Language::English),
+                    &processor.detector,
+                );
+                processor.replay_keys.push(ReplayKey {
+                    scan_code: 0x22,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                });
+                processor.set_privacy_reason_with_manual_exception(
+                    Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                    true,
+                );
+            }
+            assert_eq!(processor.session.buffered_character_count(), word.len());
+            assert_eq!(processor.replay_keys.len(), word.len());
+            assert!(!processor.session.is_suppressed());
+            assert!(processor.manual_only_word);
+        }
+    }
+
+    #[test]
+    fn manual_exception_does_not_preserve_input_for_hard_privacy_failures() {
+        for reason in [
+            PrivacyBlockReason::PasswordField,
+            PrivacyBlockReason::ExcludedProcess,
+            PrivacyBlockReason::ElevatedProcess,
+            PrivacyBlockReason::InspectionUnavailable,
+            PrivacyBlockReason::FieldInspectionUnavailable,
+        ] {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            processor.session.handle(
+                InputEvent::Printable('a'),
+                Some(Language::English),
+                &processor.detector,
+            );
+            processor.replay_keys.push(ReplayKey {
+                scan_code: 0x1e,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            });
+            // Field failures without a verified exception also stay denied.
+            processor.set_privacy_reason_with_manual_exception(
+                Some(reason),
+                reason != PrivacyBlockReason::FieldInspectionUnavailable,
+            );
+            assert_eq!(processor.session.buffered_character_count(), 0);
+            assert!(processor.replay_keys.is_empty());
+            assert!(processor.session.is_suppressed());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-bundled-input")]
+    fn recovered_field_inspection_does_not_promote_manual_word_to_auto() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        for manual_only in [true, false] {
+            processor.set_privacy_reason(None);
+            for (character, scan_code) in "ghbdtn".chars().zip([0x22, 0x23, 0x30, 0x20, 0x14, 0x31])
+            {
+                processor.session.handle(
+                    InputEvent::Printable(character),
+                    Some(Language::English),
+                    &processor.detector,
+                );
+                processor.replay_keys.push(ReplayKey {
+                    scan_code,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                });
+            }
+            if manual_only {
+                processor.set_privacy_reason_with_manual_exception(
+                    Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                    true,
+                );
+                processor.set_privacy_reason(None);
+            }
+            let conversion = processor.handle_boundary(Some(Language::English), Some(' '), false);
+            assert_eq!(conversion.is_none(), manual_only);
+            assert!(!processor.manual_only_word);
+        }
     }
 
     #[test]

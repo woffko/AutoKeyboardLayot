@@ -17,6 +17,11 @@
 - The manual terminal exception is explicit and default off. Only field-level
   UIA unavailability qualifies, with independently verified process identity,
   integrity and context. Transport and process errors fail closed.
+  This exception preserves bounded volatile word/cycle state for Pause/Break,
+  including words without a trailing space. Words observed under the exception
+  remain manual-only through their boundary even if UIA recovers in the meantime.
+  It never authorizes automatic conversion or recovery of input lost during a
+  hard privacy failure.
 - Post-write failure and worker loss report an uncertain outcome, never
   "nothing changed" or "not started". Failed writes are inspected once where
   possible, without repeating confirmation or activating a failed migration.
