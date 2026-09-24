@@ -187,6 +187,32 @@ impl InputSession {
         self.at_line_start = true;
     }
 
+    /// Remove the last tracked character after an observed plain Backspace and
+    /// keep the corrected word eligible. Returns false when the erased
+    /// character is not part of a known word, so the caller must fail closed.
+    pub fn erase_last_character(&mut self) -> bool {
+        if self.suppressed_until_boundary || self.current_word.pop().is_none() {
+            return false;
+        }
+        self.backspace_remaining = None;
+        if self.current_word.is_empty() {
+            self.at_line_start = self.current_word_started_at_line_start;
+            self.current_word_started_at_line_start = false;
+        }
+        true
+    }
+
+    /// Resume a completed word after the user erased its delimiter. The caller
+    /// validates that the word is still adjacent to the caret.
+    pub fn restore_word(&mut self, word: &str) -> bool {
+        if word.is_empty() || word.chars().count() > self.max_word_characters {
+            return false;
+        }
+        self.clear();
+        self.current_word.push_str(word);
+        true
+    }
+
     /// Handle Ctrl+Backspace only when the tracked word is known to be the
     /// first word after an observed Enter. Arbitrary selection deletion stays
     /// fail-closed because the caret range is unknown.
@@ -507,6 +533,63 @@ mod tests {
         assert!(!session.is_suppressed());
         session.handle(InputEvent::Backspace, Some(Language::English), &detector);
         assert!(session.is_suppressed());
+    }
+
+    #[test]
+    fn erasing_a_character_keeps_the_corrected_word() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        for character in "ghbdnb".chars() {
+            session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &detector,
+            );
+        }
+        assert!(session.erase_last_character());
+        assert!(session.erase_last_character());
+        assert_eq!(session.buffered_character_count(), 4);
+        assert!(!session.is_suppressed());
+        assert!(matches!(
+            type_word(&mut session, "tn", Language::English, &detector),
+            SessionAction::Candidate(detection) if detection.replacement == "привет"
+        ));
+    }
+
+    #[test]
+    fn erasing_outside_a_known_word_is_refused() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        assert!(!session.erase_last_character());
+        session.handle(InputEvent::UnsupportedInput, None, &detector);
+        assert!(!session.erase_last_character());
+        assert!(session.is_suppressed());
+    }
+
+    #[test]
+    fn erasing_the_first_word_returns_to_line_start() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        session.mark_line_start();
+        session.handle(
+            InputEvent::Printable('g'),
+            Some(Language::English),
+            &detector,
+        );
+        assert!(session.erase_last_character());
+        assert!(session.at_line_start);
+    }
+
+    #[test]
+    fn restored_word_can_be_forced_and_bounds_are_checked() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        session.handle(InputEvent::UnsupportedInput, None, &detector);
+        assert!(!session.restore_word(""));
+        assert!(!session.restore_word(&"g".repeat(DEFAULT_MAX_WORD_CHARACTERS + 1)));
+        assert!(session.restore_word("ghbdtn"));
+        assert!(!session.is_suppressed());
+        assert_eq!(session.buffered_character_count(), 6);
     }
 
     #[test]

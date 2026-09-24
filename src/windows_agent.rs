@@ -4166,7 +4166,12 @@ struct InputProcessor {
     replay_keys: Vec<ReplayKey>,
     // Field-inspection fallback authorizes manual input only. Recovery of UIA
     // must not promote a word captured under that exception to automatic input.
+    // A word resumed by erasing its delimiter is also manual-only, so erasing
+    // and retyping a space never re-triggers automatic conversion.
     manual_only_word: bool,
+    // Coarse category of the last event that discarded or blocked the word
+    // buffer. It never contains typed text and only explains ignored hotkeys.
+    last_word_reset: &'static str,
     last_boundary: Option<LastBoundary>,
     transpose_cycle: Option<TransposeCycle>,
     text_edit_backend: TextEditBackend,
@@ -4264,6 +4269,7 @@ impl InputProcessor {
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
             manual_only_word: false,
+            last_word_reset: "none",
             last_boundary: None,
             transpose_cycle: None,
             text_edit_backend: TextEditBackend::ObserveOnly,
@@ -4453,6 +4459,7 @@ impl InputProcessor {
 
         match queued.event {
             RawInputEvent::Mouse => {
+                self.last_word_reset = "mouse";
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
                 self.last_boundary = None;
@@ -4461,6 +4468,7 @@ impl InputProcessor {
                 self.mark_privacy_dirty(false);
             }
             RawInputEvent::ExternalInjection => {
+                self.last_word_reset = "external-input";
                 self.invalidate_conversion_state();
                 self.suppress_session();
                 self.mark_privacy_dirty(true);
@@ -4702,6 +4710,7 @@ impl InputProcessor {
         let foreground_key = foreground_identity_key(event.foreground);
         let language = self.language_for_layout(event.foreground.layout);
         if self.last_foreground != Some(foreground_key) {
+            self.last_word_reset = "focus";
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
             self.replay_keys.clear();
@@ -4724,6 +4733,7 @@ impl InputProcessor {
                 self.last_layout = Some(event.foreground.layout);
                 self.layout_switch_in_flight = None;
             } else {
+                self.last_word_reset = "layout";
                 self.layout_switch_in_flight = None;
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
@@ -4791,7 +4801,8 @@ impl InputProcessor {
         self.clear_undo();
         // Any non-modifier, non-hotkey key can change text or caret position,
         // including punctuation and otherwise unsupported application keys.
-        self.last_boundary = None;
+        // Only a plain Backspace may resume the word before an erased delimiter.
+        let previous_boundary = self.last_boundary.take();
         self.transpose_cycle = None;
         if event.virtual_key as u16 != VK_SPACE.0 {
             self.pending_conversion = None;
@@ -4801,6 +4812,7 @@ impl InputProcessor {
         }
 
         if self.modifiers.has_shortcut_modifier() {
+            self.last_word_reset = "shortcut";
             self.replay_keys.clear();
             self.last_boundary = None;
             self.transpose_cycle = None;
@@ -4820,14 +4832,20 @@ impl InputProcessor {
 
         match event.virtual_key as u16 {
             key if key == VK_BACK.0 => {
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Backspace,
-                    language,
-                    self.settings.suppress_after_backspace,
-                );
+                if self.settings.suppress_after_backspace
+                    || !self.erase_or_resume_word(previous_boundary, event, language)
+                {
+                    self.last_word_reset = "backspace";
+                    self.replay_keys.clear();
+                    self.handle_switching_rule(
+                        InputEvent::Backspace,
+                        language,
+                        self.settings.suppress_after_backspace,
+                    );
+                }
             }
             key if key == VK_DELETE.0 => {
+                self.last_word_reset = "delete";
                 self.replay_keys.clear();
                 self.handle_switching_rule(
                     InputEvent::Delete,
@@ -4836,6 +4854,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_LEFT.0 => {
+                self.last_word_reset = "navigation";
                 self.replay_keys.clear();
                 self.handle_switching_rule(
                     InputEvent::Navigation,
@@ -4844,6 +4863,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_RIGHT.0 => {
+                self.last_word_reset = "navigation";
                 self.replay_keys.clear();
                 self.handle_switching_rule(
                     InputEvent::Navigation,
@@ -4852,6 +4872,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_UP.0 => {
+                self.last_word_reset = "navigation";
                 self.replay_keys.clear();
                 self.handle_switching_rule(
                     InputEvent::Navigation,
@@ -4860,6 +4881,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_DOWN.0 => {
+                self.last_word_reset = "navigation";
                 self.replay_keys.clear();
                 self.handle_switching_rule(
                     InputEvent::Navigation,
@@ -4868,6 +4890,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_HOME.0 || key == VK_END.0 => {
+                self.last_word_reset = "navigation";
                 self.replay_keys.clear();
                 self.handle_switching_rule(
                     InputEvent::Navigation,
@@ -4876,6 +4899,7 @@ impl InputProcessor {
                 );
             }
             key if key == VK_SPACE.0 => {
+                self.last_word_reset = "boundary";
                 let last_keys = self.replay_keys.clone();
                 self.transpose_cycle = None;
                 // A second space invalidates adjacency too. Record the source
@@ -4921,11 +4945,13 @@ impl InputProcessor {
                 }
             }
             key if key == VK_TAB.0 => {
+                self.last_word_reset = "boundary";
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
             }
             key if key == VK_RETURN.0 => {
+                self.last_word_reset = "boundary";
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
@@ -4942,6 +4968,7 @@ impl InputProcessor {
                             event.foreground.process_id, self.text_edit_backend
                         ),
                     );
+                    self.last_word_reset = "privacy";
                     self.suppress_session();
                     return;
                 }
@@ -4963,6 +4990,7 @@ impl InputProcessor {
                     },
                 );
                 if input_event == InputEvent::UnsupportedInput {
+                    self.last_word_reset = "unsupported";
                     self.diagnostic(
                         "input",
                         format!(
@@ -4978,6 +5006,9 @@ impl InputProcessor {
                     self.transpose_cycle = None;
                 }
                 let boundary = input_event == InputEvent::Boundary;
+                if boundary {
+                    self.last_word_reset = "boundary";
+                }
                 let buffered_before = self.session.buffered_character_count();
                 if matches!(input_event, InputEvent::Printable(_)) && buffered_before == 0 {
                     // Bind the manual-only mark to the word being started. Resets
@@ -5094,6 +5125,68 @@ impl InputProcessor {
         transaction.map(|transaction| (transaction, replay_keys))
     }
 
+    fn erase_or_resume_word(
+        &mut self,
+        previous_boundary: Option<LastBoundary>,
+        event: RawKeyEvent,
+        language: Option<Language>,
+    ) -> bool {
+        self.erase_or_resume_word_with(previous_boundary, event, language, |keys, layout| {
+            map_replay_keys_to_layout(keys, HKL(layout as *mut c_void))
+        })
+    }
+
+    /// With Backspace suppression disabled, a plain Backspace edits the tracked
+    /// word instead of discarding it. Erasing the delimiter directly after a
+    /// word resumes that word for manual conversion when its input target,
+    /// layout, epoch and profile generation are unchanged. Returns false when
+    /// the caller must discard the word as before.
+    fn erase_or_resume_word_with(
+        &mut self,
+        previous_boundary: Option<LastBoundary>,
+        event: RawKeyEvent,
+        language: Option<Language>,
+        map_to_layout: impl FnOnce(&[ReplayKey], usize) -> Option<String>,
+    ) -> bool {
+        let buffered = self.session.buffered_character_count();
+        if buffered != 0 {
+            if self.replay_keys.len() != buffered || !self.session.erase_last_character() {
+                return false;
+            }
+            self.replay_keys.pop();
+            return true;
+        }
+        if self.session.is_suppressed() || !self.replay_keys.is_empty() {
+            return false;
+        }
+        let (Some(last), Some(language)) = (previous_boundary, language) else {
+            return false;
+        };
+        if !same_input_target(last.foreground, event.foreground)
+            || last.foreground.layout != event.foreground.layout
+            || last.epoch != self.metrics.input_epoch.load(Ordering::Acquire)
+            || last.profile_generation != self.input_profiles.generation()
+            || (self.privacy_reason.is_some()
+                && !self.manual_privacy_allows_current(event.foreground))
+        {
+            return false;
+        }
+        let Some(word) = map_to_layout(&last.replay_keys, last.foreground.layout) else {
+            return false;
+        };
+        if word.chars().count() != last.replay_keys.len()
+            || !word
+                .chars()
+                .all(|character| self.detector.can_extend_word(character, language))
+            || !self.session.restore_word(&word)
+        {
+            return false;
+        }
+        self.replay_keys = last.replay_keys;
+        self.manual_only_word = true;
+        true
+    }
+
     fn handle_switching_rule(
         &mut self,
         event: InputEvent,
@@ -5171,8 +5264,8 @@ impl InputProcessor {
             self.diagnostic(
                 "hotkey",
                 format!(
-                    "result=ignored reason=no-word-before-caret suppressed={} privacy={:?} manual_only={}",
-                    self.session.is_suppressed(), self.privacy_reason, self.manual_only_word,
+                    "result=ignored reason=no-word-before-caret suppressed={} privacy={:?} manual_only={} last_reset={}",
+                    self.session.is_suppressed(), self.privacy_reason, self.manual_only_word, self.last_word_reset,
                 ),
             );
             return;
@@ -5493,6 +5586,7 @@ impl InputProcessor {
                 self.deferred_drained_conversion = None;
                 self.clear_undo();
             } else {
+                self.last_word_reset = "privacy";
                 self.invalidate_conversion_state();
                 self.suppress_session();
             }
@@ -9910,6 +10004,139 @@ mod tests {
             foreground_identity_key(first),
             foreground_identity_key(second)
         );
+    }
+
+    fn buffer_test_word(processor: &mut InputProcessor, word: &str) {
+        for character in word.chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+            processor.replay_keys.push(ReplayKey {
+                scan_code: 0x22,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            });
+        }
+    }
+
+    fn test_last_boundary(processor: &InputProcessor, length: usize) -> LastBoundary {
+        LastBoundary {
+            replay_keys: vec![
+                ReplayKey {
+                    scan_code: 0x22,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                };
+                length
+            ],
+            delimiter: ' ',
+            foreground: test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0).foreground,
+            epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+            profile_generation: processor.input_profiles.generation(),
+        }
+    }
+
+    #[test]
+    fn backspace_edits_the_tracked_word_and_its_replay_keys() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        buffer_test_word(&mut processor, "ghbdnb");
+        let event = test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0);
+        for expected in [5, 4] {
+            assert!(processor.erase_or_resume_word_with(
+                None,
+                event,
+                Some(Language::English),
+                |_, _| unreachable!("a buffered word is edited in place"),
+            ));
+            assert_eq!(processor.session.buffered_character_count(), expected);
+            assert_eq!(processor.replay_keys.len(), expected);
+            assert!(!processor.session.is_suppressed());
+        }
+        assert!(!processor.manual_only_word);
+
+        // A misaligned buffer is never edited; the caller discards it instead.
+        processor.replay_keys.pop();
+        assert!(!processor.erase_or_resume_word_with(
+            None,
+            event,
+            Some(Language::English),
+            |_, _| None,
+        ));
+    }
+
+    #[test]
+    fn backspace_over_the_delimiter_resumes_the_word_for_manual_conversion_only() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        let event = test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0);
+        let last = test_last_boundary(&processor, 6);
+        assert!(processor.erase_or_resume_word_with(
+            Some(last),
+            event,
+            Some(Language::English),
+            |keys, layout| {
+                assert_eq!((keys.len(), layout), (6, event.foreground.layout));
+                Some("ghbdtn".to_owned())
+            },
+        ));
+        assert_eq!(processor.session.buffered_character_count(), 6);
+        assert_eq!(processor.replay_keys.len(), 6);
+        assert!(processor.manual_only_word);
+        // Retyping the delimiter does not re-trigger automatic conversion.
+        assert!(
+            processor
+                .handle_boundary(Some(Language::English), Some(' '), false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn backspace_does_not_resume_a_stale_or_different_word() {
+        let event = test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0);
+        let cases: [fn(&mut LastBoundary); 4] = [
+            |last| last.foreground.layout += 1,
+            |last| last.foreground.focus += 1,
+            |last| last.epoch += 1,
+            |last| last.profile_generation += 1,
+        ];
+        for change in cases {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            processor.set_privacy_reason(None);
+            let mut last = test_last_boundary(&processor, 6);
+            change(&mut last);
+            assert!(!processor.erase_or_resume_word_with(
+                Some(last),
+                event,
+                Some(Language::English),
+                |_, _| Some("ghbdtn".to_owned()),
+            ));
+            assert_eq!(processor.session.buffered_character_count(), 0);
+        }
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        for word in [None, Some("ghbdt"), Some("gh1dtn")] {
+            let last = test_last_boundary(&processor, 6);
+            assert!(!processor.erase_or_resume_word_with(
+                Some(last),
+                event,
+                Some(Language::English),
+                |_, _| word.map(str::to_owned),
+            ));
+        }
+        processor.suppress_session();
+        let last = test_last_boundary(&processor, 6);
+        assert!(!processor.erase_or_resume_word_with(
+            Some(last),
+            event,
+            Some(Language::English),
+            |_, _| Some("ghbdtn".to_owned()),
+        ));
+        assert!(!processor.manual_only_word);
     }
 
     #[test]
