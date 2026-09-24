@@ -360,7 +360,9 @@ export struct DownloadRow {
 }
 
 export component SettingsWindow inherits Window {
-    title: Localization.text("window.settings", Localization.revision);
+    // Build identity is not translated; it is appended to the localized caption.
+    in property <string> app-version;
+    title: Localization.text("window.settings", Localization.revision) + " · " + root.app-version;
     icon: @image-url("../assets/app-256.png");
     preferred-width: 1080px;
     preferred-height: 760px;
@@ -811,6 +813,7 @@ export component SettingsWindow inherits Window {
                     settings_card_7 := VerticalLayout {
                         padding: 20px;
                         spacing: 10px;
+                        UiText { text: "AutoKeyboardLayot " + root.app-version; color: Palette.foreground; font-size: 16px; font-weight: 600; }
                         UiText { text: Localization.text("packs.notice", Localization.revision); color: Palette.foreground; font-size: 14px; wrap: word-wrap; }
                         UiText { text: Localization.text("about.ui_framework", Localization.revision); color: Palette.foreground; opacity: 0.72; font-size: 13px; }
                         UiText { text: Localization.text("about.slint_license", Localization.revision); color: Palette.foreground; opacity: 0.72; font-size: 12px; wrap: word-wrap; }

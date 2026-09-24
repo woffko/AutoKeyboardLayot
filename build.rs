@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use flate2::read::GzDecoder;
 use fst::SetBuilder;
@@ -73,6 +74,10 @@ fn main() {
         println!("cargo:rerun-if-changed={}", pack.path);
         build_dictionary(*pack, &output);
     }
+    println!(
+        "cargo:rustc-env=AUTOKEY_BUILD_COMMIT={}",
+        build_commit(Path::new(env!("CARGO_MANIFEST_DIR")))
+    );
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=ui/settings.slint");
         slint_build::compile("ui/settings.slint").expect("cannot compile settings UI");
@@ -86,6 +91,35 @@ fn main() {
             println!("cargo:warning=assets/app.res is missing; executables have no icon");
         }
     }
+}
+
+/// Short source commit shown next to the package version. Builds outside a Git
+/// checkout can supply it through `AKL_BUILD_COMMIT`; otherwise it is unknown.
+fn build_commit(manifest: &Path) -> String {
+    println!("cargo:rerun-if-env-changed=AKL_BUILD_COMMIT");
+    if let Ok(commit) = std::env::var("AKL_BUILD_COMMIT")
+        && !commit.trim().is_empty()
+    {
+        return commit.trim().to_owned();
+    }
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(manifest)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    let mut watched = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+    watched.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+    for name in watched {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            println!("cargo:rerun-if-changed={}", manifest.join(path).display());
+        }
+    }
+    git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn build_dictionary(input: DictionaryInput, output: &Path) {

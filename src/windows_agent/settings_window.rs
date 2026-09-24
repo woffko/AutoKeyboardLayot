@@ -120,6 +120,7 @@ pub(super) fn run() -> Result<(), String> {
     ui.global::<Localization>()
         .on_text(|id, _revision| tr(id.as_str()).into());
     ui.global::<Localization>().set_revision(1);
+    ui.set_app_version(super::APP_VERSION.into());
     ui.global::<Localization>()
         .set_rtl(super::ui_localization::is_rtl());
     populate_ui(&ui, &document, &packages.dictionaries);

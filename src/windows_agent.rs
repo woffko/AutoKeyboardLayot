@@ -122,6 +122,13 @@ use windows::Win32::{
 
 const WINDOW_CLASS: PCWSTR = w!("AutoKeyboardLayot.ObserverWindow");
 const WINDOW_TITLE: PCWSTR = w!("AutoKeyboardLayot");
+/// Package version and short source commit, shown in the settings window.
+const APP_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("AUTOKEY_BUILD_COMMIT"),
+    ")"
+);
 const TRAY_ID: u32 = 1;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 // Composite macro from Shellapi.h (not emitted by windows-rs metadata).
