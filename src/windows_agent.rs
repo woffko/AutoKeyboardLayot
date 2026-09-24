@@ -122,6 +122,9 @@ use windows::Win32::{
 
 const WINDOW_CLASS: PCWSTR = w!("AutoKeyboardLayot.ObserverWindow");
 const WINDOW_TITLE: PCWSTR = w!("AutoKeyboardLayot");
+/// Same bound as the tracked word; longer tokens are discarded, not converted.
+const MANUAL_TOKEN_MAX_KEYS: usize = 64;
+
 /// Package version and short source commit, shown in the settings window.
 const APP_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -4772,10 +4775,11 @@ impl InputProcessor {
             self.diagnostic(
                 "hotkey",
                 format!(
-                    "sequence={} ready={released} undo_available={} buffered_chars={} deferred={}",
+                    "sequence={} ready={released} undo_available={} buffered_chars={} replay_keys={} deferred={}",
                     event.sequence,
                     self.metrics.undo_available.load(Ordering::Acquire),
                     self.session.buffered_character_count(),
+                    self.replay_keys.len(),
                     event.drain_token != 0
                 ),
             );
@@ -4982,20 +4986,18 @@ impl InputProcessor {
                 if language.is_none() {
                     self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
-                let input_event = translate_printable(event, self.modifiers).map_or(
-                    InputEvent::UnsupportedInput,
-                    |character| {
-                        if language.is_some_and(|language| {
-                            self.detector.can_extend_word(character, language)
-                        }) {
-                            InputEvent::Printable(character)
-                        } else if character.is_whitespace() || character.is_ascii_punctuation() {
-                            InputEvent::Boundary
-                        } else {
-                            InputEvent::UnsupportedInput
-                        }
-                    },
-                );
+                let printable = translate_printable(event, self.modifiers);
+                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
+                    if language
+                        .is_some_and(|language| self.detector.can_extend_word(character, language))
+                    {
+                        InputEvent::Printable(character)
+                    } else if character.is_whitespace() || character.is_ascii_punctuation() {
+                        InputEvent::Boundary
+                    } else {
+                        InputEvent::UnsupportedInput
+                    }
+                });
                 if input_event == InputEvent::UnsupportedInput {
                     self.last_word_reset = "unsupported";
                     self.diagnostic(
@@ -5017,6 +5019,8 @@ impl InputProcessor {
                     self.last_word_reset = "boundary";
                 }
                 let buffered_before = self.session.buffered_character_count();
+                let token_keys =
+                    self.take_manual_token_keys(input_event, printable.is_some(), buffered_before);
                 if matches!(input_event, InputEvent::Printable(_)) && buffered_before == 0 {
                     // Bind the manual-only mark to the word being started. Resets
                     // such as focus, mouse or layout changes discard the previous
@@ -5042,11 +5046,47 @@ impl InputProcessor {
                         self.suppress_session();
                     }
                 }
+                if let Some(keys) = token_keys {
+                    self.extend_manual_token(keys, replay_key_from_event(event, self.modifiers));
+                }
                 if boundary {
                     self.replay_keys.clear();
                     self.privacy_needs_check = true;
                 }
             }
+        }
+    }
+
+    /// Pause replays physical keys instead of looking words up, so a token
+    /// such as "IPv6" typed in the wrong layout stays available for manual
+    /// conversion. Its first unsupported character (for example a digit) still
+    /// suppresses automatic conversion until the next boundary; afterwards the
+    /// token is represented only by replay keys over a suppressed session.
+    /// Returns the keys to extend when this printable key continues the token.
+    fn take_manual_token_keys(
+        &mut self,
+        input_event: InputEvent,
+        printable: bool,
+        buffered_before: usize,
+    ) -> Option<Vec<ReplayKey>> {
+        if !printable || input_event == InputEvent::Boundary {
+            return None;
+        }
+        let suppressed = self.session.is_suppressed();
+        let continues = suppressed && !self.replay_keys.is_empty();
+        let starts = input_event == InputEvent::UnsupportedInput
+            && !suppressed
+            && self.replay_keys.len() == buffered_before;
+        (continues || starts).then(|| core::mem::take(&mut self.replay_keys))
+    }
+
+    fn extend_manual_token(&mut self, mut keys: Vec<ReplayKey>, key: Option<ReplayKey>) {
+        match key {
+            Some(key) if keys.len() < MANUAL_TOKEN_MAX_KEYS => {
+                keys.push(key);
+                self.replay_keys = keys;
+            }
+            _ => self.replay_keys.clear(),
         }
     }
 
@@ -5155,6 +5195,15 @@ impl InputProcessor {
         language: Option<Language>,
         map_to_layout: impl FnOnce(&[ReplayKey], usize) -> Option<String>,
     ) -> bool {
+        if self.session.is_suppressed() && !self.replay_keys.is_empty() {
+            // Manual token (see take_manual_token_keys). Erasing all of it
+            // returns to the token start, which was a known boundary.
+            self.replay_keys.pop();
+            if self.replay_keys.is_empty() {
+                self.session.clear();
+            }
+            return true;
+        }
         let buffered = self.session.buffered_character_count();
         if buffered != 0 {
             if self.replay_keys.len() != buffered || !self.session.erase_last_character() {
@@ -10045,6 +10094,114 @@ mod tests {
             epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
             profile_generation: processor.input_profiles.generation(),
         }
+    }
+
+    fn type_token_character(processor: &mut InputProcessor, event: InputEvent) {
+        let buffered_before = processor.session.buffered_character_count();
+        let keys = processor.take_manual_token_keys(event, true, buffered_before);
+        let action = processor
+            .session
+            .handle(event, Some(Language::English), &processor.detector);
+        if matches!(action, SessionAction::Reset(_)) {
+            processor.replay_keys.clear();
+        }
+        if matches!(event, InputEvent::Printable(_))
+            && processor.session.buffered_character_count() == buffered_before + 1
+        {
+            processor.replay_keys.push(ReplayKey {
+                scan_code: 0x22,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            });
+        }
+        if let Some(keys) = keys {
+            processor.extend_manual_token(
+                keys,
+                Some(ReplayKey {
+                    scan_code: 0x07,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn digit_keeps_the_token_for_manual_conversion_only() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        // "ШЗм6" typed in the Russian layout for "IPv6"; tested with Latin
+        // letters because only the key sequence matters here.
+        for event in [
+            InputEvent::Printable('i'),
+            InputEvent::Printable('p'),
+            InputEvent::Printable('v'),
+            InputEvent::UnsupportedInput,
+            InputEvent::Printable('x'),
+        ] {
+            type_token_character(&mut processor, event);
+        }
+        assert_eq!(processor.replay_keys.len(), 5);
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        // Automatic conversion stays suppressed for the token.
+        assert!(processor.session.is_suppressed());
+
+        // Backspace edits the token; erasing all of it reopens the boundary.
+        let event = test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0);
+        for expected in (0..5).rev() {
+            assert!(processor.erase_or_resume_word_with(
+                None,
+                event,
+                Some(Language::English),
+                |_, _| unreachable!(),
+            ));
+            assert_eq!(processor.replay_keys.len(), expected);
+        }
+        assert!(!processor.session.is_suppressed());
+
+        // A token may also start with the unsupported character.
+        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        type_token_character(&mut processor, InputEvent::Printable('t'));
+        assert_eq!(processor.replay_keys.len(), 2);
+        assert!(
+            processor
+                .take_manual_token_keys(InputEvent::Boundary, true, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manual_token_never_starts_inside_unknown_text_and_is_bounded() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        // After navigation the caret position inside the text is unknown.
+        processor
+            .session
+            .handle(InputEvent::Navigation, None, &processor.detector);
+        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        type_token_character(&mut processor, InputEvent::Printable('a'));
+        assert!(processor.replay_keys.is_empty());
+        // A key without a replay form, or an overlong token, discards it.
+        processor.session.clear();
+        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        let keys = processor.take_manual_token_keys(InputEvent::UnsupportedInput, true, 0);
+        processor.extend_manual_token(keys.unwrap(), None);
+        assert!(processor.replay_keys.is_empty());
+        processor.session.clear();
+        for _ in 0..MANUAL_TOKEN_MAX_KEYS {
+            type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        }
+        assert_eq!(processor.replay_keys.len(), MANUAL_TOKEN_MAX_KEYS);
+        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        assert!(processor.replay_keys.is_empty());
+        // Non-printable keys never extend a token.
+        assert!(
+            processor
+                .take_manual_token_keys(InputEvent::UnsupportedInput, false, 0)
+                .is_none()
+        );
     }
 
     #[test]
