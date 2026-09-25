@@ -607,6 +607,9 @@ enum ReplayAttempt {
     Applied,
     Cancelled,
     Failed,
+    /// The target layout was not confirmed before any text input was sent, so
+    /// the text is unchanged. Only perform_physical_edit reports this.
+    LayoutSwitchFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5719,7 +5722,7 @@ impl InputProcessor {
         match source_settle {
             ReplayAttempt::Applied => {}
             ReplayAttempt::Cancelled => return,
-            ReplayAttempt::Failed => {
+            ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::SourceBarrier);
                 return;
             }
@@ -5946,7 +5949,11 @@ impl InputProcessor {
         ) {
             ReplayAttempt::Applied => {}
             ReplayAttempt::Cancelled => return None,
-            ReplayAttempt::Failed => {
+            ReplayAttempt::LayoutSwitchFailed if pending.forced => {
+                self.record_manual_edit_failure("layout-switch");
+                return None;
+            }
+            ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::PhysicalEdit);
                 return None;
             }
@@ -5965,7 +5972,7 @@ impl InputProcessor {
                 self.session.clear();
                 None
             }
-            ReplayAttempt::Failed => {
+            ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::ReplayCommit);
                 None
             }
@@ -6200,6 +6207,10 @@ impl InputProcessor {
                 ) {
                     ReplayAttempt::Applied => {}
                     ReplayAttempt::Cancelled => return,
+                    ReplayAttempt::LayoutSwitchFailed => {
+                        self.record_manual_edit_failure("layout-switch");
+                        return;
+                    }
                     ReplayAttempt::Failed => {
                         self.record_conversion_failure(ConversionFailureReason::PhysicalEdit);
                         return;
@@ -6219,7 +6230,7 @@ impl InputProcessor {
                         self.session.clear();
                         return;
                     }
-                    ReplayAttempt::Failed => {
+                    ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                         self.record_conversion_failure(ConversionFailureReason::ReplayCommit);
                         return;
                     }
@@ -6367,7 +6378,9 @@ impl InputProcessor {
         );
         match switched {
             ReplayAttempt::Applied => {}
-            ReplayAttempt::Cancelled | ReplayAttempt::Failed => return TextEditAttempt::Failed,
+            ReplayAttempt::Cancelled
+            | ReplayAttempt::Failed
+            | ReplayAttempt::LayoutSwitchFailed => return TextEditAttempt::Failed,
         }
         let target_commit = self.wait_for_text_commit(
             foreground,
@@ -6420,7 +6433,10 @@ impl InputProcessor {
             .flatten();
         match self.switch_layout_and_wait(foreground, target_layout, input_sequence) {
             ReplayAttempt::Applied => {}
-            result @ (ReplayAttempt::Cancelled | ReplayAttempt::Failed) => return result,
+            ReplayAttempt::Cancelled => return ReplayAttempt::Cancelled,
+            ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
+                return ReplayAttempt::LayoutSwitchFailed;
+            }
         }
         if !self.edit_guard_is_current(foreground, input_sequence) {
             return ReplayAttempt::Failed;
@@ -6659,6 +6675,20 @@ impl InputProcessor {
 
     fn input_sequence_is_current(&self, expected: u64) -> bool {
         self.metrics.observed_input_sequence.load(Ordering::Acquire) == expected
+    }
+
+    /// A Pause conversion or undo failed before any text input was sent. The
+    /// user is watching and can press Pause again; unlike an automatic edit
+    /// failure, this says nothing about text integrity, so automatic
+    /// conversion stays enabled.
+    fn record_manual_edit_failure(&mut self, reason: &str) {
+        self.diagnostic(
+            "conversion",
+            format!("result=failed reason={reason} manual=true text=unchanged automatic=kept"),
+        );
+        self.invalidate_conversion_state();
+        self.suppress_session();
+        self.layout_switch_in_flight = None;
     }
 
     fn record_conversion_failure(&mut self, reason: ConversionFailureReason) {
@@ -10191,6 +10221,24 @@ mod tests {
                 .take_manual_token_keys(InputEvent::Boundary, true, 0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn manual_layout_switch_failure_keeps_automatic_conversion() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(metrics.clone(), 0);
+        metrics.auto_enabled.store(true, Ordering::Release);
+        buffer_test_word(&mut processor, "ghb");
+        processor.record_manual_edit_failure("layout-switch");
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(!metrics.safety_paused.load(Ordering::Acquire));
+        assert!(processor.replay_keys.is_empty());
+        assert_eq!(processor.session.buffered_character_count(), 0);
+
+        // Automatic edit failures still pause automatic conversion.
+        processor.record_conversion_failure(ConversionFailureReason::PhysicalEdit);
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(metrics.safety_paused.load(Ordering::Acquire));
     }
 
     #[test]
