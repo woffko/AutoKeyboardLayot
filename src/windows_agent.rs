@@ -4179,6 +4179,10 @@ struct InputProcessor {
     // A word resumed by erasing its delimiter is also manual-only, so erasing
     // and retyping a space never re-triggers automatic conversion.
     manual_only_word: bool,
+    // Whether the active manual token began at a known word start. A token
+    // typed after a shortcut has an unknown left context; erasing it must not
+    // re-enable automatic conversion for the following text.
+    manual_token_start_known: bool,
     // Coarse category of the last event that discarded or blocked the word
     // buffer. It never contains typed text and only explains ignored hotkeys.
     last_word_reset: &'static str,
@@ -4279,6 +4283,7 @@ impl InputProcessor {
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
             manual_only_word: false,
+            manual_token_start_known: false,
             last_word_reset: "none",
             last_boundary: None,
             transpose_cycle: None,
@@ -5062,6 +5067,11 @@ impl InputProcessor {
     /// conversion. Its first unsupported character (for example a digit) still
     /// suppresses automatic conversion until the next boundary; afterwards the
     /// token is represented only by replay keys over a suppressed session.
+    ///
+    /// Text typed right after a shortcut (for example Ctrl+C in a terminal) is
+    /// also kept as a manual token: its left context is unknown, so automatic
+    /// conversion stays suppressed, but Pause replaces exactly the keys typed
+    /// since the shortcut.
     /// Returns the keys to extend when this printable key continues the token.
     fn take_manual_token_keys(
         &mut self,
@@ -5074,10 +5084,16 @@ impl InputProcessor {
         }
         let suppressed = self.session.is_suppressed();
         let continues = suppressed && !self.replay_keys.is_empty();
-        let starts = input_event == InputEvent::UnsupportedInput
+        let starts_at_word = input_event == InputEvent::UnsupportedInput
             && !suppressed
             && self.replay_keys.len() == buffered_before;
-        (continues || starts).then(|| core::mem::take(&mut self.replay_keys))
+        let starts_after_shortcut =
+            suppressed && self.replay_keys.is_empty() && self.last_word_reset == "shortcut";
+        if starts_at_word || starts_after_shortcut {
+            self.manual_token_start_known = starts_at_word;
+        }
+        (continues || starts_at_word || starts_after_shortcut)
+            .then(|| core::mem::take(&mut self.replay_keys))
     }
 
     fn extend_manual_token(&mut self, mut keys: Vec<ReplayKey>, key: Option<ReplayKey>) {
@@ -5197,9 +5213,10 @@ impl InputProcessor {
     ) -> bool {
         if self.session.is_suppressed() && !self.replay_keys.is_empty() {
             // Manual token (see take_manual_token_keys). Erasing all of it
-            // returns to the token start, which was a known boundary.
+            // returns to the token start; only a known word start reopens
+            // automatic conversion.
             self.replay_keys.pop();
-            if self.replay_keys.is_empty() {
+            if self.replay_keys.is_empty() && self.manual_token_start_known {
                 self.session.clear();
             }
             return true;
@@ -5613,10 +5630,14 @@ impl InputProcessor {
     fn mark_privacy_dirty(&mut self, pause_now: bool) {
         self.privacy_needs_check = true;
         if pause_now {
+            // Keep the triggering category (shortcut, external input) visible
+            // in diagnostics and to manual-token handling.
+            let reset = self.last_word_reset;
             self.set_privacy_reason(
                 self.process_reason
                     .or(Some(PrivacyBlockReason::InspectionUnavailable)),
             );
+            self.last_word_reset = reset;
         }
     }
 
@@ -10170,6 +10191,50 @@ mod tests {
                 .take_manual_token_keys(InputEvent::Boundary, true, 0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn text_after_a_shortcut_is_a_manual_token_only() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        // Ctrl+C in a terminal: the shortcut suppresses the session and pauses
+        // privacy until the next key rechecks it.
+        processor.last_word_reset = "shortcut";
+        processor
+            .session
+            .handle(InputEvent::Shortcut, None, &processor.detector);
+        processor.mark_privacy_dirty(true);
+        assert_eq!(processor.last_word_reset, "shortcut");
+        processor.set_privacy_reason(None);
+        for event in [
+            InputEvent::Printable('g'),
+            InputEvent::Printable('b'),
+            InputEvent::UnsupportedInput,
+        ] {
+            type_token_character(&mut processor, event);
+        }
+        assert_eq!(processor.replay_keys.len(), 3);
+        assert!(processor.session.is_suppressed());
+        assert!(!processor.manual_token_start_known);
+
+        // Erasing it keeps automatic conversion suppressed: the left context
+        // is still unknown.
+        let event = test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0);
+        for _ in 0..3 {
+            assert!(processor.erase_or_resume_word_with(
+                None,
+                event,
+                Some(Language::English),
+                |_, _| unreachable!(),
+            ));
+        }
+        assert!(processor.replay_keys.is_empty());
+        assert!(processor.session.is_suppressed());
+
+        // Other suppression causes still do not start a token.
+        processor.last_word_reset = "external-input";
+        type_token_character(&mut processor, InputEvent::Printable('a'));
+        assert!(processor.replay_keys.is_empty());
     }
 
     #[test]
