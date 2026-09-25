@@ -4469,6 +4469,7 @@ impl InputProcessor {
         }
 
         if self.metrics.configuration_pending.load(Ordering::Acquire) {
+            self.log_word_discard("configuration", String::new());
             self.invalidate_conversion_state();
             self.session.clear();
             self.replay_keys.clear();
@@ -4477,6 +4478,7 @@ impl InputProcessor {
 
         match queued.event {
             RawInputEvent::Mouse => {
+                self.log_word_discard("mouse", String::new());
                 self.last_word_reset = "mouse";
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
@@ -4627,6 +4629,7 @@ impl InputProcessor {
     fn reset_for_epoch(&mut self, epoch: u64) {
         let dropped_events = self.metrics.dropped_events.load(Ordering::Acquire);
         let queue_overflowed = dropped_events != self.last_dropped_events;
+        self.log_word_discard("epoch", format!("overflow={queue_overflowed}"));
         self.invalidate_conversion_state();
         if queue_overflowed {
             self.session
@@ -4728,6 +4731,21 @@ impl InputProcessor {
         let foreground_key = foreground_identity_key(event.foreground);
         let language = self.language_for_layout(event.foreground.layout);
         if self.last_foreground != Some(foreground_key) {
+            if let Some((hwnd, focus, process_id)) = self.last_foreground {
+                // Handles are opaque identities; only which parts changed is
+                // recorded, to explain words split by transient focus changes.
+                self.log_word_discard(
+                    "focus",
+                    format!(
+                        "window_changed={} focus_changed={} process_changed={} focus_was_null={} focus_is_null={}",
+                        hwnd != foreground_key.0,
+                        focus != foreground_key.1,
+                        process_id != foreground_key.2,
+                        focus == 0,
+                        foreground_key.1 == 0,
+                    ),
+                );
+            }
             self.last_word_reset = "focus";
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -5274,7 +5292,24 @@ impl InputProcessor {
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
+            self.log_word_discard("switching-rule", format!("event={event:?}"));
             self.session.clear();
+        }
+    }
+
+    /// Record that a buffered word was dropped without suppressing the rest of
+    /// it, so the following letters would start a new word. Only the category
+    /// and length are logged, never text.
+    fn log_word_discard(&self, reason: &str, detail: String) {
+        let chars = self
+            .session
+            .buffered_character_count()
+            .max(self.replay_keys.len());
+        if chars != 0 {
+            self.diagnostic(
+                "word_discard",
+                format!("reason={reason} chars={chars} {detail}"),
+            );
         }
     }
 
