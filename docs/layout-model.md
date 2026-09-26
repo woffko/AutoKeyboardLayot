@@ -60,16 +60,18 @@ are synthetic measurements, not a substitute for real typing acceptance.
 
 ## Enabling it
 
-The model is off by default and has no checkbox yet. To try it:
+The model is off by default. Select **Settings → General → Experimental
+layout model for EN/RU/ET words missing from the dictionaries** and then
+Apply; clear the checkbox and Apply to return to the dictionary detector
+only. The change takes effect immediately, without restarting.
 
-1. Exit AutoKeyboardLayot from the tray menu.
-2. Open `%LOCALAPPDATA%\AutoKeyboardLayot\config.ini` and add, under
-   `[settings]`, the line `layout_model=true`.
-3. Start AutoKeyboardLayot again.
+The same switch is the `layout_model=true|false` line under `[settings]` in
+`%LOCALAPPDATA%\AutoKeyboardLayot\config.ini`. Installed interface language
+packages published before this option show its label in English until they
+are updated.
 
 It needs the English, Russian and Estonian input packs; other enabled
-languages keep using the dictionary detector only. Set `layout_model=false`
-(or remove the line) to turn it off.
+languages keep using the dictionary detector only.
 
 ## Adding other languages
 

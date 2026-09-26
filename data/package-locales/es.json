@@ -75,6 +75,7 @@
     "general.physical_fallback": "Sustitución mediante pulsaciones cuando no hay acceso UIA seguro",
     "general.recheck_erased": "Volver a comprobar la primera palabra tras borrarla por completo",
     "general.single_letter_words": "Convertir automáticamente palabras de una letra (por ejemplo z → я)",
+    "general.layout_model": "Modelo de distribución experimental para palabras EN/RU/ET que faltan en los diccionarios",
     "general.offer_exclusion": "Ofrecer excluir una palabra después de deshacer",
     "general.offer_dictionary": "Ofrecer añadir una palabra después de una conversión forzada",
     "hotkey.enabled": "Activar el atajo de teclado",

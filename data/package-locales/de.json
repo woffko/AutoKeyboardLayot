@@ -75,6 +75,7 @@
     "general.physical_fallback": "Ersetzung durch Tastendrücke ohne sicheren UIA-Zugriff",
     "general.recheck_erased": "Erstes Wort nach vollständigem Löschen erneut prüfen",
     "general.single_letter_words": "Einzelbuchstaben-Wörter automatisch umwandeln (zum Beispiel z → я)",
+    "general.layout_model": "Experimentelles Layoutmodell für EN/RU/ET-Wörter, die in den Wörterbüchern fehlen",
     "general.offer_exclusion": "Nach dem Rückgängigmachen eine Wortausnahme anbieten",
     "general.offer_dictionary": "Nach erzwungener Umwandlung einen Wörterbucheintrag anbieten",
     "hotkey.enabled": "Tastenkürzel aktivieren",

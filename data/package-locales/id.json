@@ -75,6 +75,7 @@
     "general.physical_fallback": "Penggantian melalui penekanan tombol ketika akses UIA yang aman tidak tersedia",
     "general.recheck_erased": "Periksa kembali kata pertama setelah dihapus seluruhnya",
     "general.single_letter_words": "Konversi otomatis kata satu huruf (misalnya z → я)",
+    "general.layout_model": "Model tata letak eksperimental untuk kata EN/RU/ET yang tidak ada di kamus",
     "general.offer_exclusion": "Tawarkan pengecualian kata setelah pembatalan",
     "general.offer_dictionary": "Tawarkan penambahan kata setelah konversi paksa",
     "hotkey.enabled": "Aktifkan pintasan keyboard",

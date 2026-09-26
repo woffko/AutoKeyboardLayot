@@ -29,7 +29,7 @@ pub struct Settings {
     pub physical_fallback_for_unsupported_apps: bool,
     pub single_letter_words: bool,
     /// Experimental second-stage character model for EN/RU/ET words that the
-    /// dictionary detector leaves unchanged. Configuration file only.
+    /// dictionary detector leaves unchanged.
     pub layout_model: bool,
     /// Explicitly permit manual conversion in verified terminals when only the
     /// focused field's UIA inspection is unavailable.

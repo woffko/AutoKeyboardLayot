@@ -75,6 +75,7 @@
     "general.physical_fallback": "محفوظ UIA رسائی دستیاب نہ ہونے پر کلیدیں دبانے کے ذریعے متبادل",
     "general.recheck_erased": "پہلا لفظ مکمل مٹانے کے بعد دوبارہ جانچیں",
     "general.single_letter_words": "ایک حرف کے الفاظ خودکار طور پر تبدیل کریں (مثال z → я)",
+    "general.layout_model": "لغات میں موجود نہ ہونے والے EN/RU/ET الفاظ کے لیے تجرباتی لے آؤٹ ماڈل",
     "general.offer_exclusion": "واپس کرنے کے بعد لفظ کو مستثنیٰ کرنے کی تجویز دیں",
     "general.offer_dictionary": "جبری تبدیلی کے بعد لفظ شامل کرنے کی تجویز دیں",
     "hotkey.enabled": "کی بورڈ شارٹ کٹ فعال کریں",

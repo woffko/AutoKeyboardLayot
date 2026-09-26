@@ -75,6 +75,7 @@
     "general.physical_fallback": "Remplacement par frappes lorsque l’accès UIA sécurisé est indisponible",
     "general.recheck_erased": "Revérifier le premier mot après son effacement complet",
     "general.single_letter_words": "Convertir automatiquement les mots d'une lettre (par exemple z → я)",
+    "general.layout_model": "Modèle de disposition expérimental pour les mots EN/RU/ET absents des dictionnaires",
     "general.offer_exclusion": "Proposer d’exclure un mot après l’annulation",
     "general.offer_dictionary": "Proposer d’ajouter un mot après une conversion forcée",
     "hotkey.enabled": "Activer le raccourci clavier",

@@ -252,8 +252,8 @@ languages are treated as ambiguous rather than guessed.
 An optional, experimental second stage for English, Russian and Estonian, the
 [layout model](docs/layout-model.md), corrects wrong-layout words that the
 dictionaries miss (for example inflected Estonian forms). It is off by default
-(`layout_model=true` in `config.ini` enables it); the same document explains
-how to train a model for other languages.
+and switched on or off in Settings → General; the same document explains how
+to train a model for other languages.
 
 The Windows adapter blocks known password-manager/system credential processes
 by default. Additional executable names are managed on the

@@ -75,6 +75,7 @@
     "general.physical_fallback": "الاستبدال بضغطات المفاتيح عند تعذّر الوصول الآمن عبر UIA",
     "general.recheck_erased": "إعادة فحص الكلمة الأولى بعد مسحها بالكامل",
     "general.single_letter_words": "تحويل الكلمات ذات الحرف الواحد تلقائيًا (مثال z → я)",
+    "general.layout_model": "نموذج تخطيط تجريبي لكلمات EN/RU/ET غير الموجودة في القواميس",
     "general.offer_exclusion": "اقتراح استثناء الكلمة بعد التراجع",
     "general.offer_dictionary": "اقتراح إضافة الكلمة بعد التحويل القسري",
     "hotkey.enabled": "تفعيل اختصار لوحة المفاتيح",

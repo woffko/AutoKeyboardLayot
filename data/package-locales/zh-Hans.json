@@ -79,6 +79,7 @@
     "general.physical_fallback": "无法安全访问 UIA 时，通过按键进行替换",
     "general.recheck_erased": "完全删除第一个词后重新检查",
     "general.single_letter_words": "自动转换单字母单词（例如 z → я）",
+    "general.layout_model": "对词典中没有的 EN/RU/ET 单词使用实验性布局模型",
     "general.offer_exclusion": "撤销后建议排除该词",
     "general.offer_dictionary": "强制转换后建议将词加入词典",
     "hotkey.enabled": "启用快捷键",

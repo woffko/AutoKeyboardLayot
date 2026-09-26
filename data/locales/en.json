@@ -70,6 +70,7 @@
     "general.physical_fallback": "Physical replacement when safe UIA access is unavailable",
     "general.recheck_erased": "Recheck the first word after it has been fully erased",
     "general.single_letter_words": "Automatically convert single-letter words (for example z → я)",
+    "general.layout_model": "Experimental layout model for EN/RU/ET words missing from the dictionaries",
     "general.offer_exclusion": "Offer a word exclusion after undo",
     "general.offer_dictionary": "Offer to add a word after forced conversion",
     "hotkey.enabled": "Enable the hotkey",

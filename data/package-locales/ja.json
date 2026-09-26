@@ -72,6 +72,7 @@
     "general.physical_fallback": "安全なUIAアクセスが利用できない場合にキー入力を再現する",
     "general.recheck_erased": "最初の単語を完全に消去した後、再度確認する",
     "general.single_letter_words": "1文字の単語を自動変換する（例 z → я）",
+    "general.layout_model": "辞書にない EN/RU/ET の単語に実験的な配列モデルを使う",
     "general.offer_exclusion": "元に戻した後に単語の除外を提案する",
     "general.offer_dictionary": "強制変換後に辞書への単語追加を提案する",
     "hotkey.enabled": "ホットキーを使用する",
