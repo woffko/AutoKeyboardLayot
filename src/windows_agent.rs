@@ -1388,18 +1388,39 @@ impl AppState {
         if self.shutdown.load(Ordering::Acquire) {
             return true;
         }
-        if self.correction_gate.active
-            || has_retained_input(&self.metrics)
-            || self.metrics.worker_busy.load(Ordering::Acquire)
-            || self.metrics.configuration_pending.load(Ordering::Acquire)
-            || self.metrics.undo_hotkey_active.load(Ordering::Acquire)
-            || self
-                .metrics
-                .hotkey_waiting_for_release
-                .load(Ordering::Acquire)
-        {
+        let blockers: Vec<&str> = [
+            ("correction-gate", self.correction_gate.active),
+            ("retained-input", has_retained_input(&self.metrics)),
+            (
+                "worker-busy",
+                self.metrics.worker_busy.load(Ordering::Acquire),
+            ),
+            (
+                "configuration-pending",
+                self.metrics.configuration_pending.load(Ordering::Acquire),
+            ),
+            (
+                "undo-hotkey",
+                self.metrics.undo_hotkey_active.load(Ordering::Acquire),
+            ),
+            (
+                "hotkey-release",
+                self.metrics
+                    .hotkey_waiting_for_release
+                    .load(Ordering::Acquire),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, active)| active.then_some(name))
+        .collect();
+        if !blockers.is_empty() {
+            self.gate_diagnostic(
+                "shutdown",
+                format!("result=declined blockers={}", blockers.join(",")),
+            );
             return false;
         }
+        self.gate_diagnostic("shutdown", "result=accepted".to_owned());
         self.shutdown.store(true, Ordering::Release);
         self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
         // Disconnect recv even when there is no queued event to wake it.
@@ -1785,7 +1806,10 @@ impl Drop for AppState {
     }
 }
 
-fn request_shutdown(hwnd: HWND) {
+/// `explicit` marks the tray menu Exit: a declined request is then shown in
+/// a message box, which cannot be missed like a tray notification. Installer
+/// and other WM_CLOSE requests keep the non-blocking notification.
+fn request_shutdown(hwnd: HWND, explicit: bool) {
     let accepted = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
@@ -1793,6 +1817,15 @@ fn request_shutdown(hwnd: HWND) {
     });
     if accepted {
         finish_shutdown(hwnd);
+    } else if explicit {
+        unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                &HSTRING::from(tr("lifecycle.close_busy")),
+                WINDOW_TITLE,
+                ui_localization::message_box_style(MB_OK | MB_ICONINFORMATION),
+            );
+        }
     } else {
         show_tray_information(hwnd, "AutoKeyboardLayot", tr("lifecycle.close_busy"));
     }
@@ -1812,6 +1845,21 @@ fn finish_shutdown(hwnd: HWND) -> bool {
     if finished {
         unsafe {
             let _ = DestroyWindow(hwnd);
+        }
+    } else if requested {
+        // Record once if the worker has not stopped a few seconds after an
+        // accepted shutdown; the window then stays until it does.
+        static SHUTDOWN_STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static SHUTDOWN_REPORTED: AtomicBool = AtomicBool::new(false);
+        let started = *SHUTDOWN_STARTED.get_or_init(Instant::now);
+        if started.elapsed() >= Duration::from_secs(3)
+            && !SHUTDOWN_REPORTED.swap(true, Ordering::AcqRel)
+        {
+            APP_STATE.with(|slot| {
+                if let Some(state) = slot.borrow().as_ref() {
+                    state.gate_diagnostic("shutdown", "result=waiting-for-worker".to_owned());
+                }
+            });
         }
     }
     requested
@@ -2619,13 +2667,13 @@ unsafe extern "system" fn window_proc(
                 MENU_RECOVER_INPUT_ID => arm_input_recovery(hwnd),
                 MENU_DISCARD_INPUT_ID => discard_retained_input(hwnd),
                 MENU_SETTINGS_ID => settings_window::show(hwnd),
-                MENU_EXIT_ID => request_shutdown(hwnd),
+                MENU_EXIT_ID => request_shutdown(hwnd, true),
                 _ => {}
             }
             LRESULT(0)
         }
         WM_CLOSE => {
-            request_shutdown(hwnd);
+            request_shutdown(hwnd, false);
             LRESULT(0)
         }
         WM_DESTROY => {
