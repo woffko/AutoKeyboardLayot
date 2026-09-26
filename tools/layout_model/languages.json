@@ -1,0 +1,41 @@
+{
+  "comment": "Languages of the layout model, in model order. id: input pack id; language_id: Windows layout language (LANGID, hex) as exported by export_layouts.ps1; frequency: 'wordfreq:CODE' or 'file:NAME' (a 'word count' list in the sources directory); share: how often generated sentences use it as the main language; dictionary: main and short word lists relative to the dictionary directory. noise: wordfreq codes of other languages whose words, typed on noise_layout, must stay unchanged.",
+  "languages": [
+    {
+      "id": "en-US",
+      "language_id": "0409",
+      "share": 0.4,
+      "dictionary": [
+        "en-US/words.txt.gz",
+        "en-US/common-short-words.txt"
+      ],
+      "frequency": "wordfreq:en"
+    },
+    {
+      "id": "ru-RU",
+      "language_id": "0419",
+      "share": 0.4,
+      "dictionary": [
+        "ru-RU/words.txt",
+        "ru-RU/short-words.txt"
+      ],
+      "frequency": "wordfreq:ru"
+    },
+    {
+      "id": "et-EE",
+      "language_id": "0425",
+      "share": 0.2,
+      "dictionary": [
+        "et-EE/words.txt",
+        "et-EE/short-words.txt"
+      ],
+      "frequency": "file:et_full.txt"
+    }
+  ],
+  "noise_layout": "en-US",
+  "noise": [
+    "de",
+    "fr",
+    "es"
+  ]
+}

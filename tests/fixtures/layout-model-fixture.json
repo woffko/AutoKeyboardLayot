@@ -1,0 +1,1273 @@
+[
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "as",
+   "ru-RU": "фы",
+   "et-EE": "as"
+  },
+  "context": [],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    false
+   ]
+  },
+  "probabilities": [
+   0.11387272924184799,
+   0.000103265636425931,
+   0.8860240578651428
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "b",
+   "ru-RU": "и",
+   "et-EE": "b"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.0007481590146198869,
+   0.9991931319236755,
+   5.870905806659721e-05
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "is",
+   "ru-RU": "шы",
+   "et-EE": "is"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.6852661967277527,
+   7.714734238106757e-05,
+   0.31465670466423035
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "relf",
+   "ru-RU": "куда",
+   "et-EE": "relf"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "en-US",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    true,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   5.2120067266514525e-06,
+   0.9999841451644897,
+   1.0625042705214582e-05
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "oled",
+   "ru-RU": "щдув",
+   "et-EE": "oled"
+  },
+  "context": [],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.0001898796617751941,
+   4.446463321983174e-07,
+   0.9998096823692322
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "sir",
+   "ru-RU": "ышк",
+   "et-EE": "sir"
+  },
+  "context": [
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.24798999726772308,
+   2.1700402612623293e-06,
+   0.752007782459259
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "On",
+   "ru-RU": "Щт",
+   "et-EE": "On"
+  },
+  "context": [],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    true
+   ]
+  },
+  "probabilities": [
+   0.4092053771018982,
+   7.307917258003727e-05,
+   0.5907215476036072
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "immobilier",
+   "ru-RU": "шььщишдшук",
+   "et-EE": "immobilier"
+  },
+  "context": [
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.008368149399757385,
+   5.073123361398757e-07,
+   0.9916313290596008
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "ckj;bditqcz",
+   "ru-RU": "сложившейся",
+   "et-EE": "ckjöbditqcz"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    true,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   4.7459647589676024e-07,
+   0.9999958276748657,
+   3.7205832086328883e-06
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "laps",
+   "ru-RU": "дфзы",
+   "et-EE": "laps"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    false
+   ]
+  },
+  "probabilities": [
+   0.0009422536822967231,
+   6.79659066804561e-08,
+   0.9990577101707458
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "on",
+   "ru-RU": "щт",
+   "et-EE": "on"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    true
+   ]
+  },
+  "probabilities": [
+   0.44308239221572876,
+   1.2707469068118371e-05,
+   0.5569048523902893
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "'ra",
+   "ru-RU": "экф",
+   "et-EE": "ära"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "et-EE",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    false
+   ]
+  },
+  "probabilities": [
+   6.758235304715754e-09,
+   2.1337616544769844e-06,
+   0.9999978542327881
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "to",
+   "ru-RU": "ещ",
+   "et-EE": "to"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "ru-RU",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.017301442101597786,
+   2.9870514481444843e-05,
+   0.9826686382293701
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "voyage",
+   "ru-RU": "мщнфпу",
+   "et-EE": "voyage"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.9581097364425659,
+   6.529628535645315e-07,
+   0.041889626532793045
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "souterrain",
+   "ru-RU": "ыщгеуккфшт",
+   "et-EE": "souterrain"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "ru-RU",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.14157666265964508,
+   4.5618882893450063e-08,
+   0.8584232330322266
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "rfhrfcs",
+   "ru-RU": "каркасы",
+   "et-EE": "rfhrfcs"
+  },
+  "context": [
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    true,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   1.480583932789159e-06,
+   0.9999969005584717,
+   1.7054650243153446e-06
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "so",
+   "ru-RU": "ыщ",
+   "et-EE": "so"
+  },
+  "context": [
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.9975302815437317,
+   6.444257905968698e-06,
+   0.0024633381981402636
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "commissions",
+   "ru-RU": "сщььшыышщты",
+   "et-EE": "commissions"
+  },
+  "context": [
+   "et-EE",
+   "en-US",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.6545341610908508,
+   1.194727587972011e-07,
+   0.34546568989753723
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "handeln",
+   "ru-RU": "рфтвудт",
+   "et-EE": "handeln"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   2.1230951460893266e-05,
+   3.2291854950017296e-06,
+   0.9999755620956421
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "from",
+   "ru-RU": "акщь",
+   "et-EE": "from"
+  },
+  "context": [
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.9573538303375244,
+   4.093818688488682e-07,
+   0.04264576733112335
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "rjnjhsq",
+   "ru-RU": "который",
+   "et-EE": "rjnjhsq"
+  },
+  "context": [
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    true,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   1.348989599136985e-06,
+   0.9999986886978149,
+   5.2050435073169865e-08
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "on",
+   "ru-RU": "щт",
+   "et-EE": "on"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    true
+   ]
+  },
+  "probabilities": [
+   0.39052289724349976,
+   2.2409785742638633e-05,
+   0.6094546318054199
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "it",
+   "ru-RU": "ше",
+   "et-EE": "it"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.14150367677211761,
+   0.010589000768959522,
+   0.847907304763794
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "often",
+   "ru-RU": "щаеут",
+   "et-EE": "often"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.394461452960968,
+   3.967567408835748e-06,
+   0.6055346131324768
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "nahka",
+   "ru-RU": "тфрлф",
+   "et-EE": "nahka"
+  },
+  "context": [
+   "ru-RU",
+   "en-US",
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    false
+   ]
+  },
+  "probabilities": [
+   0.0020849560387432575,
+   0.00026261433959007263,
+   0.9976524710655212
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "zeitpunkt",
+   "ru-RU": "яушезгтле",
+   "et-EE": "zeitpunkt"
+  },
+  "context": [
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.016576455906033516,
+   5.862225953023881e-05,
+   0.9833648800849915
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "K]ige",
+   "ru-RU": "Лъшпу",
+   "et-EE": "Kõige"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    false
+   ]
+  },
+  "probabilities": [
+   2.9140878154976235e-07,
+   8.975152923085261e-06,
+   0.999990701675415
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": ",jtdjt",
+   "ru-RU": "боевое",
+   "et-EE": ",jtdjt"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    true,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   3.1296472968733724e-08,
+   1.0,
+   2.8077158376049738e-08
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "Mentionner",
+   "ru-RU": "Ьутешщттук",
+   "et-EE": "Mentionner"
+  },
+  "context": [],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.08670967817306519,
+   1.6669162050675368e-06,
+   0.9132885932922363
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "ricky",
+   "ru-RU": "кшслн",
+   "et-EE": "ricky"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.3832017183303833,
+   6.880282512611302e-07,
+   0.6167975664138794
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "b",
+   "ru-RU": "и",
+   "et-EE": "b"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.0009981105104088783,
+   0.9989210367202759,
+   8.086306479526684e-05
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "nsa",
+   "ru-RU": "тыф",
+   "et-EE": "nsa"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.01590605080127716,
+   9.282636710850056e-06,
+   0.9840846061706543
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "yourself",
+   "ru-RU": "нщгкыуда",
+   "et-EE": "yourself"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.9048212766647339,
+   3.5366525708013796e-07,
+   0.09517841041088104
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "ei",
+   "ru-RU": "уш",
+   "et-EE": "ei"
+  },
+  "context": [
+   "et-EE",
+   "en-US",
+   "et-EE",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    true
+   ]
+  },
+  "probabilities": [
+   8.173611604433972e-06,
+   0.006044567096978426,
+   0.9939472675323486
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "durchgesetzt",
+   "ru-RU": "вгксрпуыуеяе",
+   "et-EE": "durchgesetzt"
+  },
+  "context": [
+   "ru-RU",
+   "ru-RU",
+   "en-US",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.014528471976518631,
+   0.0001333040272584185,
+   0.9853382110595703
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "palub",
+   "ru-RU": "зфдги",
+   "et-EE": "palub"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.00036901762359775603,
+   1.9487511337956676e-07,
+   0.9996308088302612
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "ei",
+   "ru-RU": "уш",
+   "et-EE": "ei"
+  },
+  "context": [
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    true
+   ]
+  },
+  "probabilities": [
+   1.6057809261837974e-05,
+   1.837381387304049e-05,
+   0.9999655485153198
+  ]
+ },
+ {
+  "typed": "en-US",
+  "candidates": {
+   "en-US": "out",
+   "ru-RU": "щге",
+   "et-EE": "out"
+  },
+  "context": [
+   "en-US",
+   "en-US",
+   "en-US",
+   "en-US"
+  ],
+  "flags": {
+   "en-US": [
+    true,
+    true
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   0.9807398319244385,
+   1.0075734735437436e-07,
+   0.01926005817949772
+  ]
+ },
+ {
+  "typed": "ru-RU",
+  "candidates": {
+   "en-US": "xnj",
+   "ru-RU": "что",
+   "et-EE": "xnj"
+  },
+  "context": [
+   "ru-RU",
+   "en-US",
+   "ru-RU",
+   "ru-RU"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    true,
+    true
+   ],
+   "et-EE": [
+    false,
+    false
+   ]
+  },
+  "probabilities": [
+   9.420746778232569e-07,
+   0.9999990463256836,
+   1.9525698391476e-08
+  ]
+ },
+ {
+  "typed": "et-EE",
+  "candidates": {
+   "en-US": "selge",
+   "ru-RU": "ыудпу",
+   "et-EE": "selge"
+  },
+  "context": [
+   "et-EE",
+   "et-EE",
+   "et-EE",
+   "et-EE"
+  ],
+  "flags": {
+   "en-US": [
+    false,
+    false
+   ],
+   "ru-RU": [
+    false,
+    false
+   ],
+   "et-EE": [
+    true,
+    false
+   ]
+  },
+  "probabilities": [
+   7.060655207169475e-06,
+   1.0054735932740755e-09,
+   0.9999929666519165
+  ]
+ }
+]

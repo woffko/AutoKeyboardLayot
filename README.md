@@ -249,6 +249,12 @@ thread's dead-key state. Caps Lock and extended scan codes are preserved.
 Dead-key or multi-character mappings fail closed, and two plausible target
 languages are treated as ambiguous rather than guessed.
 
+An optional, experimental second stage for English, Russian and Estonian, the
+[layout model](docs/layout-model.md), corrects wrong-layout words that the
+dictionaries miss (for example inflected Estonian forms). It is off by default
+(`layout_model=true` in `config.ini` enables it); the same document explains
+how to train a model for other languages.
+
 The Windows adapter blocks known password-manager/system credential processes
 by default. Additional executable names are managed on the
 process-exclusions page; the built-in security list cannot be removed by a
@@ -293,6 +299,7 @@ remain there even if the monitoring connection is interrupted.
 ## Third-party notices
 
 Dictionary source information and redistribution notices are included in
-`data/language-packs/`. The settings UI uses Slint. Dependency versions are pinned
+`data/language-packs/`. The layout model's data sources and license are in
+`data/layout-model/NOTICE.md`. The settings UI uses Slint. Dependency versions are pinned
 by `Cargo.lock`; upstream dependency licenses remain applicable. No project-wide
 license file has been selected for this initial source snapshot.

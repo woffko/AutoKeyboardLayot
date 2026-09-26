@@ -41,6 +41,9 @@ pub enum SessionAction {
     Reset(ResetReason),
 }
 
+/// Platform-mapped target strings and the languages of recent words.
+type MappedContext<'a> = (&'a [(Language, String)], &'a [Language]);
+
 /// Holds only the current word and volatile suppression state.
 ///
 /// Nothing in this type persists typed text or exposes it to diagnostics.
@@ -128,7 +131,19 @@ impl InputSession {
         detector: &Detector,
         candidates: &[(Language, String)],
     ) -> SessionAction {
-        self.finish_boundary(current_language, detector, Some(candidates))
+        self.finish_boundary(current_language, detector, Some((candidates, &[])))
+    }
+
+    /// As finish_boundary_with_candidates, also passing the languages (not
+    /// the text) of recent words to the optional layout model.
+    pub fn finish_boundary_in_context(
+        &mut self,
+        current_language: Option<Language>,
+        detector: &Detector,
+        candidates: &[(Language, String)],
+        previous: &[Language],
+    ) -> SessionAction {
+        self.finish_boundary(current_language, detector, Some((candidates, previous)))
     }
 
     /// Explicitly evaluate the word still under the caret without typing a
@@ -232,7 +247,7 @@ impl InputSession {
         &mut self,
         current_language: Option<Language>,
         detector: &Detector,
-        candidates: Option<&[(Language, String)]>,
+        candidates: Option<MappedContext<'_>>,
     ) -> SessionAction {
         if self.suppressed_until_boundary {
             self.current_word.clear();
@@ -252,7 +267,9 @@ impl InputSession {
         };
         let detection = candidates.map_or_else(
             || detector.detect(&word, language),
-            |candidates| detector.detect_mapped_candidates(&word, language, candidates),
+            |(candidates, previous)| {
+                detector.detect_mapped_candidates_in_context(&word, language, candidates, previous)
+            },
         );
         detection.map_or(SessionAction::None, SessionAction::Candidate)
     }

@@ -4189,6 +4189,9 @@ struct InputProcessor {
     // Coarse category of the last event that discarded or blocked the word
     // buffer. It never contains typed text and only explains ignored hotkeys.
     last_word_reset: &'static str,
+    // Languages (never text) of the most recent completed words, for the
+    // optional layout model. Cleared when the input target changes.
+    recent_languages: Vec<Language>,
     last_boundary: Option<LastBoundary>,
     transpose_cycle: Option<TransposeCycle>,
     text_edit_backend: TextEditBackend,
@@ -4240,6 +4243,13 @@ impl InputProcessor {
         detector.set_resolved_profiles(None);
         detector
             .replace_user_lexicons(configuration.user_dictionary, configuration.word_exclusions);
+        detector.set_layout_model(
+            configuration
+                .settings
+                .layout_model
+                .then(autokeyboardlayot::layout_model::embedded)
+                .flatten(),
+        );
         metrics
             .pause_break_undo
             .store(configuration.settings.pause_break_undo, Ordering::Release);
@@ -4288,6 +4298,7 @@ impl InputProcessor {
             manual_only_word: false,
             manual_token_start_known: false,
             last_word_reset: "none",
+            recent_languages: Vec::new(),
             last_boundary: None,
             transpose_cycle: None,
             text_edit_backend: TextEditBackend::ObserveOnly,
@@ -4543,6 +4554,14 @@ impl InputProcessor {
         self.detector.set_resolved_profiles(profiles.as_ref());
         self.detector
             .replace_user_lexicons(configuration.user_dictionary, configuration.word_exclusions);
+        self.detector.set_layout_model(
+            configuration
+                .settings
+                .layout_model
+                .then(autokeyboardlayot::layout_model::embedded)
+                .flatten(),
+        );
+        self.recent_languages.clear();
         self.exclusion_policy = configuration.process_exclusions;
         self.backend_rules = configuration.backend_rules;
         self.settings = configuration.settings;
@@ -4747,6 +4766,7 @@ impl InputProcessor {
                 );
             }
             self.last_word_reset = "focus";
+            self.recent_languages.clear();
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
             self.replay_keys.clear();
@@ -5174,15 +5194,32 @@ impl InputProcessor {
             })
             .unwrap_or_default();
         let transaction = if self.privacy_reason.is_none() && !manual_only {
-            if let SessionAction::Candidate(detection) = self
-                .session
-                .finish_boundary_with_candidates(language, &self.detector, &candidates)
-            {
+            if let SessionAction::Candidate(detection) = self.session.finish_boundary_in_context(
+                language,
+                &self.detector,
+                &candidates,
+                &self.recent_languages,
+            ) {
                 self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
+                // Only the stage is logged, never the word.
+                let stage = if self.detector.layout_model_enabled()
+                    && self
+                        .detector
+                        .detect_mapped_candidates(
+                            &detection.original,
+                            detection.source_language,
+                            &candidates,
+                        )
+                        .is_none()
+                {
+                    "model"
+                } else {
+                    "dictionary"
+                };
                 self.diagnostic(
                     "candidate",
                     format!(
-                        "forced=false source={} target={} original_chars={} replacement_chars={} mapped_targets={} route={:?}",
+                        "forced=false source={} target={} original_chars={} replacement_chars={} mapped_targets={} route={:?} stage={stage}",
                         detection.source_language.id(),
                         detection.target_language.id(),
                         detection.original.chars().count(),
@@ -5191,8 +5228,14 @@ impl InputProcessor {
                         self.text_edit_backend,
                     ),
                 );
+                self.remember_word_language(detection.target_language);
                 delimiter.and_then(|delimiter| ConversionTransaction::new(&detection, delimiter))
             } else {
+                if !replay_keys.is_empty()
+                    && let Some(language) = language
+                {
+                    self.remember_word_language(language);
+                }
                 None
             }
         } else {
@@ -5207,6 +5250,14 @@ impl InputProcessor {
             self.mark_privacy_dirty(false);
         }
         transaction.map(|transaction| (transaction, replay_keys))
+    }
+
+    fn remember_word_language(&mut self, language: Language) {
+        const RECENT_LANGUAGES: usize = 4;
+        if self.recent_languages.len() == RECENT_LANGUAGES {
+            self.recent_languages.remove(0);
+        }
+        self.recent_languages.push(language);
     }
 
     fn erase_or_resume_word(
@@ -10255,6 +10306,29 @@ mod tests {
             processor
                 .take_manual_token_keys(InputEvent::Boundary, true, 0)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn recent_word_languages_keep_only_the_last_four() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        for language in [
+            Language::English,
+            Language::Russian,
+            Language::Estonian,
+            Language::Russian,
+            Language::English,
+        ] {
+            processor.remember_word_language(language);
+        }
+        assert_eq!(
+            processor.recent_languages,
+            [
+                Language::Russian,
+                Language::Estonian,
+                Language::Russian,
+                Language::English
+            ]
         );
     }
 

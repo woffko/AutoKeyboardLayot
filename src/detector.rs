@@ -2,6 +2,7 @@
 
 use crate::input_capabilities::{InputBinding, bind_conservative_profile};
 use crate::language::Language;
+use crate::layout_model::{self, LayoutModel};
 use crate::{DictionaryRegistry, UserLexicon};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -10,6 +11,13 @@ use std::{
 
 const DICTIONARY_SCORE_BONUS: f32 = 10.0;
 const MINIMUM_STATISTICAL_CHARACTERS: usize = 4;
+/// Shorter words keep the dictionary detector's list-based policy.
+const LAYOUT_MODEL_MINIMUM_CHARACTERS: usize = 3;
+/// Chosen on generated EN/RU/ET typing: the model adds almost no unwanted
+/// conversions of real words at these confidences (docs/layout-model.md).
+/// Three-letter words are more often ambiguous and need more certainty.
+const LAYOUT_MODEL_THRESHOLD: f32 = 0.9;
+const LAYOUT_MODEL_SHORT_THRESHOLD: f32 = 0.97;
 
 /// Configuration for precision-first automatic detection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +72,7 @@ pub struct Detector {
     resolved_input_packs: Option<BTreeSet<Language>>,
     user_dictionary: UserLexicon,
     word_exclusions: UserLexicon,
+    layout_model: Option<Arc<LayoutModel>>,
 }
 
 impl Default for Detector {
@@ -126,6 +135,7 @@ impl Detector {
             resolved_input_packs: None,
             user_dictionary: UserLexicon::default(),
             word_exclusions: UserLexicon::default(),
+            layout_model: None,
         }
     }
 
@@ -213,6 +223,127 @@ impl Detector {
         });
         let language = matches.next()?;
         matches.next().is_none().then_some(language)
+    }
+
+    /// Enable (Some) or disable the optional second-stage layout model.
+    pub fn set_layout_model(&mut self, model: Option<Arc<LayoutModel>>) {
+        self.layout_model = model;
+    }
+
+    pub fn layout_model_enabled(&self) -> bool {
+        self.layout_model.is_some()
+    }
+
+    /// Dictionary detection first; when it leaves the word unchanged, the
+    /// optional layout model may still pick another layout. `previous` holds
+    /// the languages of recent words, never their text.
+    pub fn detect_mapped_candidates_in_context(
+        &self,
+        word: &str,
+        current_language: Language,
+        candidates: &[(Language, String)],
+        previous: &[Language],
+    ) -> Option<Detection> {
+        self.detect_mapped_candidates(word, current_language, candidates)
+            .or_else(|| self.detect_with_layout_model(word, current_language, candidates, previous))
+    }
+
+    /// Second stage. It keeps every hard rule of the dictionary detector: the
+    /// word must be long enough, not excluded and not a known word in the typed
+    /// layout, and the target must use the target language's alphabet. The
+    /// model must be sure of another layout (LAYOUT_MODEL_*THRESHOLD).
+    fn detect_with_layout_model(
+        &self,
+        word: &str,
+        current_language: Language,
+        candidates: &[(Language, String)],
+        previous: &[Language],
+    ) -> Option<Detection> {
+        let model = self.layout_model.as_ref()?;
+        self.dictionaries.active_language(current_language)?;
+        let length = word.chars().count();
+        let threshold = if length == LAYOUT_MODEL_MINIMUM_CHARACTERS {
+            LAYOUT_MODEL_SHORT_THRESHOLD
+        } else {
+            LAYOUT_MODEL_THRESHOLD
+        };
+        if length < LAYOUT_MODEL_MINIMUM_CHARACTERS
+            || self.word_exclusions.contains(current_language, word)
+        {
+            return None;
+        }
+        let lower = word.to_lowercase();
+        if self.base_dictionary_contains(current_language, &lower)
+            || self.common_short_contains(current_language, &lower)
+            || self.user_dictionary.contains(current_language, word)
+        {
+            return None;
+        }
+        let typed = model.index_of(current_language)?;
+        let texts: Vec<Option<&str>> = model
+            .languages()
+            .iter()
+            .map(|&language| {
+                if language == current_language {
+                    return Some(word);
+                }
+                self.dictionaries.active_language(language)?;
+                candidates
+                    .iter()
+                    .find(|(candidate, _)| *candidate == language)
+                    .map(|(_, text)| text.as_str())
+            })
+            .collect();
+        let lowered: Vec<Option<String>> = texts
+            .iter()
+            .map(|text| text.map(str::to_lowercase))
+            .collect();
+        let features: Vec<Option<layout_model::Candidate<'_>>> = texts
+            .iter()
+            .zip(&lowered)
+            .zip(model.languages())
+            .map(|((text, lower), &language)| {
+                let lower = lower.as_deref()?;
+                Some(layout_model::Candidate {
+                    text: (*text)?,
+                    in_dictionary: self.base_dictionary_contains(language, lower),
+                    in_short_list: self.common_short_contains(language, lower),
+                })
+            })
+            .collect();
+        let probabilities = model.probabilities(&features, typed, previous)?;
+        let (best, probability) = probabilities
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let replacement = texts[best]?;
+        let target_language = model.languages()[best];
+        if best == typed
+            || replacement == word
+            || probability < threshold
+            || !self.accepts_word(target_language, replacement)
+        {
+            return None;
+        }
+        Some(Detection {
+            source_language: current_language,
+            target_language,
+            original: word.to_owned(),
+            replacement: replacement.to_owned(),
+            source_score: score_word(
+                word,
+                current_language,
+                &self.user_dictionary,
+                &self.dictionaries,
+            ),
+            target_score: score_word(
+                replacement,
+                target_language,
+                &self.user_dictionary,
+                &self.dictionaries,
+            ),
+        })
     }
 
     pub fn replace_user_lexicons(
@@ -647,6 +778,128 @@ fn ngram_score(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_detector() -> Detector {
+        let mut detector = crate::test_support::detector();
+        detector.set_layout_model(crate::layout_model::embedded());
+        assert!(detector.layout_model_enabled());
+        detector
+    }
+
+    fn mapped(pairs: &[(Language, &str)]) -> Vec<(Language, String)> {
+        pairs
+            .iter()
+            .map(|(language, text)| (*language, (*text).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn layout_model_corrects_estonian_words_the_dictionary_misses() {
+        let detector = model_detector();
+        for (word, typed, candidates, previous, expected) in [
+            (
+                "k[simusele",
+                Language::English,
+                mapped(&[
+                    (Language::Russian, "лхышьгыуду"),
+                    (Language::Estonian, "küsimusele"),
+                ]),
+                vec![Language::English],
+                "küsimusele",
+            ),
+            (
+                "j]udma",
+                Language::English,
+                mapped(&[
+                    (Language::Russian, "оъгвьф"),
+                    (Language::Estonian, "jõudma"),
+                ]),
+                vec![Language::Estonian, Language::English],
+                "jõudma",
+            ),
+        ] {
+            assert!(
+                detector
+                    .detect_mapped_candidates(word, typed, &candidates)
+                    .is_none(),
+                "{word} is expected to need the model"
+            );
+            let detection = detector
+                .detect_mapped_candidates_in_context(word, typed, &candidates, &previous)
+                .expect("model conversion");
+            assert_eq!(detection.replacement, expected);
+            assert_eq!(detection.target_language, Language::Estonian);
+        }
+    }
+
+    #[test]
+    fn layout_model_keeps_the_dictionary_rules() {
+        let mut detector = model_detector();
+        let previous = [Language::English];
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду"),
+            (Language::Estonian, "küsimusele"),
+        ]);
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &previous,
+                )
+                .is_some()
+        );
+        // A known word of the typed layout is never converted by the model.
+        detector.replace_user_lexicons(
+            UserLexicon::from_lines(["en-US: k[simusele"]),
+            UserLexicon::default(),
+        );
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &previous,
+                )
+                .is_none()
+        );
+        // Two-letter words keep the list-based policy.
+        let short = mapped(&[(Language::Russian, "лх"), (Language::Estonian, "kü")]);
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context("k[", Language::English, &short, &[])
+                .is_none()
+        );
+        // Word exclusions and a disabled model stop it.
+        detector.replace_user_lexicons(
+            UserLexicon::default(),
+            UserLexicon::from_lines(["en-US: k[simusele"]),
+        );
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &previous,
+                )
+                .is_none()
+        );
+        detector.replace_user_lexicons(UserLexicon::default(), UserLexicon::default());
+        detector.set_layout_model(None);
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &previous,
+                )
+                .is_none()
+        );
+    }
     use crate::{DictionaryPack, PackId};
 
     fn custom_us_pack(id: PackId, profiles: &[&str]) -> DictionaryPack {

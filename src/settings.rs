@@ -28,6 +28,9 @@ pub struct Settings {
     pub recheck_first_word_after_erasing: bool,
     pub physical_fallback_for_unsupported_apps: bool,
     pub single_letter_words: bool,
+    /// Experimental second-stage character model for EN/RU/ET words that the
+    /// dictionary detector leaves unchanged. Configuration file only.
+    pub layout_model: bool,
     /// Explicitly permit manual conversion in verified terminals when only the
     /// focused field's UIA inspection is unavailable.
     pub manual_terminal_uia_fallback: bool,
@@ -57,6 +60,7 @@ impl Default for Settings {
             recheck_first_word_after_erasing: true,
             physical_fallback_for_unsupported_apps: true,
             single_letter_words: false,
+            layout_model: false,
             manual_terminal_uia_fallback: false,
             diagnostics_enabled: false,
             suppress_after_backspace: true,
@@ -176,6 +180,7 @@ impl Settings {
                     &mut settings.physical_fallback_for_unsupported_apps
                 }
                 "single_letter_words" => &mut settings.single_letter_words,
+                "layout_model" => &mut settings.layout_model,
                 "manual_terminal_uia_fallback" => &mut settings.manual_terminal_uia_fallback,
                 "diagnostics_enabled" => &mut settings.diagnostics_enabled,
                 "suppress_after_backspace" => &mut settings.suppress_after_backspace,
@@ -228,6 +233,7 @@ impl Settings {
              recheck_first_word_after_erasing={}\n\
              physical_fallback_for_unsupported_apps={}\n\
              single_letter_words={}\n\
+             layout_model={}\n\
              manual_terminal_uia_fallback={}\n\
              diagnostics_enabled={}\n\
              suppress_after_backspace={}\n\
@@ -248,6 +254,7 @@ impl Settings {
             self.recheck_first_word_after_erasing,
             self.physical_fallback_for_unsupported_apps,
             self.single_letter_words,
+            self.layout_model,
             self.manual_terminal_uia_fallback,
             self.diagnostics_enabled,
             self.suppress_after_backspace,

@@ -26,6 +26,7 @@ pub mod installer_session;
 pub mod installer_worker;
 pub mod language;
 pub mod language_package;
+pub mod layout_model;
 pub mod localization;
 pub mod package_catalog;
 pub mod package_download;
