@@ -267,6 +267,15 @@ optional diagnostics log records `phase=armed`, `phase=release_forced`,
 `phase=auto_resumed`, `event=ui_stall` (timer ticks more than 700 ms apart) and
 `event=hook_slow` (a hook callback over 50 ms).
 
+The protected-paste backend selects the word it is about to replace. If the
+selection cannot be confirmed to hold exactly that word, or the paste does not
+complete, the selection is collapsed to its end instead of being left behind to
+be typed over; a selection the user made is never touched. When the text edit is
+confirmed but the previous clipboard contents cannot be put back (restoring
+waits up to 60 ms for the clipboard), the conversion still counts as done:
+automatic conversion stays on and the diagnostics log records
+`clipboard_restored=false`.
+
 ## Language packs
 
 Pack metadata is exposed by `language::language_packs()`. Dictionary sources,

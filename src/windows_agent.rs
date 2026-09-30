@@ -162,6 +162,9 @@ const UIA_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 50;
 const NOTEPAD_REPLAY_STEP_DELAY_MS: u64 = 3;
 const NOTEPAD_REPLAY_GATE_MARGIN_MS: u64 = 200;
 const CLIPBOARD_OPEN_RETRIES: usize = 10;
+/// Putting the user's clipboard back is worth a longer wait than installing the temporary text
+/// (30 x 2 ms instead of 10 x 2 ms): a clipboard manager may hold the clipboard open for a moment.
+const CLIPBOARD_RESTORE_OPEN_RETRIES: usize = 30;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 2;
 const CLIPBOARD_BROKER_TIMEOUT_MS: u64 = 500;
 const VK_V_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -283,6 +286,8 @@ struct ObserverMetrics {
     worker_dead: AtomicBool,
     // Gate release requests made by the worker, counted before any window is involved.
     gate_release_requests: AtomicU64,
+    // Confirmed edits after which the user's previous clipboard could not be put back.
+    clipboard_restore_failures: AtomicU64,
     retained_input: Mutex<Option<RetainedInput>>,
     recovery_armed: AtomicBool,
 }
@@ -320,6 +325,7 @@ impl Default for ObserverMetrics {
             worker_busy: AtomicBool::new(false),
             worker_dead: AtomicBool::new(false),
             gate_release_requests: AtomicU64::new(0),
+            clipboard_restore_failures: AtomicU64::new(0),
             retained_input: Mutex::new(None),
             recovery_armed: AtomicBool::new(false),
         }
@@ -633,6 +639,8 @@ enum ReplayAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextEditAttempt {
     Applied,
+    /// The edit is confirmed; only the user's previous clipboard could not be restored.
+    AppliedClipboardNotRestored,
     Unsupported,
     Cancelled,
     Failed,
@@ -707,8 +715,8 @@ impl Drop for ReplayPacer {
 struct ClipboardOpenGuard;
 
 impl ClipboardOpenGuard {
-    fn open(owner: HWND) -> Option<Self> {
-        for _ in 0..CLIPBOARD_OPEN_RETRIES {
+    fn open(owner: HWND, retries: usize) -> Option<Self> {
+        for _ in 0..retries {
             if unsafe { OpenClipboard(Some(owner)).is_ok() } {
                 return Some(Self);
             }
@@ -1062,7 +1070,7 @@ fn wait_clipboard_broker_command(
 }
 
 fn install_protected_clipboard(owner: HWND, text: &str) -> bool {
-    let Some(_open) = ClipboardOpenGuard::open(owner) else {
+    let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES) else {
         return false;
     };
     let exclusion =
@@ -1128,7 +1136,7 @@ fn restore_materialized_clipboard(
     expected_sequence: Option<u32>,
     entries: &mut [MaterializedClipboardEntry],
 ) -> bool {
-    let Some(_open) = ClipboardOpenGuard::open(owner) else {
+    let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_RESTORE_OPEN_RETRIES) else {
         return false;
     };
     if expected_sequence.is_some_and(|sequence| {
@@ -3830,61 +3838,57 @@ impl PrivacyGuard {
                 return TextBarrierStatus::Mismatch;
             }
 
-            let deadline = Instant::now() + Duration::from_millis(UIA_SELECTION_CONFIRM_TIMEOUT_MS);
-            let mut saw_mismatch = false;
-            while Instant::now() < deadline {
-                let Ok(selected_ranges) = pattern.GetSelection() else {
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                };
-                if selected_ranges.Length().ok() != Some(1) {
-                    saw_mismatch = true;
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                let Ok(selected) = selected_ranges.GetElement(0) else {
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                };
-                if selected
-                    .CompareEndpoints(
-                        TextPatternRangeEndpoint_Start,
-                        &selected,
-                        TextPatternRangeEndpoint_End,
-                    )
-                    .ok()
-                    == Some(0)
-                {
-                    saw_mismatch = true;
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                if let Ok(actual) = selected.GetText(-1) {
-                    let actual = actual.to_string();
-                    self.last_barrier_report.set(classify_text_barrier(
-                        &actual,
-                        expected_text,
-                        TextBarrierStage::SelectionConfirm,
-                        moved.unwrap_or_default(),
-                    ));
-                    if text_barrier_matches(&actual, expected_text) {
-                        return TextBarrierStatus::Match;
+            let moved_units = moved.unwrap_or_default();
+            let status = confirm_selection(
+                Duration::from_millis(UIA_SELECTION_CONFIRM_TIMEOUT_MS),
+                || {
+                    let Ok(selected_ranges) = pattern.GetSelection() else {
+                        return SelectionPoll::Unreadable;
+                    };
+                    if selected_ranges.Length().ok() != Some(1) {
+                        return SelectionPoll::NotOneRange;
                     }
-                    saw_mismatch = true;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-            if saw_mismatch {
-                TextBarrierStatus::Mismatch
-            } else {
+                    let Ok(selected) = selected_ranges.GetElement(0) else {
+                        return SelectionPoll::Unreadable;
+                    };
+                    if selected
+                        .CompareEndpoints(
+                            TextPatternRangeEndpoint_Start,
+                            &selected,
+                            TextPatternRangeEndpoint_End,
+                        )
+                        .ok()
+                        == Some(0)
+                    {
+                        return SelectionPoll::Empty;
+                    }
+                    match selected.GetText(-1) {
+                        Ok(actual) => {
+                            let actual = actual.to_string();
+                            self.last_barrier_report.set(classify_text_barrier(
+                                &actual,
+                                expected_text,
+                                TextBarrierStage::SelectionConfirm,
+                                moved_units,
+                            ));
+                            SelectionPoll::Text(actual)
+                        }
+                        Err(_) => SelectionPoll::Unreadable,
+                    }
+                },
+                |actual| text_barrier_matches(actual, expected_text),
+                || thread::sleep(Duration::from_millis(1)),
+                || self.collapse_selection_to_end(expected_process_id),
+            );
+            if status == TextBarrierStatus::Unavailable {
                 self.last_barrier_report.set(TextBarrierReport {
                     stage: TextBarrierStage::SelectionConfirm,
                     expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or_default(),
+                    moved_units,
                     ..TextBarrierReport::default()
                 });
-                TextBarrierStatus::Unavailable
             }
+            status
         }
     }
 
@@ -4080,6 +4084,69 @@ fn text_barrier_matches(actual: &str, expected: &str) -> bool {
         .strip_suffix(' ')
         .zip(actual.strip_suffix('\u{00a0}'))
         .is_some_and(|(expected_word, actual_word)| expected_word == actual_word)
+}
+
+/// What one poll of the selection found after the selection was made.
+enum SelectionPoll {
+    /// Reading the selection failed; try again.
+    Unreadable,
+    /// The selection does not consist of exactly one range.
+    NotOneRange,
+    /// The selection is empty.
+    Empty,
+    /// The text of the selected range.
+    Text(String),
+}
+
+/// Confirms that the selection made by `Select()` holds the expected text, polling until
+/// `timeout`. Every outcome but `Match` collapses the selection, exactly once: the selection is
+/// ours, made a moment ago, and must not be left behind to be typed over. This runs only after
+/// our own successful `Select()`, so a selection the user made is never collapsed.
+fn confirm_selection(
+    timeout: Duration,
+    mut poll: impl FnMut() -> SelectionPoll,
+    text_matches: impl Fn(&str) -> bool,
+    mut sleep: impl FnMut(),
+    collapse: impl FnOnce(),
+) -> TextBarrierStatus {
+    let deadline = Instant::now() + timeout;
+    let mut saw_mismatch = false;
+    let status = loop {
+        if Instant::now() >= deadline {
+            break if saw_mismatch {
+                TextBarrierStatus::Mismatch
+            } else {
+                TextBarrierStatus::Unavailable
+            };
+        }
+        match poll() {
+            SelectionPoll::Unreadable => {}
+            SelectionPoll::NotOneRange | SelectionPoll::Empty => saw_mismatch = true,
+            SelectionPoll::Text(actual) => {
+                if text_matches(&actual) {
+                    break TextBarrierStatus::Match;
+                }
+                saw_mismatch = true;
+            }
+        }
+        sleep();
+    };
+    if status != TextBarrierStatus::Match {
+        collapse();
+    }
+    status
+}
+
+/// The result of a protected paste whose text edit and clipboard restoration are known.
+const fn protected_paste_outcome(
+    target_confirmed: bool,
+    clipboard_restored: bool,
+) -> TextEditAttempt {
+    match (target_confirmed, clipboard_restored) {
+        (true, true) => TextEditAttempt::Applied,
+        (true, false) => TextEditAttempt::AppliedClipboardNotRestored,
+        (false, _) => TextEditAttempt::Failed,
+    }
 }
 
 fn barrier_character_class(character: Option<char>) -> BarrierCharacterClass {
@@ -6324,21 +6391,19 @@ impl InputProcessor {
         let edit_strategy = match self.text_edit_backend {
             TextEditBackend::ObserveOnly => return,
             TextEditBackend::ProtectedPaste => {
-                match self.perform_protected_paste(
+                let attempt = self.perform_protected_paste(
                     pending.foreground,
                     boundary_sequence,
                     pending.source_layout,
                     target_layout,
                     &pending.transaction.undo.insert_text,
                     &pending.transaction.forward.insert_text,
-                ) {
-                    TextEditAttempt::Applied => EditStrategy::ProtectedPaste,
-                    TextEditAttempt::Cancelled => return,
-                    TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
-                        self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
-                        return;
-                    }
-                }
+                );
+                let Some(strategy) = self.apply_paste_attempt_result(attempt, boundary_sequence)
+                else {
+                    return;
+                };
+                strategy
             }
             TextEditBackend::PhysicalReplay => {
                 let Some(strategy) =
@@ -6388,7 +6453,11 @@ impl InputProcessor {
                             ),
                         );
                         match attempt {
-                            TextEditAttempt::Applied => {
+                            TextEditAttempt::Applied
+                            | TextEditAttempt::AppliedClipboardNotRestored => {
+                                if attempt == TextEditAttempt::AppliedClipboardNotRestored {
+                                    self.note_clipboard_not_restored(boundary_sequence);
+                                }
                                 self.metrics
                                     .backend_status
                                     .store(BACKEND_PROTECTED_PASTE, Ordering::Release);
@@ -6747,20 +6816,19 @@ impl InputProcessor {
                 else {
                     return;
                 };
-                match self.perform_protected_paste(
+                let attempt = self.perform_protected_paste(
                     record.foreground,
                     pause_sequence,
                     current_layout,
                     source_layout,
                     &record.transaction.forward.insert_text,
                     &record.transaction.undo.insert_text,
-                ) {
-                    TextEditAttempt::Applied => {}
-                    TextEditAttempt::Cancelled => return,
-                    TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
-                        self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
-                        return;
-                    }
+                );
+                if self
+                    .apply_paste_attempt_result(attempt, pause_sequence)
+                    .is_none()
+                {
+                    return;
                 }
             }
             EditStrategy::PhysicalReplay => {
@@ -6933,6 +7001,12 @@ impl InputProcessor {
         let clipboard_restored = clipboard.restore();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
         if !matches!(paste_commit, ReplayAttempt::Applied) {
+            // The paste may not have replaced the selected word: do not leave our selection behind,
+            // unless the user has already moved on.
+            if self.edit_guard_is_current(foreground, input_sequence) {
+                self.privacy_guard
+                    .collapse_selection_to_end(foreground.process_id);
+            }
             return TextEditAttempt::Failed;
         }
         let switched = self.switch_layout_and_wait(foreground, target_layout, input_sequence);
@@ -6957,12 +7031,43 @@ impl InputProcessor {
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=target_commit result={target_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
-        let target_confirmed = matches!(target_commit, ReplayAttempt::Applied);
-        if clipboard_restored && target_confirmed {
-            TextEditAttempt::Applied
-        } else {
-            TextEditAttempt::Failed
+        protected_paste_outcome(
+            matches!(target_commit, ReplayAttempt::Applied),
+            clipboard_restored,
+        )
+    }
+
+    /// Decides what a finished paste attempt means for the conversion. `Some` carries the strategy
+    /// to record when the text edit was made. A confirmed edit whose clipboard could not be
+    /// restored still counts as success (policy D2): it is logged and counted, and automatic
+    /// conversion stays on.
+    fn apply_paste_attempt_result(
+        &mut self,
+        attempt: TextEditAttempt,
+        sequence: u64,
+    ) -> Option<EditStrategy> {
+        match attempt {
+            TextEditAttempt::Applied => Some(EditStrategy::ProtectedPaste),
+            TextEditAttempt::AppliedClipboardNotRestored => {
+                self.note_clipboard_not_restored(sequence);
+                Some(EditStrategy::ProtectedPaste)
+            }
+            TextEditAttempt::Cancelled => None,
+            TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
+                self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
+                None
+            }
         }
+    }
+
+    fn note_clipboard_not_restored(&self, sequence: u64) {
+        self.metrics
+            .clipboard_restore_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.diagnostic(
+            "paste",
+            format!("sequence={sequence} clipboard_restored=false edit=confirmed"),
+        );
     }
 
     fn perform_physical_edit(
@@ -9274,6 +9379,140 @@ mod tests {
         );
     }
 
+    fn scripted_polls(polls: Vec<SelectionPoll>) -> impl FnMut() -> SelectionPoll {
+        let mut polls = std::collections::VecDeque::from(polls);
+        move || polls.pop_front().unwrap_or(SelectionPoll::Unreadable)
+    }
+
+    #[test]
+    fn a_confirmed_selection_is_kept_and_every_other_outcome_collapses_it_exactly_once() {
+        let text = |value: &str| SelectionPoll::Text(value.to_owned());
+        // (path, scripted polls; an exhausted script reads as unreadable, expected status, collapses)
+        let cases = [
+            (
+                "match at once",
+                vec![text("ghbdtn")],
+                TextBarrierStatus::Match,
+                0,
+            ),
+            (
+                "unreadable, then match",
+                vec![
+                    SelectionPoll::Unreadable,
+                    SelectionPoll::Unreadable,
+                    text("ghbdtn"),
+                ],
+                TextBarrierStatus::Match,
+                0,
+            ),
+            (
+                "mismatch, then match",
+                vec![text("other"), text("ghbdtn")],
+                TextBarrierStatus::Match,
+                0,
+            ),
+            (
+                "the selected text never matches",
+                vec![text("other")],
+                TextBarrierStatus::Mismatch,
+                1,
+            ),
+            (
+                "the selection is empty",
+                vec![SelectionPoll::Empty],
+                TextBarrierStatus::Mismatch,
+                1,
+            ),
+            (
+                "the selection is not one range",
+                vec![SelectionPoll::NotOneRange],
+                TextBarrierStatus::Mismatch,
+                1,
+            ),
+            (
+                "the selection stays unreadable",
+                vec![],
+                TextBarrierStatus::Unavailable,
+                1,
+            ),
+        ];
+        for (path, polls, expected, collapses) in cases {
+            let collapsed = Cell::new(0);
+            let status = confirm_selection(
+                Duration::from_millis(40),
+                scripted_polls(polls),
+                |actual| actual == "ghbdtn",
+                || thread::sleep(Duration::from_millis(1)),
+                || collapsed.set(collapsed.get() + 1),
+            );
+            assert_eq!(status, expected, "{path}");
+            assert_eq!(collapsed.get(), collapses, "{path}: collapses");
+        }
+    }
+
+    #[test]
+    fn a_confirmed_edit_with_an_unrestored_clipboard_is_not_a_failure() {
+        assert_eq!(
+            protected_paste_outcome(true, true),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            protected_paste_outcome(true, false),
+            TextEditAttempt::AppliedClipboardNotRestored
+        );
+        assert_eq!(
+            protected_paste_outcome(false, true),
+            TextEditAttempt::Failed
+        );
+        assert_eq!(
+            protected_paste_outcome(false, false),
+            TextEditAttempt::Failed
+        );
+        // Restoring the user's clipboard waits three times as long as installing the temporary text.
+        assert_eq!(CLIPBOARD_RESTORE_OPEN_RETRIES, 3 * CLIPBOARD_OPEN_RETRIES);
+        assert_eq!(
+            CLIPBOARD_RESTORE_OPEN_RETRIES as u64 * CLIPBOARD_RETRY_DELAY_MS,
+            60
+        );
+    }
+
+    #[test]
+    fn an_unrestored_clipboard_keeps_automatic_conversion_on_but_a_failed_edit_pauses_it() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        assert_eq!(
+            processor.apply_paste_attempt_result(TextEditAttempt::Applied, 5),
+            Some(EditStrategy::ProtectedPaste)
+        );
+        assert_eq!(
+            metrics.clipboard_restore_failures.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            processor.apply_paste_attempt_result(TextEditAttempt::AppliedClipboardNotRestored, 6),
+            Some(EditStrategy::ProtectedPaste)
+        );
+        assert_eq!(
+            metrics.clipboard_restore_failures.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            processor.apply_paste_attempt_result(TextEditAttempt::Cancelled, 7),
+            None
+        );
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            processor.apply_paste_attempt_result(TextEditAttempt::Failed, 8),
+            None
+        );
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::ClipboardEdit as u8
+        );
+    }
+
     #[test]
     fn events_that_did_not_arm_a_gate_request_no_release() {
         let cases = [
@@ -9707,7 +9946,7 @@ mod tests {
     }
 
     fn test_clipboard_formats(owner: HWND) -> Option<Vec<u32>> {
-        let _open = ClipboardOpenGuard::open(owner)?;
+        let _open = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES)?;
         let mut formats = Vec::new();
         let mut previous = 0;
         loop {
@@ -9724,7 +9963,7 @@ mod tests {
     }
 
     fn test_clipboard_unicode(owner: HWND) -> Option<String> {
-        let _open = ClipboardOpenGuard::open(owner)?;
+        let _open = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES)?;
         let handle = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()? };
         let memory = HGLOBAL(handle.0);
         let text = unsafe { GlobalLock(memory) }.cast::<u16>();
