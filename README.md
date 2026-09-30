@@ -276,6 +276,14 @@ waits up to 60 ms for the clipboard), the conversion still counts as done:
 automatic conversion stays on and the diagnostics log records
 `clipboard_restored=false`.
 
+The privacy check asks Windows UI Automation about the focused field from a
+dedicated provider thread. If that provider stops answering (a call that never
+returns), every later check used to report "queue busy" and privacy stayed
+unavailable for good. A provider that keeps the queue busy for 5 seconds is now
+abandoned and replaced by a fresh one on a new thread, at most three times; the
+diagnostics log records `event=probe respawned=N`, and the hung thread is never
+joined.
+
 ## Language packs
 
 Pack metadata is exposed by `language::language_packs()`. Dictionary sources,

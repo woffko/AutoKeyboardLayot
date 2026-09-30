@@ -179,6 +179,9 @@ const PRIVACY_ALLOWED: u8 = 0;
 // Give ordinary delayed replies more headroom before failing closed.
 const PRIVACY_PROBE_WAIT_MS: u64 = 300;
 const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
+/// A privacy provider that keeps the probe busy this long without answering is replaced.
+const PRIVACY_PROBE_STUCK_AFTER_SECS: u64 = 5;
+const PRIVACY_PROBE_MAX_RESPAWNS: usize = 3;
 /// A hook callback slower than this is recorded; Windows gives hooks a tight time budget.
 const HOOK_SLOW_DIAGNOSTIC_MS: u64 = 50;
 /// Timer ticks are 250 ms apart; a longer gap means the UI thread was blocked.
@@ -4657,6 +4660,8 @@ struct InputProcessor {
     last_gate_release_token: u64,
     // Policy D1: how often automatic conversion may resume after a recovered gate abort.
     auto_resumes: RateLimit,
+    // Replacements of the privacy provider that were already logged.
+    reported_probe_respawns: u32,
 }
 
 impl InputProcessor {
@@ -4721,19 +4726,27 @@ impl InputProcessor {
             session,
             modifiers: Modifiers::default(),
             privacy_guard: PrivacyGuard::new(),
-            privacy_probe: BoundedProbe::spawn("autokey-privacy", || {
-                let guard = PrivacyGuard::new();
-                move |(foreground, _epoch): (ForegroundContext, u64)| {
-                    if !foreground_identity_matches(foreground) {
-                        return Some(PrivacyBlockReason::InspectionUnavailable);
+            // A UIA call that never returns would leave every later check "queue busy" and
+            // privacy unavailable for good. A provider stuck for 5 s is replaced by a fresh one,
+            // built on a new thread (its COM objects are created there), at most three times.
+            privacy_probe: BoundedProbe::spawn_resilient(
+                "autokey-privacy",
+                || {
+                    let guard = PrivacyGuard::new();
+                    move |(foreground, _epoch): (ForegroundContext, u64)| {
+                        if !foreground_identity_matches(foreground) {
+                            return Some(PrivacyBlockReason::InspectionUnavailable);
+                        }
+                        let reason = guard.inspect(foreground.process_id);
+                        if !foreground_identity_matches(foreground) {
+                            return Some(PrivacyBlockReason::InspectionUnavailable);
+                        }
+                        reason
                     }
-                    let reason = guard.inspect(foreground.process_id);
-                    if !foreground_identity_matches(foreground) {
-                        return Some(PrivacyBlockReason::InspectionUnavailable);
-                    }
-                    reason
-                }
-            })
+                },
+                Duration::from_secs(PRIVACY_PROBE_STUCK_AFTER_SECS),
+                PRIVACY_PROBE_MAX_RESPAWNS,
+            )
             .ok(),
             exclusion_policy: configuration.process_exclusions,
             backend_rules: configuration.backend_rules,
@@ -4766,6 +4779,7 @@ impl InputProcessor {
             gate_window,
             last_gate_release_token: 0,
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
+            reported_probe_respawns: 0,
         }
     }
 
@@ -6166,6 +6180,17 @@ impl InputProcessor {
         )
     }
 
+    /// Records each replacement of a stuck privacy provider once.
+    fn report_probe_respawn(&mut self) {
+        let Some(respawns) = self.privacy_probe.as_ref().map(BoundedProbe::respawn_count) else {
+            return;
+        };
+        if respawns != self.reported_probe_respawns {
+            self.reported_probe_respawns = respawns;
+            self.diagnostic("probe", format!("respawned={respawns}"));
+        }
+    }
+
     fn evaluate_privacy(&mut self, foreground: ForegroundContext) {
         self.refresh_process_policy(foreground.process_id);
         let started = Instant::now();
@@ -6196,6 +6221,7 @@ impl InputProcessor {
                 ),
             }
         };
+        self.report_probe_respawn();
         // A late safe reply cannot authorize a different focus or input epoch.
         if self.metrics.input_epoch.load(Ordering::Acquire) != epoch
             || !foreground_identity_matches(foreground)
