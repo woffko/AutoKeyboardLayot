@@ -160,10 +160,14 @@ key without suppressing that first word.
 
 ## Privacy boundary
 
-The process retains at most the current word in volatile memory. It does not
-write typed text to logs, configuration, diagnostics, or network services.
-Unsupported input, editing, navigation, focus changes, layout changes, and
-queue overflow clear or suppress the current context.
+The process retains at most the current word in volatile memory, plus the
+physical keys of a word that is being converted by hand (at most 64 key scan
+codes, kept only until the next word boundary or reset). While the correction
+gate is armed after a Space, up to 256 key events are held in memory for at
+most 1.2 seconds and then replayed unchanged. None of this is written to logs,
+configuration, diagnostics, or network services. Unsupported input, editing,
+navigation, focus changes, layout changes, and queue overflow clear or suppress
+the current context.
 
 For the protected-paste backend, the replacement is placed on the global
 clipboard only for the bounded paste transaction. The item opts out of Windows
@@ -225,10 +229,14 @@ never include the typed source or replacement.
 
 `diagnostics_enabled` is off by default. When explicitly enabled, a dedicated
 bounded queue writes `%LOCALAPPDATA%\AutoKeyboardLayot\diagnostics.log`. The
-log contains timestamps, process basename/PID, backend stages, language IDs,
-character counts, gate results, and edit outcomes. It never records words,
-clipboard contents, window titles, URLs, or message text. The file rotates at
-1 MiB and has no network transport.
+log contains timestamps, process basename and PID, backend stages, language
+IDs, word lengths, gate results, edit outcomes, reset and discard categories,
+and the reasons that blocked a shutdown. It never records key codes, scan
+codes, characters, words, clipboard contents, window titles, URLs, file names,
+or message text; the test `diagnostics_never_log_key_identity` checks every
+diagnostic format string. The file rotates at 1 MiB and has no network
+transport. Earlier builds logged the virtual-key code of unsupported keys
+(including digits) as `vk=`; delete `diagnostics*.log` files written by them.
 
 ## Language packs
 

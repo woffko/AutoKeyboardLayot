@@ -5094,13 +5094,7 @@ impl InputProcessor {
                 });
                 if input_event == InputEvent::UnsupportedInput {
                     self.last_word_reset = "unsupported";
-                    self.diagnostic(
-                        "input",
-                        format!(
-                            "result=suppressed reason=unsupported vk={}",
-                            event.virtual_key
-                        ),
-                    );
+                    self.diagnostic("input", "result=suppressed reason=unsupported".to_owned());
                 }
                 if matches!(input_event, InputEvent::Printable(_)) {
                     // A new word has started; the previous word is no longer the
@@ -5391,7 +5385,7 @@ impl InputProcessor {
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
-            self.log_word_discard("switching-rule", format!("event={event:?}"));
+            self.log_word_discard("switching-rule", format!("event={}", event.category()));
             self.session.clear();
         }
     }
@@ -6818,7 +6812,7 @@ impl InputProcessor {
     fn record_manual_edit_failure(&mut self, reason: &str) {
         self.diagnostic(
             "conversion",
-            format!("result=failed reason={reason} manual=true text=unchanged automatic=kept"),
+            format!("result=failed reason={reason} manual=true edit=none automatic=kept"),
         );
         self.invalidate_conversion_state();
         self.suppress_session();

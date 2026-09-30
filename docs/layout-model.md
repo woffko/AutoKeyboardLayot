@@ -33,8 +33,10 @@ converted only when all of the following hold:
 5. the model is at least 90% sure of another layout (97% for three-letter
    words).
 
-Nothing typed is stored, logged or sent anywhere. Diagnostics record only
-`stage=model` or `stage=dictionary` next to the existing candidate counters.
+Typed text is processed in memory only: it is never written to disk, logged or
+sent anywhere. Diagnostics record only `stage=model` or `stage=dictionary` next
+to the existing candidate counters, never the word, its characters or key
+codes.
 
 ## Measured effect
 
