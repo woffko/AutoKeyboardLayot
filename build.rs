@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use flate2::read::GzDecoder;
 use fst::SetBuilder;
+
+#[path = "build_support.rs"]
+mod build_support;
 
 const PACKS: &[DictionaryInput] = &[
     DictionaryInput::gzip("en-US", "data/language-packs/en-US/words.txt.gz"),
@@ -93,8 +95,9 @@ fn main() {
     }
 }
 
-/// Short source commit shown next to the package version. Builds outside a Git
-/// checkout can supply it through `AKL_BUILD_COMMIT`; otherwise it is unknown.
+/// Short source commit shown next to the package version, with `-dirty` appended when a tracked
+/// build input differs from it. Builds outside a Git checkout can supply the label through
+/// `AKL_BUILD_COMMIT`; otherwise it is unknown.
 fn build_commit(manifest: &Path) -> String {
     println!("cargo:rerun-if-env-changed=AKL_BUILD_COMMIT");
     if let Ok(commit) = std::env::var("AKL_BUILD_COMMIT")
@@ -102,27 +105,35 @@ fn build_commit(manifest: &Path) -> String {
     {
         return commit.trim().to_owned();
     }
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .args(args)
-            .current_dir(manifest)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|text| !text.is_empty())
-    };
+    // The dirty flag must follow edits, so the script re-runs when any build input changes.
+    for input in build_support::BUILD_INPUTS {
+        println!("cargo:rerun-if-changed={input}");
+    }
     let mut watched = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
-    watched.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+    watched.extend(build_support::git(
+        manifest,
+        &["symbolic-ref", "-q", "HEAD"],
+    ));
     for name in watched {
-        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+        if let Some(path) = build_support::git(manifest, &["rev-parse", "--git-path", &name]) {
             println!("cargo:rerun-if-changed={}", manifest.join(path).display());
         }
     }
-    git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
+    build_support::describe_checkout(manifest).unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn build_dictionary(input: DictionaryInput, output: &Path) {
+    let path = output.join(format!("{}.fst", input.id));
+    // Building is slow and the script re-runs whenever any build input changes (see
+    // `build_commit`), so an FST that is newer than its word list and the build logic is kept.
+    let sources = [
+        Path::new(input.path),
+        Path::new("build.rs"),
+        Path::new("build_support.rs"),
+    ];
+    if build_support::is_up_to_date(&path, &sources) {
+        return;
+    }
     let content = read_dictionary(input);
 
     let mut words = Vec::new();
@@ -155,10 +166,11 @@ fn build_dictionary(input: DictionaryInput, output: &Path) {
     words.sort_unstable();
     words.dedup();
 
-    let path = output.join(format!("{}.fst", input.id));
+    // Write to a temporary file first: a half-written FST would look up to date.
+    let temporary = output.join(format!("{}.fst.tmp", input.id));
     let writer = BufWriter::new(
-        File::create(&path)
-            .unwrap_or_else(|error| panic!("cannot create {}: {error}", path.display())),
+        File::create(&temporary)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", temporary.display())),
     );
     let mut builder = SetBuilder::new(writer)
         .unwrap_or_else(|error| panic!("cannot create FST for {}: {error}", input.id));
@@ -170,6 +182,8 @@ fn build_dictionary(input: DictionaryInput, output: &Path) {
     builder
         .finish()
         .unwrap_or_else(|error| panic!("cannot finish FST for {}: {error}", input.id));
+    std::fs::rename(&temporary, &path)
+        .unwrap_or_else(|error| panic!("cannot publish {}: {error}", path.display()));
 }
 
 fn read_dictionary(input: DictionaryInput) -> String {

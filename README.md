@@ -308,6 +308,12 @@ with a `summary.txt`, and the test counts may not fall below recorded floors.
 `--keep-going` runs every step after a failure; `--list` and `--only` show and
 select steps.
 
+The settings window and About page show the version as `0.1.0 (abc1234)`, where
+`abc1234` is the source commit. A build whose tracked source files (`src`,
+`data`, `ui`, `assets`, `Cargo.toml`, `Cargo.lock`, `build.rs`) differ from that
+commit shows `abc1234-dirty`; builds outside a Git checkout can set
+`AKL_BUILD_COMMIT` and otherwise show `unknown`.
+
 `tools/verify-windows.ps1` runs native format/tests/Clippy/release checks, using
 an isolated temporary profile for adapter tests. `tools/start-windows-build.ps1`
 launches that script independently of SSH through WMI and monitors its result.

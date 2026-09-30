@@ -5270,8 +5270,18 @@ impl InputProcessor {
                         self.text_edit_backend,
                     ),
                 );
-                self.remember_word_language(detection.target_language);
-                delimiter.and_then(|delimiter| ConversionTransaction::new(&detection, delimiter))
+                let transaction = delimiter
+                    .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter));
+                // The following words see this one as the target language only when the
+                // conversion will be attempted; otherwise the text stays as typed.
+                let attempted =
+                    transaction.is_some() && self.metrics.auto_enabled.load(Ordering::Acquire);
+                self.remember_word_language(if attempted {
+                    detection.target_language
+                } else {
+                    detection.source_language
+                });
+                transaction
             } else {
                 if !replay_keys.is_empty()
                     && let Some(language) = language
@@ -6822,6 +6832,9 @@ impl InputProcessor {
     fn record_conversion_failure(&mut self, reason: ConversionFailureReason) {
         self.diagnostic("conversion", format!("result=failed reason={reason:?}"));
         self.invalidate_conversion_state();
+        // What the failed edit left in the document is uncertain, so the recent
+        // words no longer describe it.
+        self.recent_languages.clear();
         self.suppress_session();
         self.layout_switch_in_flight = None;
         if !self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
@@ -10372,6 +10385,56 @@ mod tests {
                 Language::English
             ]
         );
+    }
+
+    fn type_wrong_layout_word(processor: &mut InputProcessor) {
+        for (character, scan_code) in "ghbdtn".chars().zip([0x22, 0x23, 0x30, 0x20, 0x14, 0x31]) {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+            processor.replay_keys.push(ReplayKey {
+                scan_code,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            });
+        }
+    }
+
+    #[test]
+    fn a_finished_word_counts_as_the_target_language_only_when_a_conversion_is_attempted() {
+        // (automatic conversion on, delimiter, language the next words see)
+        let cases = [
+            (true, Some(' '), Language::Russian),
+            (false, Some(' '), Language::English),
+            (true, None, Language::English),
+            (false, None, Language::English),
+        ];
+        for (automatic, delimiter, expected) in cases {
+            let metrics = Arc::new(ObserverMetrics::default());
+            metrics.auto_enabled.store(automatic, Ordering::Release);
+            let mut processor = InputProcessor::new(metrics, 0);
+            processor.set_privacy_reason(None);
+            type_wrong_layout_word(&mut processor);
+            let conversion = processor.handle_boundary(Some(Language::English), delimiter, false);
+            assert_eq!(conversion.is_some(), delimiter.is_some());
+            assert_eq!(
+                processor.recent_languages,
+                [expected],
+                "automatic={automatic} delimiter={delimiter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conversion_failure_forgets_the_recent_word_languages() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.remember_word_language(Language::Russian);
+        processor.remember_word_language(Language::English);
+        processor.record_conversion_failure(ConversionFailureReason::PhysicalEdit);
+        assert!(processor.recent_languages.is_empty());
     }
 
     #[test]
