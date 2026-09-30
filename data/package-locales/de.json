@@ -158,6 +158,8 @@
     "fault.title": "Automatische Umwandlung nach einem internen Fehler pausiert",
     "fault.engine": "Ein interner Fehler wurde abgefangen, die automatische Umwandlung ist jetzt aus. Das Tippen ist nicht betroffen. Einzelheiten stehen in crash.log im Profilordner von AutoKeyboardLayot. Schalten Sie die automatische Umwandlung über das Tray-Menü wieder ein.",
     "fault.worker_stopped": "Die Umwandlungs-Engine hat nach wiederholten internen Fehlern angehalten. Die automatische Umwandlung ist aus, das Tippen ist nicht betroffen. Starten Sie AutoKeyboardLayot neu; Einzelheiten stehen in crash.log im Profilordner.",
+    "hooks.unstable_title": "Die Tastatur-Hooks sind instabil",
+    "hooks.unstable_body": "AutoKeyboardLayot hat seine Tastatur-Hooks in kurzer Zeit mehrfach repariert oder konnte sie nicht erneut installieren. Die automatische Umwandlung kann einzelne Eingaben verpassen. Starten Sie AutoKeyboardLayot neu, wenn das anhält.",
     "tray.active": "Automatische Umwandlung eingeschaltet",
     "tray.disabled": "Automatische Umwandlung ausgeschaltet",
     "menu.auto_on": "Automatische Umwandlung: EIN",

@@ -175,6 +175,8 @@
     "fault.title": "Automatic conversion paused after an internal error",
     "fault.engine": "An internal error was contained and automatic conversion is now off. Typing is not affected. Details are in crash.log in the AutoKeyboardLayot profile folder. Turn automatic conversion back on from the tray menu.",
     "fault.worker_stopped": "The conversion engine stopped after repeated internal errors. Automatic conversion is off and typing is not affected. Restart AutoKeyboardLayot; details are in crash.log in its profile folder.",
+    "hooks.unstable_title": "Keyboard hooks are unstable",
+    "hooks.unstable_body": "AutoKeyboardLayot repaired its keyboard hooks several times in a short time, or could not install them again. Automatic conversion may miss some typing. Restart AutoKeyboardLayot if this continues.",
     "tray.active": "Automatic conversion is on",
     "tray.disabled": "Automatic conversion is off",
     "menu.auto_on": "Automatic conversion: ON",

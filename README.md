@@ -284,6 +284,22 @@ abandoned and replaced by a fresh one on a new thread, at most three times; the
 diagnostics log records `event=probe respawned=N`, and the hung thread is never
 joined.
 
+The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
+the tray icon is added again, and if Explorer is not ready yet the addition is
+retried with a growing delay. Unlocking the session, reconnecting and resuming
+from sleep reinstall both hooks (held keys are released unchanged first). A
+watchdog on the 250 ms timer also reinstalls them when the user types (input
+within the last 400 ms) but no hook callback ran for more than 3 seconds. It does
+not act on the lock screen or the UAC desktop, when the foreground window has no
+known or a higher integrity level (its input may legitimately never reach the
+hooks), or when nothing is in the foreground; it acts at most once per 15 seconds
+and four times an hour, after which a tray notice says the hooks are unstable.
+A failed installation is retried with backoff (1 s up to 30 s) and reported after
+the third failure. Tray updates are limited to two per second and wait while the
+correction gate holds keys, because the shell call can block on an unresponsive
+Explorer while the hooks need the UI thread; a skipped update is tried again on a
+later tick. The diagnostics log records `event=hooks` with the reason.
+
 ## Language packs
 
 Pack metadata is exposed by `language::language_packs()`. Dictionary sources,

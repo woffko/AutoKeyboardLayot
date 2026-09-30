@@ -155,6 +155,8 @@
     "fault.title": "Automaatne teisendus peatati sisemise vea tõttu",
     "fault.engine": "Sisemine viga piirati ja automaatne teisendus on nüüd väljas. Tippimine ei ole mõjutatud. Üksikasjad on AutoKeyboardLayoti profiilikaustas failis crash.log. Lülita automaatne teisendus teavitusala menüüst uuesti sisse.",
     "fault.worker_stopped": "Teisendusmootor peatus korduvate sisemiste vigade tõttu. Automaatne teisendus on väljas ja tippimine ei ole mõjutatud. Taaskäivita AutoKeyboardLayot; üksikasjad on profiilikaustas failis crash.log.",
+    "hooks.unstable_title": "Klaviatuurikonksud on ebastabiilsed",
+    "hooks.unstable_body": "AutoKeyboardLayot parandas oma klaviatuurikonkse lühikese aja jooksul mitu korda või ei suutnud neid uuesti paigaldada. Automaatne teisendus võib osa tippimisest vahele jätta. Kui see jätkub, taaskäivita AutoKeyboardLayot.",
     "tray.active": "Automaatne teisendus on sees",
     "tray.disabled": "Automaatne teisendus on väljas",
     "menu.auto_on": "Automaatne teisendus: SEES",

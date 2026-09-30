@@ -46,6 +46,7 @@ pub mod settings;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tray_visual;
+pub mod ui_guard;
 pub mod user_lexicon;
 #[cfg(windows)]
 pub mod windows_input_profiles;

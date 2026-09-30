@@ -158,6 +158,8 @@
     "fault.title": "Konversi otomatis dijeda setelah kesalahan internal",
     "fault.engine": "Kesalahan internal telah ditangani dan konversi otomatis kini mati. Pengetikan tidak terpengaruh. Rinciannya ada di crash.log pada folder profil AutoKeyboardLayot. Aktifkan kembali konversi otomatis dari menu baki.",
     "fault.worker_stopped": "Mesin konversi berhenti setelah kesalahan internal berulang. Konversi otomatis mati dan pengetikan tidak terpengaruh. Mulai ulang AutoKeyboardLayot; rinciannya ada di crash.log pada folder profilnya.",
+    "hooks.unstable_title": "Kait papan ketik tidak stabil",
+    "hooks.unstable_body": "AutoKeyboardLayot memperbaiki kait papan ketiknya beberapa kali dalam waktu singkat atau tidak dapat memasangnya kembali. Konversi otomatis mungkin melewatkan sebagian ketikan. Mulai ulang AutoKeyboardLayot jika ini berlanjut.",
     "tray.active": "Konversi otomatis aktif",
     "tray.disabled": "Konversi otomatis nonaktif",
     "menu.auto_on": "Konversi otomatis: AKTIF",

@@ -158,6 +158,8 @@
     "fault.title": "Conversion automatique suspendue après une erreur interne",
     "fault.engine": "Une erreur interne a été contenue et la conversion automatique est maintenant désactivée. La saisie n’est pas affectée. Les détails figurent dans crash.log, dans le dossier de profil d’AutoKeyboardLayot. Réactivez la conversion automatique depuis le menu de la zone de notification.",
     "fault.worker_stopped": "Le moteur de conversion s’est arrêté après des erreurs internes répétées. La conversion automatique est désactivée et la saisie n’est pas affectée. Redémarrez AutoKeyboardLayot ; les détails figurent dans crash.log, dans son dossier de profil.",
+    "hooks.unstable_title": "Les crochets clavier sont instables",
+    "hooks.unstable_body": "AutoKeyboardLayot a réparé ses crochets clavier plusieurs fois en peu de temps ou n’a pas pu les réinstaller. La conversion automatique peut manquer une partie de la saisie. Redémarrez AutoKeyboardLayot si cela continue.",
     "tray.active": "Conversion automatique activée",
     "tray.disabled": "Conversion automatique désactivée",
     "menu.auto_on": "Conversion automatique : ACTIVÉE",

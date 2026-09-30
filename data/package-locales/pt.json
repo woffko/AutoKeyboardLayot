@@ -158,6 +158,8 @@
     "fault.title": "Conversão automática pausada após um erro interno",
     "fault.engine": "Um erro interno foi contido e a conversão automática está desativada. A digitação não é afetada. Os detalhes estão em crash.log, na pasta de perfil do AutoKeyboardLayot. Ative novamente a conversão automática no menu da bandeja.",
     "fault.worker_stopped": "O mecanismo de conversão parou após erros internos repetidos. A conversão automática está desativada e a digitação não é afetada. Reinicie o AutoKeyboardLayot; os detalhes estão em crash.log, na pasta de perfil.",
+    "hooks.unstable_title": "Os ganchos de teclado estão instáveis",
+    "hooks.unstable_body": "O AutoKeyboardLayot reparou seus ganchos de teclado várias vezes em pouco tempo ou não conseguiu instalá-los de novo. A conversão automática pode perder parte da digitação. Reinicie o AutoKeyboardLayot se isso continuar.",
     "tray.active": "Conversão automática ativada",
     "tray.disabled": "Conversão automática desativada",
     "menu.auto_on": "Conversão automática: ATIVADA",

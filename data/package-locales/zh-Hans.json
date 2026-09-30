@@ -162,6 +162,8 @@
     "fault.title": "发生内部错误，自动转换已暂停",
     "fault.engine": "已遏制一个内部错误，自动转换现已关闭。打字不受影响。详细信息见 AutoKeyboardLayot 配置文件夹中的 crash.log。可从托盘菜单重新开启自动转换。",
     "fault.worker_stopped": "转换引擎在反复发生内部错误后已停止。自动转换已关闭，打字不受影响。请重新启动 AutoKeyboardLayot；详细信息见其配置文件夹中的 crash.log。",
+    "hooks.unstable_title": "键盘钩子不稳定",
+    "hooks.unstable_body": "AutoKeyboardLayot 在短时间内多次修复键盘钩子，或无法重新安装。自动转换可能会漏掉部分输入。如果这种情况持续，请重新启动 AutoKeyboardLayot。",
     "tray.active": "自动转换已开启",
     "tray.disabled": "自动转换已关闭",
     "menu.auto_on": "自动转换：开启",

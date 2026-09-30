@@ -21,6 +21,10 @@ use autokeyboardlayot::panic_guard::{FaultWindow, WorkerExit, guarded, run_conta
 use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
 use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
+use autokeyboardlayot::ui_guard::{
+    ForegroundPrivilege, HookWatchdog, TrayThrottle, WatchdogAction, WatchdogFacts,
+    hooks_look_silent, retry_delay,
+};
 use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
 use ui_localization::{tr, tr_format};
 
@@ -62,6 +66,15 @@ use windows::{
             Ole::{
                 CF_UNICODETEXT, OleGetClipboard, OleInitialize, OleUninitialize, ReleaseStgMedium,
             },
+            RemoteDesktop::{
+                NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification,
+                WTSUnRegisterSessionNotification,
+            },
+            StationsAndDesktops::{
+                CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+                GetUserObjectInformationW, OpenInputDesktop, UOI_NAME,
+            },
+            SystemInformation::GetTickCount64,
             Threading::{
                 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateMutexW, CreateWaitableTimerExW,
                 GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
@@ -77,13 +90,13 @@ use windows::{
                 UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_TextPatternId,
             },
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL, INPUT,
-                INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-                KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx,
-                VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_F24,
-                VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
-                VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
-                VK_UP,
+                GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState,
+                GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
+                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_BACK,
+                VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME, VK_LCONTROL,
+                VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT,
+                VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -97,15 +110,17 @@ use windows::{
                 GetShellWindow, GetWindowThreadProcessId, HHOOK, HICON, HMENU, ICONINFO, IDYES,
                 KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MB_ICONERROR,
                 MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED,
-                MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW, PM_REMOVE,
-                PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SMTO_ABORTIFHUNG,
-                SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
-                SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu,
-                TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+                MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW,
+                PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PM_REMOVE, PeekMessageW,
+                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+                SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW,
+                SetForegroundWindow, SetTimer, SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON,
+                TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
                 WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
-                WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSW,
+                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONDOWN,
+                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN,
+                WNDCLASSW, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
             },
         },
     },
@@ -249,6 +264,52 @@ impl Drop for InstanceGuard {
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
     static LAST_TIMER_TICK: Cell<Option<Instant>> = const { Cell::new(None) };
+    static UI_GUARDS: RefCell<UiGuards> = RefCell::new(UiGuards::new());
+}
+
+/// Milliseconds (`GetTickCount64`) of the last hook callback or hook installation. The watchdog
+/// compares it with the time of the last user input.
+static HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+/// The window message registered as "TaskbarCreated"; 0 until it is registered.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+/// A failed attempt to install hooks or the tray icon, repeated on later timer ticks.
+struct Retry {
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl Retry {
+    fn first(now: Instant) -> Self {
+        Self {
+            failures: 1,
+            next_attempt: now + retry_delay(1),
+        }
+    }
+
+    fn failed_again(&mut self, now: Instant) {
+        self.failures += 1;
+        self.next_attempt = now + retry_delay(self.failures);
+    }
+}
+
+/// UI-thread state of the rules that keep the thread responsive for the hooks (see `ui_guard`).
+struct UiGuards {
+    watchdog: HookWatchdog,
+    tray: TrayThrottle,
+    hook_retry: Option<Retry>,
+    tray_retry: Option<Retry>,
+}
+
+impl UiGuards {
+    fn new() -> Self {
+        Self {
+            watchdog: HookWatchdog::new(),
+            tray: TrayThrottle::new(),
+            hook_retry: None,
+            tray_retry: None,
+        }
+    }
 }
 
 /// Set when a panic was contained in a hook callback, the window procedure or the input worker.
@@ -369,6 +430,7 @@ enum GateFailureCause {
     WorkerAck,
     DownstreamHook,
     InternalFault,
+    HookReinstall,
 }
 
 #[derive(Debug, Clone)]
@@ -1701,6 +1763,7 @@ impl AppState {
                 GateFailureCause::Deadline
                     | GateFailureCause::Capacity
                     | GateFailureCause::WorkerQueue
+                    | GateFailureCause::HookReinstall
             )
         {
             let _ = self.enqueue(RawInputEvent::RecoverInput {
@@ -2027,6 +2090,346 @@ fn finish_shutdown(hwnd: HWND) -> bool {
         }
     }
     requested
+}
+
+fn touch_hook_activity() {
+    HOOK_ACTIVITY_MS.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+}
+
+/// Time since the last hook callback or installation.
+fn hook_silence() -> Duration {
+    let now = unsafe { GetTickCount64() };
+    Duration::from_millis(now.saturating_sub(HOOK_ACTIVITY_MS.load(Ordering::Relaxed)))
+}
+
+/// Time since the last user input of the session, from `GetLastInputInfo`.
+fn input_idle() -> Option<Duration> {
+    let mut info = LASTINPUTINFO {
+        cbSize: core::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return None;
+    }
+    // `dwTime` holds the low 32 bits of the tick count at the last input.
+    let now = unsafe { GetTickCount64() } as u32;
+    Some(Duration::from_millis(u64::from(
+        now.wrapping_sub(info.dwTime),
+    )))
+}
+
+/// True when the desktop that receives input is the default one. The lock screen and the UAC
+/// secure desktop are others: typing there counts as input but never reaches the hooks.
+fn input_desktop_is_default() -> bool {
+    let Ok(desktop) =
+        (unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) })
+    else {
+        return false;
+    };
+    let mut name = [0u16; 32];
+    let read = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            core::mem::size_of_val(&name) as u32,
+            None,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseDesktop(desktop);
+    }
+    let length = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    read && String::from_utf16_lossy(&name[..length]).eq_ignore_ascii_case("Default")
+}
+
+fn foreground_privilege() -> ForegroundPrivilege {
+    let Some(context) = current_foreground_context() else {
+        return ForegroundPrivilege::None;
+    };
+    ForegroundPrivilege::compare(
+        process_integrity_level(context.process_id),
+        process_integrity_level(unsafe { GetCurrentProcessId() }),
+    )
+}
+
+/// Why the hooks are reinstalled for a session change notification, if they are.
+fn session_reinstall_reason(event: u32) -> Option<&'static str> {
+    match event {
+        WTS_SESSION_UNLOCK => Some("unlock"),
+        WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => Some("connect"),
+        _ => None,
+    }
+}
+
+/// Why the hooks are reinstalled for a power notification, if they are.
+fn power_reinstall_reason(event: u32) -> Option<&'static str> {
+    match event {
+        PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => Some("resume"),
+        _ => None,
+    }
+}
+
+/// Notices hooks that Windows removed or that stopped receiving input and reinstalls them. The
+/// cheap checks come first; the others run only when the hooks already look silent.
+fn hook_watchdog_tick(hwnd: HWND) {
+    let running = APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|state| !state.shutdown.load(Ordering::Acquire))
+    });
+    if !running {
+        return;
+    }
+    let Some(input_idle) = input_idle() else {
+        return;
+    };
+    let hook_silent = hook_silence();
+    if !hooks_look_silent(input_idle, hook_silent) {
+        return;
+    }
+    let facts = WatchdogFacts {
+        input_idle,
+        hook_silent,
+        foreground: foreground_privilege(),
+        input_desktop_is_default: input_desktop_is_default(),
+    };
+    let action =
+        UI_GUARDS.with(|guards| guards.borrow_mut().watchdog.decide(&facts, Instant::now()));
+    match action {
+        WatchdogAction::Nothing => {}
+        WatchdogAction::Reinstall => {
+            reinstall_hooks("silent");
+        }
+        WatchdogAction::WarnUnstable => notify_hooks_unstable(hwnd, "watchdog-limit"),
+    }
+}
+
+fn notify_hooks_unstable(hwnd: HWND, why: &str) {
+    APP_STATE.with(|slot| {
+        if let Ok(borrowed) = slot.try_borrow()
+            && let Some(state) = borrowed.as_ref()
+        {
+            state.event_diagnostic("hooks", format!("result=unstable why={why}"));
+        }
+    });
+    show_tray_information(hwnd, tr("hooks.unstable_title"), tr("hooks.unstable_body"));
+}
+
+/// Installs whichever of the two hooks is missing; true when both are installed afterwards.
+fn install_missing_hooks() -> bool {
+    let missing = APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|state| (state.keyboard_hook.is_none(), state.mouse_hook.is_none()))
+    });
+    let Some((keyboard_missing, mouse_missing)) = missing else {
+        return false;
+    };
+    let Ok(module) = (unsafe { GetModuleHandleW(None) }) else {
+        return false;
+    };
+    let instance = HINSTANCE(module.0);
+    let keyboard = keyboard_missing
+        .then(|| unsafe {
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(instance), 0).ok()
+        })
+        .flatten();
+    let mouse = mouse_missing
+        .then(|| unsafe {
+            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(instance), 0).ok()
+        })
+        .flatten();
+    // A fresh hook has had no chance to be called yet.
+    touch_hook_activity();
+    let stored = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        if keyboard.is_some() {
+            state.keyboard_hook = keyboard;
+        }
+        if mouse.is_some() {
+            state.mouse_hook = mouse;
+        }
+        Some(state.keyboard_hook.is_some() && state.mouse_hook.is_some())
+    });
+    match stored {
+        Some(complete) => complete,
+        None => {
+            // The application state is gone (shutdown): do not leave new hooks behind.
+            for hook in [keyboard, mouse].into_iter().flatten() {
+                unsafe {
+                    let _ = UnhookWindowsHookEx(hook);
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Unhooks both hooks and hooks again. Held keys are released unchanged first, and no borrow is
+/// held while Windows is called. A failure is retried on later timer ticks with backoff.
+fn reinstall_hooks(reason: &str) -> bool {
+    let handles = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        if state.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        state.break_correction_gate_fail_open(GateFailureCause::HookReinstall);
+        state.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        Some((state.keyboard_hook.take(), state.mouse_hook.take()))
+    });
+    let Some((keyboard, mouse)) = handles else {
+        return false;
+    };
+    for hook in [keyboard, mouse].into_iter().flatten() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
+    let installed = install_missing_hooks();
+    APP_STATE.with(|slot| {
+        if let Ok(borrowed) = slot.try_borrow()
+            && let Some(state) = borrowed.as_ref()
+        {
+            state.event_diagnostic(
+                "hooks",
+                format!(
+                    "result={} reason={reason}",
+                    if installed { "reinstalled" } else { "failed" }
+                ),
+            );
+        }
+    });
+    if !installed {
+        UI_GUARDS.with(|guards| {
+            let mut guards = guards.borrow_mut();
+            if guards.hook_retry.is_none() {
+                guards.hook_retry = Some(Retry::first(Instant::now()));
+            }
+        });
+    }
+    installed
+}
+
+/// Repeats a failed hook installation with backoff, and tells the user after the third failure.
+fn retry_missing_hooks(hwnd: HWND) {
+    let now = Instant::now();
+    let due = UI_GUARDS.with(|guards| {
+        guards
+            .borrow()
+            .hook_retry
+            .as_ref()
+            .is_some_and(|retry| now >= retry.next_attempt)
+    });
+    if !due {
+        return;
+    }
+    let installed = install_missing_hooks();
+    let failures = UI_GUARDS.with(|guards| {
+        let mut guards = guards.borrow_mut();
+        if installed {
+            guards.hook_retry = None;
+            return 0;
+        }
+        guards.hook_retry.as_mut().map_or(0, |retry| {
+            retry.failed_again(now);
+            retry.failures
+        })
+    });
+    if installed {
+        APP_STATE.with(|slot| {
+            if let Ok(borrowed) = slot.try_borrow()
+                && let Some(state) = borrowed.as_ref()
+            {
+                state.event_diagnostic("hooks", "result=reinstalled reason=retry".to_owned());
+            }
+        });
+    } else if failures == 3 {
+        notify_hooks_unstable(hwnd, "install-failed");
+    }
+}
+
+/// Adds the tray icon; on failure a retry is scheduled, because Explorer may still be starting.
+fn add_tray(hwnd: HWND, indicator: LayoutIndicator) -> bool {
+    let now = Instant::now();
+    match TrayIcon::add(hwnd, indicator) {
+        Ok(tray) => {
+            let duplicate = APP_STATE.with(|slot| {
+                let mut borrowed = slot.borrow_mut();
+                let state = borrowed.as_mut()?;
+                if state.tray.is_none() {
+                    state.tray = Some(tray);
+                    // The new icon shows the initial status; the next refresh brings it up to date.
+                    state.last_tray_status = TrayStatus::initial(indicator);
+                    None
+                } else {
+                    Some(tray)
+                }
+            });
+            // Dropping an icon deletes it from the shell by id, which would remove the live one.
+            core::mem::forget(duplicate);
+            UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None);
+            true
+        }
+        Err(_) => {
+            UI_GUARDS.with(|guards| {
+                let mut guards = guards.borrow_mut();
+                match guards.tray_retry.as_mut() {
+                    Some(retry) => retry.failed_again(now),
+                    None => guards.tray_retry = Some(Retry::first(now)),
+                }
+            });
+            false
+        }
+    }
+}
+
+/// Explorer restarted (`TaskbarCreated`) and every notification icon is gone: build a new one.
+fn recreate_tray(hwnd: HWND) {
+    let taken = APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|state| (state.tray.take(), state.last_tray_status.indicator))
+    });
+    let Some((old, indicator)) = taken else {
+        return;
+    };
+    // Dropping the old icon calls the shell, so no borrow is held here.
+    drop(old);
+    add_tray(hwnd, indicator);
+}
+
+/// Repeats a failed tray registration with backoff while the icon is missing.
+fn retry_tray(hwnd: HWND) {
+    let now = Instant::now();
+    let due = UI_GUARDS.with(|guards| {
+        guards
+            .borrow()
+            .tray_retry
+            .as_ref()
+            .is_some_and(|retry| now >= retry.next_attempt)
+    });
+    if !due {
+        return;
+    }
+    let indicator = APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|state| state.tray.is_none())
+            .map(|state| state.last_tray_status.indicator)
+    });
+    match indicator {
+        Some(indicator) => {
+            add_tray(hwnd, indicator);
+        }
+        None => UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None),
+    }
 }
 
 /// The gap since the previous timer tick in milliseconds, when it exceeds the stall threshold.
@@ -2470,6 +2873,13 @@ fn refresh_tray_state() {
         if status == state.last_tray_status {
             return None;
         }
+        // The shell call below can block on an unresponsive Explorer while the hooks wait for this
+        // thread: at most two updates per second and none while a gate holds keys. The status
+        // stays different from the shown one, so a refused update is tried again on a later tick.
+        let gate_active = state.correction_gate.active;
+        if !UI_GUARDS.with(|guards| guards.borrow_mut().tray.allow(now, gate_active)) {
+            return None;
+        }
         let notify_failure = should_notify_conversion_failure(state.last_tray_status, status);
         state.tray.take().map(|tray| (tray, status, notify_failure))
     }) else {
@@ -2637,6 +3047,12 @@ pub fn run() -> Result<()> {
             return Err(Error::from_thread());
         }
 
+        // Registered before the message loop starts, so no broadcast can be missed.
+        TASKBAR_CREATED.store(
+            RegisterWindowMessageW(w!("TaskbarCreated")),
+            Ordering::Release,
+        );
+
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             WINDOW_CLASS,
@@ -2651,6 +3067,9 @@ pub fn run() -> Result<()> {
             Some(instance),
             None,
         )?;
+        // Unlock, reconnect and resume reinstall the hooks. Not fatal when it is refused: the
+        // watchdog still notices hooks that stopped receiving input.
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
 
         let initial_indicator = current_foreground_context()
             .map(|context| LayoutIndicator::from_layout(context.layout))
@@ -2748,6 +3167,7 @@ pub fn run() -> Result<()> {
                 state.mouse_hook = Some(mouse_hook);
             }
         });
+        touch_hook_activity();
 
         if SetTimer(Some(hwnd), LAYOUT_TIMER_ID, LAYOUT_TIMER_INTERVAL_MS, None) == 0 {
             let error = Error::from_thread();
@@ -2834,6 +3254,9 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 return LRESULT(0);
             }
             handle_engine_fault(hwnd);
+            hook_watchdog_tick(hwnd);
+            retry_missing_hooks(hwnd);
+            retry_tray(hwnd);
             finish_configuration_load(hwnd);
             finish_configuration_reload(hwnd);
             expire_correction_gate();
@@ -2962,7 +3385,27 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             request_shutdown(hwnd, false);
             LRESULT(0)
         }
+        WM_WTSSESSION_CHANGE => {
+            if let Some(reason) = session_reinstall_reason(wparam.0 as u32) {
+                reinstall_hooks(reason);
+            }
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            if let Some(reason) = power_reinstall_reason(wparam.0 as u32) {
+                reinstall_hooks(reason);
+            }
+            // TRUE grants the request for the messages that ask for one.
+            LRESULT(1)
+        }
+        message if message != 0 && message == TASKBAR_CREATED.load(Ordering::Acquire) => {
+            recreate_tray(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            unsafe {
+                let _ = WTSUnRegisterSessionNotification(hwnd);
+            }
             installer_lifecycle::remove_safe_close(hwnd);
             drop(take_app_state());
             unsafe {
@@ -2992,6 +3435,7 @@ fn tray_interaction(notification: u32) -> TrayInteraction {
 /// Hook callbacks must not unwind (that aborts the process). A contained panic passes the event
 /// on untouched and raises `ENGINE_FAULT`.
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    touch_hook_activity();
     let started = Instant::now();
     let result = guarded(
         || unsafe { keyboard_hook_body(code, wparam, lparam) },
@@ -3288,6 +3732,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    touch_hook_activity();
     let started = Instant::now();
     let result = guarded(
         || unsafe { mouse_hook_body(code, wparam, lparam) },
@@ -9537,6 +9982,80 @@ mod tests {
             metrics.last_failure_reason.load(Ordering::Acquire),
             ConversionFailureReason::ClipboardEdit as u8
         );
+    }
+
+    #[test]
+    fn session_and_power_notifications_choose_the_reinstall_reason() {
+        assert_eq!(session_reinstall_reason(WTS_SESSION_UNLOCK), Some("unlock"));
+        assert_eq!(
+            session_reinstall_reason(WTS_CONSOLE_CONNECT),
+            Some("connect")
+        );
+        assert_eq!(
+            session_reinstall_reason(WTS_REMOTE_CONNECT),
+            Some("connect")
+        );
+        // Console disconnect, remote disconnect, logon, logoff and lock change nothing.
+        for event in [2, 4, 5, 6, 7] {
+            assert_eq!(
+                session_reinstall_reason(event),
+                None,
+                "session event {event}"
+            );
+        }
+        assert_eq!(
+            power_reinstall_reason(PBT_APMRESUMEAUTOMATIC),
+            Some("resume")
+        );
+        assert_eq!(power_reinstall_reason(PBT_APMRESUMESUSPEND), Some("resume"));
+        // Suspend and power status changes are not a resume.
+        for event in [0x4, 0xA, 0x8013] {
+            assert_eq!(
+                power_reinstall_reason(event),
+                None,
+                "power event {event:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_attempt_is_retried_with_a_growing_delay() {
+        let now = Instant::now();
+        let mut retry = Retry::first(now);
+        assert_eq!(retry.failures, 1);
+        assert_eq!(retry.next_attempt, now + Duration::from_secs(1));
+        retry.failed_again(now);
+        assert_eq!(retry.failures, 2);
+        assert_eq!(retry.next_attempt, now + Duration::from_secs(2));
+        for _ in 0..10 {
+            retry.failed_again(now);
+        }
+        assert_eq!(retry.next_attempt, now + Duration::from_secs(30));
+    }
+
+    #[test]
+    fn hook_silence_is_measured_from_the_last_callback_or_installation() {
+        touch_hook_activity();
+        assert!(hook_silence() < Duration::from_secs(2));
+        let tick = unsafe { GetTickCount64() };
+        HOOK_ACTIVITY_MS.store(tick.saturating_sub(10_000), Ordering::Relaxed);
+        let silence = hook_silence();
+        assert!(
+            silence >= Duration::from_secs(10) && silence < Duration::from_secs(12),
+            "{silence:?}"
+        );
+        touch_hook_activity();
+    }
+
+    #[test]
+    fn the_input_probes_answer_without_crashing() {
+        // The values depend on the session (a locked screen has another input desktop), so only
+        // the calls themselves are exercised: sizes, handles and buffers must be right.
+        if let Some(idle) = input_idle() {
+            assert!(idle < Duration::from_secs(60 * 60 * 24 * 50), "{idle:?}");
+        }
+        let _ = input_desktop_is_default();
+        let _ = foreground_privilege();
     }
 
     #[test]

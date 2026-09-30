@@ -155,6 +155,8 @@
     "fault.title": "内部エラーのため自動変換を一時停止しました",
     "fault.engine": "内部エラーを検出して処理し、自動変換をオフにしました。入力には影響ありません。詳細は AutoKeyboardLayot のプロファイルフォルダーにある crash.log を参照してください。自動変換はトレイのメニューから再びオンにできます。",
     "fault.worker_stopped": "内部エラーが繰り返されたため、変換エンジンが停止しました。自動変換はオフで、入力には影響ありません。AutoKeyboardLayot を再起動してください。詳細はプロファイルフォルダーの crash.log にあります。",
+    "hooks.unstable_title": "キーボードフックが不安定です",
+    "hooks.unstable_body": "AutoKeyboardLayot は短時間に何度もキーボードフックを修復したか、再インストールできませんでした。自動変換が一部の入力を見逃す可能性があります。この状態が続く場合は AutoKeyboardLayot を再起動してください。",
     "tray.active": "自動変換は有効です",
     "tray.disabled": "自動変換は無効です",
     "menu.auto_on": "自動変換: 有効",
