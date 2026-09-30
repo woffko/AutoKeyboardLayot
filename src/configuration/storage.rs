@@ -1,15 +1,24 @@
 //! Bounded configuration loading and explicit pre-migration backup.
 
 use std::{
-    fs::OpenOptions,
+    ffi::OsStr,
+    fs::{File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime},
 };
 
 use super::ConfigurationDocument;
 use crate::Settings;
 
 pub const CONFIGURATION_MAX_BYTES: u64 = 1024 * 1024;
+
+/// A temporary file untouched for this long was left behind by a crashed or
+/// failed save. The next save removes it.
+const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(10 * 60);
+/// Serial numbers tried before giving up on creating a temporary file.
+const TEMPORARY_NAME_ATTEMPTS: usize = 128;
 
 /// Provenance of successfully read files, not a second path-existence probe.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -104,7 +113,10 @@ fn backup_before_package_migration(path: &Path, next: &ConfigurationDocument) ->
 
 /// Prepare an explicit save without touching the destination. The caller must
 /// hold its writer lock and perform platform-specific atomic replacement.
-/// Existing temporary files (including links) are never truncated or followed.
+/// The temporary file gets a unique name (`config.tmp-<pid>-<serial>`) and is
+/// created exclusively, so an existing file, directory or link is never
+/// truncated or followed and a leftover from an earlier failed save cannot
+/// block this one. Stale leftovers are removed on the way.
 pub fn prepare_configuration_write(path: &Path, contents: &str) -> io::Result<PathBuf> {
     if contents.len() as u64 > CONFIGURATION_MAX_BYTES {
         return Err(io::Error::new(
@@ -123,20 +135,96 @@ pub fn prepare_configuration_write(path: &Path, contents: &str) -> io::Result<Pa
     std::fs::create_dir_all(directory)?;
     backup_before_schema_upgrade(path)?;
     backup_before_package_migration(path, &next)?;
-    let temporary = path.with_extension("tmp");
-    if temporary == path {
+    let temporary_base = path.with_extension("tmp");
+    if temporary_base == path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "temporary path would replace the destination",
         ));
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
+    let prefix = temporary_base.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no file name",
+        )
+    })?;
+    remove_stale_temporaries(directory, prefix, SystemTime::now(), STALE_TEMPORARY_AGE);
+    static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
+    let (mut file, temporary) = create_unique_temporary(directory, prefix, &NEXT_SERIAL)?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        // A half-written file must not stay behind to confuse the next save.
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     Ok(temporary)
+}
+
+/// Creates `<prefix>-<pid>-<serial>` exclusively. A name that is taken by
+/// anything (file, directory, link) is skipped, never reused.
+fn create_unique_temporary(
+    directory: &Path,
+    prefix: &OsStr,
+    next_serial: &AtomicU64,
+) -> io::Result<(File, PathBuf)> {
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS {
+        let serial = next_serial.fetch_add(1, Ordering::Relaxed);
+        let mut name = prefix.to_os_string();
+        name.push(format!("-{}-{serial}", std::process::id()));
+        let temporary = directory.join(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((file, temporary)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused temporary file name is available",
+    ))
+}
+
+/// Removes leftovers of earlier failed saves: regular files named `prefix` or
+/// `prefix-...` whose last modification is at least `max_age` before `now`.
+/// Links, directories and every other name are left alone, and errors are
+/// ignored because cleaning up must never fail a save.
+fn remove_stale_temporaries(directory: &Path, prefix: &OsStr, now: SystemTime, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let prefix = prefix.to_string_lossy();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let matches = name == prefix
+            || name
+                .strip_prefix(prefix.as_ref())
+                .is_some_and(|rest| rest.starts_with('-'));
+        if !matches {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn read_optional_file(path: &Path) -> io::Result<Option<String>> {
@@ -332,46 +420,173 @@ mod tests {
         );
     }
 
+    fn temporary_names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("config.tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn set_modified(path: &Path, modified: SystemTime) {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
     #[test]
-    fn save_preparation_stops_on_backup_failure_and_never_overwrites_a_temporary() {
+    fn save_preparation_stops_on_backup_failure_before_creating_a_temporary() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.ini");
-        let temporary = path.with_extension("tmp");
         let backup = path.with_extension("schema-1.bak");
         let original = "schema_version=1\n[process_exclusions]\nprivate.exe\n";
         let replacement = "schema_version=2\n[process_exclusions]\nprivate-new.exe\n";
         std::fs::write(&path, original).unwrap();
         std::fs::write(&backup, "different backup").unwrap();
         assert!(prepare_configuration_write(&path, replacement).is_err());
-        assert!(!temporary.exists());
+        assert!(temporary_names(directory.path()).is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         std::fs::write(&backup, original).unwrap();
-        std::fs::write(&temporary, "unrelated file").unwrap();
-        assert!(prepare_configuration_write(&path, replacement).is_err());
-        assert_eq!(
-            std::fs::read_to_string(&temporary).unwrap(),
-            "unrelated file"
-        );
-        std::fs::remove_file(&temporary).unwrap();
+        let temporary = prepare_configuration_write(&path, replacement).unwrap();
+        assert_eq!(std::fs::read_to_string(&temporary).unwrap(), replacement);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn a_leftover_temporary_name_does_not_block_saving() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.ini");
+        let saved = ConfigurationDocument::default().to_text().unwrap();
+        let legacy = path.with_extension("tmp");
+        std::fs::write(&legacy, "unrelated file").unwrap();
+        let temporary = prepare_configuration_write(&path, &saved).unwrap();
+        assert_ne!(temporary, legacy);
+        let name = temporary
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("config.tmp-"), "{name}");
+        assert_eq!(std::fs::read_to_string(&temporary).unwrap(), saved);
+        // A fresh file under the old fixed name is not ours to delete.
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "unrelated file");
+        assert!(!path.exists());
         #[cfg(unix)]
         {
+            std::fs::remove_file(&legacy).unwrap();
             let unrelated = directory.path().join("unrelated.txt");
             std::fs::write(&unrelated, "do not overwrite").unwrap();
-            std::os::unix::fs::symlink(&unrelated, &temporary).unwrap();
-            assert!(prepare_configuration_write(&path, replacement).is_err());
+            std::os::unix::fs::symlink(&unrelated, &legacy).unwrap();
+            let next = prepare_configuration_write(&path, &saved).unwrap();
+            assert_eq!(std::fs::read_to_string(&next).unwrap(), saved);
             assert_eq!(
                 std::fs::read_to_string(&unrelated).unwrap(),
                 "do not overwrite"
             );
-            std::fs::remove_file(&temporary).unwrap();
         }
-        assert_eq!(
-            prepare_configuration_write(&path, replacement).unwrap(),
-            temporary
-        );
-        assert_eq!(std::fs::read_to_string(&temporary).unwrap(), replacement);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn saving_removes_stale_leftovers_and_keeps_fresh_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.ini");
+        let saved = ConfigurationDocument::default().to_text().unwrap();
+        let stale = directory.path().join("config.tmp-1-1");
+        let fresh = directory.path().join("config.tmp-2-2");
+        std::fs::write(&stale, "stale").unwrap();
+        std::fs::write(&fresh, "fresh").unwrap();
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(3600));
+        let temporary = prepare_configuration_write(&path, &saved).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "fresh");
+        assert!(temporary.exists());
+    }
+
+    #[test]
+    fn every_preparation_gets_its_own_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.ini");
+        let saved = ConfigurationDocument::default().to_text().unwrap();
+        let first = prepare_configuration_write(&path, &saved).unwrap();
+        let second = prepare_configuration_write(&path, &saved).unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+    }
+
+    #[test]
+    fn taken_temporary_names_are_skipped_whatever_they_are() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let name = |serial: u64| directory.path().join(format!("config.tmp-{pid}-{serial}"));
+        std::fs::create_dir(name(0)).unwrap();
+        std::fs::write(name(1), "taken").unwrap();
+        #[cfg(unix)]
+        let expected = {
+            // A dangling link must be skipped, not followed to create its target.
+            std::os::unix::fs::symlink(directory.path().join("missing-target"), name(2)).unwrap();
+            name(3)
+        };
+        #[cfg(not(unix))]
+        let expected = name(2);
+        let counter = AtomicU64::new(0);
+        let (file, created) =
+            create_unique_temporary(directory.path(), OsStr::new("config.tmp"), &counter).unwrap();
+        drop(file);
+        assert_eq!(created, expected);
+        assert_eq!(std::fs::read_to_string(name(1)).unwrap(), "taken");
+        assert!(name(0).is_dir());
+        assert!(!directory.path().join("missing-target").exists());
+    }
+
+    #[test]
+    fn stale_cleanup_removes_only_old_regular_files_with_the_temporary_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let write = |name: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let stale = ["config.tmp", "config.tmp-111-1"].map(write);
+        let fresh = write("config.tmp-222-2");
+        let unrelated = [
+            "config.tmpx",
+            "config.tmp.txt",
+            "config.ini",
+            "config.schema-1.bak",
+            "other.tmp-1-1",
+        ]
+        .map(write);
+        std::fs::create_dir(root.join("config.tmp-dir")).unwrap();
+        #[cfg(unix)]
+        {
+            let target = write("target.txt");
+            std::os::unix::fs::symlink(&target, root.join("config.tmp-333-3")).unwrap();
+        }
+        // Everything was just written, so judge it an hour later and keep one file
+        // "fresh" by stamping it with that later time.
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        set_modified(&fresh, later);
+        remove_stale_temporaries(root, OsStr::new("config.tmp"), later, STALE_TEMPORARY_AGE);
+        for path in &stale {
+            assert!(!path.exists(), "{path:?} should have been removed");
+        }
+        assert!(fresh.exists());
+        for path in &unrelated {
+            assert!(path.exists(), "{path:?} must be kept");
+        }
+        assert!(root.join("config.tmp-dir").is_dir());
+        #[cfg(unix)]
+        {
+            assert!(root.join("config.tmp-333-3").symlink_metadata().is_ok());
+            assert!(root.join("target.txt").exists());
+        }
     }
 
     #[test]
