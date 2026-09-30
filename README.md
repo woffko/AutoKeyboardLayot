@@ -321,10 +321,25 @@ launches that script independently of SSH through WMI and monitors its result.
 Each run requires a fresh log directory; per-stage logs and `result.json`
 remain there even if the monitoring connection is interrupted.
 
-## Third-party notices
+## License and third-party notices
 
-Dictionary source information and redistribution notices are included in
-`data/language-packs/`. The layout model's data sources and license are in
-`data/layout-model/NOTICE.md`. The settings UI uses Slint. Dependency versions are pinned
-by `Cargo.lock`; upstream dependency licenses remain applicable. No project-wide
-license file has been selected for this initial source snapshot.
+The project's own code, tools, documentation and translation drafts are released
+under the MIT License ([`LICENSE`](LICENSE)). Third-party material keeps its own
+terms:
+
+- Dictionary sources and their redistribution notices are in
+  `data/language-packs/*/LICENSE*`.
+- The layout model's data sources and its CC BY-SA 4.0 license are in
+  `data/layout-model/NOTICE.md`.
+- Dependency versions are pinned by `Cargo.lock`; upstream dependency licenses
+  remain applicable. `tools/collect_dependency_notices.py` gathers their texts,
+  together with the notices of the bundled English dictionary and the layout
+  model, into the installer's `THIRD-PARTY-NOTICES.txt`.
+- The settings UI uses Slint, declared by its crates as
+  `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`.
+  Which option applies to the distributed executable is an open item.
+
+Open licensing questions (the Estonian LGPL dictionary in signed packages, the
+ShareAlike model, Slint, the application icon) are listed in
+[`docs/licensing-notes.md`](docs/licensing-notes.md), which records facts and
+questions, not legal advice.

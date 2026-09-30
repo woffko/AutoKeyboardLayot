@@ -3,10 +3,32 @@ import unittest
 import hashlib
 import json
 from pathlib import Path
-from collect_dependency_notices import license_paths, upstream_texts, packages_from_receipt, curated_texts
+from collect_dependency_notices import (
+    license_paths, upstream_texts, packages_from_receipt, curated_texts, bundled_data_sections)
 
 
 class LicensePathsTests(unittest.TestCase):
+    def test_bundled_data_notices_cover_the_dictionary_and_the_layout_model(self):
+        root = Path(__file__).resolve().parents[1]
+        sections = bundled_data_sections(root)
+        self.assertEqual([section.split('\n')[1] for section in sections],
+                         ['=== Bundled English dictionary ===', '=== Bundled layout model ==='])
+        notice = (root / 'data/layout-model/NOTICE.md').read_text(encoding='utf-8')
+        self.assertTrue(sections[1].endswith(notice))
+        self.assertIn('Creative Commons Attribution-ShareAlike 4.0', sections[1])
+        self.assertIn('wordfreq', sections[1])
+        self.assertIn('FrequencyWords', sections[1])
+
+    def test_a_missing_bundled_notice_is_an_error_not_a_silent_omission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(OSError):
+                bundled_data_sections(Path(directory))
+            root = Path(directory)
+            (root / 'data/language-packs/en-US').mkdir(parents=True)
+            (root / 'data/language-packs/en-US/LICENSE.words.md').write_text('dictionary', encoding='utf-8')
+            with self.assertRaises(OSError):
+                bundled_data_sections(root)
+
     def test_curated_license_only_commit_requires_exact_source_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
