@@ -315,6 +315,10 @@ The settings window and About page show the version as `0.1.0 (abc1234)`, where
 commit shows `abc1234-dirty`; builds outside a Git checkout can set
 `AKL_BUILD_COMMIT` and otherwise show `unknown`.
 
+`tools/deploy-host.ps1` installs a verified build over the per-user installation
+with a backup, a graceful close and a rollback on failure; `-WhatIf` only prints
+the plan. See [`docs/host-deployment.md`](docs/host-deployment.md).
+
 `tools/verify-windows.ps1` runs native format/tests/Clippy/release checks, using
 an isolated temporary profile for adapter tests. `tools/start-windows-build.ps1`
 launches that script independently of SSH through WMI and monitors its result.
