@@ -19,6 +19,7 @@ use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
 use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
 use autokeyboardlayot::panic_guard::{FaultWindow, WorkerExit, guarded, run_contained};
 use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
+use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
 use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
 use ui_localization::{tr, tr_format};
@@ -175,6 +176,10 @@ const PRIVACY_ALLOWED: u8 = 0;
 // Give ordinary delayed replies more headroom before failing closed.
 const PRIVACY_PROBE_WAIT_MS: u64 = 300;
 const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
+/// A hook callback slower than this is recorded; Windows gives hooks a tight time budget.
+const HOOK_SLOW_DIAGNOSTIC_MS: u64 = 50;
+/// Timer ticks are 250 ms apart; a longer gap means the UI thread was blocked.
+const UI_STALL_DIAGNOSTIC_MS: u64 = 700;
 const UIA_PROVIDER_TIMEOUT_MS: u32 = 100;
 const PRIVACY_PASSWORD: u8 = 1;
 const PRIVACY_EXCLUDED: u8 = 2;
@@ -237,6 +242,7 @@ impl Drop for InstanceGuard {
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+    static LAST_TIMER_TICK: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// Set when a panic was contained in a hook callback, the window procedure or the input worker.
@@ -275,6 +281,8 @@ struct ObserverMetrics {
     worker_busy: AtomicBool,
     // Set when the input worker gave up after repeated internal faults.
     worker_dead: AtomicBool,
+    // Gate release requests made by the worker, counted before any window is involved.
+    gate_release_requests: AtomicU64,
     retained_input: Mutex<Option<RetainedInput>>,
     recovery_armed: AtomicBool,
 }
@@ -311,6 +319,7 @@ impl Default for ObserverMetrics {
             privacy_refresh_queued: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
             worker_dead: AtomicBool::new(false),
+            gate_release_requests: AtomicU64::new(0),
             retained_input: Mutex::new(None),
             recovery_armed: AtomicBool::new(false),
         }
@@ -1798,6 +1807,27 @@ impl AppState {
         }
     }
 
+    /// A diagnostics record outside the gate protocol, for UI-thread timing.
+    fn event_diagnostic(&self, event: &str, details: String) {
+        if self.metrics.diagnostics_enabled.load(Ordering::Acquire)
+            && let Some(sender) = &self.diagnostic_sender
+        {
+            let record = format!(
+                "event={event} captured_ms={} epoch={} {details}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                self.metrics.input_epoch.load(Ordering::Acquire)
+            );
+            if sender.try_send(record).is_err() {
+                self.metrics
+                    .dropped_diagnostics
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn record_gate_failure_without_worker(&self) {
         if !self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
             return;
@@ -1988,6 +2018,30 @@ fn finish_shutdown(hwnd: HWND) -> bool {
     requested
 }
 
+/// The gap since the previous timer tick in milliseconds, when it exceeds the stall threshold.
+fn timer_stall_ms(previous: Option<Instant>, now: Instant) -> Option<u128> {
+    previous
+        .map(|previous| now.saturating_duration_since(previous))
+        .filter(|gap| *gap > Duration::from_millis(UI_STALL_DIAGNOSTIC_MS))
+        .map(|gap| gap.as_millis())
+}
+
+/// The UI thread serves the hooks' synchronous requests, so a long gap between its timer ticks
+/// explains a gate that timed out.
+fn report_timer_stall() {
+    let now = Instant::now();
+    let previous = LAST_TIMER_TICK.with(|tick| tick.replace(Some(now)));
+    if let Some(gap_ms) = timer_stall_ms(previous, now) {
+        APP_STATE.with(|slot| {
+            if let Ok(borrowed) = slot.try_borrow()
+                && let Some(state) = borrowed.as_ref()
+            {
+                state.event_diagnostic("ui_stall", format!("delta_ms={gap_ms}"));
+            }
+        });
+    }
+}
+
 /// Reacts on the UI thread to a contained panic (`ENGINE_FAULT`) or to a worker that gave up:
 /// release held keys, pause automatic conversion, and say so once in a while.
 fn handle_engine_fault(hwnd: HWND) {
@@ -2063,6 +2117,12 @@ fn shutdown_blockers(facts: &ShutdownFacts) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(name, active)| active.then_some(name))
     .collect()
+}
+
+/// Whether a finished recovery may resume automatic conversion (policy D1): only the automatic
+/// recovery after a gate abort, and only when every requested key was submitted.
+const fn should_resume_after_recovery(explicit: bool, submitted: usize, requested: usize) -> bool {
+    !explicit && requested != 0 && submitted == requested
 }
 
 fn has_retained_input(metrics: &ObserverMetrics) -> bool {
@@ -2758,6 +2818,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
     match message {
         WM_TIMER if wparam.0 == LAYOUT_TIMER_ID => {
+            report_timer_stall();
             if finish_shutdown(hwnd) {
                 return LRESULT(0);
             }
@@ -2792,6 +2853,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     return false;
                 }
                 state.correction_gate.activate(token);
+                state.gate_diagnostic("armed", format!("token={token} source=worker"));
                 state.correction_gate.origin = foreground;
                 state
                     .metrics
@@ -2919,13 +2981,35 @@ fn tray_interaction(notification: u32) -> TrayInteraction {
 /// Hook callbacks must not unwind (that aborts the process). A contained panic passes the event
 /// on untouched and raises `ENGINE_FAULT`.
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    guarded(
+    let started = Instant::now();
+    let result = guarded(
         || unsafe { keyboard_hook_body(code, wparam, lparam) },
         || {
             ENGINE_FAULT.store(true, Ordering::Release);
             unsafe { CallNextHookEx(None, code, wparam, lparam) }
         },
-    )
+    );
+    report_slow_hook(started, "keyboard");
+    result
+}
+
+/// Records a hook callback that used a large part of the time Windows allows it.
+fn report_slow_hook(started: Instant, hook: &str) {
+    let elapsed = started.elapsed();
+    if elapsed < Duration::from_millis(HOOK_SLOW_DIAGNOSTIC_MS) {
+        return;
+    }
+    APP_STATE.with(|slot| {
+        // The callback may run while this thread holds the state; skip the record then.
+        if let Ok(borrowed) = slot.try_borrow()
+            && let Some(state) = borrowed.as_ref()
+        {
+            state.event_diagnostic(
+                "hook_slow",
+                format!("hook={hook} elapsed_ms={}", elapsed.as_millis()),
+            );
+        }
+    });
 }
 
 unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -3116,6 +3200,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         && !state.metrics.configuration_pending.load(Ordering::Acquire)
                     {
                         state.correction_gate.activate(sequence);
+                        state.gate_diagnostic("armed", format!("token={sequence}"));
                         state.correction_gate.origin = Some(foreground);
                         state
                             .metrics
@@ -3192,13 +3277,16 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    guarded(
+    let started = Instant::now();
+    let result = guarded(
         || unsafe { mouse_hook_body(code, wparam, lparam) },
         || {
             ENGINE_FAULT.store(true, Ordering::Release);
             unsafe { CallNextHookEx(None, code, wparam, lparam) }
         },
-    )
+    );
+    report_slow_hook(started, "mouse");
+    result
 }
 
 unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -4498,6 +4586,10 @@ struct InputProcessor {
     last_dropped_events: u64,
     metrics: Arc<ObserverMetrics>,
     gate_window: usize,
+    // Token of the most recent gate release request (0 when none yet).
+    last_gate_release_token: u64,
+    // Policy D1: how often automatic conversion may resume after a recovered gate abort.
+    auto_resumes: RateLimit,
 }
 
 impl InputProcessor {
@@ -4605,6 +4697,8 @@ impl InputProcessor {
             last_dropped_events: 0,
             metrics,
             gate_window,
+            last_gate_release_token: 0,
+            auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
         }
     }
 
@@ -4699,7 +4793,64 @@ impl InputProcessor {
         }
     }
 
+    /// Handles one queued event. When the event is the Space key-down that armed a correction
+    /// gate, the gate is released afterwards on every path: the normal paths do it themselves, but
+    /// early returns (stale epoch, pending configuration, automatic mode off, a pending
+    /// conversion, a shortcut modifier) used to leave the held keys waiting for the deadline and
+    /// aborting the gate. Releasing is always safe: it only replays held keys unchanged.
     fn process(&mut self, queued: QueuedInputEvent) {
+        let armed = self.armed_gate_token(&queued);
+        let reason = if armed == 0 {
+            ""
+        } else {
+            self.gate_bypass_reason(&queued)
+        };
+        self.process_event(queued);
+        if armed != 0 && self.last_gate_release_token != armed {
+            self.diagnostic(
+                "gate",
+                format!("phase=release_forced token={armed} reason={reason}"),
+            );
+            self.request_gate_release(armed);
+        }
+    }
+
+    /// The gate token when this event is the Space key-down that armed the decision gate, else 0.
+    fn armed_gate_token(&self, queued: &QueuedInputEvent) -> u64 {
+        let RawInputEvent::Key(key) = &queued.event else {
+            return 0;
+        };
+        let is_space_down = matches!(key.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+            && key.virtual_key == u32::from(VK_SPACE.0);
+        if is_space_down
+            && key.drain_token == 0
+            && key.sequence != 0
+            && self.metrics.active_gate_token.load(Ordering::Acquire) == key.sequence
+        {
+            key.sequence
+        } else {
+            0
+        }
+    }
+
+    /// Which condition would bypass the normal release, for the diagnostics of a forced one.
+    fn gate_bypass_reason(&self, queued: &QueuedInputEvent) -> &'static str {
+        if queued.epoch != self.metrics.input_epoch.load(Ordering::Acquire) {
+            "stale-epoch"
+        } else if self.metrics.configuration_pending.load(Ordering::Acquire) {
+            "configuration-pending"
+        } else if !self.metrics.auto_enabled.load(Ordering::Acquire) {
+            "automatic-off"
+        } else if self.pending_conversion.is_some() {
+            "pending-conversion"
+        } else if self.modifiers.has_shortcut_modifier() {
+            "shortcut-modifier"
+        } else {
+            "unhandled"
+        }
+    }
+
+    fn process_event(&mut self, queued: QueuedInputEvent) {
         let queue_wait_ms = queued.captured_at.elapsed().as_millis();
         if queue_wait_ms >= u128::from(SLOW_INPUT_DIAGNOSTIC_MS)
             || matches!(queued.event, RawInputEvent::GateDrainReady { .. })
@@ -5032,7 +5183,41 @@ impl InputProcessor {
         self.session.clear();
         self.replay_keys.clear();
         self.diagnostic("recovery", format!("token={} explicit={explicit} submitted={sent} requested={} evidence=input-submitted-text-unverified", record.token, inputs.len()));
-        // Recovery never silently re-enables automatic conversion.
+        // Only the automatic recovery of a gate abort, and only when every held key was handed
+        // back, may resume automatic conversion; explicit or partial recovery leaves it paused.
+        if should_resume_after_recovery(explicit, sent, inputs.len()) {
+            self.resume_after_recovered_abort(Instant::now());
+        }
+    }
+
+    /// Policy D1: a gate abort whose held input came back in full is no reason to stay off.
+    /// Automatic conversion resumes when that abort was the only reason for the pause, at most
+    /// three times an hour; any other pause, including one the user chose, stays as it is.
+    fn resume_after_recovered_abort(&mut self, now: Instant) {
+        let metrics = &self.metrics;
+        let paused_by_the_abort = !metrics.auto_enabled.load(Ordering::Acquire)
+            && metrics.safety_paused.load(Ordering::Acquire)
+            && metrics.last_failure_reason.load(Ordering::Acquire)
+                == ConversionFailureReason::GateDrain as u8;
+        if !paused_by_the_abort {
+            return;
+        }
+        if !self.auto_resumes.try_take(now) {
+            self.diagnostic(
+                "gate",
+                "phase=auto_resume_declined reason=budget".to_owned(),
+            );
+            return;
+        }
+        let metrics = &self.metrics;
+        metrics
+            .last_failure_reason
+            .store(ConversionFailureReason::None as u8, Ordering::Release);
+        metrics.safety_paused.store(false, Ordering::Release);
+        metrics.auto_enabled.store(true, Ordering::Release);
+        // Events queued while paused are stale now, as after a manual toggle.
+        metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.diagnostic("gate", "phase=auto_resumed".to_owned());
     }
 
     fn process_key(&mut self, event: RawKeyEvent) {
@@ -6966,7 +7151,15 @@ impl InputProcessor {
     }
 
     fn request_gate_release(&mut self, token: u64) {
-        if token == 0 || self.gate_window == 0 {
+        if token == 0 {
+            return;
+        }
+        // Recorded before the window check so that tests, which run without a window, see it.
+        self.last_gate_release_token = token;
+        self.metrics
+            .gate_release_requests
+            .fetch_add(1, Ordering::Relaxed);
+        if self.gate_window == 0 {
             return;
         }
         let posted = unsafe {
@@ -8931,6 +9124,195 @@ mod tests {
             state.request_shutdown(),
             "a stale busy flag of a finished worker must not refuse Exit"
         );
+    }
+
+    /// A Space key-down whose hook armed a gate with this sequence as its token.
+    fn armed_space(metrics: &Arc<ObserverMetrics>, sequence: u64, epoch: u64) -> QueuedInputEvent {
+        metrics.active_gate_token.store(sequence, Ordering::Release);
+        QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(test_raw_key(WM_KEYDOWN, VK_SPACE, sequence, 0)),
+            configuration: None,
+        }
+    }
+
+    #[test]
+    fn every_way_of_handling_an_armed_space_requests_exactly_one_gate_release() {
+        type Prepare = fn(&ObserverMetrics);
+        // (path, prepare the metrics, epoch of the queued event)
+        let cases: [(&str, Prepare, u64); 4] = [
+            (
+                "normal path",
+                |metrics| metrics.auto_enabled.store(true, Ordering::Release),
+                0,
+            ),
+            (
+                "stale epoch",
+                |metrics| {
+                    metrics.auto_enabled.store(true, Ordering::Release);
+                    metrics.input_epoch.store(5, Ordering::Release);
+                },
+                4,
+            ),
+            (
+                "configuration pending",
+                |metrics| {
+                    metrics.auto_enabled.store(true, Ordering::Release);
+                    metrics.configuration_pending.store(true, Ordering::Release);
+                },
+                0,
+            ),
+            ("automatic conversion off", |_| {}, 0),
+        ];
+        for (path, prepare, epoch) in cases {
+            let metrics = Arc::new(ObserverMetrics::default());
+            prepare(&metrics);
+            let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+            processor.set_privacy_reason(None);
+            let queued = armed_space(&metrics, 7, epoch);
+            processor.process(queued);
+            assert_eq!(
+                metrics.gate_release_requests.load(Ordering::Acquire),
+                1,
+                "{path}: an armed gate needs exactly one release request"
+            );
+            assert_eq!(processor.last_gate_release_token, 7, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_recovered_gate_abort_resumes_automatic_conversion_at_most_three_times_an_hour() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let start = Instant::now();
+        let minute = |n: u64| start + Duration::from_secs(60 * n);
+        let pause = |reason: ConversionFailureReason| {
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.safety_paused.store(true, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(reason as u8, Ordering::Release);
+        };
+        for n in 0..3 {
+            pause(ConversionFailureReason::GateDrain);
+            let epoch = metrics.input_epoch.load(Ordering::Acquire);
+            processor.resume_after_recovered_abort(minute(n));
+            assert!(metrics.auto_enabled.load(Ordering::Acquire), "resume {n}");
+            assert!(!metrics.safety_paused.load(Ordering::Acquire));
+            assert_eq!(
+                metrics.last_failure_reason.load(Ordering::Acquire),
+                ConversionFailureReason::None as u8
+            );
+            assert!(metrics.input_epoch.load(Ordering::Acquire) > epoch);
+        }
+        // The fourth abort within the hour stays paused.
+        pause(ConversionFailureReason::GateDrain);
+        processor.resume_after_recovered_abort(minute(30));
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(metrics.safety_paused.load(Ordering::Acquire));
+        // Once the first resume is an hour old, there is room again.
+        processor.resume_after_recovered_abort(minute(60));
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn only_a_pause_caused_by_the_gate_abort_is_resumed() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let now = Instant::now();
+        // (auto enabled, safety paused, reason, resumed): every other pause stays as it is.
+        let cases = [
+            (false, true, ConversionFailureReason::PhysicalEdit, false),
+            (false, true, ConversionFailureReason::ClipboardEdit, false),
+            (false, true, ConversionFailureReason::InternalFault, false),
+            // The user switched automatic conversion off: no safety pause is recorded.
+            (false, false, ConversionFailureReason::GateDrain, false),
+            // Already on: nothing to resume and no budget is consumed.
+            (true, false, ConversionFailureReason::GateDrain, true),
+            (false, true, ConversionFailureReason::GateDrain, true),
+        ];
+        for (auto_enabled, paused, reason, resumed) in cases {
+            metrics.auto_enabled.store(auto_enabled, Ordering::Release);
+            metrics.safety_paused.store(paused, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(reason as u8, Ordering::Release);
+            processor.resume_after_recovered_abort(now);
+            assert_eq!(
+                metrics.auto_enabled.load(Ordering::Acquire),
+                resumed,
+                "{auto_enabled} {paused} {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_complete_automatic_recovery_may_resume() {
+        assert!(should_resume_after_recovery(false, 12, 12));
+        assert!(!should_resume_after_recovery(true, 12, 12), "explicit");
+        assert!(!should_resume_after_recovery(false, 7, 12), "partial");
+        assert!(!should_resume_after_recovery(false, 0, 12), "nothing sent");
+        assert!(
+            !should_resume_after_recovery(false, 0, 0),
+            "nothing requested"
+        );
+    }
+
+    #[test]
+    fn a_long_gap_between_timer_ticks_is_reported_as_a_ui_stall() {
+        let start = Instant::now();
+        let after = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(timer_stall_ms(None, after(5_000)), None);
+        assert_eq!(timer_stall_ms(Some(start), after(250)), None);
+        assert_eq!(timer_stall_ms(Some(start), after(700)), None);
+        assert_eq!(timer_stall_ms(Some(start), after(701)), Some(701));
+        assert_eq!(
+            timer_stall_ms(Some(after(10)), start),
+            None,
+            "clock went back"
+        );
+    }
+
+    #[test]
+    fn events_that_did_not_arm_a_gate_request_no_release() {
+        let cases = [
+            // A drained Space replay carries its gate token: the gate is already being drained.
+            (VK_SPACE, WM_KEYDOWN, 7, 3),
+            // Space key-up, and keys other than Space, never arm the decision gate.
+            (VK_SPACE, WM_KEYUP, 7, 0),
+            (VIRTUAL_KEY(0x47), WM_KEYDOWN, 7, 0),
+        ];
+        for (key, message, sequence, drain_token) in cases {
+            let metrics = Arc::new(ObserverMetrics::default());
+            metrics.auto_enabled.store(true, Ordering::Release);
+            metrics.active_gate_token.store(sequence, Ordering::Release);
+            let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+            processor.set_privacy_reason(None);
+            processor.process(QueuedInputEvent {
+                epoch: 0,
+                captured_at: Instant::now(),
+                event: RawInputEvent::Key(test_raw_key(message, key, sequence, drain_token)),
+                configuration: None,
+            });
+            assert_eq!(
+                metrics.gate_release_requests.load(Ordering::Acquire),
+                0,
+                "{key:?} {message} drain_token={drain_token}"
+            );
+        }
+        // A Space that belongs to a different gate token is not this gate's decision event.
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.active_gate_token.store(9, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.set_privacy_reason(None);
+        processor.process(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0)),
+            configuration: None,
+        });
+        assert_eq!(metrics.gate_release_requests.load(Ordering::Acquire), 0);
     }
 
     #[test]

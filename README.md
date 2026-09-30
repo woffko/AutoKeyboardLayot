@@ -256,6 +256,17 @@ now asks whether to exit anyway and names those reasons; it warns that
 keystrokes held back for recovery are lost. A worker thread that has already
 finished never blocks Exit. Installer-driven closes never force an exit.
 
+A Space that arms the correction gate is always released once the worker has
+handled it, whichever path it took (stale input epoch, pending configuration,
+automatic conversion switched off, a pending conversion, a shortcut modifier),
+so held keys no longer wait for the 1.2 second deadline that aborts the gate.
+When a gate timeout does happen and its held keys are handed back in full,
+automatic conversion resumes by itself, at most three times an hour; a failed
+or partial recovery, an explicit recovery, or any other pause stays paused. The
+optional diagnostics log records `phase=armed`, `phase=release_forced`,
+`phase=auto_resumed`, `event=ui_stall` (timer ticks more than 700 ms apart) and
+`event=hook_slow` (a hook callback over 50 ms).
+
 ## Language packs
 
 Pack metadata is exposed by `language::language_packs()`. Dictionary sources,

@@ -39,6 +39,7 @@ pub mod package_store;
 pub mod panic_guard;
 pub mod privacy;
 pub mod profile_resolver;
+pub mod rate_limit;
 pub mod scoring_model;
 pub mod session;
 pub mod settings;
