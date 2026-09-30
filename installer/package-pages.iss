@@ -107,7 +107,9 @@ end;
 
 procedure PackageFailed;
 begin
-  if PackageReason <> '' then
+  if PackageReason = 'catalog_expired' then
+    PackageStatus.Caption := CustomMessage('AkCatalogExpired') + ' [' + PackageReason + ']'
+  else if PackageReason <> '' then
     PackageStatus.Caption := CustomMessage('AkPackageFailed') + ' [' + PackageReason + ']'
   else
     PackageStatus.Caption := CustomMessage('AkPackageFailed');

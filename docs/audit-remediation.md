@@ -45,9 +45,10 @@ settings-row projection, which Linux library tests cannot execute. Run tests
 serially when they share native process/window facilities.
 
 The CI matrix runs Linux and Windows. A separate scheduled job verifies the
-published catalog's signature and requires at least 72 hours remaining. It does
-not sign or publish a renewal. An operator must review and publish one before
-expiry. Frozen-release package verification is separate from live-catalog
+published catalog's signature and requires at least 240 hours (10 days) remaining,
+opening or updating one issue when it fails. It does not sign or publish a renewal.
+An operator must review and publish one before expiry
+(see `package-release-catalog.md`). Frozen-release package verification is separate from live-catalog
 expiry checks so historical fixtures remain useful after expiry.
 
 `.gitattributes` fixes text checkouts to LF and preserves the exact bytes of

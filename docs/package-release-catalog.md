@@ -5,7 +5,7 @@ HTTP requests, install packages, persist receipts or change settings. The separa
 language-pack project's existing `pack-index.json` is a development source list,
 not this signed release format. The selected source is the main
 `woffko/AutoKeyboardLayot` repository; release trust now embeds the public key
-`pkg-20260912-01`. A local seven-day revision-1 candidate now exists at
+`pkg-20260912-01`. A local revision-1 candidate now exists at
 `target/ui-package-candidates-20260912-01/catalog.aklc`; its signature and all
 13 referenced local artifacts passed offline verification. No signed catalog
 has yet been published, and its planned GitHub URLs were not contacted.
@@ -53,6 +53,38 @@ lock. Passing no prior checkpoint establishes no historical rollback protection.
 The current module does not implement durable storage or protect the system
 clock; the caller supplies trusted time. Installed-package downgrade protection
 remains separate from catalog-generation protection.
+
+## Renewing the catalog
+
+A published catalog must be renewed before it expires. Clients refuse a catalog outside
+`issued_at <= now < expires_at`, and online language installation stops until a valid catalog is
+published again. The scheduled workflow `catalog-freshness.yml` fails, and opens or updates one
+issue, when fewer than 10 days (240 hours) of validity remain.
+
+A renewal is a new catalog generation: the same package records, **a new, higher `revision`**,
+and a new window. A client that accepted revision N refuses a lower revision, and also revision N
+again with a different document.
+
+1. Build the unsigned candidate from the release's `.aklp` files (all in one directory):
+   `cargo run --locked --features signing-tools --example prepare_release_catalog -- DIRECTORY TAG REVISION OUTPUT.json [VALIDITY_DAYS]`.
+   `VALIDITY_DAYS` defaults to 21 and may be 1 to 31. `issued_at` is placed one hour in the past,
+   so a client whose clock runs slightly behind still accepts a fresh catalog, and the window is
+   exactly `VALIDITY_DAYS` long, which keeps even 31 days inside the client's lifetime limit.
+2. Review the candidate: package IDs, revisions, sha256 values and the tag equal the previous
+   catalog, and only `revision`, `issued_at` and `expires_at` differ. Record the file's sha256.
+3. Sign it with the release key using `tools/sign-package.ps1 -Kind catalog` (key handling is
+   described in `package-signing-key.md`).
+4. Verify offline: `cargo run --locked --example verify_release_catalog -- CATALOG ARTIFACT_DIRECTORY`
+   and `cargo run --locked --example check_catalog_expiry -- CATALOG [MIN_HOURS]` (lead time
+   defaults to 240 hours).
+5. Publish by replacing the `catalog.aklc` asset of the release that
+   `releases/latest/download/catalog.aklc` resolves to, keeping a copy of the previous catalog for
+   rollback. Download it anonymously, compare the hash, and run `check_catalog_expiry` on the download.
+
+When a catalog has expired, Settings and the installer show a dedicated message ("The published
+package catalog has expired, or the date and time on this computer are wrong. Check the system
+clock, or try again later.") instead of a raw error code; a wrong system clock produces the same
+message because the window is compared with the local clock.
 
 ## Explicit selection and artifact verification
 

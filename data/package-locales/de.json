@@ -22,6 +22,7 @@
     "download.unavailable": "Nicht verfügbar: inkompatible Paket-API oder geschützte englische Basis.",
     "download.progress": "Vorbereitet: {count}/{total}; {bytes}/{total_bytes} Bytes (aus dem Cache oder heruntergeladen).",
     "download.failed": "Online-Paketvorgang fehlgeschlagen: {code}. Prüfen Sie vor einem erneuten Versuch den Katalog erneut.",
+    "download.catalog_expired": "Der veröffentlichte Paketkatalog ist abgelaufen, oder Datum und Uhrzeit dieses Computers sind falsch. Prüfen Sie die Systemuhr oder versuchen Sie es später erneut.",
     "download.install_summary": "Geprüft: {count} Pakete, {bytes} Bytes. Prüfen Sie unten jede Lizenz und bestätigen Sie die Installation. Eingabeauswahl und bevorzugte Oberflächensprache bleiben erhalten. Der Katalogverlauf wurde bereits bestätigt.",
     "download.confirm": "Ausgewählte Pakete installieren",
     "download.done": "Ausgewählte Pakete installiert. Eingabeauswahl und bevorzugte Oberflächensprache bleiben erhalten. Falls der Agent läuft, wurde ihm die Anforderung zum Neuladen gesendet.",

@@ -22,6 +22,7 @@
     "download.unavailable": "Tidak tersedia: API paket tidak kompatibel atau basis bahasa Inggris dilindungi.",
     "download.progress": "Disiapkan: {count}/{total}; {bytes}/{total_bytes} byte (dari cache atau diunduh).",
     "download.failed": "Operasi paket online gagal: {code}. Periksa katalog lagi sebelum mencoba ulang.",
+    "download.catalog_expired": "Katalog paket yang dipublikasikan telah kedaluwarsa, atau tanggal dan waktu di komputer ini salah. Periksa jam sistem, atau coba lagi nanti.",
     "download.install_summary": "Terverifikasi: {count} paket, {bytes} byte. Tinjau setiap lisensi di bawah, lalu konfirmasikan instalasi. Pilihan input dan preferensi bahasa antarmuka dipertahankan. Riwayat katalog sudah diterima.",
     "download.confirm": "Instal paket yang dipilih",
     "download.done": "Paket yang dipilih terinstal. Pilihan input dan preferensi bahasa antarmuka dipertahankan. Permintaan pemuatan ulang dikirim ke agen jika sedang berjalan.",

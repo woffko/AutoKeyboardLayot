@@ -143,31 +143,6 @@ fn leases() -> std::result::Result<Vec<Handle>, InstallError> {
     Ok(handles)
 }
 
-/// Coarse, path-free failure code for asynchronous worker results. It never
-/// includes paths, URLs, secrets or raw error text.
-fn poll_reason(error: &SessionError) -> &'static str {
-    match error {
-        SessionError::WrongState => "state",
-        SessionError::Exhausted => "exhausted",
-        SessionError::Install(InstallError::Store(StoreError::Busy)) => "store_busy",
-        SessionError::Install(InstallError::Store(_)) => "store",
-        SessionError::Install(InstallError::Download(DownloadError::HttpStatus(_))) => {
-            "download_http"
-        }
-        SessionError::Install(InstallError::Download(DownloadError::LocalRead)) => "local_read",
-        SessionError::Install(InstallError::Download(DownloadError::Verification(_))) => {
-            "verification"
-        }
-        SessionError::Install(InstallError::Download(DownloadError::Cancelled)) => {
-            "download_cancelled"
-        }
-        SessionError::Install(InstallError::Download(_)) => "download",
-        SessionError::Install(InstallError::Catalog(_)) => "catalog",
-        SessionError::Install(InstallError::Inventory(_)) => "inventory",
-        SessionError::Install(_) => "install",
-    }
-}
-
 /// Coarse, path-free failure code for a rejected synchronous command.
 fn reject_reason(text: &str) -> &'static str {
     let text = text.to_ascii_lowercase();
@@ -255,7 +230,7 @@ pub fn run() -> Result<()> {
                     }
                     Err(error) => {
                         outcome = "failed";
-                        reason = poll_reason(&error);
+                        reason = error.reason();
                     }
                 }
             }

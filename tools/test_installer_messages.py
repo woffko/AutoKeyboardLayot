@@ -70,6 +70,31 @@ class InstallerMessageTests(unittest.TestCase):
         })
         self.assertNotRegex(source.replace(names.group(), ''), r"Result\s*:=\s*'[^']+'")
 
+    def test_expired_catalog_reason_has_its_own_message_in_every_language(self):
+        root = Path(__file__).resolve().parents[1]
+        pages = (root / 'installer/package-pages.iss').read_text(encoding='utf-8')
+        branch = re.search(
+            r"if PackageReason = '(\w+)' then\s+PackageStatus\.Caption := CustomMessage\('AkCatalogExpired'\)", pages)
+        self.assertIsNotNone(branch, 'PackageFailed must show AkCatalogExpired for the expired-catalog reason')
+        self.assertLess(branch.start(), pages.index("CustomMessage('AkPackageFailed')"))
+        # The reason code must be one the helper can actually report.
+        session = (root / 'src/installer_session.rs').read_text(encoding='utf-8')
+        reasons = set(re.findall(r'=> "(\w+)",', session))
+        self.assertIn(branch.group(1), reasons)
+        english = {}
+        for file in sorted((root / 'installer/messages').glob('*.isl')):
+            pairs = dict(line.split('=', 1) for line in file.read_text(encoding='utf-8').splitlines() if line.startswith('Ak'))
+            with self.subTest(locale=file.stem):
+                self.assertTrue(pairs.get('AkCatalogExpired'))
+                self.assertNotEqual(pairs['AkCatalogExpired'], pairs['AkPackageFailed'])
+                self.assertNotIn('%', pairs['AkCatalogExpired'])
+                if file.stem == 'en':
+                    english = pairs
+                else:
+                    self.assertNotEqual(pairs['AkCatalogExpired'], 'AkCatalogExpired')
+        self.assertIn('expired', english['AkCatalogExpired'])
+        self.assertIn('clock', english['AkCatalogExpired'])
+
     def test_locale_keys_and_placeholders_match_english_fallback(self):
         root = Path(__file__).resolve().parents[1] / 'installer'
         def catalog(name):

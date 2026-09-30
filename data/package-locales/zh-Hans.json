@@ -26,6 +26,7 @@
     "download.unavailable": "不可用：语言包 API 不兼容，或属于受保护的内置英语基础。",
     "download.progress": "已准备：{count}/{total}；{bytes}/{total_bytes} 字节（来自缓存或下载）。",
     "download.failed": "在线语言包操作失败：{code}。重试前请再次检查目录。",
+    "download.catalog_expired": "已发布的语言包目录已过期，或此计算机的日期和时间不正确。请检查系统时钟，或稍后重试。",
     "download.install_summary": "已验证：{count} 个语言包，共 {bytes} 字节。请在下方查看每个许可证，然后确认安装。输入选择和界面语言偏好将保留。目录记录已被接受。",
     "download.confirm": "安装所选语言包",
     "download.done": "所选语言包已安装。输入选择和界面语言偏好已保留。如果代理正在运行，已向其发送重新加载请求。",

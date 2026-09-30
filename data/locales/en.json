@@ -23,6 +23,7 @@
     "download.unavailable": "Unavailable: incompatible package API or protected English base.",
     "download.progress": "Prepared: {count}/{total}; {bytes}/{total_bytes} bytes (cached or downloaded).",
     "download.failed": "Online package operation failed: {code}. Check the catalog again before retrying.",
+    "download.catalog_expired": "The published package catalog has expired, or the date and time on this computer are wrong. Check the system clock, or try again later.",
     "download.install_summary": "Verified: {count} packages, {bytes} bytes. Review each license below, then confirm installation. Input selections and interface-language preference are kept. The catalog history has already been accepted.",
     "download.confirm": "Install selected packages",
     "download.done": "Selected packages installed. Input selections and interface-language preference were kept. The reload request was sent to the agent if it is running.",

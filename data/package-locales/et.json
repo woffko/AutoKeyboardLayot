@@ -22,6 +22,7 @@
     "download.unavailable": "Pole saadaval: ühildumatu paketi API või kaitstud ingliskeelne alus.",
     "download.progress": "Ette valmistatud: {count}/{total}; {bytes}/{total_bytes} baiti (vahemälust või alla laaditud).",
     "download.failed": "Võrgupaketitoiming ebaõnnestus: {code}. Enne uuesti proovimist kontrolli kataloogi uuesti.",
+    "download.catalog_expired": "Avaldatud paketikataloog on aegunud või selle arvuti kuupäev ja kellaaeg on valed. Kontrolli süsteemikella või proovi hiljem uuesti.",
     "download.install_summary": "Kontrollitud: {count} paketti, {bytes} baiti. Vaata allpool üle iga litsents ja kinnita paigaldamine. Sisendivalikud ja liidesekeele eelistus säilivad. Kataloogi ajalugu on juba kinnitatud.",
     "download.confirm": "Paigalda valitud paketid",
     "download.done": "Valitud paketid on paigaldatud. Sisendivalikud ja liidesekeele eelistus säilitati. Kui agent töötab, saadeti sellele andmete uuesti laadimise taotlus.",

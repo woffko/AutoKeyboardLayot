@@ -17,6 +17,7 @@ AkPackageCancel=Batalkan unduhan
 AkPackageInstall=Instal paket yang dipilih
 AkPackageBusy=Memproses paket…
 AkPackageFailed=Operasi paket gagal. Tidak ada percobaan ulang otomatis; periksa status paket saat ini sebelum mencoba lagi.
+AkCatalogExpired=Katalog paket yang dipublikasikan telah kedaluwarsa, atau tanggal dan waktu di komputer ini salah. Periksa jam sistem, atau coba lagi nanti.
 AkPackageInput=Termasuk kamus dan aturan input.
 AkPackageUnavailable=Tidak tersedia: API paket tidak kompatibel atau basis bahasa Inggris dilindungi.
 AkPackageIntro=Bahasa Inggris sudah disertakan. Paket opsional hanya dipasang setelah Anda mengonfirmasi.

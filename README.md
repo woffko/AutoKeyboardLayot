@@ -300,7 +300,8 @@ cargo check --target x86_64-pc-windows-msvc
 
 From WSL, `tools/verify-wsl.sh` runs the whole local gate with one command:
 formatting, Clippy (default features, `installer-tools` without default
-features, and the Windows target), tests in two feature configurations, strict
+features, the Windows target, the signing tools, and the Windows installer
+helper), tests in two feature configurations plus the signing tools, strict
 locale validation, the Python unit tests, and the Windows unit tests, which are
 cross-built with `cargo-xwin` and executed on the Windows host with a temporary
 `LOCALAPPDATA`. Each step logs to `target/verify/<timestamp>/`, the run ends

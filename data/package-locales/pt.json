@@ -22,6 +22,7 @@
     "download.unavailable": "Indisponível: API de pacote incompatível ou base inglesa protegida.",
     "download.progress": "Preparados: {count}/{total}; {bytes}/{total_bytes} bytes (em cache ou transferidos).",
     "download.failed": "A operação de pacotes online falhou: {code}. Verifique novamente o catálogo antes de tentar outra vez.",
+    "download.catalog_expired": "O catálogo de pacotes publicado expirou, ou a data e a hora deste computador estão incorretas. Verifique o relógio do sistema ou tente novamente mais tarde.",
     "download.install_summary": "Verificados: {count} pacotes, {bytes} bytes. Reveja abaixo cada licença e confirme a instalação. As escolhas de entrada e o idioma preferido da interface são mantidos. O histórico do catálogo já foi aceite.",
     "download.confirm": "Instalar pacotes selecionados",
     "download.done": "Pacotes selecionados instalados. As escolhas de entrada e o idioma preferido da interface foram mantidos. O pedido de recarregamento foi enviado ao agente, se estiver em execução.",
