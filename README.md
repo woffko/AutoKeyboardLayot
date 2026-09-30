@@ -290,6 +290,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo check --target x86_64-pc-windows-msvc
 ```
 
+From WSL, `tools/verify-wsl.sh` runs the whole local gate with one command:
+formatting, Clippy (default features, `installer-tools` without default
+features, and the Windows target), tests in two feature configurations, strict
+locale validation, the Python unit tests, and the Windows unit tests, which are
+cross-built with `cargo-xwin` and executed on the Windows host with a temporary
+`LOCALAPPDATA`. Each step logs to `target/verify/<timestamp>/`, the run ends
+with a `summary.txt`, and the test counts may not fall below recorded floors.
+`--keep-going` runs every step after a failure; `--list` and `--only` show and
+select steps.
+
 `tools/verify-windows.ps1` runs native format/tests/Clippy/release checks, using
 an isolated temporary profile for adapter tests. `tools/start-windows-build.ps1`
 launches that script independently of SSH through WMI and monitors its result.
