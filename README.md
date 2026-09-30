@@ -238,6 +238,24 @@ diagnostic format string. The file rotates at 1 MiB and has no network
 transport. Earlier builds logged the virtual-key code of unsupported keys
 (including digits) as `vk=`; delete `diagnostics*.log` files written by them.
 
+`crash.log` in the same folder is always written, independent of
+`diagnostics_enabled`: one line per panic with the time in Unix milliseconds,
+the thread name, the source location and the application version, for example
+`1700000000123 panic thread=unnamed at src/windows_agent.rs:123:9 version=0.1.0 (abc1234)`.
+It never contains the panic message, typed text or key codes. The file is
+capped at 256 KiB and rotates to `crash.1.log`.
+
+A panic in a keyboard or mouse hook callback, the window procedure or the input
+worker is contained. Typing is not affected: the event is passed on untouched,
+keys held by the correction gate are released unchanged, automatic conversion is
+paused and a tray notice points to `crash.log`. If the worker panics three times
+within a minute it stops, which is reported once and turned into a prompt when
+Exit is chosen. A tray Exit that is declined (an active correction gate,
+retained input, a busy worker, a pending configuration, a hotkey in progress)
+now asks whether to exit anyway and names those reasons; it warns that
+keystrokes held back for recovery are lost. A worker thread that has already
+finished never blocks Exit. Installer-driven closes never force an exit.
+
 ## Language packs
 
 Pack metadata is exposed by `language::language_packs()`. Dictionary sources,

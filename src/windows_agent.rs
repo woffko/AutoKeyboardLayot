@@ -17,6 +17,7 @@ use std::{
 
 use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
 use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
+use autokeyboardlayot::panic_guard::{FaultWindow, WorkerExit, guarded, run_contained};
 use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
 use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
@@ -94,10 +95,10 @@ use windows::{
                 GUITHREADINFO, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetMessageW,
                 GetShellWindow, GetWindowThreadProcessId, HHOOK, HICON, HMENU, ICONINFO, IDYES,
                 KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MB_ICONERROR,
-                MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-                MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW, PM_REMOVE, PeekMessageW,
-                PostMessageW, PostQuitMessage, RegisterClassW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-                SMTO_ERRORONEXIT, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
+                MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED,
+                MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW, PM_REMOVE,
+                PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SMTO_ABORTIFHUNG,
+                SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
                 SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu,
                 TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
@@ -238,6 +239,10 @@ thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
 }
 
+/// Set when a panic was contained in a hook callback, the window procedure or the input worker.
+/// The UI timer reacts to it (see `handle_engine_fault`).
+static ENGINE_FAULT: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug)]
 struct ObserverMetrics {
     candidates: AtomicU64,
@@ -268,6 +273,8 @@ struct ObserverMetrics {
     cancelled_gate_token: AtomicU64,
     privacy_refresh_queued: AtomicBool,
     worker_busy: AtomicBool,
+    // Set when the input worker gave up after repeated internal faults.
+    worker_dead: AtomicBool,
     retained_input: Mutex<Option<RetainedInput>>,
     recovery_armed: AtomicBool,
 }
@@ -303,6 +310,7 @@ impl Default for ObserverMetrics {
             cancelled_gate_token: AtomicU64::new(0),
             privacy_refresh_queued: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            worker_dead: AtomicBool::new(false),
             retained_input: Mutex::new(None),
             recovery_armed: AtomicBool::new(false),
         }
@@ -342,6 +350,7 @@ enum GateFailureCause {
     ReplaySubmit,
     WorkerAck,
     DownstreamHook,
+    InternalFault,
 }
 
 #[derive(Debug, Clone)]
@@ -1136,6 +1145,7 @@ enum ConversionFailureReason {
     ReplayCommit = 5,
     GateDrain = 6,
     ClipboardEdit = 7,
+    InternalFault = 8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1388,31 +1398,7 @@ impl AppState {
         if self.shutdown.load(Ordering::Acquire) {
             return true;
         }
-        let blockers: Vec<&str> = [
-            ("correction-gate", self.correction_gate.active),
-            ("retained-input", has_retained_input(&self.metrics)),
-            (
-                "worker-busy",
-                self.metrics.worker_busy.load(Ordering::Acquire),
-            ),
-            (
-                "configuration-pending",
-                self.metrics.configuration_pending.load(Ordering::Acquire),
-            ),
-            (
-                "undo-hotkey",
-                self.metrics.undo_hotkey_active.load(Ordering::Acquire),
-            ),
-            (
-                "hotkey-release",
-                self.metrics
-                    .hotkey_waiting_for_release
-                    .load(Ordering::Acquire),
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(name, active)| active.then_some(name))
-        .collect();
+        let blockers = self.decline_reasons();
         if !blockers.is_empty() {
             self.gate_diagnostic(
                 "shutdown",
@@ -1426,6 +1412,53 @@ impl AppState {
         // Disconnect recv even when there is no queued event to wake it.
         self.input_sender.take();
         true
+    }
+
+    /// Why a graceful Exit would be declined right now; empty when it would be accepted.
+    fn decline_reasons(&self) -> Vec<&'static str> {
+        shutdown_blockers(&ShutdownFacts {
+            correction_gate_active: self.correction_gate.active,
+            retained_input: has_retained_input(&self.metrics),
+            worker_busy: self.metrics.worker_busy.load(Ordering::Acquire),
+            worker_finished: self.worker.as_ref().is_some_and(JoinHandle::is_finished),
+            configuration_pending: self.metrics.configuration_pending.load(Ordering::Acquire),
+            undo_hotkey_active: self.metrics.undo_hotkey_active.load(Ordering::Acquire),
+            hotkey_waiting_for_release: self
+                .metrics
+                .hotkey_waiting_for_release
+                .load(Ordering::Acquire),
+        })
+    }
+
+    /// A contained panic makes the state untrustworthy: release held keys unchanged, end hotkey
+    /// gestures that may be half tracked, discard queued work of the old epoch and pause
+    /// automatic conversion.
+    fn record_engine_fault(&mut self) {
+        self.break_correction_gate_fail_open(GateFailureCause::InternalFault);
+        self.metrics
+            .undo_hotkey_active
+            .store(false, Ordering::Release);
+        self.metrics
+            .hotkey_waiting_for_release
+            .store(false, Ordering::Release);
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        if self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
+            self.metrics.last_failure_reason.store(
+                ConversionFailureReason::InternalFault as u8,
+                Ordering::Release,
+            );
+            self.metrics.safety_paused.store(true, Ordering::Release);
+            self.metrics
+                .conversion_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.gate_diagnostic(
+            "fault",
+            format!(
+                "result=engine_fault worker_dead={}",
+                self.metrics.worker_dead.load(Ordering::Acquire)
+            ),
+        );
     }
 
     fn shutdown_finished(&self) -> bool {
@@ -1806,29 +1839,99 @@ impl Drop for AppState {
     }
 }
 
-/// `explicit` marks the tray menu Exit: a declined request is then shown in
-/// a message box, which cannot be missed like a tray notification. Installer
-/// and other WM_CLOSE requests keep the non-blocking notification.
+/// `explicit` marks the tray menu Exit. A declined explicit request asks whether to exit anyway,
+/// naming the coarse reasons; installer and other WM_CLOSE requests keep the non-blocking
+/// notification and never force.
 fn request_shutdown(hwnd: HWND, explicit: bool) {
-    let accepted = APP_STATE.with(|slot| {
+    // The reasons are read under the same borrow as the attempt, so they describe the state that
+    // declined it.
+    let (accepted, reasons) = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
-            .is_some_and(AppState::request_shutdown)
+            .map_or((false, Vec::new()), |state| {
+                let accepted = state.request_shutdown();
+                let reasons = if accepted {
+                    Vec::new()
+                } else {
+                    state.decline_reasons()
+                };
+                (accepted, reasons)
+            })
     });
     if accepted {
+        // Only the tray menu sets the flag: a later implicit close must not clear it.
+        if explicit {
+            EXPLICIT_SHUTDOWN.store(true, Ordering::Release);
+        }
         finish_shutdown(hwnd);
-    } else if explicit {
-        unsafe {
-            MessageBoxW(
-                Some(hwnd),
-                &HSTRING::from(tr("lifecycle.close_busy")),
-                WINDOW_TITLE,
-                ui_localization::message_box_style(MB_OK | MB_ICONINFORMATION),
-            );
+    } else if explicit && !reasons.is_empty() {
+        if confirm_exit_anyway(hwnd, &reasons) {
+            force_exit();
         }
     } else {
         show_tray_information(hwnd, "AutoKeyboardLayot", tr("lifecycle.close_busy"));
     }
+}
+
+/// True when the user started the graceful shutdown from the tray menu.
+static EXPLICIT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// One exit prompt at a time: the dialog's nested message loop keeps dispatching timer and tray
+/// messages, which could otherwise stack further prompts.
+static EXIT_PROMPT_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Text of the "exit anyway?" prompt: the coarse reasons, and a warning when keystrokes that were
+/// held back for recovery would be lost.
+fn exit_anyway_text(reasons: &[&str]) -> String {
+    let mut text = tr_format("lifecycle.exit_anyway", &[("reasons", &reasons.join(", "))]);
+    if reasons.contains(&"retained-input") {
+        text.push_str("\n\n");
+        text.push_str(&tr("lifecycle.exit_anyway_discard"));
+    }
+    text
+}
+
+/// Asks whether to leave although Exit was declined or does not finish.
+fn confirm_exit_anyway(hwnd: HWND, reasons: &[&str]) -> bool {
+    if EXIT_PROMPT_OPEN.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let answer = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            &HSTRING::from(exit_anyway_text(reasons)),
+            WINDOW_TITLE,
+            ui_localization::message_box_style(MB_YESNO | MB_ICONWARNING),
+        )
+    };
+    EXIT_PROMPT_OPEN.store(false, Ordering::Release);
+    answer == IDYES
+}
+
+/// Leaves the process without waiting for the worker. Only for an exit the user confirmed: input
+/// held back for recovery is lost. The order follows the graceful path: stop the hooks so no new
+/// input is swallowed, remove the tray icon, give the diagnostics queue a moment, then exit.
+fn force_exit() -> ! {
+    let handles = APP_STATE.with(|slot| {
+        slot.borrow_mut().as_mut().map(|state| {
+            state.gate_diagnostic("shutdown", "result=forced".to_owned());
+            (
+                state.keyboard_hook.take(),
+                state.mouse_hook.take(),
+                state.tray.take(),
+            )
+        })
+    });
+    if let Some((keyboard, mouse, tray)) = handles {
+        for hook in [keyboard, mouse].into_iter().flatten() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
+        // Dropping the tray icon removes it from the notification area.
+        drop(tray);
+    }
+    thread::sleep(Duration::from_millis(200));
+    std::process::exit(0)
 }
 
 // True means shutdown owns this timer tick, including while the worker is
@@ -1861,8 +1964,71 @@ fn finish_shutdown(hwnd: HWND) -> bool {
                 }
             });
         }
+        // A shutdown the user started that still has not completed is offered as a forced exit,
+        // and asked again at most every 30 seconds. Installer-driven closes never force.
+        static NEXT_STUCK_PROMPT: Mutex<Option<Instant>> = Mutex::new(None);
+        if started.elapsed() >= Duration::from_secs(5) && EXPLICIT_SHUTDOWN.load(Ordering::Acquire)
+        {
+            let due = {
+                let mut next = NEXT_STUCK_PROMPT
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let now = Instant::now();
+                let due = next.is_none_or(|at| now >= at);
+                if due {
+                    *next = Some(now + Duration::from_secs(30));
+                }
+                due
+            };
+            if due && confirm_exit_anyway(hwnd, &["worker-not-stopping"]) {
+                force_exit();
+            }
+        }
     }
     requested
+}
+
+/// Reacts on the UI thread to a contained panic (`ENGINE_FAULT`) or to a worker that gave up:
+/// release held keys, pause automatic conversion, and say so once in a while.
+fn handle_engine_fault(hwnd: HWND) {
+    static WORKER_STOP_REPORTED: AtomicBool = AtomicBool::new(false);
+    static LAST_NOTICE: Mutex<Option<Instant>> = Mutex::new(None);
+    let faulted = ENGINE_FAULT.swap(false, Ordering::AcqRel);
+    let worker_stopped = APP_STATE.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|state| {
+            state.metrics.worker_dead.load(Ordering::Acquire)
+                && !state.shutdown.load(Ordering::Acquire)
+        })
+    }) && !WORKER_STOP_REPORTED.swap(true, Ordering::AcqRel);
+    if !faulted && !worker_stopped {
+        return;
+    }
+    APP_STATE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.record_engine_fault();
+        }
+    });
+    // A fault that repeats on every key would otherwise show a notice every quarter second.
+    let notice_due = {
+        let mut last = LAST_NOTICE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = Instant::now();
+        let due = worker_stopped
+            || last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60));
+        if due {
+            *last = Some(now);
+        }
+        due
+    };
+    if notice_due {
+        let body = if worker_stopped {
+            tr("fault.worker_stopped")
+        } else {
+            tr("fault.engine")
+        };
+        show_tray_information(hwnd, tr("fault.title"), body);
+    }
 }
 
 fn take_app_state() -> Option<AppState> {
@@ -1870,6 +2036,33 @@ fn take_app_state() -> Option<AppState> {
         let mut state = slot.borrow_mut();
         state.take()
     })
+}
+
+/// Facts that can make a graceful Exit wait or be declined.
+struct ShutdownFacts {
+    correction_gate_active: bool,
+    retained_input: bool,
+    worker_busy: bool,
+    worker_finished: bool,
+    configuration_pending: bool,
+    undo_hotkey_active: bool,
+    hotkey_waiting_for_release: bool,
+}
+
+/// The reasons for declining Exit, in reporting order. A finished worker thread cannot be busy,
+/// so the stale flag a crashed worker leaves behind is ignored.
+fn shutdown_blockers(facts: &ShutdownFacts) -> Vec<&'static str> {
+    [
+        ("correction-gate", facts.correction_gate_active),
+        ("retained-input", facts.retained_input),
+        ("worker-busy", facts.worker_busy && !facts.worker_finished),
+        ("configuration-pending", facts.configuration_pending),
+        ("undo-hotkey", facts.undo_hotkey_active),
+        ("hotkey-release", facts.hotkey_waiting_for_release),
+    ]
+    .into_iter()
+    .filter_map(|(name, active)| active.then_some(name))
+    .collect()
 }
 
 fn has_retained_input(metrics: &ObserverMetrics) -> bool {
@@ -2337,7 +2530,15 @@ impl Drop for TrayIcon {
     }
 }
 
+/// Panics of this process are written to crash.log in the profile folder (never their message).
+fn install_crash_log() {
+    if let Some(directory) = configuration_directory() {
+        autokeyboardlayot::crash_log::install(directory, APP_VERSION);
+    }
+}
+
 pub fn run() -> Result<()> {
+    install_crash_log();
     let initial_configuration = load_runtime_configuration().map_err(|error| {
         Error::new(
             windows::core::HRESULT(0x8007000Du32 as i32),
@@ -2513,6 +2714,7 @@ pub fn verify_profile() -> i32 {
 }
 
 pub fn run_settings() -> core::result::Result<(), String> {
+    install_crash_log();
     settings_window::run()
 }
 
@@ -2534,6 +2736,16 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    guarded(
+        || unsafe { window_proc_body(hwnd, message, wparam, lparam) },
+        || {
+            ENGINE_FAULT.store(true, Ordering::Release);
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        },
+    )
+}
+
+unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if matches!(
         message,
         WM_COMMAND | TRAY_CALLBACK_MESSAGE | SETTINGS_APPLIED_MESSAGE
@@ -2549,6 +2761,7 @@ unsafe extern "system" fn window_proc(
             if finish_shutdown(hwnd) {
                 return LRESULT(0);
             }
+            handle_engine_fault(hwnd);
             finish_configuration_load(hwnd);
             finish_configuration_reload(hwnd);
             expire_correction_gate();
@@ -2703,7 +2916,19 @@ fn tray_interaction(notification: u32) -> TrayInteraction {
     }
 }
 
+/// Hook callbacks must not unwind (that aborts the process). A contained panic passes the event
+/// on untouched and raises `ENGINE_FAULT`.
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    guarded(
+        || unsafe { keyboard_hook_body(code, wparam, lparam) },
+        || {
+            ENGINE_FAULT.store(true, Ordering::Release);
+            unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        },
+    )
+}
+
+unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let mut swallow = false;
     let mut forwarded_sequence = None;
     let mut drained_event = false;
@@ -2967,6 +3192,16 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    guarded(
+        || unsafe { mouse_hook_body(code, wparam, lparam) },
+        || {
+            ENGINE_FAULT.store(true, Ordering::Release);
+            unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        },
+    )
+}
+
+unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0
         && matches!(
             wparam.0 as u32,
@@ -4185,6 +4420,7 @@ fn input_worker(
     diagnostic_sender: SyncSender<String>,
     configuration: RuntimeConfiguration,
 ) {
+    let flags = Arc::clone(&metrics);
     let mut processor = InputProcessor::new_with_lexicon_candidate(
         metrics,
         gate_window,
@@ -4192,16 +4428,24 @@ fn input_worker(
         Some(diagnostic_sender),
         configuration,
     );
-    while let Ok(event) = receiver.recv() {
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
-        processor.metrics.worker_busy.store(true, Ordering::Release);
-        processor.process(event);
-        processor
-            .metrics
-            .worker_busy
-            .store(false, Ordering::Release);
+    // A panic while handling an event is contained: the busy flag is cleared, conversion state is
+    // dropped and automatic conversion pauses. A run of panics stops the worker instead of
+    // spinning on a bug; the UI then reports it and Exit no longer waits for it.
+    let mut faults = FaultWindow::new(3, Duration::from_secs(60));
+    let exit = run_contained(
+        &mut processor,
+        &receiver,
+        &flags.worker_busy,
+        &shutdown,
+        &mut faults,
+        |processor, event| processor.process(event),
+        |processor| {
+            ENGINE_FAULT.store(true, Ordering::Release);
+            processor.record_conversion_failure(ConversionFailureReason::InternalFault);
+        },
+    );
+    if exit == WorkerExit::TooManyFaults {
+        flags.worker_dead.store(true, Ordering::Release);
     }
 }
 
@@ -7662,6 +7906,7 @@ const fn conversion_failure_label(reason: u8) -> &'static str {
         value if value == ConversionFailureReason::ReplayCommit as u8 => "replay-commit",
         value if value == ConversionFailureReason::GateDrain as u8 => "gate-drain",
         value if value == ConversionFailureReason::ClipboardEdit as u8 => "clipboard-edit",
+        value if value == ConversionFailureReason::InternalFault as u8 => "internal-fault",
         _ => "unknown",
     }
 }
@@ -8670,6 +8915,162 @@ mod tests {
             diagnostic_worker: None,
         };
         (state, receiver)
+    }
+
+    #[test]
+    fn a_finished_worker_with_a_stuck_busy_flag_does_not_block_exit() {
+        let (mut state, _receiver) = test_gate_state(4);
+        // A worker that panicked while busy leaves the flag set and its thread finished.
+        state.metrics.worker_busy.store(true, Ordering::Release);
+        let worker = thread::spawn(|| {});
+        while !worker.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        state.worker = Some(worker);
+        assert!(
+            state.request_shutdown(),
+            "a stale busy flag of a finished worker must not refuse Exit"
+        );
+    }
+
+    #[test]
+    fn a_running_worker_still_blocks_exit_until_its_thread_has_finished() {
+        let (mut state, _receiver) = test_gate_state(4);
+        state.metrics.worker_busy.store(true, Ordering::Release);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        state.worker = Some(thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        assert!(!state.request_shutdown());
+        assert_eq!(state.decline_reasons(), ["worker-busy"]);
+        release.send(()).unwrap();
+        while !state.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The flag is still set (nobody cleared it), but the thread is gone.
+        assert!(state.metrics.worker_busy.load(Ordering::Acquire));
+        assert!(state.request_shutdown());
+    }
+
+    #[test]
+    fn shutdown_blockers_name_every_reason_in_order_and_ignore_a_finished_workers_flag() {
+        let all = ShutdownFacts {
+            correction_gate_active: true,
+            retained_input: true,
+            worker_busy: true,
+            worker_finished: false,
+            configuration_pending: true,
+            undo_hotkey_active: true,
+            hotkey_waiting_for_release: true,
+        };
+        assert_eq!(
+            shutdown_blockers(&all),
+            [
+                "correction-gate",
+                "retained-input",
+                "worker-busy",
+                "configuration-pending",
+                "undo-hotkey",
+                "hotkey-release",
+            ]
+        );
+        let finished = ShutdownFacts {
+            worker_finished: true,
+            ..all
+        };
+        assert_eq!(shutdown_blockers(&finished).len(), 5);
+        assert!(!shutdown_blockers(&finished).contains(&"worker-busy"));
+        let idle = ShutdownFacts {
+            correction_gate_active: false,
+            retained_input: false,
+            worker_busy: false,
+            worker_finished: false,
+            configuration_pending: false,
+            undo_hotkey_active: false,
+            hotkey_waiting_for_release: false,
+        };
+        assert!(shutdown_blockers(&idle).is_empty());
+    }
+
+    #[test]
+    fn the_exit_prompt_names_the_reasons_and_warns_only_about_retained_input() {
+        let plain = exit_anyway_text(&["worker-busy", "correction-gate"]);
+        assert!(plain.contains("worker-busy, correction-gate"), "{plain}");
+        assert!(!plain.contains("held back"), "{plain}");
+        let retained = exit_anyway_text(&["retained-input", "worker-busy"]);
+        assert!(
+            retained.contains("retained-input, worker-busy"),
+            "{retained}"
+        );
+        assert!(retained.contains("held back"), "{retained}");
+        assert!(retained.starts_with(plain.split("worker-busy").next().unwrap()));
+    }
+
+    #[test]
+    fn a_later_implicit_close_keeps_the_explicit_exit_mark() {
+        EXPLICIT_SHUTDOWN.store(false, Ordering::Release);
+        for explicit in [true, false] {
+            let (state, _receiver) = test_gate_state(4);
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            request_shutdown(HWND::default(), explicit);
+            // Accepted both times; only the tray menu sets the mark and nothing clears it.
+            assert!(EXPLICIT_SHUTDOWN.load(Ordering::Acquire));
+            drop(take_app_state());
+        }
+        EXPLICIT_SHUTDOWN.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn an_engine_fault_pauses_automatic_conversion_and_ends_hotkey_gestures() {
+        let (mut state, _receiver) = test_gate_state(4);
+        state
+            .metrics
+            .undo_hotkey_active
+            .store(true, Ordering::Release);
+        state
+            .metrics
+            .hotkey_waiting_for_release
+            .store(true, Ordering::Release);
+        state.correction_gate.activate(10);
+        let epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        state.record_engine_fault();
+        let metrics = &state.metrics;
+        assert!(!state.correction_gate.active);
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(metrics.safety_paused.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::InternalFault as u8
+        );
+        assert_eq!(
+            conversion_failure_label(ConversionFailureReason::InternalFault as u8),
+            "internal-fault"
+        );
+        assert_eq!(metrics.conversion_failures.load(Ordering::Acquire), 1);
+        assert!(!metrics.undo_hotkey_active.load(Ordering::Acquire));
+        assert!(!metrics.hotkey_waiting_for_release.load(Ordering::Acquire));
+        assert!(metrics.input_epoch.load(Ordering::Acquire) > epoch);
+        // Repeating the fault does not count the same pause twice.
+        state.record_engine_fault();
+        assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 1);
+        assert!(state.decline_reasons().is_empty());
+    }
+
+    #[test]
+    fn the_ui_timer_turns_a_contained_panic_into_a_pause_and_clears_the_flag() {
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        ENGINE_FAULT.store(true, Ordering::Release);
+        handle_engine_fault(HWND::default());
+        assert!(!ENGINE_FAULT.load(Ordering::Acquire));
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(metrics.safety_paused.load(Ordering::Acquire));
+        // Without a fault the handler changes nothing.
+        metrics.safety_paused.store(false, Ordering::Release);
+        handle_engine_fault(HWND::default());
+        assert!(!metrics.safety_paused.load(Ordering::Acquire));
+        drop(take_app_state());
     }
 
     #[test]
