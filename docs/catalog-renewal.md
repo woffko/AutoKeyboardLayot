@@ -3,7 +3,8 @@
 The published catalog (`catalog.aklc`) is valid for a window. A client refuses it
 outside `issued_at <= now < expires_at`, and online language installation stops
 until a valid one is published again. The revision 5 catalog expired on
-2026-09-26. This page is the runbook for replacing it. The background is in
+2026-09-26 and was replaced by revision 6 on 2026-10-03 (see the next section).
+This page is the runbook for every renewal. The background is in
 [`package-release-catalog.md`](package-release-catalog.md); the key is described
 in [`package-signing-key.md`](package-signing-key.md).
 
@@ -12,20 +13,26 @@ signing with the release key, and replacing a published release asset. Nothing i
 this repository, no script and no agent does either on its own. The commands
 below are what the owner runs; reading them authorizes nothing.
 
-## What is already prepared
+## Last renewal: revision 6, 2026-10-03
 
-An unsigned candidate for revision 6 was produced and reviewed on 2026-10-03:
+Done with the owner's approval, following the steps below.
 
 | | |
 |---|---|
-| Candidate | `target/catalog-candidates-20260930-06/catalog-r6.unsigned.json` |
-| SHA-256 | `d71cf1fc09e1cb6eb9e5aae7cbc73c48b371bf06784652de00eba7aba362f2ba` |
+| Candidate | `catalog-r6.unsigned.json`, SHA-256 `7e66cc51c36d7270da7c5de613422b2bc86748149fcd5f409d040b2d230e80bf` |
 | Content | the 13 package records of revision 5, unchanged; revision 6 |
-| Window | 21 days: `issued_at` 2026-10-03 06:20:10 UTC, `expires_at` 2026-10-24 06:20:10 UTC |
+| Window | 21 days: `issued_at` 2026-10-03 14:39:10 UTC, `expires_at` 2026-10-24 14:39:10 UTC |
+| Signer | `sign-language-package.exe` built from commit `ef2146b`, SHA-256 `1e0b392321bfb50928665697beb66a57a311cfffc5f63936dfdeba2e0cd4a6dc` |
+| Published | `catalog.aklc`, SHA-256 `be12be43683069b4d543cb2bdadff6b050d23c6d00ed54f4c46807ed3325ceda`, signed by `pkg-20260912-01`, uploaded to the release `lang-r5-20260919` (the Latest release) |
+| Checked | offline (`verify_release_catalog`: 13 packages; `check_catalog_expiry`: 502 hours left), then anonymously from the Latest URL: same bytes, and all 13 package URLs match the catalog |
+| Replaced | revision 5, SHA-256 `b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503` (kept as `tests/fixtures/mutation-seed-catalog.aklc`) |
+
+**The next renewal is due before about 2026-10-14**, when the daily check starts to
+report fewer than 10 days. Revision 7 is the next revision number.
 
 The window starts when the candidate is made, not when it is signed. Every day
 between the two shortens what the signed catalog is good for, so **make the
-candidate again on the day you sign** (step 1). The checker in step 2 refuses a
+candidate on the day you sign** (step 1). The checker in step 2 refuses a
 candidate whose window started more than three hours earlier.
 
 ## Steps
@@ -39,7 +46,7 @@ client that accepted the earlier one.
 ```sh
 TAG=lang-r5-20260919                # the release that holds the package files
 REVISION=6
-PACKAGES=target/catalog-candidates-20260919-05   # the 13 package files and the published revision 5 catalog
+PACKAGES=target/catalog-candidates-20260919-05   # the 13 package files and the revision 5 catalog (compare against the one published now)
 WORK=target/catalog-candidates-$(date -u +%Y%m%d)-0$REVISION
 ```
 

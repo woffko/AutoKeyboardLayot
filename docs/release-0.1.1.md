@@ -67,10 +67,11 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
 ## Language catalog and packages
 
 No package changes in this release: the 13 packages of catalog revision 5 are unchanged, and
-installed packages keep working. The published catalog expired on 2026-09-26, so **online
-language installation works again only after a renewed catalog is published**. That is a
-separate step that needs the owner's signing key; the runbook is
-[`catalog-renewal.md`](catalog-renewal.md). An unsigned revision 6 candidate is prepared.
+installed packages keep working. The published catalog had expired on 2026-09-26; a renewed one
+(revision 6, signed on 2026-10-03 and valid until 2026-10-24 14:39 UTC) is published, so online
+language installation works again. The catalog has to be renewed before every expiry with the
+owner's signing key; the runbook is [`catalog-renewal.md`](catalog-renewal.md), and the next
+renewal is due before about 2026-10-14.
 
 ## Known limits
 
@@ -140,8 +141,8 @@ that nobody has reviewed.
    [`audit-remediation-2026-09.md`](audit-remediation-2026-09.md) and, if the installer is the
    change under test, the VM scripts (see `tools/vm_config.py` for the settings they need).
 
-5. **Renew the catalog first,** following [`catalog-renewal.md`](catalog-renewal.md), so that
-   the new release's installer can offer languages.
+5. **Keep the catalog current.** Revision 6 is published (see above). If the 0.1.1 release is
+   going to be marked Latest, it must also carry the signed `catalog.aklc` (step 6).
 
 6. **Publish.** Create the release, upload the installer and its checksums, download
    everything anonymously and compare the hashes (the r5 procedure in
