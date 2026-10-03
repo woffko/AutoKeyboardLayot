@@ -193,6 +193,9 @@ const PRIVACY_ALLOWED: u8 = 0;
 // Worker-only wait: the low-level hook never waits for UI Automation.
 // Give ordinary delayed replies more headroom before failing closed.
 const PRIVACY_PROBE_WAIT_MS: u64 = 300;
+/// How long a failed field check may lean on the last good one for the same input target. The
+/// provider of a busy terminal answers a check late now and then; see `settle_probe_outcome`.
+const PRIVACY_RECENT_OK_MS: u64 = 2_000;
 const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
 /// A privacy provider that keeps the probe busy this long without answering is replaced.
 const PRIVACY_PROBE_STUCK_AFTER_SECS: u64 = 5;
@@ -403,6 +406,55 @@ struct ForegroundContext {
     input_thread_id: u32,
     process_id: u32,
     layout: usize,
+}
+
+/// What asked for a privacy check. Typing and the periodic refresh may keep a recent good verdict
+/// through a late provider answer; recovery and manual conversion take every failure at face value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeTrigger {
+    Typing,
+    Refresh,
+    Recovery,
+    Manual,
+}
+
+impl ProbeTrigger {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Typing => "typing",
+            Self::Refresh => "refresh",
+            Self::Recovery => "recovery",
+            Self::Manual => "manual",
+        }
+    }
+
+    const fn keeps_recent_ok(self) -> bool {
+        matches!(self, Self::Typing | Self::Refresh)
+    }
+}
+
+/// The last privacy check that found the input field fine, and for which target.
+#[derive(Debug, Clone, Copy)]
+struct RecentPrivacyOk {
+    foreground: ForegroundContext,
+    epoch: u64,
+    at: Instant,
+}
+
+/// What a privacy probe answered, before the context check and the recent-good rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeAnswer {
+    reason: Option<PrivacyBlockReason>,
+    source: &'static str,
+}
+
+/// A finished privacy check after the recent-good rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeVerdict {
+    reason: Option<PrivacyBlockReason>,
+    source: &'static str,
+    /// Set when a failure was taken for a late answer: the age of the good check it leaned on.
+    recent_ok_age: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5086,6 +5138,7 @@ struct InputProcessor {
     diagnostic_sender: Option<SyncSender<String>>,
     privacy_needs_check: bool,
     privacy_reason: Option<PrivacyBlockReason>,
+    recent_privacy_ok: Option<RecentPrivacyOk>,
     process_reason: Option<PrivacyBlockReason>,
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
@@ -5218,6 +5271,7 @@ impl InputProcessor {
             diagnostic_sender,
             privacy_needs_check: true,
             privacy_reason: Some(PrivacyBlockReason::InspectionUnavailable),
+            recent_privacy_ok: None,
             process_reason: None,
             last_process_id: None,
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
@@ -5503,7 +5557,7 @@ impl InputProcessor {
                 }
                 self.refresh_input_profiles();
                 if foreground_identity_matches(foreground) {
-                    self.evaluate_privacy(foreground);
+                    self.evaluate_privacy(foreground, ProbeTrigger::Refresh);
                 } else {
                     self.mark_privacy_dirty(false);
                 }
@@ -5689,7 +5743,7 @@ impl InputProcessor {
             thread::sleep(Duration::from_millis(1));
         }
         self.privacy_needs_check = true;
-        if !self.ensure_privacy(record.foreground) {
+        if !self.ensure_privacy(record.foreground, ProbeTrigger::Recovery) {
             self.diagnostic(
                 "recovery",
                 format!("token={} result=retained reason=privacy", record.token),
@@ -6036,7 +6090,7 @@ impl InputProcessor {
                 self.session.mark_line_start();
             }
             _ => {
-                if !self.ensure_privacy(event.foreground)
+                if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
                     self.diagnostic(
@@ -6197,6 +6251,10 @@ impl InputProcessor {
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
         let manual_only = core::mem::take(&mut self.manual_only_word);
+        // What happened to a word that is not converted is logged as a category only, so a
+        // missed conversion can be explained from the log without recording the word.
+        let suppressed = self.session.is_suppressed();
+        let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
         let candidates = language
             .map(|language| {
                 mapped_layout_candidates(
@@ -6261,9 +6319,30 @@ impl InputProcessor {
                 {
                     self.remember_word_language(language);
                 }
+                if suppressed {
+                    self.diagnostic(
+                        "word",
+                        format!("result=suppressed reset={}", self.last_word_reset),
+                    );
+                } else if had_word {
+                    let result = if language.is_none() {
+                        "no-language"
+                    } else {
+                        "no-candidate"
+                    };
+                    self.diagnostic("word", format!("result={result}"));
+                }
                 None
             }
         } else {
+            if had_word {
+                let result = if manual_only {
+                    "manual-only"
+                } else {
+                    "privacy"
+                };
+                self.diagnostic("word", format!("result={result}"));
+            }
             self.session.clear();
             None
         };
@@ -6594,10 +6673,10 @@ impl InputProcessor {
         self.execute_pending_conversion(sequence);
     }
 
-    fn ensure_privacy(&mut self, foreground: ForegroundContext) -> bool {
+    fn ensure_privacy(&mut self, foreground: ForegroundContext, trigger: ProbeTrigger) -> bool {
         self.refresh_process_policy(foreground.process_id);
         if self.privacy_needs_check {
-            self.evaluate_privacy(foreground);
+            self.evaluate_privacy(foreground, trigger);
         }
         self.privacy_reason.is_none()
     }
@@ -6608,7 +6687,7 @@ impl InputProcessor {
         let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
         self.last_process_id = None;
         self.refresh_process_policy(foreground.process_id);
-        self.evaluate_privacy(foreground);
+        self.evaluate_privacy(foreground, ProbeTrigger::Manual);
         epoch == self.metrics.input_epoch.load(Ordering::Acquire)
             && foreground_identity_matches(foreground)
             && self.manual_privacy_allows_current(foreground)
@@ -6654,11 +6733,11 @@ impl InputProcessor {
         }
     }
 
-    fn evaluate_privacy(&mut self, foreground: ForegroundContext) {
+    fn evaluate_privacy(&mut self, foreground: ForegroundContext, trigger: ProbeTrigger) {
         self.refresh_process_policy(foreground.process_id);
         let started = Instant::now();
         let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
-        let (mut reason, mut source) = if let Some(reason) = self.process_reason {
+        let (reason, source) = if let Some(reason) = self.process_reason {
             (Some(reason), "process-policy")
         } else {
             match self.privacy_probe.as_mut() {
@@ -6686,20 +6765,53 @@ impl InputProcessor {
         };
         self.report_probe_respawn();
         // A late safe reply cannot authorize a different focus or input epoch.
-        if self.metrics.input_epoch.load(Ordering::Acquire) != epoch
-            || !foreground_identity_matches(foreground)
-        {
+        let context_current = self.metrics.input_epoch.load(Ordering::Acquire) == epoch
+            && foreground_identity_matches(foreground);
+        self.apply_probe_answer(
+            ProbeAnswer { reason, source },
+            context_current,
+            foreground,
+            epoch,
+            started,
+            trigger,
+        );
+    }
+
+    /// Everything that follows a probe answer: the context check, the recent-good rule, the log
+    /// line and the new privacy state of the word being typed.
+    fn apply_probe_answer(
+        &mut self,
+        answer: ProbeAnswer,
+        context_current: bool,
+        foreground: ForegroundContext,
+        epoch: u64,
+        started: Instant,
+        trigger: ProbeTrigger,
+    ) {
+        let ProbeAnswer {
+            mut reason,
+            mut source,
+        } = answer;
+        if !context_current {
             reason = Some(PrivacyBlockReason::InspectionUnavailable);
             source = "context-changed";
         }
+        let verdict =
+            self.settle_probe_outcome(reason, source, foreground, epoch, Instant::now(), trigger);
+        let (reason, source) = (verdict.reason, verdict.source);
         if reason != self.privacy_reason
+            || verdict.recent_ok_age.is_some()
             || started.elapsed() >= Duration::from_millis(SLOW_INPUT_DIAGNOSTIC_MS)
         {
+            let leaned_on = verdict
+                .recent_ok_age
+                .map_or_else(String::new, |age| format!(" age_ms={}", age.as_millis()));
             self.diagnostic(
                 "privacy_probe",
                 format!(
-                    "elapsed_ms={} result={reason:?} source={source} wait_budget_ms={PRIVACY_PROBE_WAIT_MS}",
-                    started.elapsed().as_millis()
+                    "elapsed_ms={} result={reason:?} source={source} trigger={} wait_budget_ms={PRIVACY_PROBE_WAIT_MS}{leaned_on}",
+                    started.elapsed().as_millis(),
+                    trigger.label()
                 ),
             );
         }
@@ -6753,8 +6865,65 @@ impl InputProcessor {
         );
     }
 
+    /// Applies the recent-good rule to one finished check.
+    ///
+    /// The provider of a busy window (Windows Terminal while the user types and our own
+    /// replacement edits arrive) sometimes answers a check late, and the probe reports that as
+    /// `FieldInspectionUnavailable`. Taken at face value it makes the word being typed
+    /// manual-only, so fast typing in a terminal loses the automatic conversion of a word now and
+    /// then. When the same input target (window, focus, layout, epoch) passed a check less than
+    /// `PRIVACY_RECENT_OK_MS` ago, and nothing that can move the focus has happened since (that
+    /// clears the record), one such failure keeps the earlier verdict.
+    ///
+    /// Only the provider's own field-inspection failure is softened. A password field, an
+    /// excluded or unreadable process, a changed context and every transport failure stand, and a
+    /// failure never renews the good check, so a window that keeps failing counts as failing
+    /// after two seconds.
+    fn settle_probe_outcome(
+        &mut self,
+        reason: Option<PrivacyBlockReason>,
+        source: &'static str,
+        foreground: ForegroundContext,
+        epoch: u64,
+        now: Instant,
+        trigger: ProbeTrigger,
+    ) -> ProbeVerdict {
+        let from_provider = source == "provider";
+        if from_provider && reason.is_none() {
+            self.recent_privacy_ok = Some(RecentPrivacyOk {
+                foreground,
+                epoch,
+                at: now,
+            });
+        } else if from_provider
+            && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
+            && trigger.keeps_recent_ok()
+            && let Some(recent) = self.recent_privacy_ok
+            && recent.foreground == foreground
+            && recent.epoch == epoch
+            && let Some(age) = now.checked_duration_since(recent.at)
+            && age < Duration::from_millis(PRIVACY_RECENT_OK_MS)
+        {
+            return ProbeVerdict {
+                reason: None,
+                source: "recent-ok",
+                recent_ok_age: Some(age),
+            };
+        } else {
+            self.recent_privacy_ok = None;
+        }
+        ProbeVerdict {
+            reason,
+            source,
+            recent_ok_age: None,
+        }
+    }
+
     fn mark_privacy_dirty(&mut self, pause_now: bool) {
         self.privacy_needs_check = true;
+        // Tab, Enter, a click, a shortcut, injected input and focus changes all come through
+        // here: the field may be another one now, so no earlier good check applies to it.
+        self.recent_privacy_ok = None;
         if pause_now {
             // Keep the triggering category (shortcut, external input) visible
             // in diagnostics and to manual-token handling.
@@ -12358,6 +12527,460 @@ mod tests {
             assert_eq!(conversion.is_none(), manual_only);
             assert!(!processor.manual_only_word);
         }
+    }
+
+    const FIELD_FAILURE: Option<PrivacyBlockReason> =
+        Some(PrivacyBlockReason::FieldInspectionUnavailable);
+
+    fn recent_ok_foreground() -> ForegroundContext {
+        test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground
+    }
+
+    /// One finished check for the standard target and epoch 5, as typing reports it.
+    fn settle(
+        processor: &mut InputProcessor,
+        reason: Option<PrivacyBlockReason>,
+        source: &'static str,
+        at: Instant,
+    ) -> ProbeVerdict {
+        processor.settle_probe_outcome(
+            reason,
+            source,
+            recent_ok_foreground(),
+            5,
+            at,
+            ProbeTrigger::Typing,
+        )
+    }
+
+    #[test]
+    fn a_late_provider_answer_keeps_a_good_verdict_for_two_seconds() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let start = Instant::now();
+        let good = settle(&mut processor, None, "provider", start);
+        assert_eq!((good.reason, good.source), (None, "provider"));
+        assert_eq!(good.recent_ok_age, None);
+        for milliseconds in [0, 120, 400, 1_999] {
+            let age = Duration::from_millis(milliseconds);
+            let verdict = settle(&mut processor, FIELD_FAILURE, "provider", start + age);
+            assert_eq!(verdict.reason, None, "{milliseconds} ms after a good check");
+            assert_eq!(verdict.source, "recent-ok");
+            assert_eq!(verdict.recent_ok_age, Some(age));
+        }
+    }
+
+    #[test]
+    fn a_failure_that_lasts_is_taken_at_face_value() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let start = Instant::now();
+        let at = |milliseconds| start + Duration::from_millis(milliseconds);
+        // Without any good check there is nothing to lean on.
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", at(0));
+        assert_eq!(
+            (verdict.reason, verdict.source),
+            (FIELD_FAILURE, "provider")
+        );
+        settle(&mut processor, None, "provider", at(10));
+        // Two seconds after the good check the window is over.
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", at(2_010));
+        assert_eq!(verdict.reason, FIELD_FAILURE);
+        assert_eq!(verdict.recent_ok_age, None);
+        // A failure never renews the good check: leaning on it for 1.5 s must not extend it.
+        settle(&mut processor, None, "provider", at(3_000));
+        assert_eq!(
+            settle(&mut processor, FIELD_FAILURE, "provider", at(4_500)).reason,
+            None
+        );
+        assert_eq!(
+            settle(&mut processor, FIELD_FAILURE, "provider", at(5_100)).reason,
+            FIELD_FAILURE
+        );
+    }
+
+    #[test]
+    fn the_rule_never_applies_to_another_input_target() {
+        let start = Instant::now();
+        let later = start + Duration::from_millis(300);
+        let foreground = recent_ok_foreground();
+        let variants = [
+            ForegroundContext {
+                hwnd: 9,
+                ..foreground
+            },
+            ForegroundContext {
+                focus: 9,
+                ..foreground
+            },
+            ForegroundContext {
+                input_thread_id: 9,
+                ..foreground
+            },
+            ForegroundContext {
+                process_id: 9,
+                ..foreground
+            },
+            ForegroundContext {
+                layout: 9,
+                ..foreground
+            },
+        ];
+        for other in variants {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            settle(&mut processor, None, "provider", start);
+            let verdict = processor.settle_probe_outcome(
+                FIELD_FAILURE,
+                "provider",
+                other,
+                5,
+                later,
+                ProbeTrigger::Typing,
+            );
+            assert_eq!(verdict.reason, FIELD_FAILURE, "{other:?}");
+        }
+        // The input epoch moves on focus changes, clicks, overflow and layout switches.
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        settle(&mut processor, None, "provider", start);
+        let verdict = processor.settle_probe_outcome(
+            FIELD_FAILURE,
+            "provider",
+            foreground,
+            6,
+            later,
+            ProbeTrigger::Typing,
+        );
+        assert_eq!(verdict.reason, FIELD_FAILURE);
+    }
+
+    #[test]
+    fn only_a_field_inspection_failure_from_the_provider_is_softened() {
+        let start = Instant::now();
+        let later = start + Duration::from_millis(300);
+        for hard in [
+            PrivacyBlockReason::PasswordField,
+            PrivacyBlockReason::ExcludedProcess,
+            PrivacyBlockReason::ElevatedProcess,
+            PrivacyBlockReason::InspectionUnavailable,
+        ] {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            settle(&mut processor, None, "provider", start);
+            assert_eq!(
+                settle(&mut processor, Some(hard), "provider", later).reason,
+                Some(hard)
+            );
+            // A password verdict supersedes the good check: nothing is left to lean on.
+            assert_eq!(
+                settle(&mut processor, FIELD_FAILURE, "provider", later).reason,
+                FIELD_FAILURE,
+                "after {hard:?}"
+            );
+        }
+        for source in [
+            "wait-timeout",
+            "queue-busy",
+            "provider-disconnected",
+            "reply-expired",
+            "context-changed",
+            "process-policy",
+            "probe-missing",
+        ] {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            settle(&mut processor, None, "provider", start);
+            let verdict = settle(&mut processor, FIELD_FAILURE, source, later);
+            assert_eq!((verdict.reason, verdict.source), (FIELD_FAILURE, source));
+        }
+    }
+
+    #[test]
+    fn anything_that_can_move_the_focus_ends_the_window() {
+        let start = Instant::now();
+        let later = start + Duration::from_millis(100);
+        for pause_now in [false, true] {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            settle(&mut processor, None, "provider", start);
+            // Tab, Enter, a click, a shortcut, injected input and a focus change all end here.
+            processor.mark_privacy_dirty(pause_now);
+            let verdict = settle(&mut processor, FIELD_FAILURE, "provider", later);
+            assert_eq!(verdict.reason, FIELD_FAILURE, "pause_now={pause_now}");
+        }
+    }
+
+    #[test]
+    fn recovery_and_manual_conversion_take_a_failure_at_face_value() {
+        let start = Instant::now();
+        let later = start + Duration::from_millis(100);
+        for (trigger, softened) in [
+            (ProbeTrigger::Typing, true),
+            (ProbeTrigger::Refresh, true),
+            (ProbeTrigger::Recovery, false),
+            (ProbeTrigger::Manual, false),
+        ] {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            settle(&mut processor, None, "provider", start);
+            let verdict = processor.settle_probe_outcome(
+                FIELD_FAILURE,
+                "provider",
+                recent_ok_foreground(),
+                5,
+                later,
+                trigger,
+            );
+            assert_eq!(verdict.reason.is_none(), softened, "{trigger:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-bundled-input")]
+    fn a_word_typed_through_a_late_privacy_answer_is_still_converted() {
+        let start = Instant::now();
+        for (good_check_first, converted) in [(true, true), (false, false)] {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            processor.set_privacy_reason(None);
+            if good_check_first {
+                settle(&mut processor, None, "provider", start);
+            }
+            for (character, scan_code) in "ghbdtn".chars().zip([0x22, 0x23, 0x30, 0x20, 0x14, 0x31])
+            {
+                processor.session.handle(
+                    InputEvent::Printable(character),
+                    Some(Language::English),
+                    &processor.detector,
+                );
+                processor.replay_keys.push(ReplayKey {
+                    scan_code,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                });
+            }
+            // The late answer arrives in the middle of the word.
+            processor.apply_probe_answer(
+                ProbeAnswer {
+                    reason: FIELD_FAILURE,
+                    source: "provider",
+                },
+                true,
+                recent_ok_foreground(),
+                5,
+                Instant::now(),
+                ProbeTrigger::Typing,
+            );
+            // The next check succeeds, but a word that met a failure never becomes automatic.
+            processor.set_privacy_reason(None);
+            let conversion = processor.handle_boundary(Some(Language::English), Some(' '), false);
+            assert_eq!(
+                conversion.is_some(),
+                converted,
+                "good check first: {good_check_first}"
+            );
+        }
+    }
+
+    fn probe_lines(receiver: &Receiver<String>) -> Vec<String> {
+        receiver
+            .try_iter()
+            .filter(|record| record.starts_with("event=privacy_probe "))
+            .collect()
+    }
+
+    fn apply(
+        processor: &mut InputProcessor,
+        reason: Option<PrivacyBlockReason>,
+        context_current: bool,
+    ) {
+        processor.apply_probe_answer(
+            ProbeAnswer {
+                reason,
+                source: "provider",
+            },
+            context_current,
+            recent_ok_foreground(),
+            5,
+            Instant::now(),
+            ProbeTrigger::Typing,
+        );
+    }
+
+    #[test]
+    fn a_late_answer_after_a_good_check_leaves_the_state_and_the_word_alone() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        apply(&mut processor, None, true);
+        type_letters(&mut processor, "hel");
+        apply(&mut processor, FIELD_FAILURE, true);
+        assert!(processor.privacy_reason.is_none());
+        assert!(!processor.manual_only_word);
+        assert!(!processor.privacy_needs_check);
+        assert_eq!(processor.session.buffered_character_count(), 3);
+        let lines = probe_lines(&receiver);
+        let line = lines.last().expect("the softened answer is logged");
+        for expected in [
+            "result=None",
+            "source=recent-ok",
+            "trigger=typing",
+            " age_ms=",
+        ] {
+            assert!(line.contains(expected), "{expected}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_failure_without_a_good_check_stands_and_is_logged_as_it_was() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        type_letters(&mut processor, "hel");
+        apply(&mut processor, FIELD_FAILURE, true);
+        assert_eq!(processor.privacy_reason, FIELD_FAILURE);
+        assert!(processor.session.is_suppressed());
+        let lines = probe_lines(&receiver);
+        let line = lines.last().expect("the failure is logged");
+        assert!(
+            line.contains("result=Some(FieldInspectionUnavailable)"),
+            "{line}"
+        );
+        assert!(line.contains("source=provider"), "{line}");
+        assert!(line.contains("trigger=typing"), "{line}");
+        assert!(!line.contains("age_ms"), "{line}");
+    }
+
+    #[test]
+    fn a_changed_context_is_never_softened() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        apply(&mut processor, None, true);
+        type_letters(&mut processor, "hel");
+        apply(&mut processor, FIELD_FAILURE, false);
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::InspectionUnavailable)
+        );
+        assert!(processor.session.is_suppressed());
+        let lines = probe_lines(&receiver);
+        let line = lines.last().expect("the change is logged");
+        assert!(line.contains("source=context-changed"), "{line}");
+    }
+
+    fn processor_with_diagnostics() -> (InputProcessor, Receiver<String>) {
+        let mut configuration = RuntimeConfiguration::default();
+        configuration.settings.diagnostics_enabled = true;
+        let (sender, receiver) = sync_channel(64);
+        let mut processor = InputProcessor::new_with_lexicon_candidate(
+            Arc::new(ObserverMetrics::default()),
+            0,
+            Arc::new(Mutex::new(None)),
+            Some(sender),
+            configuration,
+        );
+        processor.profile_override = Some(test_profiles());
+        processor
+            .detector
+            .set_resolved_profiles(processor.profile_override.as_ref());
+        processor.set_privacy_reason(None);
+        (processor, receiver)
+    }
+
+    fn type_letters(processor: &mut InputProcessor, word: &str) {
+        for character in word.chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+            processor.replay_keys.push(ReplayKey {
+                scan_code: 0x1e,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            });
+        }
+    }
+
+    fn word_lines(receiver: &Receiver<String>) -> Vec<String> {
+        receiver
+            .try_iter()
+            .filter(|record| record.starts_with("event=word "))
+            .collect()
+    }
+
+    #[test]
+    fn a_word_that_is_not_converted_leaves_one_line_with_the_reason() {
+        type Prepare = fn(&mut InputProcessor);
+        let cases: [(&str, Prepare, Option<Language>); 5] = [
+            ("no-candidate", |_| {}, Some(Language::English)),
+            (
+                "manual-only",
+                |processor| processor.manual_only_word = true,
+                Some(Language::English),
+            ),
+            (
+                "privacy",
+                |processor| processor.privacy_reason = Some(PrivacyBlockReason::PasswordField),
+                Some(Language::English),
+            ),
+            (
+                "suppressed",
+                |processor| {
+                    processor.session.handle(
+                        InputEvent::UnsupportedInput,
+                        Some(Language::English),
+                        &processor.detector,
+                    );
+                    processor.last_word_reset = "unsupported";
+                },
+                Some(Language::English),
+            ),
+            ("no-language", |_| {}, None),
+        ];
+        for (expected, prepare, language) in cases {
+            let (mut processor, receiver) = processor_with_diagnostics();
+            type_letters(&mut processor, "hello");
+            prepare(&mut processor);
+            processor.handle_boundary(language, Some(' '), false);
+            let lines = word_lines(&receiver);
+            assert_eq!(lines.len(), 1, "{expected}: {lines:?}");
+            assert!(
+                lines[0].contains(&format!("result={expected}")),
+                "{expected}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_boundary_without_a_word_leaves_no_word_line() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        assert!(word_lines(&receiver).is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-bundled-input")]
+    fn a_converted_word_leaves_its_candidate_line_and_no_word_line() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        for (character, scan_code) in "ghbdtn".chars().zip([0x22, 0x23, 0x30, 0x20, 0x14, 0x31]) {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+            processor.replay_keys.push(ReplayKey {
+                scan_code,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            });
+        }
+        assert!(
+            processor
+                .handle_boundary(Some(Language::English), Some(' '), false)
+                .is_some()
+        );
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.starts_with("event=candidate "))
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.starts_with("event=word "))
+        );
     }
 
     #[test]

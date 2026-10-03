@@ -30,6 +30,12 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
   strict conditions and with rate limits.
 - **A stuck privacy check heals.** A UI Automation provider that stops answering for 5 seconds
   is replaced instead of leaving the privacy check unavailable until restart.
+- **Fast typing in a terminal keeps its conversions.** In Windows Terminal the check of the
+  focused field sometimes answers late while you type, which made the word being typed
+  manual-only, so one word in a quick series was not converted. A late answer now keeps the
+  verdict of a check that passed less than two seconds earlier for the same window. A password
+  field, a changed window, input that can move the focus and a failure that lasts still stop
+  automatic conversion.
 - **Protected paste leaves nothing behind.** The selection made by the program is collapsed
   when the outcome is not the expected one (a selection you made is never touched), and a
   clipboard that could not be restored is counted and logged without switching conversion off.
@@ -41,6 +47,9 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
 - The optional diagnostics log never records key codes. Earlier builds logged the virtual-key
   code of unsupported keys, digits included: **delete `diagnostics*.log` files written by
   earlier versions** (in `%LOCALAPPDATA%\AutoKeyboardLayot`).
+- The diagnostics log now says why a typed word was not converted (`event=word result=` and
+  one of `no-candidate`, `manual-only`, `privacy`, `suppressed`, `no-language`) without
+  recording the word, and its privacy lines name what triggered them.
 - `crash.log` (one line per panic: time, thread, source location, version; never the message
   or any typed text) is written next to the configuration. It is capped at 256 KiB.
 

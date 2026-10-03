@@ -223,6 +223,18 @@ input epoch and target identity still have to succeed. A transport timeout,
 changed target, unreadable process or confirmed password field does not qualify.
 Routing an application to `physical-replay` alone never grants this permission.
 
+A field check that fails because the focused window answers late (Windows
+Terminal while you type quickly) does not by itself make the word being typed
+manual-only. When the same window, focus and input epoch passed a check less than
+two seconds earlier, and nothing that can move the focus has happened since (Tab,
+Enter, a click, a shortcut, injected input or a focus change), one failed field
+check keeps that earlier verdict. A failure never renews the good check, so a
+window that keeps failing counts as failing after two seconds. A password field,
+an excluded or unreadable process, a changed context and every transport failure
+stand as before, and recovery of held keys and manual conversion always take a
+failure at face value. A word that did meet a standing failure stays manual-only
+even when the next check passes.
+
 Capability diagnostics expose only backend states such as `uia-paste`,
 `physical-replay`, `capability-probe`, `unsupported`, or `text-mismatch`; they
 never include the typed source or replacement.
@@ -231,7 +243,11 @@ never include the typed source or replacement.
 bounded queue writes `%LOCALAPPDATA%\AutoKeyboardLayot\diagnostics.log`. The
 log contains timestamps, process basename and PID, backend stages, language
 IDs, word lengths, gate results, edit outcomes, reset and discard categories,
-and the reasons that blocked a shutdown. It never records key codes, scan
+the reasons that blocked a shutdown, and one result for every typed word that was
+not converted (`event=word result=` `no-candidate`, `manual-only`, `privacy`,
+`suppressed` or `no-language`), never the word. Privacy check lines name what
+asked for them (`trigger=`) and say when a late answer kept an earlier verdict
+(`source=recent-ok age_ms=`). It never records key codes, scan
 codes, characters, words, clipboard contents, window titles, URLs, file names,
 or message text; the test `diagnostics_never_log_key_identity` checks every
 diagnostic format string. The file rotates at 1 MiB and has no network
