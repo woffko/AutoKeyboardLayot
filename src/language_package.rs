@@ -39,6 +39,142 @@ impl fmt::Display for PackageError {
 }
 impl std::error::Error for PackageError {}
 
+/// Most keys the release metadata may list, and the most a trust can hold.
+const MAX_TRUSTED_KEYS: usize = 8;
+const MAX_RELEASE_METADATA_BYTES: usize = 4096;
+
+/// What a key in the release metadata is for. Both roles verify signatures; the
+/// release tools sign with the release key only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRole {
+    /// The key the release pipeline signs with.
+    Release,
+    /// An offline key, kept apart from the release machine, that can sign a
+    /// replacement catalog or package if the release key is lost.
+    Recovery,
+}
+
+struct MetadataKey {
+    signer: String,
+    public: [u8; 32],
+    role: KeyRole,
+}
+
+/// The key the release tools sign with, as recorded in the embedded trust
+/// metadata. A recovery key is trusted for verification but never chosen here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseSigner {
+    pub signer: String,
+    pub public_key: [u8; 32],
+    /// The key in lowercase hex, which also names it in the key-protection entropy.
+    pub public_key_hex: String,
+}
+
+/// Parses the release metadata. Format 1 lists one key and format 2 lists one to
+/// eight, each with a role; exactly one key has the role "release". Unknown
+/// fields, unknown formats, a wrong repository or algorithm, and a fingerprint
+/// that does not match its key are all refused.
+fn parse_release_metadata(bytes: &[u8]) -> Result<Vec<MetadataKey>, PackageError> {
+    #[derive(Deserialize)]
+    struct Header {
+        format: u32,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Single {
+        format: u32,
+        algorithm: String,
+        signer: String,
+        public_key_hex: String,
+        fingerprint_sha256: String,
+        repository: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Listed {
+        format: u32,
+        algorithm: String,
+        repository: String,
+        keys: Vec<Listing>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Listing {
+        signer: String,
+        public_key_hex: String,
+        fingerprint_sha256: String,
+        role: String,
+    }
+    if bytes.len() > MAX_RELEASE_METADATA_BYTES {
+        return Err(PackageError::TooLarge);
+    }
+    let header: Header = serde_json::from_slice(bytes).map_err(|_| PackageError::InvalidData)?;
+    let (algorithm, repository, listings) = match header.format {
+        1 => {
+            let single: Single =
+                serde_json::from_slice(bytes).map_err(|_| PackageError::InvalidData)?;
+            if single.format != 1 {
+                return Err(PackageError::InvalidData);
+            }
+            let only = Listing {
+                signer: single.signer,
+                public_key_hex: single.public_key_hex,
+                fingerprint_sha256: single.fingerprint_sha256,
+                role: "release".to_owned(),
+            };
+            (single.algorithm, single.repository, vec![only])
+        }
+        2 => {
+            let listed: Listed =
+                serde_json::from_slice(bytes).map_err(|_| PackageError::InvalidData)?;
+            if listed.format != 2 {
+                return Err(PackageError::InvalidData);
+            }
+            (listed.algorithm, listed.repository, listed.keys)
+        }
+        _ => return Err(PackageError::UnsupportedFormat),
+    };
+    let repository = crate::package_catalog::repository_id(&repository)
+        .map_err(|_| PackageError::InvalidData)?;
+    let expected_repository =
+        crate::package_catalog::repository_id(crate::package_catalog::DEFAULT_PACKAGE_REPOSITORY)
+            .map_err(|_| PackageError::InvalidData)?;
+    if algorithm != "Ed25519" || repository != expected_repository || listings.is_empty() {
+        return Err(PackageError::InvalidData);
+    }
+    if listings.len() > MAX_TRUSTED_KEYS {
+        return Err(PackageError::TooLarge);
+    }
+    let mut keys = Vec::with_capacity(listings.len());
+    for listing in listings {
+        let public = decode_hex::<32>(&listing.public_key_hex)?;
+        if <[u8; 32]>::from(Sha256::digest(public))
+            != decode_hex::<32>(&listing.fingerprint_sha256)?
+        {
+            return Err(PackageError::IntegrityMismatch);
+        }
+        let role = match listing.role.as_str() {
+            "release" => KeyRole::Release,
+            "recovery" => KeyRole::Recovery,
+            _ => return Err(PackageError::InvalidData),
+        };
+        keys.push(MetadataKey {
+            signer: listing.signer,
+            public,
+            role,
+        });
+    }
+    if keys
+        .iter()
+        .filter(|key| key.role == KeyRole::Release)
+        .count()
+        != 1
+    {
+        return Err(PackageError::InvalidData);
+    }
+    Ok(keys)
+}
+
 /// Trust anchors must be supplied by the application/release policy, NEVER by
 /// the package being inspected. The empty default accepts no external packages.
 #[derive(Debug, Clone, Default)]
@@ -50,41 +186,29 @@ impl PackageTrust {
         Self::from_release_metadata(include_bytes!("../data/package-signing/public-key.json"))
     }
 
+    /// The key the release tools sign with, from the same embedded metadata
+    /// and under the same checks as `release()`.
+    pub fn release_signer() -> Result<ReleaseSigner, PackageError> {
+        Self::release_signer_from(include_bytes!("../data/package-signing/public-key.json"))
+    }
+
     fn from_release_metadata(bytes: &[u8]) -> Result<Self, PackageError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Metadata {
-            format: u32,
-            algorithm: String,
-            signer: String,
-            public_key_hex: String,
-            fingerprint_sha256: String,
-            repository: String,
-        }
-        if bytes.len() > 4096 {
-            return Err(PackageError::TooLarge);
-        }
-        let metadata: Metadata =
-            serde_json::from_slice(bytes).map_err(|_| PackageError::InvalidData)?;
-        let repository = crate::package_catalog::repository_id(&metadata.repository)
-            .map_err(|_| PackageError::InvalidData)?;
-        let expected_repository = crate::package_catalog::repository_id(
-            crate::package_catalog::DEFAULT_PACKAGE_REPOSITORY,
-        )
-        .map_err(|_| PackageError::InvalidData)?;
-        if metadata.format != 1
-            || metadata.algorithm != "Ed25519"
-            || repository != expected_repository
-        {
-            return Err(PackageError::InvalidData);
-        }
-        let public = decode_hex::<32>(&metadata.public_key_hex)?;
-        if <[u8; 32]>::from(Sha256::digest(public))
-            != decode_hex::<32>(&metadata.fingerprint_sha256)?
-        {
-            return Err(PackageError::IntegrityMismatch);
-        }
-        Self::from_public_keys([(metadata.signer, public)])
+        let keys = parse_release_metadata(bytes)?;
+        Self::from_public_keys(keys.into_iter().map(|key| (key.signer, key.public)))
+    }
+
+    fn release_signer_from(bytes: &[u8]) -> Result<ReleaseSigner, PackageError> {
+        let keys = parse_release_metadata(bytes)?;
+        Self::from_public_keys(keys.iter().map(|key| (key.signer.clone(), key.public)))?;
+        let release = keys
+            .into_iter()
+            .find(|key| key.role == KeyRole::Release)
+            .ok_or(PackageError::InvalidData)?;
+        Ok(ReleaseSigner {
+            public_key_hex: release.public.iter().map(|b| format!("{b:02x}")).collect(),
+            signer: release.signer,
+            public_key: release.public,
+        })
     }
 
     pub(crate) fn verify_document(
@@ -111,8 +235,9 @@ impl PackageTrust {
         keys: impl IntoIterator<Item = (String, [u8; 32])>,
     ) -> Result<Self, PackageError> {
         let mut trusted = BTreeMap::new();
+        let mut seen_keys = std::collections::BTreeSet::new();
         for (index, (id, bytes)) in keys.into_iter().enumerate() {
-            if index >= 8 {
+            if index >= MAX_TRUSTED_KEYS {
                 return Err(PackageError::TooLarge);
             }
             if id.is_empty()
@@ -124,7 +249,8 @@ impl PackageTrust {
                 return Err(PackageError::InvalidData);
             }
             let key = VerifyingKey::from_bytes(&bytes).map_err(|_| PackageError::InvalidData)?;
-            if key.is_weak() || trusted.insert(id, key).is_some() {
+            // The same key under two names would make one signer count twice.
+            if key.is_weak() || !seen_keys.insert(bytes) || trusted.insert(id, key).is_some() {
                 return Err(PackageError::InvalidData);
             }
         }
@@ -770,9 +896,492 @@ mod tests {
             PackageTrust::from_public_keys([("test".into(), public), ("test".into(), public)])
                 .is_err()
         );
+        // The same key under two names would count one signer twice.
+        assert_eq!(
+            PackageTrust::from_public_keys([("one".into(), public), ("two".into(), public)])
+                .unwrap_err(),
+            PackageError::InvalidData
+        );
         assert!(PackageTrust::from_public_keys([("../key".into(), public)]).is_err());
+        let distinct = |count: u8| {
+            (0..count).map(|i| {
+                (
+                    format!("key-{i}"),
+                    SigningKey::from_bytes(&[i + 1; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                )
+            })
+        };
+        assert_eq!(
+            PackageTrust::from_public_keys(distinct(8)).unwrap().0.len(),
+            8
+        );
+        assert_eq!(
+            PackageTrust::from_public_keys(distinct(9)).unwrap_err(),
+            PackageError::TooLarge
+        );
+    }
+
+    // The trust metadata as it is published today (format 1).
+    const FORMAT_1: &str = r#"{"format":1,"algorithm":"Ed25519","signer":"pkg-20260912-01","public_key_hex":"ed32cc8fc0341647aab1b7b2b691056f831b512529f4344497cacc4e05aca77d","fingerprint_sha256":"5700a261650fc5edd9dc18b5e3e3dd3ecea3aae6614f997b43679ff0f259ca11","repository":"woffko/AutoKeyboardLayot"}"#;
+
+    // Public deterministic seeds: these keys sign nothing real.
+    fn listed(seed: u8, signer: &str, role: &str) -> Value {
+        listed_public(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+            signer,
+            role,
+        )
+    }
+    fn listed_public(public: [u8; 32], signer: &str, role: &str) -> Value {
+        json!({
+            "signer": signer,
+            "public_key_hex": hex(&public),
+            "fingerprint_sha256": hex(&Sha256::digest(public)),
+            "role": role,
+        })
+    }
+    fn format_2(keys: Vec<Value>) -> Value {
+        json!({
+            "format": 2,
+            "algorithm": "Ed25519",
+            "repository": crate::package_catalog::DEFAULT_PACKAGE_REPOSITORY,
+            "keys": keys,
+        })
+    }
+    fn trust_from(metadata: &Value) -> Result<PackageTrust, PackageError> {
+        PackageTrust::from_release_metadata(&serde_json::to_vec(metadata).unwrap())
+    }
+    fn signer_from(metadata: &Value) -> Result<ReleaseSigner, PackageError> {
+        PackageTrust::release_signer_from(&serde_json::to_vec(metadata).unwrap())
+    }
+    fn signature_by(seed: u8, domain: &[u8], document: &str) -> String {
+        let mut signed = domain.to_vec();
+        signed.extend_from_slice(document.as_bytes());
+        hex(&SigningKey::from_bytes(&[seed; 32]).sign(&signed).to_bytes())
+    }
+
+    #[test]
+    fn release_metadata_format_1_is_still_accepted() {
+        let trust = PackageTrust::from_release_metadata(FORMAT_1.as_bytes()).unwrap();
+        assert_eq!(
+            trust.0.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["pkg-20260912-01"]
+        );
+        let signer = PackageTrust::release_signer_from(FORMAT_1.as_bytes()).unwrap();
+        assert_eq!(signer.signer, "pkg-20260912-01");
+        assert_eq!(
+            signer.public_key_hex,
+            "ed32cc8fc0341647aab1b7b2b691056f831b512529f4344497cacc4e05aca77d"
+        );
+        assert_eq!(hex(&signer.public_key), signer.public_key_hex);
+        // The embedded file works through the public entry points.
+        let embedded = PackageTrust::release_signer().unwrap();
         assert!(
-            PackageTrust::from_public_keys((0..9).map(|i| (format!("key-{i}"), public))).is_err()
+            PackageTrust::release()
+                .unwrap()
+                .0
+                .contains_key(&embedded.signer)
+        );
+    }
+
+    #[test]
+    fn release_metadata_format_2_trusts_every_listed_key_and_signs_with_the_release_key() {
+        let metadata = format_2(vec![
+            listed(1, "release-one", "release"),
+            listed(2, "recovery-one", "recovery"),
+        ]);
+        let trust = trust_from(&metadata).unwrap();
+        assert_eq!(trust.0.len(), 2);
+        // Both keys verify their own signatures and nobody else's.
+        for (seed, signer) in [(1, "release-one"), (2, "recovery-one")] {
+            assert_eq!(
+                trust.verify_document(
+                    b"domain",
+                    signer,
+                    "{}",
+                    &signature_by(seed, b"domain", "{}"),
+                    128
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            trust.verify_document(
+                b"domain",
+                "release-one",
+                "{}",
+                &signature_by(2, b"domain", "{}"),
+                128
+            ),
+            Err(PackageError::InvalidSignature)
+        );
+        // Only the release key is offered for signing, wherever it is listed.
+        let signer = signer_from(&metadata).unwrap();
+        assert_eq!(signer.signer, "release-one");
+        assert_eq!(
+            signer.public_key,
+            SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes()
+        );
+        assert_eq!(hex(&signer.public_key), signer.public_key_hex);
+        let reversed = format_2(vec![
+            listed(2, "recovery-one", "recovery"),
+            listed(1, "release-one", "release"),
+        ]);
+        assert_eq!(signer_from(&reversed).unwrap(), signer);
+        // Eight keys are the limit.
+        let eight: Vec<Value> = std::iter::once(listed(1, "release-one", "release"))
+            .chain((2..=8).map(|seed| listed(seed, &format!("recovery-{seed}"), "recovery")))
+            .collect();
+        assert_eq!(trust_from(&format_2(eight)).unwrap().0.len(), 8);
+    }
+
+    #[test]
+    fn swapping_the_roles_changes_the_signing_key_and_not_who_is_trusted() {
+        // The recovery procedure builds the signing tool from a local copy of the
+        // metadata in which the recovery key is the release key; the shipped
+        // applications already trust both keys, so nothing has to be republished.
+        let shipped = format_2(vec![
+            listed(1, "release-one", "release"),
+            listed(2, "recovery-one", "recovery"),
+        ]);
+        let swapped = format_2(vec![
+            listed(1, "release-one", "recovery"),
+            listed(2, "recovery-one", "release"),
+        ]);
+        let trusted = |metadata: &Value| {
+            trust_from(metadata)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|(name, key)| (name, key.to_bytes()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(trusted(&shipped), trusted(&swapped));
+        assert_eq!(signer_from(&shipped).unwrap().signer, "release-one");
+        assert_eq!(signer_from(&swapped).unwrap().signer, "recovery-one");
+    }
+
+    #[test]
+    fn release_metadata_rejects_duplicates_bad_roles_and_wrong_counts() {
+        let release = || listed(1, "release-one", "release");
+        let mut weak = [0; 32];
+        weak[0] = 1;
+        let nine: Vec<Value> = (1..=9)
+            .map(|seed| {
+                let role = if seed == 1 { "release" } else { "recovery" };
+                listed(seed, &format!("key-{seed}"), role)
+            })
+            .collect();
+        let cases: Vec<(&str, Vec<Value>, PackageError)> = vec![
+            (
+                "the same signer twice",
+                vec![release(), listed(2, "release-one", "recovery")],
+                PackageError::InvalidData,
+            ),
+            (
+                "the same key under two signers",
+                vec![release(), listed(1, "recovery-one", "recovery")],
+                PackageError::InvalidData,
+            ),
+            (
+                "no release key",
+                vec![listed(2, "recovery-one", "recovery")],
+                PackageError::InvalidData,
+            ),
+            (
+                "two release keys",
+                vec![release(), listed(2, "release-two", "release")],
+                PackageError::InvalidData,
+            ),
+            ("no keys", vec![], PackageError::InvalidData),
+            ("nine keys", nine, PackageError::TooLarge),
+            (
+                "an unknown role",
+                vec![release(), listed(2, "recovery-one", "backup")],
+                PackageError::InvalidData,
+            ),
+            (
+                "a role in capitals",
+                vec![release(), listed(2, "recovery-one", "Recovery")],
+                PackageError::InvalidData,
+            ),
+            (
+                "a signer name in capitals",
+                vec![release(), listed(2, "RECOVERY", "recovery")],
+                PackageError::InvalidData,
+            ),
+            (
+                "an empty signer name",
+                vec![release(), listed(2, "", "recovery")],
+                PackageError::InvalidData,
+            ),
+            (
+                "a weak key",
+                vec![release(), listed_public(weak, "recovery-one", "recovery")],
+                PackageError::InvalidData,
+            ),
+        ];
+        for (name, keys, expected) in cases {
+            let metadata = format_2(keys);
+            assert_eq!(trust_from(&metadata).unwrap_err(), expected, "{name}");
+            assert_eq!(signer_from(&metadata).unwrap_err(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn release_metadata_rejects_unknown_fields_formats_and_wrong_scope() {
+        let base = format_2(vec![
+            listed(1, "release-one", "release"),
+            listed(2, "recovery-one", "recovery"),
+        ]);
+        assert!(trust_from(&base).is_ok());
+        let single: Value = serde_json::from_str(FORMAT_1).unwrap();
+        let changed = |edit: &dyn Fn(&mut Value)| {
+            let mut metadata = base.clone();
+            edit(&mut metadata);
+            metadata
+        };
+        // Unknown fields, at the top, in a key, and format 1 fields in a format 2 file.
+        for (name, metadata) in [
+            (
+                "an extra top-level field",
+                changed(&|m| m["note"] = json!(true)),
+            ),
+            (
+                "an extra field in a key",
+                changed(&|m| m["keys"][1]["expires"] = json!("2030-01-01")),
+            ),
+            (
+                "format 1 fields in a format 2 file",
+                changed(&|m| m["signer"] = json!("release-one")),
+            ),
+            (
+                "a missing key list",
+                changed(&|m| {
+                    m.as_object_mut().unwrap().remove("keys");
+                }),
+            ),
+            (
+                "a missing role",
+                changed(&|m| {
+                    m["keys"][1].as_object_mut().unwrap().remove("role");
+                }),
+            ),
+        ] {
+            assert_eq!(
+                trust_from(&metadata).unwrap_err(),
+                PackageError::InvalidData,
+                "{name}"
+            );
+        }
+        let mut with_keys = single.clone();
+        with_keys["keys"] = base["keys"].clone();
+        assert_eq!(
+            trust_from(&with_keys).unwrap_err(),
+            PackageError::InvalidData,
+            "a key list in a format 1 file"
+        );
+        let mut with_role = single;
+        with_role["role"] = json!("release");
+        assert_eq!(
+            trust_from(&with_role).unwrap_err(),
+            PackageError::InvalidData,
+            "a role in a format 1 file"
+        );
+        // Unknown or missing formats.
+        for format in [0, 3, 99] {
+            let metadata = changed(&|m| m["format"] = json!(format));
+            assert_eq!(
+                trust_from(&metadata).unwrap_err(),
+                PackageError::UnsupportedFormat,
+                "format {format}"
+            );
+        }
+        let metadata = changed(&|m| {
+            m.as_object_mut().unwrap().remove("format");
+        });
+        assert_eq!(
+            trust_from(&metadata).unwrap_err(),
+            PackageError::InvalidData
+        );
+        // Wrong scope.
+        for (name, metadata) in [
+            (
+                "another repository",
+                changed(&|m| m["repository"] = json!("other/repository")),
+            ),
+            (
+                "another algorithm",
+                changed(&|m| m["algorithm"] = json!("RSA")),
+            ),
+        ] {
+            assert_eq!(
+                trust_from(&metadata).unwrap_err(),
+                PackageError::InvalidData,
+                "{name}"
+            );
+        }
+        // A fingerprint that belongs to another key, or to none.
+        let swapped = changed(&|m| {
+            let first = m["keys"][0]["fingerprint_sha256"].clone();
+            m["keys"][1]["fingerprint_sha256"] = first;
+        });
+        assert_eq!(
+            trust_from(&swapped).unwrap_err(),
+            PackageError::IntegrityMismatch
+        );
+        let zeros = changed(&|m| m["keys"][1]["fingerprint_sha256"] = json!("00".repeat(32)));
+        assert_eq!(
+            trust_from(&zeros).unwrap_err(),
+            PackageError::IntegrityMismatch
+        );
+        // Malformed hex, an oversized document and text that is not JSON.
+        let short = changed(&|m| m["keys"][1]["public_key_hex"] = json!("abcd"));
+        assert_eq!(trust_from(&short).unwrap_err(), PackageError::InvalidData);
+        let padded = format!(
+            "{}{}",
+            serde_json::to_string(&base).unwrap(),
+            " ".repeat(5000)
+        );
+        assert_eq!(
+            PackageTrust::from_release_metadata(padded.as_bytes()).unwrap_err(),
+            PackageError::TooLarge
+        );
+        for bytes in [&b""[..], b"not json", b"{", b"[]", b"null"] {
+            assert!(PackageTrust::from_release_metadata(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn release_metadata_rejects_text_that_is_not_exactly_one_clean_document() {
+        let base = serde_json::to_string(&format_2(vec![
+            listed(1, "release-one", "release"),
+            listed(2, "recovery-one", "recovery"),
+        ]))
+        .unwrap();
+        let parse = |text: &str| PackageTrust::from_release_metadata(text.as_bytes());
+        assert!(parse(&base).is_ok());
+        // Anything after the document, a second document, or a byte-order mark.
+        for text in [
+            format!("{base} garbage"),
+            format!("{base}{base}"),
+            format!("{base}\n{{}}"),
+            format!("\u{feff}{base}"),
+        ] {
+            assert!(parse(&text).is_err(), "{text:.60}");
+        }
+        assert!(
+            parse(&format!("  \n{base}\n\n")).is_ok(),
+            "whitespace around the document is fine"
+        );
+        // A field written twice is refused, never resolved in favour of one copy.
+        let release = serde_json::to_string(&listed(1, "release-one", "release")).unwrap();
+        let recovery = serde_json::to_string(&listed(2, "recovery-one", "recovery")).unwrap();
+        let repository = crate::package_catalog::DEFAULT_PACKAGE_REPOSITORY;
+        for (name, text) in [
+            (
+                "format twice",
+                format!(
+                    r#"{{"format":2,"format":2,"algorithm":"Ed25519","repository":"{repository}","keys":[{release}]}}"#
+                ),
+            ),
+            (
+                "format twice with different values",
+                format!(
+                    r#"{{"format":1,"format":2,"algorithm":"Ed25519","repository":"{repository}","keys":[{release}]}}"#
+                ),
+            ),
+            (
+                "keys twice",
+                format!(
+                    r#"{{"format":2,"algorithm":"Ed25519","repository":"{repository}","keys":[{release}],"keys":[{release},{recovery}]}}"#
+                ),
+            ),
+            (
+                "role twice in a key",
+                format!(
+                    r#"{{"format":2,"algorithm":"Ed25519","repository":"{repository}","keys":[{}]}}"#,
+                    release.replace(
+                        r#""role":"release""#,
+                        r#""role":"recovery","role":"release""#
+                    )
+                ),
+            ),
+        ] {
+            assert_eq!(
+                parse(&text).unwrap_err(),
+                PackageError::InvalidData,
+                "{name}"
+            );
+        }
+        // The format number must be a plain unsigned integer.
+        for number in [
+            "2.0",
+            "\"2\"",
+            "-1",
+            "4294967296",
+            "true",
+            "null",
+            "[2]",
+            "1e0",
+        ] {
+            let text = base.replacen("\"format\":2", &format!("\"format\":{number}"), 1);
+            assert_ne!(text, base, "the replacement must apply");
+            assert_eq!(
+                parse(&text).unwrap_err(),
+                PackageError::InvalidData,
+                "format {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_may_be_written_in_either_case_but_the_signer_key_is_always_lowercase() {
+        // The key-protection entropy of the signing tool contains this text, and the
+        // key tool records lowercase. The published file is lowercase, so nothing
+        // changes for it; an uppercase file is read as the same key, not a new one.
+        let lower = listed(1, "release-one", "release");
+        let mut upper = lower.clone();
+        upper["public_key_hex"] = json!(lower["public_key_hex"].as_str().unwrap().to_uppercase());
+        upper["fingerprint_sha256"] =
+            json!(lower["fingerprint_sha256"].as_str().unwrap().to_uppercase());
+        assert_ne!(lower, upper);
+        let (lowercase, uppercase) = (format_2(vec![lower.clone()]), format_2(vec![upper.clone()]));
+        assert_eq!(
+            signer_from(&lowercase).unwrap(),
+            signer_from(&uppercase).unwrap()
+        );
+        assert_eq!(
+            signer_from(&uppercase).unwrap().public_key_hex,
+            lower["public_key_hex"].as_str().unwrap()
+        );
+        assert_eq!(
+            trust_from(&lowercase).unwrap().0.keys().collect::<Vec<_>>(),
+            trust_from(&uppercase).unwrap().0.keys().collect::<Vec<_>>()
+        );
+        // Case does not hide a duplicate: the same key under two names is refused.
+        let twin = {
+            let mut twin = upper.clone();
+            twin["signer"] = json!("recovery-one");
+            twin["role"] = json!("recovery");
+            twin
+        };
+        assert_eq!(
+            trust_from(&format_2(vec![lower, twin])).unwrap_err(),
+            PackageError::InvalidData
+        );
+        // The published key keeps its exact entropy text.
+        assert_eq!(
+            PackageTrust::release_signer_from(FORMAT_1.as_bytes())
+                .unwrap()
+                .public_key_hex,
+            serde_json::from_str::<Value>(FORMAT_1).unwrap()["public_key_hex"]
+                .as_str()
+                .unwrap()
         );
     }
 }

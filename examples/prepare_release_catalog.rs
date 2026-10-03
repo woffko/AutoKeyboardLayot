@@ -74,14 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "issued_at":issued_at,"expires_at":expires_at,"packages":packages})
     .to_string();
     let bytes = serde_json::to_vec(&json!({"format":1,"catalog":catalog}))?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../data/package-signing/public-key.json"))?;
-    PreparedSigningInput::prepare(
-        SigningKind::Catalog,
-        metadata["signer"].as_str().ok_or("signer")?,
-        &bytes,
-        now,
-    )?;
+    let signer = autokeyboardlayot::language_package::PackageTrust::release_signer()?.signer;
+    PreparedSigningInput::prepare(SigningKind::Catalog, &signer, &bytes, now)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

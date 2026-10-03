@@ -161,20 +161,15 @@ pub fn run() -> Result<()> {
         Some("catalog") => (SigningKind::Catalog, 1024 * 1024),
         _ => return Err("input kind"),
     };
-    // The runtime trust parser validates the embedded metadata/fingerprint first.
+    // The runtime trust parser validates the embedded metadata/fingerprint first;
+    // the signer is the one key with the role "release", never a recovery key.
     let trust = PackageTrust::release().map_err(|_| "release trust")?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../data/package-signing/public-key.json"))
-            .map_err(|_| "public metadata")?;
-    let signer = metadata["signer"].as_str().ok_or("public signer")?;
-    let hex = metadata["public_key_hex"].as_str().ok_or("public key")?;
-    if hex.len() != 64 || !hex.is_ascii() {
-        return Err("public key");
-    }
-    let mut public = [0u8; 32];
-    for (index, byte) in public.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| "public key")?;
-    }
+    let release = PackageTrust::release_signer().map_err(|_| "release signer")?;
+    let (signer, hex, public) = (
+        release.signer.as_str(),
+        release.public_key_hex.as_str(),
+        release.public_key,
+    );
     let output = Path::new(&args[2]);
     reject_reparse(output.parent().ok_or("output parent")?)?;
     if !output.is_absolute() || output.try_exists().map_err(|_| "output metadata")? {
