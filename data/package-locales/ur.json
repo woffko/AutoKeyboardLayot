@@ -171,6 +171,7 @@
     "menu.settings": "ترتیبات…",
     "menu.exit": "باہر نکلیں",
     "error.read_config": "ترتیبات نہیں پڑھی جا سکیں: {error}",
+    "error.read_config_hint": "فولڈر: {folder}\n\nآپ کی ترتیبات اس فولڈر میں config.ini فائل میں محفوظ ہوتی ہیں۔ طے شدہ ترتیبات کے ساتھ شروع کرنے کے لیے اس فائل کو کہیں اور منتقل کریں اور پروگرام دوبارہ چلائیں۔ اگر اس کے ساتھ config.schema-1.bak جیسے نام کی کوئی کاپی موجود ہو تو اس کا نام config.ini کر دینے سے پچھلی ترتیبات بحال ہو جاتی ہیں۔",
     "error.save_config": "محفوظ نہیں کیا جا سکا: {error}",
     "error.invalid_hotkey": "غلط کی بورڈ شارٹ کٹ: {error}",
     "error.backend_rules": "متبادل کے غلط قواعد: {error}",

@@ -168,6 +168,7 @@
     "menu.settings": "Seaded…",
     "menu.exit": "Välju",
     "error.read_config": "Konfiguratsiooni ei saanud lugeda: {error}",
+    "error.read_config_hint": "Kaust: {folder}\n\nTeie sätted on selles kaustas failis config.ini. Vaikesätetega alustamiseks teisaldage see fail mujale ja käivitage programm uuesti. Kui selle kõrval on koopia nimega nagu config.schema-1.bak, taastab selle ümbernimetamine failiks config.ini varasemad sätted.",
     "error.save_config": "Salvestamine ebaõnnestus: {error}",
     "error.invalid_hotkey": "Vigane kiirklahv: {error}",
     "error.backend_rules": "Vigased asendusreeglid: {error}",

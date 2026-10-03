@@ -3018,21 +3018,39 @@ fn install_crash_log() {
     }
 }
 
+/// The startup dialog for a configuration that cannot be read. A document that
+/// parses badly (`InvalidData`) also gets the folder and what can be done about
+/// it; a failure elsewhere, such as in the installed packages, does not.
+fn unreadable_configuration_message(error: &std::io::Error, directory: Option<&Path>) -> String {
+    let mut message = tr_format("error.read_config", &[("error", &error.to_string())]);
+    if let (std::io::ErrorKind::InvalidData, Some(directory)) = (error.kind(), directory) {
+        message.push_str("\n\n");
+        message.push_str(&tr_format(
+            "error.read_config_hint",
+            &[("folder", &directory.to_string_lossy())],
+        ));
+    }
+    message
+}
+
 pub fn run() -> Result<()> {
     install_crash_log();
+    // The guard comes first: a second instance leaves without reading the
+    // configuration or the installed packages, and without a dialog about a
+    // file that the running instance has already read.
+    let Some(_instance_guard) = InstanceGuard::acquire()? else {
+        return Ok(());
+    };
     let initial_configuration = load_runtime_configuration().map_err(|error| {
         Error::new(
             windows::core::HRESULT(0x8007000Du32 as i32),
-            tr_format("error.read_config", &[("error", &error.to_string())]),
+            unreadable_configuration_message(&error, configuration_directory().as_deref()),
         )
     })?;
     ui_localization::initialize(
         &initial_configuration.ui_language,
         initial_configuration.package_catalogs.as_deref(),
     );
-    let Some(_instance_guard) = InstanceGuard::acquire()? else {
-        return Ok(());
-    };
 
     unsafe {
         let module = GetModuleHandleW(None)?;
@@ -9005,6 +9023,33 @@ mod tests {
             }
         }
         resolve_keyboard_profiles(&mut Fixture(0x0409)).unwrap()
+    }
+
+    #[test]
+    fn an_unreadable_document_names_the_folder_and_other_failures_do_not() {
+        let directory = Path::new("C:\\profile\\AutoKeyboardLayot");
+        let base = |error: &std::io::Error| {
+            tr_format("error.read_config", &[("error", &error.to_string())])
+        };
+        let unreadable = std::io::Error::new(std::io::ErrorKind::InvalidData, "line 3: bad value");
+        let message = unreadable_configuration_message(&unreadable, Some(directory));
+        assert!(message.starts_with(&base(&unreadable)));
+        assert!(
+            message.contains("C:\\profile\\AutoKeyboardLayot"),
+            "{message}"
+        );
+        assert!(message.len() > base(&unreadable).len() + 20, "{message}");
+        // Without a folder, or when the failure is not about the document (for
+        // example the installed packages), only the base message is shown.
+        assert_eq!(
+            unreadable_configuration_message(&unreadable, None),
+            base(&unreadable)
+        );
+        let elsewhere = std::io::Error::other("package set is invalid");
+        assert_eq!(
+            unreadable_configuration_message(&elsewhere, Some(directory)),
+            base(&elsewhere)
+        );
     }
 
     #[test]

@@ -171,6 +171,7 @@
     "menu.settings": "সেটিংস…",
     "menu.exit": "প্রস্থান",
     "error.read_config": "কনফিগারেশন পড়া যায়নি: {error}",
+    "error.read_config_hint": "ফোল্ডার: {folder}\n\nআপনার সেটিংস এই ফোল্ডারের config.ini ফাইলে সংরক্ষিত থাকে। ডিফল্ট সেটিংস নিয়ে শুরু করতে ফাইলটি অন্য কোথাও সরিয়ে প্রোগ্রামটি আবার চালু করুন। পাশে config.schema-1.bak-এর মতো নামের কোনো কপি থাকলে সেটির নাম config.ini করে দিলে আগের সেটিংস ফিরে আসবে।",
     "error.save_config": "সংরক্ষণ করা যায়নি: {error}",
     "error.invalid_hotkey": "অবৈধ কীবোর্ড শর্টকাট: {error}",
     "error.backend_rules": "অবৈধ প্রতিস্থাপন নিয়ম: {error}",

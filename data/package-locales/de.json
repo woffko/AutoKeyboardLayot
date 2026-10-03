@@ -171,6 +171,7 @@
     "menu.settings": "Einstellungen…",
     "menu.exit": "Beenden",
     "error.read_config": "Konfiguration konnte nicht gelesen werden: {error}",
+    "error.read_config_hint": "Ordner: {folder}\n\nIhre Einstellungen werden in config.ini in diesem Ordner gespeichert. Um mit den Standardeinstellungen zu starten, verschieben Sie diese Datei an einen anderen Ort und starten Sie das Programm erneut. Liegt daneben eine Kopie mit einem Namen wie config.schema-1.bak, stellt das Umbenennen dieser Kopie in config.ini die früheren Einstellungen wieder her.",
     "error.save_config": "Speichern fehlgeschlagen: {error}",
     "error.invalid_hotkey": "Ungültiges Tastenkürzel: {error}",
     "error.backend_rules": "Ungültige Ersetzungsregeln: {error}",

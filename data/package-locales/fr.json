@@ -171,6 +171,7 @@
     "menu.settings": "Paramètres…",
     "menu.exit": "Quitter",
     "error.read_config": "Impossible de lire la configuration : {error}",
+    "error.read_config_hint": "Dossier : {folder}\n\nVos paramètres sont enregistrés dans config.ini, dans ce dossier. Pour redémarrer avec les paramètres par défaut, déplacez ce fichier ailleurs, puis relancez le programme. Si une copie nommée comme config.schema-1.bak se trouve à côté, la renommer en config.ini rétablit les paramètres précédents.",
     "error.save_config": "Impossible d’enregistrer : {error}",
     "error.invalid_hotkey": "Raccourci clavier invalide : {error}",
     "error.backend_rules": "Règles de remplacement invalides : {error}",

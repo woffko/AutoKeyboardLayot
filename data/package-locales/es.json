@@ -171,6 +171,7 @@
     "menu.settings": "Configuración…",
     "menu.exit": "Salir",
     "error.read_config": "No se ha podido leer la configuración: {error}",
+    "error.read_config_hint": "Carpeta: {folder}\n\nSu configuración se guarda en config.ini, dentro de esta carpeta. Para empezar con la configuración predeterminada, mueva ese archivo a otro lugar y vuelva a iniciar el programa. Si junto a él hay una copia con un nombre como config.schema-1.bak, cambiarle el nombre a config.ini restaura la configuración anterior.",
     "error.save_config": "No se ha podido guardar: {error}",
     "error.invalid_hotkey": "Atajo de teclado no válido: {error}",
     "error.backend_rules": "Reglas de sustitución no válidas: {error}",

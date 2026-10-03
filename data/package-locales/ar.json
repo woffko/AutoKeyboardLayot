@@ -171,6 +171,7 @@
     "menu.settings": "الإعدادات…",
     "menu.exit": "خروج",
     "error.read_config": "تعذّرت قراءة الإعدادات: {error}",
+    "error.read_config_hint": "المجلد: {folder}\n\nتُحفظ إعداداتك في الملف config.ini داخل هذا المجلد. للبدء بالإعدادات الافتراضية، انقل هذا الملف إلى مكان آخر ثم شغّل البرنامج مرة أخرى. وإذا وُجدت بجواره نسخة باسم مثل config.schema-1.bak، فإن إعادة تسميتها إلى config.ini تستعيد الإعدادات السابقة.",
     "error.save_config": "تعذّر الحفظ: {error}",
     "error.invalid_hotkey": "اختصار لوحة المفاتيح غير صالح: {error}",
     "error.backend_rules": "قواعد الاستبدال غير صالحة: {error}",

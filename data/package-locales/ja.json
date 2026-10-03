@@ -168,6 +168,7 @@
     "menu.settings": "設定…",
     "menu.exit": "終了",
     "error.read_config": "設定を読み込めませんでした: {error}",
+    "error.read_config_hint": "フォルダー: {folder}\n\n設定はこのフォルダーの config.ini に保存されています。既定の設定で起動するには、このファイルを別の場所に移動してからプログラムをもう一度起動してください。config.schema-1.bak のような名前のコピーが同じ場所にある場合は、その名前を config.ini に変更すると以前の設定に戻せます。",
     "error.save_config": "保存できませんでした: {error}",
     "error.invalid_hotkey": "無効なホットキーです: {error}",
     "error.backend_rules": "置換ルールが無効です: {error}",

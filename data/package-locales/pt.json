@@ -171,6 +171,7 @@
     "menu.settings": "Configurações…",
     "menu.exit": "Sair",
     "error.read_config": "Não foi possível ler a configuração: {error}",
+    "error.read_config_hint": "Pasta: {folder}\n\nSuas configurações são salvas em config.ini, nesta pasta. Para iniciar com as configurações padrão, mova esse arquivo para outro local e inicie o programa novamente. Se houver ao lado uma cópia com nome como config.schema-1.bak, renomeá-la para config.ini restaura as configurações anteriores.",
     "error.save_config": "Não foi possível salvar: {error}",
     "error.invalid_hotkey": "Atalho de teclado inválido: {error}",
     "error.backend_rules": "Regras de substituição inválidas: {error}",
