@@ -99,8 +99,9 @@ class RunTests(unittest.TestCase):
         return run
 
     def test_each_file_is_signed_then_verified_before_the_next(self):
-        hook.sign_and_verify(self.config, [Path('/a/app.exe'), Path('/a/helper.exe')], run=self.runner(),
-                             to_windows=lambda path: 'W:' + str(path))
+        # Plain strings: a Path would print with the separators of the system the test runs on.
+        hook.sign_and_verify(self.config, ['/a/app.exe', '/a/helper.exe'], run=self.runner(),
+                             to_windows=lambda path: 'W:' + path)
         self.assertEqual([(call[0][1], call[0][-1]) for call in self.calls],
                          [('sign', 'W:/a/app.exe'), ('verify', 'W:/a/app.exe'),
                           ('sign', 'W:/a/helper.exe'), ('verify', 'W:/a/helper.exe')])

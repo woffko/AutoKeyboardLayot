@@ -13,8 +13,8 @@
 set -u
 set -o pipefail
 
-STEP_IDS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14)
-STEP_NAMES=(fmt clippy-default clippy-installer clippy-windows test-default test-no-default validate-locales python-tests windows-tests clippy-signing test-signing clippy-windows-installer clippy-windows-signing windows-signing-tests)
+STEP_IDS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15)
+STEP_NAMES=(fmt clippy-default clippy-installer clippy-windows test-default test-no-default validate-locales python-tests windows-tests clippy-signing test-signing clippy-windows-installer clippy-windows-signing windows-signing-tests windows-all-tests)
 
 usage() {
     cat <<'EOF'
@@ -40,6 +40,9 @@ Runs the complete local verification gate from WSL, one logged step at a time:
   14 windows-signing-tests
                        cross-build the signing utility's Windows unit tests (DPAPI fixtures only, never a real key)
                        and run them on the Windows host like step 09
+  15 windows-all-tests cross-build every test executable (library, agent and integration tests) with the default
+                       features and with --no-default-features (the modular base the installer ships) and run each
+                       on the Windows host, except tests that read the source tree at run time
 
 Options:
   --keep-going   run every step even after a failure (default: stop at the first failure)
@@ -50,9 +53,10 @@ Options:
 Logs and summary.txt are written to target/verify/<UTC timestamp>/. The exit status is 0 only when
 every selected step passed.
 
-Test-count floors: AKL_MIN_LINUX_LIB_TESTS (default 281) applies to the library tests of step 05 and
-AKL_MIN_WINDOWS_TESTS (default 126) to step 09. Raise them when tests are added; never lower them to
-hide a deleted test.
+Test-count floors: AKL_MIN_LINUX_LIB_TESTS (default 281) applies to the library tests of step 05,
+AKL_MIN_WINDOWS_TESTS (default 126) to step 09 and AKL_MIN_WINDOWS_ALL_TESTS (default 900, both
+configurations together) to step 15. Raise them when tests are added; never lower them to hide a
+deleted test.
 EOF
 }
 
@@ -98,6 +102,7 @@ cd "$repo_root" || exit 2
 
 min_linux_lib=${AKL_MIN_LINUX_LIB_TESTS:-281}
 min_windows=${AKL_MIN_WINDOWS_TESTS:-126}
+min_windows_all=${AKL_MIN_WINDOWS_ALL_TESTS:-900}
 
 # Step selection ---------------------------------------------------------------
 
@@ -283,6 +288,56 @@ windows_test_step() {
 step_windows_tests() { windows_test_step --bin AutoKeyboardLayot; }
 step_windows_signing_tests() { windows_test_step --features signing-tools --bin sign-language-package; }
 
+# Names (up to the hash) of cross-built test executables that cannot run on the host: they read the
+# source tree at run time through CARGO_MANIFEST_DIR, which is a Linux path inside a cross-built file.
+# They run in step 05 and in CI on Windows.
+WINDOWS_SOURCE_TREE_TESTS='package_locale_sources'
+
+# Cross-builds every test executable for one feature set and runs each on the Windows host.
+windows_all_tests_step() {
+    local label=$1 build_output status failed=0 executable name
+    local -a executables
+    shift
+    build_output=$(mktemp) || return 1
+    printf '+ %s\n' "cargo xwin test --locked --no-run --target x86_64-pc-windows-msvc $* --target-dir target/xwin-hotkeys"
+    cargo xwin test --locked --no-run --target x86_64-pc-windows-msvc "$@" --target-dir target/xwin-hotkeys >"$build_output" 2>&1
+    status=$?
+    cat "$build_output"
+    if [ "$status" -ne 0 ]; then
+        rm -f "$build_output"
+        return 1
+    fi
+    # An array, not a pipe into the loop: the commands inside would read the rest of the list from stdin.
+    mapfile -t executables < <(sed -n 's/^[[:space:]]*Executable .* (\(.*\.exe\))[[:space:]]*$/\1/p' "$build_output")
+    rm -f "$build_output"
+    if [ "${#executables[@]}" -eq 0 ]; then
+        echo "verify-wsl: no test executable found in the cargo output"
+        return 1
+    fi
+    for executable in "${executables[@]}"; do
+        name=$(basename "$executable")
+        if [[ "$name" =~ ^($WINDOWS_SOURCE_TREE_TESTS)- ]]; then
+            printf '+ skipping %s: it reads the source tree at run time\n' "$name"
+            continue
+        fi
+        if [ ! -f "$repo_root/$executable" ]; then
+            echo "verify-wsl: test executable not found: $executable"
+            failed=1
+            continue
+        fi
+        printf '+ running %s (%s) on the Windows host with a temporary LOCALAPPDATA\n' "$name" "$label"
+        run_windows_executable "$repo_root/$executable" || failed=1
+    done
+    return "$failed"
+}
+
+step_windows_all_tests() {
+    local failed=0
+    windows_all_tests_step 'default features' || failed=1
+    windows_all_tests_step 'modular base' --no-default-features || failed=1
+    return "$failed"
+}
+
 # Test counts ------------------------------------------------------------------
 
 # Prints "passed failed ignored lib_passed" summed over every "test result:" line of a libtest log.
@@ -323,6 +378,10 @@ evaluate_counts() {
     fi
     if [ "$name" = windows-tests ] && [ "$passed" -lt "$min_windows" ]; then
         step_detail="$step_detail (below the floor of $min_windows)"
+        return 1
+    fi
+    if [ "$name" = windows-all-tests ] && [ "$passed" -lt "$min_windows_all" ]; then
+        step_detail="$step_detail (below the floor of $min_windows_all)"
         return 1
     fi
     return 0
@@ -366,7 +425,7 @@ run_one() {
     status=$?
     step_detail=""
     case "$name" in
-        test-default | test-no-default | test-signing | windows-tests | windows-signing-tests)
+        test-default | test-no-default | test-signing | windows-tests | windows-signing-tests | windows-all-tests)
             evaluate_counts "$name" "$log" || status=1
             ;;
     esac

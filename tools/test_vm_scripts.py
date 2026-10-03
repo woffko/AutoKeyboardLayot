@@ -183,6 +183,7 @@ def run_driver(name, environment, fake, arguments=()):
         return code, controller
 
 
+@unittest.skipUnless(hasattr(os, 'O_NOFOLLOW'), 'the VM drivers run from Linux or WSL (/proc, O_NOFOLLOW)')
 class DriverTests(unittest.TestCase):
     def every_remote_text(self, fake):
         return [script for _, script in fake.ssh] + [batch for _, batch in fake.sftp]

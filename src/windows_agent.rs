@@ -11999,6 +11999,8 @@ mod tests {
         );
     }
 
+    // Needs the bundled Russian dictionary: the modular base installs it as a package.
+    #[cfg(feature = "legacy-bundled-input")]
     fn type_wrong_layout_word(processor: &mut InputProcessor) {
         for (character, scan_code) in "ghbdtn".chars().zip([0x22, 0x23, 0x30, 0x20, 0x14, 0x31]) {
             processor.session.handle(
@@ -12015,6 +12017,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn a_finished_word_counts_as_the_target_language_only_when_a_conversion_is_attempted() {
         // (automatic conversion on, delimiter, language the next words see)

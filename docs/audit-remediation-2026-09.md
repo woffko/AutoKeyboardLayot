@@ -23,7 +23,7 @@ describes behavior and verification, not attack details.
 | Package catalog | The published catalog expired on 2026-09-26; the tool hard-coded seven days; users saw a raw error code. | `prepare_release_catalog` takes `VALIDITY_DAYS` (default 21, at most 31) and backdates `issued_at` by one hour; `check_catalog_expiry` takes `MIN_HOURS`; the daily workflow alerts through an issue; Settings and the installer show a dedicated message in all 14 languages. **Renewing the catalog itself needs the release key and is not part of this change.** |
 | Licensing notes | The README said no license had been selected. | The README states the MIT license and where third-party licenses live; the layout-model notice joins the installer notices; `docs/licensing-notes.md` lists open questions for the owner. |
 | Host deployment | An untracked script with machine-specific values; old backups piled up. | `tools/deploy-host.ps1` with `-WhatIf`, rollback and backup pruning, described in `docs/host-deployment.md`. |
-| Local verification | Several checks were not run anywhere locally. | `tools/verify-wsl.sh` runs formatting, Clippy in five configurations, tests, locale validation, Python tests and the Windows unit tests on the Windows host. |
+| Local verification | Several checks were not run anywhere locally. | `tools/verify-wsl.sh` runs formatting, Clippy in six configurations, tests, locale validation, Python tests and every Windows test executable (library, agent, integration; default and modular configurations) on the Windows host. |
 | Terminal false positives | No measurement of how often real command and package names are converted. | `tests/fixtures/dev-tokens.txt` holds 1 659 such names; `tests/dev_tokens.rs` fails when more than 6 are converted by the dictionary stage or more than 1 more by the layout model (0.36% and 0.06% today). `cargo run --example measure_token_false_positives` lists them. Detection policy is unchanged. |
 | Parser robustness | Untrusted-input parsers were only checked on hand-written cases. | `tests/parser_mutation_smoke.rs` feeds seeded mutations of in-repo seeds to 13 parsers (configuration, settings, lexicons, rules, hotkeys, models, locale catalogs, installer protocol, layout model, signed catalog and package) and requires zero panics, in about 8 seconds. |
 | Layout-model limits | The thresholds and gates of the second stage were only partly tested and not documented. | New tests for the confidence thresholds, the known-word gate, the three-letter rule and context-settled ambiguity; `docs/layout-model.md` has a Limits section with measured numbers for real tokens and random text. |
@@ -35,11 +35,15 @@ describes behavior and verification, not attack details.
 
 ## How it was verified
 
-`tools/verify-wsl.sh` passes at the final commit (14 steps). The Windows unit tests of the agent and of
-the signing utility run on the host with a temporary profile. Library tests on Linux went from 281 to
-325 and the Windows test suite from 126 to 150; the Python tests cover the CI policy, the VM scripts,
-the catalog checker and the Authenticode hook. The tests for the Exit and correction-gate behavior
-were written first and failed on the audited commit. The behavior that only a real desktop can show
+`tools/verify-wsl.sh` passes at the final commit (15 steps). Every Windows test executable (the
+agent's, the library's, the integration tests and the signing utility's) runs on the host with a
+temporary profile, in the default and in the modular configuration. Library tests on Linux went from
+281 to 325 and the Windows agent tests from 126 to 150; the Python tests cover the CI policy, the VM
+scripts, the catalog checker and the Authenticode hook. The first pull request showed why the last
+step exists: two tests passed on Linux and in the default Windows configuration but failed natively
+on Windows (a directory in the way of a temporary file name reports "access denied", not "exists") and
+in the modular configuration (a test needed the bundled Russian dictionary). The tests for the Exit
+and correction-gate behavior were written first and failed on the audited commit. The behavior that only a real desktop can show
 (the exit prompts, the hook and tray repairs, the paste selection, the startup message for an
 unreadable configuration) is covered by the manual checklist below.
 

@@ -182,6 +182,14 @@ fn create_unique_temporary(
         {
             Ok(file) => return Ok((file, temporary)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            // Windows reports a directory in the way as "access denied", not as "exists". A name
+            // that is there is taken; a name that is not there is a real permission problem.
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && std::fs::symlink_metadata(&temporary).is_ok() =>
+            {
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }

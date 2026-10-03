@@ -364,9 +364,10 @@ From WSL, `tools/verify-wsl.sh` runs the whole local gate with one command:
 formatting, Clippy (default features, `installer-tools` without default
 features, the Windows target, the signing tools on both systems, and the Windows
 installer helper), tests in two feature configurations plus the signing tools,
-strict locale validation, the Python unit tests, and the Windows unit tests of the
-agent and of the signing utility, which are cross-built with `cargo-xwin` and
-executed on the Windows host with a temporary `LOCALAPPDATA`. Each step logs to
+strict locale validation, the Python unit tests, and every Windows test executable
+(the agent's, the library's, the integration tests and the signing utility's, in
+the default and in the modular configuration), which are cross-built with
+`cargo-xwin` and executed on the Windows host with a temporary `LOCALAPPDATA`. Each step logs to
 `target/verify/<timestamp>/`, the run ends with a `summary.txt`, and the test
 counts may not fall below recorded floors. `--keep-going` runs every step after a
 failure; `--list` and `--only` show and select steps.
