@@ -6,6 +6,7 @@
 
 # Machine-local agent configuration and private working notes.
 /.codex/
+/handoff.md
 /AGENTS.override.md
 /.env
 /.env.*

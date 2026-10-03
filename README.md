@@ -344,8 +344,8 @@ The in-development localization layer embeds English and selects translations
 using the Windows display language, independently of the keyboard layout.
 External UI catalogs are validated against the embedded messages; missing
 translations fall back to English. Thirteen external catalog drafts cover the
-planned language set with all 141 current message keys each, including the new
-input-package status messages. Strict completeness and placeholder validation
+planned language set with every current message key, including the input-package
+status messages. Strict completeness and placeholder validation
 pass. Chinese uses an explicit Simplified-script catalog with regional
 aliases; Arabic and Urdu require RTL layout acceptance. Linguistic/UI acceptance and
 the input-plugin manager are still in progress; see
@@ -393,6 +393,14 @@ an isolated temporary profile for adapter tests. `tools/start-windows-build.ps1`
 launches that script independently of SSH through WMI and monitors its result.
 Each run requires a fresh log directory; per-stage logs and `result.json`
 remain there even if the monitoring connection is interrupted.
+
+## Security
+
+Report a suspected vulnerability privately; [`SECURITY.md`](SECURITY.md) says how.
+[`docs/threat-model.md`](docs/threat-model.md) lists what the program defends against and what it
+does not (code running as the same Windows user is out of scope), and
+[`docs/repository-settings.md`](docs/repository-settings.md) lists the GitHub settings that the
+owner switches on.
 
 ## License and third-party notices
 

@@ -1,13 +1,23 @@
-"""Stage candidate3 on the VM and run the real-setup offline UI acceptance in the interactive session."""
+"""Stage candidate3 on the VM and run the real-setup offline UI acceptance in the interactive session.
+
+Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment; AKL_VM_TEST_USER names
+the interactive user (see vm_config.py).
+"""
 import base64, json, os, stat, subprocess, sys
 from pathlib import Path
 
+from vm_config import VmSettings, VmSettingsError, sftp_path
+
 ROOT = Path(__file__).resolve().parents[1]
-STAGE = r'C:\Users\w0w\AppData\Local\Temp\akl-ui-offline'
-STAGE_UNIX = '/C:/Users/w0w/AppData/Local/Temp/akl-ui-offline'
+STAGE_NAME = 'akl-ui-offline'
 TASK = 'AklUiOfflineAcceptance'
 
 def main():
+    try:
+        vm = VmSettings.from_environment()
+    except VmSettingsError as error:
+        print(error, file=sys.stderr)
+        return 2
     output = Path(sys.argv[1]).resolve()
     output.mkdir()
     raw = bytearray(sys.stdin.buffer.read(4097))
@@ -20,13 +30,13 @@ def main():
         try:
             options = ['-F', '/dev/null', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
                        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
-                       '-o', 'StrictHostKeyChecking=yes', '-o', 'HostKeyAlias=192.168.189.138',
+                       '-o', 'StrictHostKeyChecking=yes', *vm.host_key_option(),
                        '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
                        '-o', 'ClearAllForwardings=yes', '-o', 'ControlMaster=no',
                        '-i', f'/proc/{os.getpid()}/fd/{fd}']
             def remote(script, timeout=30):
                 encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-                run = subprocess.run(['/usr/bin/ssh', *options, 'root@192.168.189.129',
+                run = subprocess.run(['/usr/bin/ssh', *options, vm.login,
                     'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + encoded],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
                 if run.returncode:
@@ -36,16 +46,13 @@ def main():
                     raise ValueError('remote command')
                 return run.stdout.decode('utf-8', 'replace')
             result['phase'] = 'preflight'
-            preflight = remote(r"""$ProgressPreference='SilentlyContinue'
-'COMPUTER='+$env:COMPUTERNAME
-'APP_PROC='+@(Get-Process -Name AutoKeyboardLayot -ErrorAction SilentlyContinue).Count
-'PROFILE='+(Test-Path -LiteralPath 'C:\Users\w0w\AppData\Local\AutoKeyboardLayot')
-'SESSIONS='+(((& "$env:SystemRoot\System32\query.exe" user 2>&1) | Out-String).Trim())
-""", 30)
+            preflight = remote(vm.preflight_script(), 30)
             result['preflight'] = preflight.strip().splitlines()
             text = preflight
-            if 'COMPUTER=DESKTOP-ELS4LDK' not in text or 'APP_PROC=0' not in text or 'PROFILE=False' not in text or 'console' not in text or 'Active' not in text:
+            if not vm.preflight_ok(text):
                 raise ValueError('preflight result')
+            stage = vm.stage_directory(STAGE_NAME, text)
+            stage_unix = sftp_path(stage)
             setup = ROOT / 'target/installer-vm-candidate-20260913-03/AutoKeyboardLayot-0.1.0-setup-experimental.exe'
             catalog = ROOT / 'target/ui-package-candidates-20260912-01/catalog.aklc'
             ru = ROOT / 'target/ui-package-candidates-20260912-01/ru-RU-r1.aklp'
@@ -54,16 +61,16 @@ def main():
             setup_sha = next(a['sha256'] for a in build['artifacts'] if a['file'].endswith('setup-experimental.exe'))
             app_sha = next(a['sha256'] for a in build['artifacts'] if a['file'].endswith('release/AutoKeyboardLayot.exe'))
             result.update(phase='upload', setup_sha256=setup_sha, app_sha256=app_sha)
-            remote(r"""$ErrorActionPreference='Stop'
-$s='C:\Users\w0w\AppData\Local\Temp\akl-ui-offline'
+            remote(f"""$ErrorActionPreference='Stop'
+$s='{stage}'
 Remove-Item -LiteralPath $s -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path (Join-Path $s 'catalog') -Force | Out-Null
 'STAGE_READY'""", 30)
-            batch = (f'put "{setup}" "{STAGE_UNIX}/setup.exe"\n'
-                     f'put "{catalog}" "{STAGE_UNIX}/catalog/catalog.aklc"\n'
-                     f'put "{ru}" "{STAGE_UNIX}/catalog/ru-RU-r1.aklp"\n'
-                     f'put "{driver}" "{STAGE_UNIX}/test-installer-ui-offline.ps1"\n')
-            up = subprocess.run(['/usr/bin/sftp', *options, '-b', '-', 'root@192.168.189.129'],
+            batch = (f'put "{setup}" "{stage_unix}/setup.exe"\n'
+                     f'put "{catalog}" "{stage_unix}/catalog/catalog.aklc"\n'
+                     f'put "{ru}" "{stage_unix}/catalog/ru-RU-r1.aklp"\n'
+                     f'put "{driver}" "{stage_unix}/test-installer-ui-offline.ps1"\n')
+            up = subprocess.run(['/usr/bin/sftp', *options, '-b', '-', vm.login],
                                 input=batch.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             if up.returncode:
                 raise ValueError('upload')
@@ -75,15 +82,15 @@ New-Item -ItemType Directory -Path (Join-Path $s 'catalog') -Force | Out-Null
                    f'-OutputDirectory "%~dp0out" > "%~dp0driver.log" 2>&1\r\n'
                    f'echo DRIVER_EXIT=%ERRORLEVEL% >> "%~dp0driver.log"\r\n')
             (output / 'run_ui.cmd').write_bytes(cmd.encode('ascii'))
-            batch = f'put "{output / "run_ui.cmd"}" "{STAGE_UNIX}/run_ui.cmd"\n'
-            subprocess.run(['/usr/bin/sftp', *options, '-b', '-', 'root@192.168.189.129'],
+            batch = f'put "{output / "run_ui.cmd"}" "{stage_unix}/run_ui.cmd"\n'
+            subprocess.run(['/usr/bin/sftp', *options, '-b', '-', vm.login],
                            input=batch.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             run_script = (r"$ErrorActionPreference='Continue'"
-                r";$s='C:\Users\w0w\AppData\Local\Temp\akl-ui-offline'"
+                rf";$s='{stage}'"
                 r";$task='AklUiOfflineAcceptance'"
                 r";Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue"
                 r";$act=New-ScheduledTaskAction -Execute (Join-Path $s 'run_ui.cmd')"
-                r";$pr=New-ScheduledTaskPrincipal -UserId 'DESKTOP-ELS4LDK\w0w' -LogonType Interactive"
+                rf";$pr=New-ScheduledTaskPrincipal -UserId '{vm.scheduled_task_user}' -LogonType Interactive"
                 r";$set=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)"
                 r";Register-ScheduledTask -TaskName $task -Action $act -Principal $pr -Settings $set -Force -ErrorAction Stop | Out-Null"
                 r";Start-ScheduledTask -TaskName $task -ErrorAction Stop"
@@ -100,9 +107,9 @@ New-Item -ItemType Directory -Path (Join-Path $s 'catalog') -Force | Out-Null
             result['command_returned'] = 'VM_UI_OFFLINE_RETURNED' in returned
             result['phase'] = 'fetch'
             names = ['result.json', 'driver.log', 'package-page.png', 'catalog-selection.png', 'download-complete.png', 'review-page.png', 'installed.png', 'failure-window.png', 'inno.log']
-            batch = ''.join(f'-get "{STAGE_UNIX}/out/{n}" "{output / n}"\n' for n in names)
-            batch += f'-get "{STAGE_UNIX}/driver.log" "{output / "driver.log"}"\n'
-            subprocess.run(['/usr/bin/sftp', *options, '-b', '-', 'root@192.168.189.129'],
+            batch = ''.join(f'-get "{stage_unix}/out/{n}" "{output / n}"\n' for n in names)
+            batch += f'-get "{stage_unix}/driver.log" "{output / "driver.log"}"\n'
+            subprocess.run(['/usr/bin/sftp', *options, '-b', '-', vm.login],
                            input=batch.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             final = output / 'result.json'
             if final.is_file():
