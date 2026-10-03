@@ -65,13 +65,19 @@ A renewal is a new catalog generation: the same package records, **a new, higher
 and a new window. A client that accepted revision N refuses a lower revision, and also revision N
 again with a different document.
 
+[`catalog-renewal.md`](catalog-renewal.md) is the runbook with the exact commands, the two steps that
+need the owner's approval (signing and replacing the published asset), the checks and the rollback
+rules. The summary below is the background.
+
 1. Build the unsigned candidate from the release's `.aklp` files (all in one directory):
    `cargo run --locked --features signing-tools --example prepare_release_catalog -- DIRECTORY TAG REVISION OUTPUT.json [VALIDITY_DAYS]`.
    `VALIDITY_DAYS` defaults to 21 and may be 1 to 31. `issued_at` is placed one hour in the past,
    so a client whose clock runs slightly behind still accepts a fresh catalog, and the window is
    exactly `VALIDITY_DAYS` long, which keeps even 31 days inside the client's lifetime limit.
 2. Review the candidate: package IDs, revisions, sha256 values and the tag equal the previous
-   catalog, and only `revision`, `issued_at` and `expires_at` differ. Record the file's sha256.
+   catalog, and only `revision`, `issued_at` and `expires_at` differ.
+   `python3 tools/check_catalog_candidate.py PREVIOUS_CATALOG CANDIDATE` checks exactly that, plus the
+   window length and its freshness, and prints the file's sha256 to record.
 3. Sign it with the release key using `tools/sign-package.ps1 -Kind catalog` (key handling is
    described in `package-signing-key.md`).
 4. Verify offline: `cargo run --locked --example verify_release_catalog -- CATALOG ARTIFACT_DIRECTORY`
