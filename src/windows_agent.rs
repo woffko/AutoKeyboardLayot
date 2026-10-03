@@ -433,7 +433,9 @@ impl ProbeTrigger {
     }
 }
 
-/// The last privacy check that found the input field fine, and for which target.
+/// The last privacy check that found the input field fine, and for which input target. The
+/// keyboard layout is not part of the target: the answer does not depend on it, and a conversion
+/// switches it right before the next check.
 #[derive(Debug, Clone, Copy)]
 struct RecentPrivacyOk {
     foreground: ForegroundContext,
@@ -6871,7 +6873,7 @@ impl InputProcessor {
     /// replacement edits arrive) sometimes answers a check late, and the probe reports that as
     /// `FieldInspectionUnavailable`. Taken at face value it makes the word being typed
     /// manual-only, so fast typing in a terminal loses the automatic conversion of a word now and
-    /// then. When the same input target (window, focus, layout, epoch) passed a check less than
+    /// then. When the same input target (window, focus, thread, epoch) passed a check less than
     /// `PRIVACY_RECENT_OK_MS` ago, and nothing that can move the focus has happened since (that
     /// clears the record), one such failure keeps the earlier verdict.
     ///
@@ -6899,7 +6901,7 @@ impl InputProcessor {
             && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
             && trigger.keeps_recent_ok()
             && let Some(recent) = self.recent_privacy_ok
-            && recent.foreground == foreground
+            && same_input_target(recent.foreground, foreground)
             && recent.epoch == epoch
             && let Some(age) = now.checked_duration_since(recent.at)
             && age < Duration::from_millis(PRIVACY_RECENT_OK_MS)
@@ -12619,10 +12621,6 @@ mod tests {
                 process_id: 9,
                 ..foreground
             },
-            ForegroundContext {
-                layout: 9,
-                ..foreground
-            },
         ];
         for other in variants {
             let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
@@ -12637,7 +12635,8 @@ mod tests {
             );
             assert_eq!(verdict.reason, FIELD_FAILURE, "{other:?}");
         }
-        // The input epoch moves on focus changes, clicks, overflow and layout switches.
+        // The input epoch moves on queue overflow, hook reinstalls, configuration changes,
+        // toggling automatic conversion and a gate that gave up.
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
         settle(&mut processor, None, "provider", start);
         let verdict = processor.settle_probe_outcome(
@@ -12649,6 +12648,29 @@ mod tests {
             ProbeTrigger::Typing,
         );
         assert_eq!(verdict.reason, FIELD_FAILURE);
+    }
+
+    #[test]
+    fn a_layout_switch_does_not_end_the_window() {
+        // A conversion switches the keyboard layout right before the next check, and the user
+        // types in alternating layouts. The field is the same, so the rule must still apply.
+        let start = Instant::now();
+        let foreground = recent_ok_foreground();
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        settle(&mut processor, None, "provider", start);
+        let switched = ForegroundContext {
+            layout: foreground.layout + 1,
+            ..foreground
+        };
+        let verdict = processor.settle_probe_outcome(
+            FIELD_FAILURE,
+            "provider",
+            switched,
+            5,
+            start + Duration::from_millis(300),
+            ProbeTrigger::Refresh,
+        );
+        assert_eq!((verdict.reason, verdict.source), (None, "recent-ok"));
     }
 
     #[test]
@@ -12820,6 +12842,35 @@ mod tests {
         ] {
             assert!(line.contains(expected), "{expected}: {line}");
         }
+    }
+
+    #[test]
+    fn a_late_answer_after_a_layout_switch_is_still_softened() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        apply(&mut processor, None, true);
+        type_letters(&mut processor, "hel");
+        let foreground = recent_ok_foreground();
+        processor.apply_probe_answer(
+            ProbeAnswer {
+                reason: FIELD_FAILURE,
+                source: "provider",
+            },
+            true,
+            ForegroundContext {
+                layout: foreground.layout + 1,
+                ..foreground
+            },
+            5,
+            Instant::now(),
+            ProbeTrigger::Refresh,
+        );
+        assert!(processor.privacy_reason.is_none());
+        assert!(!processor.manual_only_word);
+        assert_eq!(processor.session.buffered_character_count(), 3);
+        let lines = probe_lines(&receiver);
+        let line = lines.last().expect("the softened answer is logged");
+        assert!(line.contains("source=recent-ok"), "{line}");
+        assert!(line.contains("trigger=refresh"), "{line}");
     }
 
     #[test]

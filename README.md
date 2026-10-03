@@ -228,8 +228,10 @@ Terminal while you type quickly) does not by itself make the word being typed
 manual-only. When the same window, focus and input epoch passed a check less than
 two seconds earlier, and nothing that can move the focus has happened since (Tab,
 Enter, a click, a shortcut, injected input or a focus change), one failed field
-check keeps that earlier verdict. A failure never renews the good check, so a
-window that keeps failing counts as failing after two seconds. A password field,
+check keeps that earlier verdict. The keyboard layout is not part of the target:
+the answer does not depend on it, and a conversion switches it. A failure never
+renews the good check, so a window that keeps failing counts as failing after two
+seconds. A password field,
 an excluded or unreadable process, a changed context and every transport failure
 stand as before, and recovery of held keys and manual conversion always take a
 failure at face value. A word that did meet a standing failure stays manual-only
