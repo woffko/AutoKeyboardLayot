@@ -24,6 +24,9 @@ describes behavior and verification, not attack details.
 | Licensing notes | The README said no license had been selected. | The README states the MIT license and where third-party licenses live; the layout-model notice joins the installer notices; `docs/licensing-notes.md` lists open questions for the owner. |
 | Host deployment | An untracked script with machine-specific values; old backups piled up. | `tools/deploy-host.ps1` with `-WhatIf`, rollback and backup pruning, described in `docs/host-deployment.md`. |
 | Local verification | Several checks were not run anywhere locally. | `tools/verify-wsl.sh` runs formatting, Clippy in five configurations, tests, locale validation, Python tests and the Windows unit tests on the Windows host. |
+| Terminal false positives | No measurement of how often real command and package names are converted. | `tests/fixtures/dev-tokens.txt` holds 1 659 such names; `tests/dev_tokens.rs` fails when more than 6 are converted by the dictionary stage or more than 1 more by the layout model (0.36% and 0.06% today). `cargo run --example measure_token_false_positives` lists them. Detection policy is unchanged. |
+| Parser robustness | Untrusted-input parsers were only checked on hand-written cases. | `tests/parser_mutation_smoke.rs` feeds seeded mutations of in-repo seeds to 13 parsers (configuration, settings, lexicons, rules, hotkeys, models, locale catalogs, installer protocol, layout model, signed catalog and package) and requires zero panics, in about 8 seconds. |
+| Layout-model limits | The thresholds and gates of the second stage were only partly tested and not documented. | New tests for the confidence thresholds, the known-word gate, the three-letter rule and context-settled ambiguity; `docs/layout-model.md` has a Limits section with measured numbers for real tokens and random text. |
 
 ## How it was verified
 
@@ -37,7 +40,6 @@ repairs, the paste selection) is covered by the manual checklist below.
 
 - Renewing and publishing the catalog, signing, releasing, installing on a host and deleting host files
   need the owner's approval and are listed with their commands in the progress notes.
-- Regression nets for terminal false positives, parser mutation smoke tests and layout-model limits.
 - Release staging for the next version, trust-root resilience, repository hygiene, a threat model and CI
   policy (dependency advisories, license checks).
 - Splitting the large Windows adapter into modules.

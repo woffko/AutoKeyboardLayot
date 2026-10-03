@@ -900,6 +900,283 @@ mod tests {
                 .is_none()
         );
     }
+    /// What the model thinks of keys typed in the English layout, with the
+    /// features built the way `detect_with_layout_model` builds them. The
+    /// limits tests below use it to state the premise of each scenario (how
+    /// sure the model is) next to the decision the detector makes.
+    fn model_probabilities(
+        detector: &Detector,
+        word: &str,
+        candidates: &[(Language, String)],
+        previous: &[Language],
+    ) -> Vec<f32> {
+        let model = crate::layout_model::embedded().expect("embedded model");
+        let texts: Vec<Option<&str>> = model
+            .languages()
+            .iter()
+            .map(|&language| {
+                if language == Language::English {
+                    return Some(word);
+                }
+                candidates
+                    .iter()
+                    .find(|(candidate, _)| *candidate == language)
+                    .map(|(_, text)| text.as_str())
+            })
+            .collect();
+        let features: Vec<Option<crate::layout_model::Candidate<'_>>> = texts
+            .iter()
+            .zip(model.languages())
+            .map(|(text, &language)| {
+                let text = (*text)?;
+                let lower = text.to_lowercase();
+                Some(crate::layout_model::Candidate {
+                    text,
+                    in_dictionary: detector.base_dictionary_contains(language, &lower),
+                    in_short_list: detector.common_short_contains(language, &lower),
+                })
+            })
+            .collect();
+        let typed = model.index_of(Language::English).expect("English");
+        model
+            .probabilities(&features, typed, previous)
+            .expect("probabilities")
+    }
+
+    fn probability_of(probabilities: &[f32], language: Language) -> f32 {
+        let model = crate::layout_model::embedded().expect("embedded model");
+        probabilities[model.index_of(language).expect("model language")]
+    }
+
+    /// The same keys read as a Russian word (or word form) and as Estonian.
+    /// Letters share their keys in the English and Estonian layouts, so for
+    /// letter-only keys the Estonian reading is the typed text itself.
+    fn russian_or_estonian(russian: &str, estonian: &str) -> Vec<(Language, String)> {
+        mapped(&[(Language::Russian, russian), (Language::Estonian, estonian)])
+    }
+
+    #[test]
+    fn layout_model_converts_only_at_or_above_its_threshold() {
+        let detector = model_detector();
+        let previous = [Language::English];
+        // Keys that read as a plausible but unknown Russian word form, so the
+        // dictionary stage has nothing to say. The band is how sure the model
+        // is of Russian; four or more letters need 90 %.
+        for (word, russian, lowest, highest, converted) in [
+            ("fdfypf", "аванза", 0.5, 0.9, false),
+            ("fdfycfsvb", "авансаыми", 0.5, 0.9, false),
+            ("fdfycttve", "авансеему", 0.9, 0.97, true),
+            ("fdfycj", "авансо", 0.9, 0.97, true),
+            ("fdfycjuj", "авансого", 0.97, 1.0, true),
+        ] {
+            let candidates = russian_or_estonian(russian, word);
+            assert!(
+                detector
+                    .detect_mapped_candidates(word, Language::English, &candidates)
+                    .is_none(),
+                "{word}: premise, the dictionary stage must leave it alone"
+            );
+            let probabilities = model_probabilities(&detector, word, &candidates, &previous);
+            let sure = probability_of(&probabilities, Language::Russian);
+            assert!(
+                (lowest..=highest).contains(&sure),
+                "{word}: premise, Russian probability {sure} is outside {lowest}..{highest}; \
+                 the model changed, pick new keys with the same bands"
+            );
+            let detection = detector.detect_mapped_candidates_in_context(
+                word,
+                Language::English,
+                &candidates,
+                &previous,
+            );
+            assert_eq!(
+                detection.is_some(),
+                converted,
+                "{word}: Russian probability {sure}"
+            );
+            if let Some(detection) = detection {
+                assert_eq!(detection.target_language, Language::Russian);
+                assert_eq!(detection.replacement, russian);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_model_needs_97_percent_for_three_letter_words_and_ignores_shorter_ones() {
+        let mut detector = model_detector();
+        let previous = [Language::English];
+        // Real Russian words that are outside the short-word list, so the
+        // dictionary stage declines them. (keys, reading, converted)
+        for (word, russian, converted) in [
+            ("flt", "аде", false),
+            ("fle", "аду", false),
+            ("fuf", "ага", true),
+        ] {
+            let candidates = russian_or_estonian(russian, word);
+            assert!(
+                detector
+                    .detect_mapped_candidates(word, Language::English, &candidates)
+                    .is_none(),
+                "{word}: premise, the dictionary stage must leave it alone"
+            );
+            let sure = probability_of(
+                &model_probabilities(&detector, word, &candidates, &previous),
+                Language::Russian,
+            );
+            assert_eq!(
+                sure >= LAYOUT_MODEL_SHORT_THRESHOLD,
+                converted,
+                "{word}: premise, Russian probability {sure}; the model changed, pick new keys"
+            );
+            assert!(
+                sure >= LAYOUT_MODEL_THRESHOLD,
+                "{word}: premise, 90 % would be enough for a longer word (got {sure})"
+            );
+            assert_eq!(
+                detector
+                    .detect_mapped_candidates_in_context(
+                        word,
+                        Language::English,
+                        &candidates,
+                        &previous,
+                    )
+                    .is_some(),
+                converted,
+                "{word}: Russian probability {sure}"
+            );
+        }
+        // Two-letter words never reach the model, however sure it is.
+        for (word, russian, estonian) in [("f[", "ах", "fü"), ("t.", "ею", "t.")] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let sure = probability_of(
+                &model_probabilities(&detector, word, &candidates, &previous),
+                Language::Russian,
+            );
+            assert!(
+                sure >= 0.99,
+                "{word}: premise, Russian probability {sure}; the model changed, pick new keys"
+            );
+            assert!(
+                detector
+                    .detect_mapped_candidates_in_context(
+                        word,
+                        Language::English,
+                        &candidates,
+                        &previous,
+                    )
+                    .is_none(),
+                "{word}: two-letter words keep the list-based policy"
+            );
+        }
+        // An excluded word is left alone at any length.
+        detector.replace_user_lexicons(
+            UserLexicon::default(),
+            UserLexicon::from_lines(["en-US: fuf"]),
+        );
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "fuf",
+                    Language::English,
+                    &russian_or_estonian("ага", "fuf"),
+                    &previous,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn layout_model_never_converts_a_word_the_typed_dictionary_knows() {
+        let detector = model_detector();
+        let previous = [Language::English];
+        // "kerf" is an English dictionary word whose keys also read as the
+        // common Russian word "лука". On its own the model prefers Russian, so
+        // only the known-word rule keeps the word English.
+        let candidates = russian_or_estonian("лука", "kerf");
+        assert!(detector.base_dictionary_contains(Language::English, "kerf"));
+        let sure = probability_of(
+            &model_probabilities(&detector, "kerf", &candidates, &previous),
+            Language::Russian,
+        );
+        assert!(
+            sure >= LAYOUT_MODEL_THRESHOLD,
+            "premise: Russian probability {sure} must reach the threshold; \
+             the model changed, pick another English dictionary word"
+        );
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "kerf",
+                    Language::English,
+                    &candidates,
+                    &previous,
+                )
+                .is_none(),
+            "a known word of the typed layout is not converted"
+        );
+    }
+
+    #[test]
+    fn layout_model_settles_a_dictionary_ambiguity_by_context_and_only_at_the_threshold() {
+        let detector = model_detector();
+        // The same keys read as the Russian word "эллу" and the Estonian word
+        // "äkke": two plausible targets, so the dictionary stage fails closed.
+        let candidates = russian_or_estonian("эллу", "äkke");
+        assert!(
+            detector
+                .detect_mapped_candidates("'kke", Language::English, &candidates)
+                .is_none()
+        );
+        // (previous words, converts)
+        for (previous, converts) in [
+            (vec![Language::English], false),
+            (vec![Language::Russian; 3], false),
+            (vec![Language::Estonian; 3], true),
+        ] {
+            let probabilities = model_probabilities(&detector, "'kke", &candidates, &previous);
+            let best = probabilities.iter().copied().fold(0.0, f32::max);
+            assert_eq!(
+                best >= LAYOUT_MODEL_THRESHOLD,
+                converts,
+                "premise: probabilities {probabilities:?} for context {previous:?}; \
+                 the model changed, pick other ambiguous keys"
+            );
+            let detection = detector.detect_mapped_candidates_in_context(
+                "'kke",
+                Language::English,
+                &candidates,
+                &previous,
+            );
+            assert_eq!(detection.is_some(), converts, "context {previous:?}");
+            if let Some(detection) = detection {
+                assert_eq!(detection.target_language, Language::Estonian);
+                assert_eq!(detection.replacement, "äkke");
+            }
+        }
+        // When the model is sure in every context, context does not matter.
+        let candidates = russian_or_estonian("мэру", "vähe");
+        assert!(
+            detector
+                .detect_mapped_candidates("v'he", Language::English, &candidates)
+                .is_none()
+        );
+        for previous in [
+            vec![],
+            vec![Language::Russian; 3],
+            vec![Language::Estonian; 3],
+        ] {
+            let detection = detector
+                .detect_mapped_candidates_in_context(
+                    "v'he",
+                    Language::English,
+                    &candidates,
+                    &previous,
+                )
+                .expect("the model is sure of Estonian in every context");
+            assert_eq!(detection.replacement, "vähe");
+        }
+    }
+
     use crate::{DictionaryPack, PackId};
 
     fn custom_us_pack(id: PackId, profiles: &[&str]) -> DictionaryPack {
