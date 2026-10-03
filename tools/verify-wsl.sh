@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Local verification gate for AutoKeyboardLayot, for use from WSL.
 #
-# Runs formatting, Clippy in three configurations, tests in two configurations,
-# strict locale validation, the Python unit tests and the Windows unit tests.
+# Runs formatting, Clippy for Linux and Windows in several feature sets, tests in
+# several feature sets, strict locale validation, the Python unit tests and the
+# Windows unit tests (the agent's and the signing utility's).
 # The Windows tests are cross-built with cargo-xwin and executed on the Windows
 # host with LOCALAPPDATA pointing at a temporary directory, so the real user
 # profile is never touched. Nothing here needs credentials.
@@ -12,8 +13,8 @@
 set -u
 set -o pipefail
 
-STEP_IDS=(01 02 03 04 05 06 07 08 09 10 11 12)
-STEP_NAMES=(fmt clippy-default clippy-installer clippy-windows test-default test-no-default validate-locales python-tests windows-tests clippy-signing test-signing clippy-windows-installer)
+STEP_IDS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14)
+STEP_NAMES=(fmt clippy-default clippy-installer clippy-windows test-default test-no-default validate-locales python-tests windows-tests clippy-signing test-signing clippy-windows-installer clippy-windows-signing windows-signing-tests)
 
 usage() {
     cat <<'EOF'
@@ -31,9 +32,14 @@ Runs the complete local verification gate from WSL, one logged step at a time:
   09 windows-tests     cross-build the Windows unit tests with cargo-xwin and run them on the
                        Windows host with LOCALAPPDATA pointing at a temporary directory
   10 clippy-signing    cargo clippy --locked --features signing-tools --all-targets -- -D warnings
-  11 test-signing      cargo test --locked --features signing-tools --lib
+  11 test-signing      cargo test --locked --features signing-tools
   12 clippy-windows-installer
                        cargo clippy --locked --target x86_64-pc-windows-msvc --no-default-features --features installer-tools --all-targets -- -D warnings
+  13 clippy-windows-signing
+                       cargo clippy --locked --target x86_64-pc-windows-msvc --features signing-tools --all-targets -- -D warnings
+  14 windows-signing-tests
+                       cross-build the signing utility's Windows unit tests (DPAPI fixtures only, never a real key)
+                       and run them on the Windows host like step 09
 
 Options:
   --keep-going   run every step even after a failure (default: stop at the first failure)
@@ -200,8 +206,9 @@ step_test_no_default() { run_logged cargo test --locked --no-default-features; }
 step_validate_locales() { run_logged cargo run --locked --example validate_locales -- data/package-locales --require-complete; }
 step_python_tests() { run_logged env PYTHONUTF8=1 python3 -m unittest discover -s tools -p 'test_*.py'; }
 step_clippy_signing() { run_logged cargo clippy --locked --features signing-tools --all-targets -- -D warnings; }
-step_test_signing() { run_logged cargo test --locked --features signing-tools --lib; }
+step_test_signing() { run_logged cargo test --locked --features signing-tools; }
 step_clippy_windows_installer() { run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --no-default-features --features installer-tools --all-targets -- -D warnings; }
+step_clippy_windows_signing() { run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --features signing-tools --all-targets -- -D warnings; }
 
 # Runs one test executable on the Windows host with a temporary LOCALAPPDATA.
 # The executable path reaches PowerShell through WSLENV, which translates it to a Windows path.
@@ -246,11 +253,12 @@ POWERSHELL
     )
 }
 
-step_windows_tests() {
+# Cross-builds the one test executable selected by the cargo arguments and runs it on the Windows host.
+windows_test_step() {
     local build_output status executable_relative found
     build_output=$(mktemp) || return 1
-    printf '+ %s\n' "cargo xwin test --locked --no-run --target x86_64-pc-windows-msvc --bin AutoKeyboardLayot --target-dir target/xwin-hotkeys"
-    cargo xwin test --locked --no-run --target x86_64-pc-windows-msvc --bin AutoKeyboardLayot --target-dir target/xwin-hotkeys >"$build_output" 2>&1
+    printf '+ %s\n' "cargo xwin test --locked --no-run --target x86_64-pc-windows-msvc $* --target-dir target/xwin-hotkeys"
+    cargo xwin test --locked --no-run --target x86_64-pc-windows-msvc "$@" --target-dir target/xwin-hotkeys >"$build_output" 2>&1
     status=$?
     cat "$build_output"
     if [ "$status" -ne 0 ]; then
@@ -271,6 +279,9 @@ step_windows_tests() {
     printf '+ running %s on the Windows host with a temporary LOCALAPPDATA\n' "$executable_relative"
     run_windows_executable "$repo_root/$executable_relative"
 }
+
+step_windows_tests() { windows_test_step --bin AutoKeyboardLayot; }
+step_windows_signing_tests() { windows_test_step --features signing-tools --bin sign-language-package; }
 
 # Test counts ------------------------------------------------------------------
 
@@ -355,7 +366,7 @@ run_one() {
     status=$?
     step_detail=""
     case "$name" in
-        test-default | test-no-default | test-signing | windows-tests)
+        test-default | test-no-default | test-signing | windows-tests | windows-signing-tests)
             evaluate_counts "$name" "$log" || status=1
             ;;
     esac

@@ -27,6 +27,7 @@ describes behavior and verification, not attack details.
 | Terminal false positives | No measurement of how often real command and package names are converted. | `tests/fixtures/dev-tokens.txt` holds 1 659 such names; `tests/dev_tokens.rs` fails when more than 6 are converted by the dictionary stage or more than 1 more by the layout model (0.36% and 0.06% today). `cargo run --example measure_token_false_positives` lists them. Detection policy is unchanged. |
 | Parser robustness | Untrusted-input parsers were only checked on hand-written cases. | `tests/parser_mutation_smoke.rs` feeds seeded mutations of in-repo seeds to 13 parsers (configuration, settings, lexicons, rules, hotkeys, models, locale catalogs, installer protocol, layout model, signed catalog and package) and requires zero panics, in about 8 seconds. |
 | Layout-model limits | The thresholds and gates of the second stage were only partly tested and not documented. | New tests for the confidence thresholds, the known-word gate, the three-letter rule and context-settled ambiguity; `docs/layout-model.md` has a Limits section with measured numbers for real tokens and random text. |
+| CI policy | CI ran `cargo audit` without a policy, never built the signing tools and checked no licenses. | `.cargo/audit.toml` ignores exactly four accepted "unmaintained" notices, each with its reason, and CI runs `cargo audit --deny warnings`; `deny.toml` allows a short list of licenses and crates.io only, checked by a pinned `cargo-deny`; CI runs Clippy and the tests with `signing-tools` on Linux and Windows. The Windows Clippy error that blocked the signing tools (`items_after_test_module`) is fixed, and the local gate has two new steps for the signing utility on Windows. |
 
 ## How it was verified
 
@@ -40,8 +41,7 @@ repairs, the paste selection) is covered by the manual checklist below.
 
 - Renewing and publishing the catalog, signing, releasing, installing on a host and deleting host files
   need the owner's approval and are listed with their commands in the progress notes.
-- Release staging for the next version, trust-root resilience, repository hygiene, a threat model and CI
-  policy (dependency advisories, license checks).
+- Release staging for the next version, trust-root resilience, repository hygiene and a threat model.
 - Splitting the large Windows adapter into modules.
 - `Shell_NotifyIconW` still runs on the thread that owns the hooks; moving it to its own thread is part of a
   later dedicated-hook-thread change. The watchdog repairs the hooks if a blocked call costs them.

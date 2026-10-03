@@ -362,14 +362,21 @@ cargo check --target x86_64-pc-windows-msvc
 
 From WSL, `tools/verify-wsl.sh` runs the whole local gate with one command:
 formatting, Clippy (default features, `installer-tools` without default
-features, the Windows target, the signing tools, and the Windows installer
-helper), tests in two feature configurations plus the signing tools, strict
-locale validation, the Python unit tests, and the Windows unit tests, which are
-cross-built with `cargo-xwin` and executed on the Windows host with a temporary
-`LOCALAPPDATA`. Each step logs to `target/verify/<timestamp>/`, the run ends
-with a `summary.txt`, and the test counts may not fall below recorded floors.
-`--keep-going` runs every step after a failure; `--list` and `--only` show and
-select steps.
+features, the Windows target, the signing tools on both systems, and the Windows
+installer helper), tests in two feature configurations plus the signing tools,
+strict locale validation, the Python unit tests, and the Windows unit tests of the
+agent and of the signing utility, which are cross-built with `cargo-xwin` and
+executed on the Windows host with a temporary `LOCALAPPDATA`. Each step logs to
+`target/verify/<timestamp>/`, the run ends with a `summary.txt`, and the test
+counts may not fall below recorded floors. `--keep-going` runs every step after a
+failure; `--list` and `--only` show and select steps.
+
+The CI workflow (`.github/workflows/checks.yml`) runs the same checks on Linux
+and Windows. On Linux it also checks dependency advisories with
+`cargo audit --deny warnings` (the four accepted notices are listed with their
+reasons in `.cargo/audit.toml`) and dependency licenses and sources with
+`cargo deny check licenses bans sources` (policy in `deny.toml`). A new license
+type or a git dependency fails the check until someone decides on it.
 
 The settings window and About page show the version as `0.1.0 (abc1234)`, where
 `abc1234` is the source commit. A build whose tracked source files (`src`,
