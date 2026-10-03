@@ -9,3 +9,6 @@
 *.ico -text
 *.res -text
 *.gz -text
+
+# Signed release assets used as mutation seeds: keep them byte-exact.
+/tests/fixtures/mutation-seed-* -text

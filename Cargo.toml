@@ -104,3 +104,12 @@ slint = { version = "=1.17.1", default-features = false, features = [
     "renderer-femtovg",
     "std",
 ] }
+
+# Signature verification dominates the packaging and mutation tests: unoptimized curve arithmetic
+# costs about 2 ms per verification. Only these crates are optimized; the project code is not.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
