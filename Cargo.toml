@@ -39,6 +39,10 @@ name = "export_input_sources"
 required-features = ["legacy-bundled-input"]
 
 [[example]]
+name = "measure_token_false_positives"
+required-features = ["legacy-bundled-input"]
+
+[[example]]
 name = "prepare_language_package"
 required-features = ["signing-tools"]
 
