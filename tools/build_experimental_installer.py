@@ -3,9 +3,12 @@ import hashlib
 import argparse
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tomllib
 import os
+
+import authenticode_hook
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -15,6 +18,10 @@ parser.add_argument('--build-receipt', required=True)
 parser.add_argument('--iscc', required=True, help='Path to the reviewed Inno Setup compiler')
 parser.add_argument('--notice-sha256', required=True, help='Reviewed SHA-256 of THIRD-PARTY-NOTICES.txt')
 args = parser.parse_args()
+try:
+    signing = authenticode_hook.configuration(os.environ)  # None unless fully configured
+except authenticode_hook.SigningConfigurationError as error:
+    raise SystemExit(str(error))
 output = (root / args.output).resolve()
 if output == root / 'target' or not output.is_relative_to(root / 'target'):
     raise SystemExit('Output must be a fresh child of this project target directory.')
@@ -54,6 +61,13 @@ def windows(path):
 
 release = root / 'target/xwin-hotkeys/x86_64-pc-windows-msvc/release'
 app, helper = release / 'AutoKeyboardLayot.exe', release / 'installer-package-helper.exe'
+if signing:
+    # Sign copies, never the files in the build directory, then package the signed copies.
+    signed_inputs = output / 'signed-inputs'
+    signed_inputs.mkdir()
+    app = Path(shutil.copy2(app, signed_inputs / app.name))
+    helper = Path(shutil.copy2(helper, signed_inputs / helper.name))
+    authenticode_hook.sign_and_verify(signing, [app, helper], to_windows=windows)
 version = tomllib.loads((root / 'Cargo.toml').read_text())['package']['version']
 command = [args.iscc,
            '/DAppVersion=' + version, '/DAppExecutable=' + windows(app),
@@ -63,9 +77,12 @@ subprocess.run(command, cwd=root, timeout=1200, check=True)
 artifacts = list(output.glob('*.exe'))
 if len(artifacts) != 1 or artifacts[0].name != f'AutoKeyboardLayot-{version}-setup-experimental.exe':
     raise SystemExit('Unexpected installer artifact.')
+if signing:
+    authenticode_hook.sign_and_verify(signing, [artifacts[0]], to_windows=windows)
 receipt = {'state': 'built_for_vm_acceptance_not_executed', 'installation_disabled': False,
            'notices_complete_text_collection': True, 'redistribution_approval': False,
            'published': False, 'installer_acceptance': False,
+           'authenticode': signing.describe() if signing else {'signed': False},
            'source_manifest_sha256': digest(root / 'Cargo.toml'), 'cargo_lock_sha256': digest(root / 'Cargo.lock'),
            'notice_sha256': digest(notices), 'compiled_package_ids': sorted(compiled),
            'artifacts': [{'file': str(path.relative_to(root)), 'bytes': path.stat().st_size, 'sha256': digest(path)}

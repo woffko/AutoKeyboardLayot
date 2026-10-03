@@ -71,6 +71,15 @@ dependency-set and fresh-output checks remain mandatory. The remaining local
 VM scripts are not required for this portable builder and are not automatically
 enrolled or published.
 
+Authenticode signing is optional and off by default. When `AKL_SIGNTOOL` (the
+path of `signtool.exe`), `AKL_SIGN_THUMBPRINT` (the thumbprint of a code-signing
+certificate in a Windows store) and `AKL_SIGN_TIMESTAMP_URL` (an RFC 3161
+server) are all set, the builder signs copies of the application and the
+package helper, compiles the installer from the copies, signs the installer,
+checks every signature with `signtool verify /pa` and records the thumbprint in
+`build.json`. Setting only some of the three stops the build. No password or key
+file is ever read or passed. See `tools/authenticode_hook.py`.
+
 ## Deployment acceptance
 
 Before replacing an installed binary, verify all currently installed signed
