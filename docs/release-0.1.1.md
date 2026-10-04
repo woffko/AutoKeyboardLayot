@@ -36,6 +36,10 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
   verdict of a check that passed less than two seconds earlier for the same window. A password
   field, a changed window, input that can move the focus and a failure that lasts still stop
   automatic conversion.
+- **Pause converts in more cases.** A manual layout switch (for example Alt+Shift) no longer
+  makes Pause forget the word typed before it, text typed right after a manual switch can be
+  converted with Pause, and digits typed on the numeric keypad no longer stop Pause from
+  reading a word back. When Pause still cannot act, the diagnostics log says why.
 - **Protected paste leaves nothing behind.** The selection made by the program is collapsed
   when the outcome is not the expected one (a selection you made is never touched), and a
   clipboard that could not be restored is counted and logged without switching conversion off.

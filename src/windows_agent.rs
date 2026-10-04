@@ -94,9 +94,10 @@ use windows::{
                 GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
                 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
                 MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_BACK,
-                VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME, VK_LCONTROL,
-                VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT,
-                VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+                VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME,
+                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMPAD0,
+                VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
+                VK_TAB, VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -675,11 +676,12 @@ struct PendingConversion {
     forced: bool,
 }
 
-/// The most recent space-delimited word, retained so the user can still convert
-/// it with the manual hotkey after the space has been typed.
+/// The most recent word, retained so the user can still convert it with the manual
+/// hotkey: after the space has been typed (the delimiter), or after a manual layout
+/// switch ended it with no delimiter. `foreground.layout` is the layout it was typed in.
 struct LastBoundary {
     replay_keys: Vec<ReplayKey>,
-    delimiter: char,
+    delimiter: Option<char>,
     foreground: ForegroundContext,
     epoch: u64,
     profile_generation: u64,
@@ -5868,15 +5870,31 @@ impl InputProcessor {
             } else {
                 self.last_word_reset = "layout";
                 self.layout_switch_in_flight = None;
+                // A manual switch ends automatic conversion of this word, not Pause: the word
+                // typed so far, or else the last completed word, stays available to the hotkey
+                // and is read in the layout it was typed in. Any other key drops it as usual.
+                let typed = core::mem::take(&mut self.replay_keys);
+                let kept = match self.last_layout {
+                    Some(typed_layout) if !typed.is_empty() => Some(LastBoundary {
+                        replay_keys: typed,
+                        delimiter: None,
+                        foreground: ForegroundContext {
+                            layout: typed_layout,
+                            ..event.foreground
+                        },
+                        epoch: self.last_input_epoch,
+                        profile_generation: self.input_profiles.generation(),
+                    }),
+                    _ => self.last_boundary.take(),
+                };
                 self.invalidate_conversion_state();
-                self.replay_keys.clear();
-                self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_switching_rule(
                     InputEvent::LayoutChanged,
                     language,
                     self.settings.suppress_after_manual_layout_change,
                 );
+                self.last_boundary = kept;
                 self.last_layout = Some(event.foreground.layout);
             }
         } else if self
@@ -6041,7 +6059,7 @@ impl InputProcessor {
                 self.last_boundary = if !last_keys.is_empty() && language.is_some() {
                     Some(LastBoundary {
                         replay_keys: last_keys,
-                        delimiter: ' ',
+                        delimiter: Some(' '),
                         foreground: event.foreground,
                         epoch: self.last_input_epoch,
                         profile_generation: self.input_profiles.generation(),
@@ -6188,10 +6206,10 @@ impl InputProcessor {
     /// suppresses automatic conversion until the next boundary; afterwards the
     /// token is represented only by replay keys over a suppressed session.
     ///
-    /// Text typed right after a shortcut (for example Ctrl+C in a terminal) is
-    /// also kept as a manual token: its left context is unknown, so automatic
-    /// conversion stays suppressed, but Pause replaces exactly the keys typed
-    /// since the shortcut.
+    /// Text typed right after a shortcut (for example Ctrl+C in a terminal) or a
+    /// manual layout switch is also kept as a manual token: its left context is
+    /// unknown, so automatic conversion stays suppressed, but Pause replaces
+    /// exactly the keys typed since the shortcut or the switch.
     /// Returns the keys to extend when this printable key continues the token.
     fn take_manual_token_keys(
         &mut self,
@@ -6207,8 +6225,9 @@ impl InputProcessor {
         let starts_at_word = input_event == InputEvent::UnsupportedInput
             && !suppressed
             && self.replay_keys.len() == buffered_before;
-        let starts_after_shortcut =
-            suppressed && self.replay_keys.is_empty() && self.last_word_reset == "shortcut";
+        let starts_after_shortcut = suppressed
+            && self.replay_keys.is_empty()
+            && matches!(self.last_word_reset, "shortcut" | "layout");
         if starts_at_word || starts_after_shortcut {
             self.manual_token_start_known = starts_at_word;
         }
@@ -6421,7 +6440,8 @@ impl InputProcessor {
         let (Some(last), Some(language)) = (previous_boundary, language) else {
             return false;
         };
-        if !same_input_target(last.foreground, event.foreground)
+        if last.delimiter.is_none()
+            || !same_input_target(last.foreground, event.foreground)
             || last.foreground.layout != event.foreground.layout
             || last.epoch != self.metrics.input_epoch.load(Ordering::Acquire)
             || last.profile_generation != self.input_profiles.generation()
@@ -6478,6 +6498,28 @@ impl InputProcessor {
         }
     }
 
+    /// The word a Pause press acts on when no cycle is active: the keys typed since the last
+    /// boundary (read in the current layout), or else the last word kept for the hotkey, with its
+    /// delimiter and the layout it was typed in.
+    fn forced_conversion_source(
+        &self,
+        event: RawKeyEvent,
+    ) -> Option<(Vec<ReplayKey>, Option<char>, usize)> {
+        if !self.replay_keys.is_empty() {
+            return Some((self.replay_keys.clone(), None, event.foreground.layout));
+        }
+        self.last_boundary
+            .as_ref()
+            .filter(|last| same_input_target(last.foreground, event.foreground))
+            .map(|last| {
+                (
+                    last.replay_keys.clone(),
+                    last.delimiter,
+                    last.foreground.layout,
+                )
+            })
+    }
+
     fn execute_forced_conversion(&mut self, event: RawKeyEvent, _language: Option<Language>) {
         let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
         let generation = self.input_profiles.generation();
@@ -6490,6 +6532,7 @@ impl InputProcessor {
                 .as_ref()
                 .is_some_and(|last| last.epoch != epoch || last.profile_generation != generation)
         {
+            self.diagnostic("hotkey", "result=ignored reason=stale-word".to_owned());
             self.invalidate_conversion_state();
             self.suppress_session();
             return;
@@ -6524,19 +6567,8 @@ impl InputProcessor {
         }
         // The manual hotkey walks the word through every enabled layout, so it
         // works even when the word is not in any dictionary.
-        let (replay_keys, delimiter, source_layout) = if !self.replay_keys.is_empty() {
-            (self.replay_keys.clone(), None, event.foreground.layout)
-        } else if let Some(last) = self
-            .last_boundary
-            .as_ref()
-            .filter(|last| same_input_target(last.foreground, event.foreground))
-        {
-            (
-                last.replay_keys.clone(),
-                Some(last.delimiter),
-                last.foreground.layout,
-            )
-        } else {
+        let Some((replay_keys, delimiter, source_layout)) = self.forced_conversion_source(event)
+        else {
             self.diagnostic(
                 "hotkey",
                 format!(
@@ -6556,9 +6588,11 @@ impl InputProcessor {
         let Some(current_text) =
             map_replay_keys_to_layout(&replay_keys, HKL(source_layout as *mut c_void))
         else {
+            // A key of the word gives no single character in the layout it was typed in, so
+            // the text on screen cannot be read back and replaced safely.
             self.diagnostic(
                 "hotkey",
-                "result=ignored reason=no-word-before-caret".to_owned(),
+                "result=ignored reason=key-without-character".to_owned(),
             );
             return;
         };
@@ -7185,7 +7219,7 @@ impl InputProcessor {
         if let Some(delimiter) = pending.transaction.delimiter {
             self.last_boundary = Some(LastBoundary {
                 replay_keys: pending.replay_keys.clone(),
-                delimiter,
+                delimiter: Some(delimiter),
                 foreground: ForegroundContext {
                     layout: target_layout.0 as usize,
                     ..pending.foreground
@@ -7546,7 +7580,7 @@ impl InputProcessor {
         self.transpose_cycle = None;
         self.last_boundary = record.transaction.delimiter.map(|delimiter| LastBoundary {
             replay_keys: record.replay_keys.clone(),
-            delimiter,
+            delimiter: Some(delimiter),
             foreground: ForegroundContext {
                 layout: record.source_layout,
                 ..record.foreground
@@ -8315,10 +8349,38 @@ fn map_replay_keys_to_layout(replay_keys: &[ReplayKey], layout: HKL) -> Option<S
         .collect()
 }
 
+/// The keypad meaning of a numeric keypad scan code. The scan code alone also names a navigation
+/// key (keypad 1 is End), but only the digit can be part of a word or token: with Num Lock off, or
+/// with Shift, the key navigates and never reaches the replay keys.
+const fn keypad_digit_key(scan_code: u16) -> Option<u16> {
+    let digit = match scan_code {
+        0x52 => 0,
+        0x4f => 1,
+        0x50 => 2,
+        0x51 => 3,
+        0x4b => 4,
+        0x4c => 5,
+        0x4d => 6,
+        0x47 => 7,
+        0x48 => 8,
+        0x49 => 9,
+        0x53 => return Some(VK_DECIMAL.0),
+        _ => return None,
+    };
+    Some(VK_NUMPAD0.0 + digit)
+}
+
 fn map_replay_key_to_layout(key: ReplayKey, layout: HKL) -> Option<char> {
     let mapping_scan_code = u32::from(key.scan_code) | if key.extended { 0xE000 } else { 0 };
-    let virtual_key =
-        unsafe { MapVirtualKeyExW(mapping_scan_code, MAPVK_VSC_TO_VK_EX, Some(layout)) };
+    let keypad = if key.extended {
+        None
+    } else {
+        keypad_digit_key(key.scan_code)
+    };
+    let virtual_key = match keypad {
+        Some(keypad) => u32::from(keypad),
+        None => unsafe { MapVirtualKeyExW(mapping_scan_code, MAPVK_VSC_TO_VK_EX, Some(layout)) },
+    };
     if virtual_key == 0 {
         return None;
     }
@@ -9249,7 +9311,7 @@ mod tests {
             let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
             processor.last_boundary = Some(LastBoundary {
                 replay_keys: Vec::new(),
-                delimiter: ' ',
+                delimiter: Some(' '),
                 foreground,
                 epoch: 0,
                 profile_generation: processor.input_profiles.generation(),
@@ -9313,7 +9375,7 @@ mod tests {
         processor.last_process_id = Some(event.foreground.process_id);
         processor.last_boundary = Some(LastBoundary {
             replay_keys: Vec::new(),
-            delimiter: ' ',
+            delimiter: Some(' '),
             foreground: event.foreground,
             epoch: 0,
             profile_generation: processor.input_profiles.generation(),
@@ -12083,7 +12145,7 @@ mod tests {
                 };
                 length
             ],
-            delimiter: ' ',
+            delimiter: Some(' '),
             foreground: test_raw_key(WM_KEYDOWN, VK_BACK, 1, 0).foreground,
             epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
             profile_generation: processor.input_profiles.generation(),
@@ -13046,6 +13108,177 @@ mod tests {
         assert_eq!(unsupported_key_class(None), "no-character");
         for printed in ['1', '\u{2116}', '\u{ab}', ' '] {
             assert_eq!(unsupported_key_class(Some(printed)), "other-character");
+        }
+    }
+
+    #[test]
+    fn numpad_digits_in_a_token_read_back_as_digits_in_every_loaded_layout() {
+        // A digit typed on the numeric keypad joins a manual token. Its scan code alone names a
+        // navigation key (End, Down and so on), so reading the token back must use the keypad
+        // meaning, or Pause cannot convert the token.
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutList;
+        let count = unsafe { GetKeyboardLayoutList(None) };
+        let mut layouts = vec![HKL::default(); usize::try_from(count).unwrap_or(0)];
+        let filled = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) };
+        layouts.truncate(usize::try_from(filled).unwrap_or(0));
+        assert!(!layouts.is_empty(), "no keyboard layout is loaded");
+        for layout in layouts {
+            for (scan_code, digit) in [
+                (0x52, '0'),
+                (0x4f, '1'),
+                (0x50, '2'),
+                (0x51, '3'),
+                (0x4b, '4'),
+                (0x4c, '5'),
+                (0x4d, '6'),
+                (0x47, '7'),
+                (0x48, '8'),
+                (0x49, '9'),
+            ] {
+                let key = ReplayKey {
+                    scan_code,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                };
+                assert_eq!(
+                    map_replay_key_to_layout(key, layout),
+                    Some(digit),
+                    "layout {:?}, scan code {scan_code:#x}",
+                    layout.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keypad_scan_codes_read_as_keypad_digits() {
+        let digits = [
+            (0x52, 0),
+            (0x4f, 1),
+            (0x50, 2),
+            (0x51, 3),
+            (0x4b, 4),
+            (0x4c, 5),
+            (0x4d, 6),
+            (0x47, 7),
+            (0x48, 8),
+            (0x49, 9),
+        ];
+        for (scan_code, digit) in digits {
+            assert_eq!(keypad_digit_key(scan_code), Some(VK_NUMPAD0.0 + digit));
+        }
+        assert_eq!(keypad_digit_key(0x53), Some(VK_DECIMAL.0));
+        // Main-row digits and the keypad operators are not ambiguous and keep their mapping.
+        for scan_code in [0x02, 0x0b, 0x4a, 0x4e, 0x37] {
+            assert_eq!(keypad_digit_key(scan_code), None, "{scan_code:#x}");
+        }
+    }
+
+    fn processor_at_the_test_target() -> InputProcessor {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let event = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0);
+        processor.last_foreground = Some(foreground_identity_key(event.foreground));
+        processor.last_layout = Some(event.foreground.layout);
+        processor.last_process_id = Some(event.foreground.process_id);
+        processor.set_privacy_reason(None);
+        processor
+    }
+
+    /// A key event that carries another layout than the last one, as after Alt+Shift.
+    fn switch_layout_by_hand(processor: &mut InputProcessor, new_layout: usize) {
+        let mut event = test_raw_key(WM_KEYDOWN, VK_SHIFT, 30, 0);
+        event.foreground.layout = new_layout;
+        processor.process_key(event);
+    }
+
+    #[test]
+    fn a_manual_layout_switch_keeps_the_word_typed_so_far_for_pause() {
+        let mut processor = processor_at_the_test_target();
+        let typed_layout = processor.last_layout.expect("set by the fixture");
+        type_letters(&mut processor, "ghbdtn");
+        switch_layout_by_hand(&mut processor, typed_layout + 1);
+        // Automatic conversion of the word ends here; Pause keeps it.
+        assert!(processor.session.is_suppressed());
+        assert!(processor.replay_keys.is_empty());
+        assert_eq!(processor.last_word_reset, "layout");
+        let kept = processor
+            .last_boundary
+            .as_ref()
+            .expect("the word stays for Pause");
+        assert_eq!(kept.replay_keys.len(), 6);
+        assert_eq!(kept.delimiter, None);
+        assert_eq!(kept.foreground.layout, typed_layout);
+        // Pause reads it in the layout it was typed in, not in the new one.
+        let mut pause = test_raw_key(WM_KEYDOWN, VK_PAUSE, 31, 0);
+        pause.foreground.layout = typed_layout + 1;
+        let source = processor
+            .forced_conversion_source(pause)
+            .map(|(keys, delimiter, layout)| (keys.len(), delimiter, layout));
+        assert_eq!(source, Some((6, None, typed_layout)));
+        // Any other key drops it, as it always dropped the last word.
+        let mut left = test_raw_key(WM_KEYDOWN, VK_LEFT, 32, 0);
+        left.foreground.layout = typed_layout + 1;
+        processor.process_key(left);
+        assert!(processor.last_boundary.is_none());
+    }
+
+    #[test]
+    fn a_manual_layout_switch_after_a_space_keeps_the_last_word_for_pause() {
+        let mut processor = processor_at_the_test_target();
+        let typed_layout = processor.last_layout.expect("set by the fixture");
+        processor.last_boundary = Some(test_last_boundary(&processor, 6));
+        switch_layout_by_hand(&mut processor, typed_layout + 1);
+        let kept = processor
+            .last_boundary
+            .as_ref()
+            .expect("the last word stays for Pause");
+        assert_eq!(kept.delimiter, Some(' '));
+        assert_eq!(kept.foreground.layout, typed_layout);
+        assert_eq!(kept.replay_keys.len(), 6);
+    }
+
+    #[test]
+    fn text_typed_right_after_a_manual_layout_switch_is_kept_for_pause() {
+        let mut processor = processor_at_the_test_target();
+        let typed_layout = processor.last_layout.expect("set by the fixture");
+        switch_layout_by_hand(&mut processor, typed_layout + 1);
+        assert!(processor.session.is_suppressed());
+        // The first letter after the switch starts a manual token, as after a shortcut.
+        let keys = processor.take_manual_token_keys(InputEvent::Printable('g'), true, 0);
+        assert_eq!(keys.map(|keys| keys.len()), Some(0));
+        assert!(!processor.manual_token_start_known);
+        // Other suppressions still do not start one.
+        let mut processor = processor_at_the_test_target();
+        processor.session.handle(
+            InputEvent::UnsupportedInput,
+            Some(Language::English),
+            &processor.detector,
+        );
+        processor.last_word_reset = "backspace";
+        assert!(
+            processor
+                .take_manual_token_keys(InputEvent::Printable('g'), true, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn erasing_after_a_word_kept_by_a_layout_switch_does_not_resume_it() {
+        // Without a delimiter there is nothing to erase between the word and the caret: the
+        // Backspace removes a letter of the word itself.
+        for (delimiter, resumed) in [(Some(' '), true), (None, false)] {
+            let mut processor = processor_at_the_test_target();
+            let mut kept = test_last_boundary(&processor, 6);
+            kept.delimiter = delimiter;
+            let event = test_raw_key(WM_KEYDOWN, VK_BACK, 33, 0);
+            let result = processor.erase_or_resume_word_with(
+                Some(kept),
+                event,
+                Some(Language::English),
+                |_, _| Some("ghbdtn".to_owned()),
+            );
+            assert_eq!(result, resumed, "{delimiter:?}");
         }
     }
 

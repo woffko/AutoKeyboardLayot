@@ -149,7 +149,15 @@ on an already empty line still invalidates the context because it joins the
 line with preceding text. Pause/Break is reserved when its setting is enabled:
 it triggers undo when available, otherwise it forces the current buffered word
 through the same replacement pipeline even when automatic mode is off. Repeats
-and key-up are swallowed so the hotkey cannot leak into the target editor.
+and key-up are swallowed so the hotkey cannot leak into the target editor. A
+manual layout switch ends automatic conversion of the word but not Pause: the
+word typed so far, or else the last completed word, can still be converted and is
+read in the layout it was typed in, and text typed right after a manual switch is
+kept for Pause like text typed after a shortcut. Digits typed on the numeric
+keypad can be part of such a word. When Pause cannot act, the diagnostics log
+names the reason (`event=hotkey result=ignored reason=` `no-word-before-caret`,
+`key-without-character`, `stale-word`, `privacy`, `unsupported-layout`,
+`single-layout` or `identical`).
 Changing automatic mode clears stale queued state without suppressing the
 first new word; only a real queue overflow keeps suppression until a boundary.
 
