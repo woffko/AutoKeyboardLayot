@@ -6033,7 +6033,6 @@ impl InputProcessor {
                 );
             }
             key if key == VK_SPACE.0 => {
-                self.last_word_reset = "boundary";
                 let last_keys = self.replay_keys.clone();
                 self.transpose_cycle = None;
                 // A second space invalidates adjacency too. Record the source
@@ -6050,8 +6049,11 @@ impl InputProcessor {
                 } else {
                     None
                 };
-                if let Some((transaction, replay_keys)) =
-                    self.handle_boundary(language, Some(' '), false)
+                let completed = self.handle_boundary(language, Some(' '), false);
+                // handle_boundary explains an unconverted word by what cancelled it, so the
+                // boundary itself is recorded only after it.
+                self.last_word_reset = "boundary";
+                if let Some((transaction, replay_keys)) = completed
                     && self.metrics.auto_enabled.load(Ordering::Acquire)
                     && !self.modifiers.shift()
                     && replay_keys.len() == transaction.original.chars().count()
@@ -6079,16 +6081,16 @@ impl InputProcessor {
                 }
             }
             key if key == VK_TAB.0 => {
-                self.last_word_reset = "boundary";
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
+                self.last_word_reset = "boundary";
             }
             key if key == VK_RETURN.0 => {
-                self.last_word_reset = "boundary";
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
+                self.last_word_reset = "boundary";
                 self.session.mark_line_start();
             }
             _ => {
@@ -6123,7 +6125,13 @@ impl InputProcessor {
                 });
                 if input_event == InputEvent::UnsupportedInput {
                     self.last_word_reset = "unsupported";
-                    self.diagnostic("input", "result=suppressed reason=unsupported".to_owned());
+                    self.diagnostic(
+                        "input",
+                        format!(
+                            "result=suppressed reason=unsupported class={}",
+                            unsupported_key_class(printable)
+                        ),
+                    );
                 }
                 if matches!(input_event, InputEvent::Printable(_)) {
                     // A new word has started; the previous word is no longer the
@@ -8733,6 +8741,17 @@ fn set_modifier_bit(mask: &mut u8, bit: u8, pressed: bool) {
         *mask |= bit;
     } else {
         *mask &= !bit;
+    }
+}
+
+/// What kind of key ended up unsupported, for the diagnostics log: one that prints nothing
+/// (function, navigation, Caps Lock and dead keys) or one that prints a character a word cannot
+/// contain (a digit, a symbol). Never the key or the character.
+const fn unsupported_key_class(printable: Option<char>) -> &'static str {
+    if printable.is_some() {
+        "other-character"
+    } else {
+        "no-character"
     }
 }
 
@@ -12989,6 +13008,44 @@ mod tests {
                 lines[0].contains(&format!("result={expected}")),
                 "{expected}: {lines:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_word_cancelled_before_its_boundary_names_what_cancelled_it() {
+        // The boundary arms used to record "boundary" before the word was explained, so every
+        // suppressed word was reported as reset=boundary. Drive the real arms.
+        for (key, name) in [(VK_SPACE, "space"), (VK_TAB, "tab"), (VK_RETURN, "return")] {
+            for reset in ["unsupported", "layout", "shortcut", "mouse"] {
+                let (mut processor, receiver) = processor_with_diagnostics();
+                let event = test_raw_key(WM_KEYDOWN, key, 7, 0);
+                processor.last_foreground = Some(foreground_identity_key(event.foreground));
+                processor.last_layout = Some(event.foreground.layout);
+                processor.last_process_id = Some(event.foreground.process_id);
+                type_letters(&mut processor, "hello");
+                processor.session.handle(
+                    InputEvent::UnsupportedInput,
+                    Some(Language::English),
+                    &processor.detector,
+                );
+                processor.last_word_reset = reset;
+                processor.process_key(event);
+                let lines = word_lines(&receiver);
+                assert_eq!(lines.len(), 1, "{name} {reset}: {lines:?}");
+                assert!(
+                    lines[0].contains(&format!("result=suppressed reset={reset}")),
+                    "{name} {reset}: {lines:?}"
+                );
+                assert_eq!(processor.last_word_reset, "boundary", "{name} {reset}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unsupported_key_is_logged_by_class_only() {
+        assert_eq!(unsupported_key_class(None), "no-character");
+        for printed in ['1', '\u{2116}', '\u{ab}', ' '] {
+            assert_eq!(unsupported_key_class(Some(printed)), "other-character");
         }
     }
 

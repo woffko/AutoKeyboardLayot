@@ -247,9 +247,13 @@ log contains timestamps, process basename and PID, backend stages, language
 IDs, word lengths, gate results, edit outcomes, reset and discard categories,
 the reasons that blocked a shutdown, and one result for every typed word that was
 not converted (`event=word result=` `no-candidate`, `manual-only`, `privacy`,
-`suppressed` or `no-language`), never the word. Privacy check lines name what
-asked for them (`trigger=`) and say when a late answer kept an earlier verdict
-(`source=recent-ok age_ms=`). It never records key codes, scan
+`suppressed` or `no-language`), never the word. A suppressed word also names what
+cancelled it (`reset=` `unsupported`, `layout`, `shortcut`, `mouse`, `focus`,
+`backspace`, `delete`, `navigation` or `external-input`), and an unsupported key is
+logged by class only (`class=no-character` for a key that prints nothing,
+`class=other-character` for a digit or symbol a word cannot contain). Privacy
+check lines name what asked for them (`trigger=`) and say when a late answer kept
+an earlier verdict (`source=recent-ok age_ms=`). It never records key codes, scan
 codes, characters, words, clipboard contents, window titles, URLs, file names,
 or message text; the test `diagnostics_never_log_key_identity` checks every
 diagnostic format string. The file rotates at 1 MiB and has no network

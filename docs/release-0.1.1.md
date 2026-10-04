@@ -48,8 +48,9 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
   code of unsupported keys, digits included: **delete `diagnostics*.log` files written by
   earlier versions** (in `%LOCALAPPDATA%\AutoKeyboardLayot`).
 - The diagnostics log now says why a typed word was not converted (`event=word result=` and
-  one of `no-candidate`, `manual-only`, `privacy`, `suppressed`, `no-language`) without
-  recording the word, and its privacy lines name what triggered them.
+  one of `no-candidate`, `manual-only`, `privacy`, `suppressed`, `no-language`, with
+  `reset=` naming what cancelled a suppressed word) without recording the word, and its
+  privacy lines name what triggered them.
 - `crash.log` (one line per panic: time, thread, source location, version; never the message
   or any typed text) is written next to the configuration. It is capped at 256 KiB.
 
