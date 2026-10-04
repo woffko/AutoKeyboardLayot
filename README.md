@@ -158,6 +158,17 @@ keypad can be part of such a word. When Pause cannot act, the diagnostics log
 names the reason (`event=hotkey result=ignored reason=` `no-word-before-caret`,
 `key-without-character`, `stale-word`, `privacy`, `unsupported-layout`,
 `single-layout` or `identical`).
+
+In applications on the protected-paste backend, whose edit checks the exact text
+before the caret before it replaces anything, Pause does more. It waits up to 100
+ms for the field to confirm the selection of the word and selects a second time
+when the field did not show it (automatic conversions keep 50 ms, which the
+correction gate's budget accounts for). After you switch to another window and
+back, or click, Pause can still convert the last word of that window for two
+minutes: the word is used only if it is still exactly before the caret, and
+nothing is typed otherwise (`event=hotkey source=remembered`). A paste the field
+did not confirm ends with `event=conversion result=cancelled`, and its selection
+line says what the field showed (`confirm=` and `attempts=`).
 Changing automatic mode clears stale queued state without suppressing the
 first new word; only a real queue overflow keeps suppression until a boundary.
 
@@ -170,7 +181,9 @@ key without suppressing that first word.
 
 The process retains at most the current word in volatile memory, plus the
 physical keys of a word that is being converted by hand (at most 64 key scan
-codes, kept only until the next word boundary or reset). While the correction
+codes, kept only until the next word boundary or reset), plus, for Pause, the
+physical keys of the last word of at most eight windows for at most two minutes
+after a window switch, a click or a shortcut ended tracking there. While the correction
 gate is armed after a Space, up to 256 key events are held in memory for at
 most 1.2 seconds and then replayed unchanged. None of this is written to logs,
 configuration, diagnostics, or network services. Unsupported input, editing,

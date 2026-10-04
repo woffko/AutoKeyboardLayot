@@ -175,6 +175,15 @@ const INPUT_SETTLE_AFTER_FORWARD_MS: u64 = 35;
 const HOOK_FORWARD_TIMEOUT_MS: u64 = 50;
 const NOTEPAD_TEXT_BARRIER_TIMEOUT_MS: u64 = 150;
 const UIA_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 50;
+/// A Pause press waits this long for the field to show the selection of the word, and selects
+/// a second time when it did not. Automatic conversions keep the shorter wait above, which the
+/// correction gate's time budget accounts for.
+const UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 100;
+const UIA_MANUAL_SELECTION_ATTEMPTS: u32 = 2;
+/// How long, and for how many windows, the last word stays available to Pause after the agent
+/// stopped tracking it (a window switch, a click, a shortcut). Memory only, never written.
+const REMEMBERED_WORD_TTL: Duration = Duration::from_secs(120);
+const REMEMBERED_WORD_WINDOWS: usize = 8;
 const NOTEPAD_REPLAY_STEP_DELAY_MS: u64 = 3;
 const NOTEPAD_REPLAY_GATE_MARGIN_MS: u64 = 200;
 const CLIPBOARD_OPEN_RETRIES: usize = 10;
@@ -679,12 +688,24 @@ struct PendingConversion {
 /// The most recent word, retained so the user can still convert it with the manual
 /// hotkey: after the space has been typed (the delimiter), or after a manual layout
 /// switch ended it with no delimiter. `foreground.layout` is the layout it was typed in.
+#[derive(Clone)]
 struct LastBoundary {
     replay_keys: Vec<ReplayKey>,
     delimiter: Option<char>,
     foreground: ForegroundContext,
     epoch: u64,
     profile_generation: u64,
+}
+
+/// What Pause knew about an input target when the agent stopped tracking it. Only Pause in a
+/// field whose edit verifies the text before the caret uses it, so a stale word is refused there
+/// instead of being typed over anything.
+#[derive(Clone)]
+struct RememberedWord {
+    target: ForegroundContext,
+    cycle: Option<TransposeCycle>,
+    word: Option<LastBoundary>,
+    at: Instant,
 }
 
 /// Forced-conversion cycle state: the manual hotkey walks the word through every
@@ -1378,6 +1399,10 @@ struct TextBarrierReport {
     resolver_depth: usize,
     resolver_reason: EditableResolverReason,
     resolver_process_id: u32,
+    /// How the selection was confirmed, when one was made.
+    confirmation: Option<SelectionConfirmation>,
+    /// How many selection attempts ran.
+    attempts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4267,29 +4292,51 @@ impl PrivacyGuard {
         &self,
         expected_process_id: u32,
         expected_text: &str,
+        patience: SelectionPatience,
     ) -> TextBarrierStatus {
+        let (status, attempts) = retry_unshown_selection(patience.attempts(), || {
+            self.select_preceding_text_once(
+                expected_process_id,
+                expected_text,
+                patience.confirm_timeout(),
+            )
+        });
+        let mut report = self.last_barrier_report.get();
+        report.attempts = attempts;
+        self.last_barrier_report.set(report);
+        status
+    }
+
+    /// One attempt: check the text before the caret, select it and confirm the selection.
+    /// The confirmation is returned when a selection was made.
+    fn select_preceding_text_once(
+        &self,
+        expected_process_id: u32,
+        expected_text: &str,
+        confirm_timeout: Duration,
+    ) -> (TextBarrierStatus, Option<SelectionConfirmation>) {
         self.last_barrier_report.set(TextBarrierReport {
             expected_chars: expected_text.chars().count(),
             ..TextBarrierReport::default()
         });
         let Ok(character_count) = i32::try_from(expected_text.encode_utf16().count()) else {
-            return TextBarrierStatus::Unavailable;
+            return (TextBarrierStatus::Unavailable, None);
         };
         if character_count == 0 || character_count > 128 {
-            return TextBarrierStatus::Unavailable;
+            return (TextBarrierStatus::Unavailable, None);
         }
 
         unsafe {
             let (_element, pattern) = match self.focused_editable_text_pattern(expected_process_id)
             {
                 Ok(value) => value,
-                Err(status) => return status,
+                Err(status) => return (status, None),
             };
             let Ok(ranges) = pattern.GetSelection() else {
-                return TextBarrierStatus::Unavailable;
+                return (TextBarrierStatus::Unavailable, None);
             };
             if ranges.Length().ok() != Some(1) {
-                return TextBarrierStatus::Mismatch;
+                return (TextBarrierStatus::Mismatch, None);
             }
             let Ok(caret) = ranges.GetElement(0) else {
                 self.last_barrier_report.set(TextBarrierReport {
@@ -4297,7 +4344,7 @@ impl PrivacyGuard {
                     expected_chars: expected_text.chars().count(),
                     ..TextBarrierReport::default()
                 });
-                return TextBarrierStatus::Unavailable;
+                return (TextBarrierStatus::Unavailable, None);
             };
             if caret
                 .CompareEndpoints(
@@ -4313,10 +4360,10 @@ impl PrivacyGuard {
                     expected_chars: expected_text.chars().count(),
                     ..TextBarrierReport::default()
                 });
-                return TextBarrierStatus::Mismatch;
+                return (TextBarrierStatus::Mismatch, None);
             }
             let Ok(range) = caret.Clone() else {
-                return TextBarrierStatus::Unavailable;
+                return (TextBarrierStatus::Unavailable, None);
             };
             let moved = range
                 .MoveEndpointByUnit(
@@ -4332,7 +4379,7 @@ impl PrivacyGuard {
                     moved_units: moved.unwrap_or(i32::MIN),
                     ..TextBarrierReport::default()
                 });
-                return TextBarrierStatus::Mismatch;
+                return (TextBarrierStatus::Mismatch, None);
             }
             let Ok(actual) = range.GetText(-1) else {
                 self.last_barrier_report.set(TextBarrierReport {
@@ -4341,7 +4388,7 @@ impl PrivacyGuard {
                     moved_units: moved.unwrap_or_default(),
                     ..TextBarrierReport::default()
                 });
-                return TextBarrierStatus::Unavailable;
+                return (TextBarrierStatus::Unavailable, None);
             };
             let actual = actual.to_string();
             self.last_barrier_report.set(classify_text_barrier(
@@ -4351,18 +4398,18 @@ impl PrivacyGuard {
                 moved.unwrap_or_default(),
             ));
             if !text_barrier_matches(&actual, expected_text) {
-                return TextBarrierStatus::Mismatch;
+                return (TextBarrierStatus::Mismatch, None);
             }
             if range.Select().is_err() {
                 let mut report = self.last_barrier_report.get();
                 report.stage = TextBarrierStage::SelectCall;
                 self.last_barrier_report.set(report);
-                return TextBarrierStatus::Mismatch;
+                return (TextBarrierStatus::Mismatch, None);
             }
 
             let moved_units = moved.unwrap_or_default();
-            let status = confirm_selection(
-                Duration::from_millis(UIA_SELECTION_CONFIRM_TIMEOUT_MS),
+            let confirmation = confirm_selection(
+                confirm_timeout,
                 || {
                     let Ok(selected_ranges) = pattern.GetSelection() else {
                         return SelectionPoll::Unreadable;
@@ -4402,15 +4449,19 @@ impl PrivacyGuard {
                 || thread::sleep(Duration::from_millis(1)),
                 || self.collapse_selection_to_end(expected_process_id),
             );
-            if status == TextBarrierStatus::Unavailable {
-                self.last_barrier_report.set(TextBarrierReport {
+            let mut report = if confirmation == SelectionConfirmation::Unreadable {
+                TextBarrierReport {
                     stage: TextBarrierStage::SelectionConfirm,
                     expected_chars: expected_text.chars().count(),
                     moved_units,
                     ..TextBarrierReport::default()
-                });
-            }
-            status
+                }
+            } else {
+                self.last_barrier_report.get()
+            };
+            report.confirmation = Some(confirmation);
+            self.last_barrier_report.set(report);
+            (confirmation.status(), Some(confirmation))
         }
     }
 
@@ -4620,43 +4671,121 @@ enum SelectionPoll {
     Text(String),
 }
 
+/// How the selection made by `Select()` turned out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionConfirmation {
+    /// The selection held the expected text.
+    Confirmed,
+    /// The selection held other text.
+    OtherText,
+    /// The selection stayed empty or was not one range: the field did not show it in time.
+    NotShown,
+    /// The selection could not be read at all.
+    Unreadable,
+}
+
+impl SelectionConfirmation {
+    const fn status(self) -> TextBarrierStatus {
+        match self {
+            Self::Confirmed => TextBarrierStatus::Match,
+            Self::OtherText | Self::NotShown => TextBarrierStatus::Mismatch,
+            Self::Unreadable => TextBarrierStatus::Unavailable,
+        }
+    }
+}
+
+/// How patiently a protected paste waits for the field to confirm the selection of the word.
+/// An automatic conversion runs inside the correction gate's time budget and looks once. A
+/// Pause press is waited for by the user, so it waits longer and selects a second time when
+/// the field did not show the first selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionPatience {
+    Automatic,
+    Manual,
+}
+
+impl SelectionPatience {
+    const fn confirm_timeout(self) -> Duration {
+        Duration::from_millis(match self {
+            Self::Automatic => UIA_SELECTION_CONFIRM_TIMEOUT_MS,
+            Self::Manual => UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS,
+        })
+    }
+
+    const fn attempts(self) -> u32 {
+        match self {
+            Self::Automatic => 1,
+            Self::Manual => UIA_MANUAL_SELECTION_ATTEMPTS,
+        }
+    }
+}
+
+/// Pause conversions are waited for by the user; automatic ones run inside the gate budget.
+const fn selection_patience(forced: bool) -> SelectionPatience {
+    if forced {
+        SelectionPatience::Manual
+    } else {
+        SelectionPatience::Automatic
+    }
+}
+
+/// Runs selection attempts until one is not an unshown selection or `attempts` have run. Only a
+/// selection the field did not show is tried again, and every attempt reads and checks the text
+/// before the caret again before it selects. Returns the last status and how many attempts ran.
+fn retry_unshown_selection(
+    attempts: u32,
+    mut attempt: impl FnMut() -> (TextBarrierStatus, Option<SelectionConfirmation>),
+) -> (TextBarrierStatus, u32) {
+    let mut ran = 0;
+    loop {
+        ran += 1;
+        let (status, confirmation) = attempt();
+        if confirmation != Some(SelectionConfirmation::NotShown) || ran >= attempts {
+            return (status, ran);
+        }
+    }
+}
+
 /// Confirms that the selection made by `Select()` holds the expected text, polling until
-/// `timeout`. Every outcome but `Match` collapses the selection, exactly once: the selection is
-/// ours, made a moment ago, and must not be left behind to be typed over. This runs only after
-/// our own successful `Select()`, so a selection the user made is never collapsed.
+/// `timeout`. Every outcome but `Confirmed` collapses the selection, exactly once: the selection
+/// is ours, made a moment ago, and must not be left behind to be typed over. This runs only
+/// after our own successful `Select()`, so a selection the user made is never collapsed.
 fn confirm_selection(
     timeout: Duration,
     mut poll: impl FnMut() -> SelectionPoll,
     text_matches: impl Fn(&str) -> bool,
     mut sleep: impl FnMut(),
     collapse: impl FnOnce(),
-) -> TextBarrierStatus {
+) -> SelectionConfirmation {
     let deadline = Instant::now() + timeout;
-    let mut saw_mismatch = false;
-    let status = loop {
+    let mut saw_other_text = false;
+    let mut saw_not_shown = false;
+    let outcome = loop {
         if Instant::now() >= deadline {
-            break if saw_mismatch {
-                TextBarrierStatus::Mismatch
+            break if saw_other_text {
+                SelectionConfirmation::OtherText
+            } else if saw_not_shown {
+                SelectionConfirmation::NotShown
             } else {
-                TextBarrierStatus::Unavailable
+                SelectionConfirmation::Unreadable
             };
         }
         match poll() {
             SelectionPoll::Unreadable => {}
-            SelectionPoll::NotOneRange | SelectionPoll::Empty => saw_mismatch = true,
+            SelectionPoll::NotOneRange | SelectionPoll::Empty => saw_not_shown = true,
             SelectionPoll::Text(actual) => {
                 if text_matches(&actual) {
-                    break TextBarrierStatus::Match;
+                    break SelectionConfirmation::Confirmed;
                 }
-                saw_mismatch = true;
+                saw_other_text = true;
             }
         }
         sleep();
     };
-    if status != TextBarrierStatus::Match {
+    if outcome != SelectionConfirmation::Confirmed {
         collapse();
     }
-    status
+    outcome
 }
 
 /// The result of a protected paste whose text edit and clipboard restoration are known.
@@ -4713,12 +4842,14 @@ fn classify_text_barrier(
         resolver_depth: 0,
         resolver_reason: EditableResolverReason::None,
         resolver_process_id: 0,
+        confirmation: None,
+        attempts: 0,
     }
 }
 
 fn format_text_barrier_report(report: TextBarrierReport) -> String {
     format!(
-        "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_is_word={},drop_last_is_word={},leading={:?},trailing={:?}",
+        "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_is_word={},drop_last_is_word={},leading={:?},trailing={:?},confirm={:?},attempts={}",
         report.stage,
         report.resolver_reason,
         report.resolver_depth,
@@ -4734,6 +4865,8 @@ fn format_text_barrier_report(report: TextBarrierReport) -> String {
         report.actual_without_last_is_word,
         report.leading,
         report.trailing,
+        report.confirmation,
+        report.attempts,
     )
 }
 
@@ -5164,6 +5297,11 @@ struct InputProcessor {
     recent_languages: Vec<Language>,
     last_boundary: Option<LastBoundary>,
     transpose_cycle: Option<TransposeCycle>,
+    // The last word of up to REMEMBERED_WORD_WINDOWS input targets the agent stopped tracking,
+    // oldest first; see RememberedWord.
+    remembered_words: Vec<RememberedWord>,
+    // The input target of the last key event, to remember its word when tracking moves on.
+    last_key_foreground: Option<ForegroundContext>,
     text_edit_backend: TextEditBackend,
     pending_conversion: Option<PendingConversion>,
     deferred_drained_conversion: Option<DeferredDrainedConversion>,
@@ -5286,6 +5424,8 @@ impl InputProcessor {
             recent_languages: Vec::new(),
             last_boundary: None,
             transpose_cycle: None,
+            remembered_words: Vec::new(),
+            last_key_foreground: None,
             text_edit_backend: TextEditBackend::ObserveOnly,
             pending_conversion: None,
             deferred_drained_conversion: None,
@@ -5534,6 +5674,9 @@ impl InputProcessor {
 
         match queued.event {
             RawInputEvent::Mouse => {
+                if let Some(target) = self.last_key_foreground {
+                    self.remember_word(target, self.last_layout, Instant::now());
+                }
                 self.log_word_discard("mouse", String::new());
                 self.last_word_reset = "mouse";
                 self.invalidate_conversion_state();
@@ -5829,6 +5972,9 @@ impl InputProcessor {
         let foreground_key = foreground_identity_key(event.foreground);
         let language = self.language_for_layout(event.foreground.layout);
         if self.last_foreground != Some(foreground_key) {
+            if let Some(previous) = self.last_key_foreground {
+                self.remember_word(previous, self.last_layout, Instant::now());
+            }
             if let Some((hwnd, focus, process_id)) = self.last_foreground {
                 // Handles are opaque identities; only which parts changed is
                 // recorded, to explain words split by transient focus changes.
@@ -5904,6 +6050,8 @@ impl InputProcessor {
             self.layout_switch_in_flight = None;
         }
 
+        self.last_key_foreground = Some(event.foreground);
+
         let key_down = matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let key_up = matches!(event.message, WM_KEYUP | WM_SYSKEYUP);
         if !key_down && !key_up {
@@ -5950,6 +6098,14 @@ impl InputProcessor {
             return;
         }
 
+        if self.modifiers.has_shortcut_modifier() {
+            // Alt+Tab, Ctrl+Shift+Esc and the like end tracking below; keep the word for Pause.
+            self.remember_word(
+                event.foreground,
+                Some(event.foreground.layout),
+                Instant::now(),
+            );
+        }
         self.clear_undo();
         // Any non-modifier, non-hotkey key can change text or caret position,
         // including punctuation and otherwise unsupported application keys.
@@ -6498,6 +6654,77 @@ impl InputProcessor {
         }
     }
 
+    /// Keeps what Pause knew about `target` before the agent stops tracking it (a window switch,
+    /// a click, a shortcut): the active cycle and the last word, or else the keys typed so far,
+    /// read later in `typed_layout`. With nothing to keep, an earlier entry for the target stays.
+    fn remember_word(
+        &mut self,
+        target: ForegroundContext,
+        typed_layout: Option<usize>,
+        now: Instant,
+    ) {
+        let word = if self.replay_keys.is_empty() {
+            self.last_boundary.clone()
+        } else {
+            typed_layout.map(|layout| LastBoundary {
+                replay_keys: self.replay_keys.clone(),
+                delimiter: None,
+                foreground: ForegroundContext { layout, ..target },
+                epoch: self.last_input_epoch,
+                profile_generation: self.input_profiles.generation(),
+            })
+        }
+        .filter(|word| same_input_target(word.foreground, target));
+        let cycle = self
+            .transpose_cycle
+            .clone()
+            .filter(|cycle| same_input_target(cycle.foreground, target));
+        self.remembered_words
+            .retain(|entry| now.saturating_duration_since(entry.at) < REMEMBERED_WORD_TTL);
+        if cycle.is_none() && word.is_none() {
+            return;
+        }
+        self.remembered_words
+            .retain(|entry| !same_input_target(entry.target, target));
+        if self.remembered_words.len() >= REMEMBERED_WORD_WINDOWS {
+            self.remembered_words.remove(0);
+        }
+        self.remembered_words.push(RememberedWord {
+            target,
+            cycle,
+            word,
+            at: now,
+        });
+    }
+
+    /// When Pause finds nothing for this field, restores what was remembered for its input
+    /// target, once, and only where the edit verifies the text before the caret (protected
+    /// paste): anywhere else a stale word could be typed over other text. Returns the age.
+    fn restore_remembered_word(
+        &mut self,
+        target: ForegroundContext,
+        now: Instant,
+    ) -> Option<Duration> {
+        self.refresh_process_policy(target.process_id);
+        if self.text_edit_backend != TextEditBackend::ProtectedPaste
+            || self.transpose_cycle.is_some()
+            || self.last_boundary.is_some()
+            || !self.replay_keys.is_empty()
+        {
+            return None;
+        }
+        self.remembered_words
+            .retain(|entry| now.saturating_duration_since(entry.at) < REMEMBERED_WORD_TTL);
+        let position = self
+            .remembered_words
+            .iter()
+            .position(|entry| same_input_target(entry.target, target))?;
+        let entry = self.remembered_words.remove(position);
+        self.transpose_cycle = entry.cycle;
+        self.last_boundary = entry.word;
+        Some(now.saturating_duration_since(entry.at))
+    }
+
     /// The word a Pause press acts on when no cycle is active: the keys typed since the last
     /// boundary (read in the current layout), or else the last word kept for the hotkey, with its
     /// delimiter and the layout it was typed in.
@@ -6521,6 +6748,12 @@ impl InputProcessor {
     }
 
     fn execute_forced_conversion(&mut self, event: RawKeyEvent, _language: Option<Language>) {
+        if let Some(age) = self.restore_remembered_word(event.foreground, Instant::now()) {
+            self.diagnostic(
+                "hotkey",
+                format!("source=remembered age_ms={}", age.as_millis()),
+            );
+        }
         let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
         let generation = self.input_profiles.generation();
         if self
@@ -7100,6 +7333,7 @@ impl InputProcessor {
                     target_layout,
                     &pending.transaction.undo.insert_text,
                     &pending.transaction.forward.insert_text,
+                    selection_patience(pending.forced),
                 );
                 let Some(strategy) = self.apply_paste_attempt_result(attempt, boundary_sequence)
                 else {
@@ -7144,6 +7378,7 @@ impl InputProcessor {
                             target_layout,
                             &pending.transaction.undo.insert_text,
                             &pending.transaction.forward.insert_text,
+                            selection_patience(pending.forced),
                         );
                         self.diagnostic(
                             "protected_paste",
@@ -7525,6 +7760,7 @@ impl InputProcessor {
                     source_layout,
                     &record.transaction.forward.insert_text,
                     &record.transaction.undo.insert_text,
+                    SelectionPatience::Manual,
                 );
                 if self
                     .apply_paste_attempt_result(attempt, pause_sequence)
@@ -7628,6 +7864,7 @@ impl InputProcessor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn perform_protected_paste(
         &self,
         foreground: ForegroundContext,
@@ -7636,6 +7873,7 @@ impl InputProcessor {
         target_layout: HKL,
         expected_source: &str,
         replacement: &str,
+        patience: SelectionPatience,
     ) -> TextEditAttempt {
         let started = Instant::now();
         if !self.edit_guard_is_current(foreground, input_sequence) {
@@ -7645,9 +7883,11 @@ impl InputProcessor {
             );
             return TextEditAttempt::Cancelled;
         }
-        let selection = self
-            .privacy_guard
-            .select_preceding_text(foreground.process_id, expected_source);
+        let selection = self.privacy_guard.select_preceding_text(
+            foreground.process_id,
+            expected_source,
+            patience,
+        );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=selection result={selection:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
         match selection {
@@ -7754,7 +7994,17 @@ impl InputProcessor {
                 self.note_clipboard_not_restored(sequence);
                 Some(EditStrategy::ProtectedPaste)
             }
-            TextEditAttempt::Cancelled => None,
+            TextEditAttempt::Cancelled => {
+                // The field did not confirm the word before the caret, so nothing was typed;
+                // the paste lines of the same sequence say at which step.
+                self.diagnostic(
+                    "conversion",
+                    format!(
+                        "sequence={sequence} result=cancelled strategy=ProtectedPaste edit=none"
+                    ),
+                );
+                None
+            }
             TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
                 self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
                 None
@@ -10160,7 +10410,7 @@ mod tests {
             (
                 "match at once",
                 vec![text("ghbdtn")],
-                TextBarrierStatus::Match,
+                SelectionConfirmation::Confirmed,
                 0,
             ),
             (
@@ -10170,37 +10420,43 @@ mod tests {
                     SelectionPoll::Unreadable,
                     text("ghbdtn"),
                 ],
-                TextBarrierStatus::Match,
+                SelectionConfirmation::Confirmed,
                 0,
             ),
             (
                 "mismatch, then match",
                 vec![text("other"), text("ghbdtn")],
-                TextBarrierStatus::Match,
+                SelectionConfirmation::Confirmed,
                 0,
             ),
             (
                 "the selected text never matches",
                 vec![text("other")],
-                TextBarrierStatus::Mismatch,
+                SelectionConfirmation::OtherText,
                 1,
             ),
             (
                 "the selection is empty",
                 vec![SelectionPoll::Empty],
-                TextBarrierStatus::Mismatch,
+                SelectionConfirmation::NotShown,
                 1,
             ),
             (
                 "the selection is not one range",
                 vec![SelectionPoll::NotOneRange],
-                TextBarrierStatus::Mismatch,
+                SelectionConfirmation::NotShown,
+                1,
+            ),
+            (
+                "empty, then other text",
+                vec![SelectionPoll::Empty, text("other")],
+                SelectionConfirmation::OtherText,
                 1,
             ),
             (
                 "the selection stays unreadable",
                 vec![],
-                TextBarrierStatus::Unavailable,
+                SelectionConfirmation::Unreadable,
                 1,
             ),
         ];
@@ -10216,6 +10472,117 @@ mod tests {
             assert_eq!(status, expected, "{path}");
             assert_eq!(collapsed.get(), collapses, "{path}: collapses");
         }
+    }
+
+    #[test]
+    fn a_selection_outcome_maps_to_the_old_status() {
+        assert_eq!(
+            SelectionConfirmation::Confirmed.status(),
+            TextBarrierStatus::Match
+        );
+        assert_eq!(
+            SelectionConfirmation::OtherText.status(),
+            TextBarrierStatus::Mismatch
+        );
+        assert_eq!(
+            SelectionConfirmation::NotShown.status(),
+            TextBarrierStatus::Mismatch
+        );
+        assert_eq!(
+            SelectionConfirmation::Unreadable.status(),
+            TextBarrierStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn only_pause_waits_longer_and_selects_again() {
+        // Automatic conversions keep the wait that the correction gate's budget accounts for.
+        assert_eq!(
+            SelectionPatience::Automatic.confirm_timeout(),
+            Duration::from_millis(UIA_SELECTION_CONFIRM_TIMEOUT_MS)
+        );
+        assert_eq!(SelectionPatience::Automatic.attempts(), 1);
+        assert_eq!(
+            SelectionPatience::Manual.confirm_timeout(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(SelectionPatience::Manual.attempts(), 2);
+        assert_eq!(selection_patience(true), SelectionPatience::Manual);
+        assert_eq!(selection_patience(false), SelectionPatience::Automatic);
+    }
+
+    #[test]
+    fn only_a_selection_the_field_did_not_show_is_tried_again() {
+        use SelectionConfirmation::{Confirmed, NotShown, OtherText, Unreadable};
+        let run =
+            |attempts: u32, script: Vec<(TextBarrierStatus, Option<SelectionConfirmation>)>| {
+                let mut script = std::collections::VecDeque::from(script);
+                retry_unshown_selection(attempts, || {
+                    script.pop_front().expect("no more attempts than scripted")
+                })
+            };
+        let not_shown = (TextBarrierStatus::Mismatch, Some(NotShown));
+        let confirmed = (TextBarrierStatus::Match, Some(Confirmed));
+        // A second selection that the field shows is used.
+        assert_eq!(
+            run(2, vec![not_shown, confirmed]),
+            (TextBarrierStatus::Match, 2)
+        );
+        // Two unshown selections give up as before.
+        assert_eq!(
+            run(2, vec![not_shown, not_shown]),
+            (TextBarrierStatus::Mismatch, 2)
+        );
+        // An automatic conversion looks once.
+        assert_eq!(run(1, vec![not_shown]), (TextBarrierStatus::Mismatch, 1));
+        // Other text, unreadable selections and text that never matched are not retried.
+        for once in [
+            (TextBarrierStatus::Mismatch, Some(OtherText)),
+            (TextBarrierStatus::Unavailable, Some(Unreadable)),
+            (TextBarrierStatus::Mismatch, None),
+            (TextBarrierStatus::Unavailable, None),
+            confirmed,
+        ] {
+            assert_eq!(run(2, vec![once]), (once.0, 1), "{once:?}");
+        }
+    }
+
+    #[test]
+    fn the_barrier_report_says_how_the_selection_was_confirmed() {
+        let report = TextBarrierReport {
+            stage: TextBarrierStage::TextCompared,
+            confirmation: Some(SelectionConfirmation::NotShown),
+            attempts: 2,
+            ..TextBarrierReport::default()
+        };
+        let line = format_text_barrier_report(report);
+        assert!(
+            line.contains(",confirm=Some(NotShown),attempts=2"),
+            "{line}"
+        );
+        assert!(
+            format_text_barrier_report(TextBarrierReport::default())
+                .ends_with(",confirm=None,attempts=0")
+        );
+    }
+
+    #[test]
+    fn a_cancelled_protected_paste_leaves_a_final_line() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 42)
+                .is_none()
+        );
+        let lines: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.starts_with("event=conversion "))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("sequence=42 result=cancelled strategy=ProtectedPaste edit=none"),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -13280,6 +13647,170 @@ mod tests {
             );
             assert_eq!(result, resumed, "{delimiter:?}");
         }
+    }
+
+    fn remembered_entry(processor: &InputProcessor) -> &RememberedWord {
+        assert_eq!(processor.remembered_words.len(), 1, "one remembered window");
+        &processor.remembered_words[0]
+    }
+
+    #[test]
+    fn a_window_switch_remembers_the_word_typed_so_far() {
+        let mut processor = processor_at_the_test_target();
+        let target = recent_ok_foreground();
+        processor.last_key_foreground = Some(target);
+        type_letters(&mut processor, "ghbdtn");
+        let mut elsewhere = test_raw_key(WM_KEYDOWN, VK_SHIFT, 40, 0);
+        elsewhere.foreground.hwnd = 77;
+        processor.process_key(elsewhere);
+        let entry = remembered_entry(&processor);
+        assert!(same_input_target(entry.target, target));
+        let word = entry.word.as_ref().expect("the word typed so far");
+        assert_eq!(word.replay_keys.len(), 6);
+        assert_eq!(word.delimiter, None);
+        assert_eq!(word.foreground.layout, target.layout);
+        assert!(entry.cycle.is_none());
+        // Tracking itself still starts over in the new window.
+        assert!(processor.replay_keys.is_empty());
+    }
+
+    #[test]
+    fn a_shortcut_remembers_the_last_word() {
+        let mut processor = processor_at_the_test_target();
+        processor.last_boundary = Some(test_last_boundary(&processor, 6));
+        processor
+            .modifiers
+            .update(u32::from(VK_CONTROL.0), true, false);
+        processor.process_key(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x43), 41, 0));
+        let word = remembered_entry(&processor)
+            .word
+            .as_ref()
+            .expect("the last word");
+        assert_eq!(word.delimiter, Some(' '));
+        assert_eq!(word.replay_keys.len(), 6);
+        assert!(processor.last_boundary.is_none());
+    }
+
+    #[test]
+    fn a_click_remembers_the_word_typed_so_far() {
+        let mut processor = processor_at_the_test_target();
+        processor.last_key_foreground = Some(recent_ok_foreground());
+        type_letters(&mut processor, "ghbd");
+        processor.process(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        let word = remembered_entry(&processor)
+            .word
+            .as_ref()
+            .expect("the word typed so far");
+        assert_eq!(word.replay_keys.len(), 4);
+        assert!(processor.replay_keys.is_empty());
+    }
+
+    #[test]
+    fn remembering_nothing_keeps_the_earlier_word() {
+        // Alt+Tab clears the state, and the key that then arrives in another window finds
+        // nothing to remember for the window that was left: the word must survive that.
+        let mut processor = processor_at_the_test_target();
+        let target = recent_ok_foreground();
+        let now = Instant::now();
+        processor.last_boundary = Some(test_last_boundary(&processor, 6));
+        processor.remember_word(target, Some(target.layout), now);
+        processor.last_boundary = None;
+        processor.remember_word(target, Some(target.layout), now);
+        assert_eq!(
+            remembered_entry(&processor)
+                .word
+                .as_ref()
+                .map(|word| word.replay_keys.len()),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn only_eight_windows_are_remembered_and_only_for_two_minutes() {
+        let mut processor = processor_at_the_test_target();
+        let now = Instant::now();
+        for hwnd in 1..=9 {
+            let target = ForegroundContext {
+                hwnd,
+                ..recent_ok_foreground()
+            };
+            let mut word = test_last_boundary(&processor, 3);
+            word.foreground = target;
+            processor.last_boundary = Some(word);
+            processor.remember_word(target, Some(target.layout), now);
+        }
+        assert_eq!(processor.remembered_words.len(), 8);
+        assert_eq!(processor.remembered_words[0].target.hwnd, 2);
+        // An entry older than two minutes is gone.
+        processor.last_boundary = None;
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        let last = ForegroundContext {
+            hwnd: 9,
+            ..recent_ok_foreground()
+        };
+        assert_eq!(
+            processor.restore_remembered_word(last, now + Duration::from_secs(121)),
+            None
+        );
+        assert!(processor.remembered_words.is_empty());
+    }
+
+    #[test]
+    fn pause_restores_a_remembered_word_once_and_only_in_a_verified_field() {
+        let target = recent_ok_foreground();
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let remembered = |backend: TextEditBackend| {
+            let mut processor = processor_at_the_test_target();
+            processor.text_edit_backend = backend;
+            processor.last_boundary = Some(test_last_boundary(&processor, 6));
+            processor.remember_word(target, Some(target.layout), now);
+            processor.last_boundary = None;
+            processor
+        };
+        // A protected-paste field checks the text before the caret, so the word is restored.
+        let mut processor = remembered(TextEditBackend::ProtectedPaste);
+        assert_eq!(
+            processor.restore_remembered_word(target, later),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            processor
+                .last_boundary
+                .as_ref()
+                .map(|word| word.replay_keys.len()),
+            Some(6)
+        );
+        // Used once.
+        processor.last_boundary = None;
+        assert_eq!(processor.restore_remembered_word(target, later), None);
+        // Physical replay types blind: never.
+        for backend in [
+            TextEditBackend::PhysicalReplay,
+            TextEditBackend::CapabilityProbe,
+            TextEditBackend::ObserveOnly,
+        ] {
+            let mut processor = remembered(backend);
+            assert_eq!(
+                processor.restore_remembered_word(target, later),
+                None,
+                "{backend:?}"
+            );
+            assert!(processor.last_boundary.is_none());
+        }
+        // Something known for the field wins over the memory.
+        let mut processor = remembered(TextEditBackend::ProtectedPaste);
+        type_letters(&mut processor, "a");
+        assert_eq!(processor.restore_remembered_word(target, later), None);
+        // Another window has nothing remembered.
+        let mut processor = remembered(TextEditBackend::ProtectedPaste);
+        let other = ForegroundContext { hwnd: 78, ..target };
+        assert_eq!(processor.restore_remembered_word(other, later), None);
     }
 
     #[test]

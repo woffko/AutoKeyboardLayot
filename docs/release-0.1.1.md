@@ -39,7 +39,11 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
 - **Pause converts in more cases.** A manual layout switch (for example Alt+Shift) no longer
   makes Pause forget the word typed before it, text typed right after a manual switch can be
   converted with Pause, and digits typed on the numeric keypad no longer stop Pause from
-  reading a word back. When Pause still cannot act, the diagnostics log says why.
+  reading a word back. In applications whose edit checks the text before the caret
+  (protected paste, such as messengers), Pause waits longer for the selection of the word
+  and tries a second time, and after a switch to another window and back it can still
+  convert the last word of that window for two minutes when the word is still exactly
+  before the caret. When Pause still cannot act, the diagnostics log says why.
 - **Protected paste leaves nothing behind.** The selection made by the program is collapsed
   when the outcome is not the expected one (a selection you made is never touched), and a
   clipboard that could not be restored is counted and logged without switching conversion off.
