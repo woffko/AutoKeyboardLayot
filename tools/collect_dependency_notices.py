@@ -101,6 +101,19 @@ def packages_from_receipt(metadata, receipt, lock_hash, manifest_hash):
     return [package for package in metadata['packages'] if package['id'] in included]
 
 
+# Data compiled into the base executable needs its notice next to the dependency licenses.
+BUNDLED_DATA_NOTICES = (
+    ('Bundled English dictionary', 'data/language-packs/en-US/LICENSE.words.md'),
+    ('Bundled layout model', 'data/layout-model/NOTICE.md'),
+)
+
+
+def bundled_data_sections(root):
+    """Notice sections for the bundled data, in file order. A missing notice is an error."""
+    return ['\n=== ' + title + ' ===\n' + (root / path).read_text(encoding='utf-8')
+            for title, path in BUNDLED_DATA_NOTICES]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path, help='new output directory')
@@ -163,8 +176,7 @@ def main():
             sections.append('\n--- ' + name + ' ---\n' + text + '\n')
             files.append({'file': name, 'sha256': digest})
         records.append({'package': identity, 'license': package.get('license'), 'files': files})
-    dictionary = root / 'data/language-packs/en-US/LICENSE.words.md'
-    sections.append('\n=== Bundled English dictionary ===\n' + dictionary.read_text(encoding='utf-8'))
+    sections.extend(bundled_data_sections(root))
     args.output.mkdir(parents=False, exist_ok=False)
     filename = 'THIRD-PARTY-NOTICES.incomplete.txt' if missing else 'THIRD-PARTY-NOTICES.txt'
     (args.output / filename).write_text('\n'.join(sections), encoding='utf-8')

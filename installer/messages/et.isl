@@ -17,6 +17,7 @@ AkPackageCancel=Tühista allalaadimine
 AkPackageInstall=Paigalda valitud paketid
 AkPackageBusy=Paketi töötlemine…
 AkPackageFailed=Paketitoiming ebaõnnestus. Automaatset korduskatset ei tehta; enne uuesti proovimist kontrolli pakettide praegust olekut.
+AkCatalogExpired=Avaldatud paketikataloog on aegunud või selle arvuti kuupäev ja kellaaeg on valed. Kontrolli süsteemikella või proovi hiljem uuesti.
 AkPackageInput=Sisaldab sõnastikku ja sisendireegleid.
 AkPackageUnavailable=Pole saadaval: ühildumatu paketi API või kaitstud ingliskeelne alus.
 AkPackageIntro=Inglise keel on kaasas. Valikulised paketid paigaldatakse alles pärast teie kinnitust.

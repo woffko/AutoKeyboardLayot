@@ -9,6 +9,7 @@ pub mod bounded_probe;
 pub mod composition;
 pub mod configuration;
 pub mod conversion;
+pub mod crash_log;
 pub mod detector;
 pub mod dictionary_registry;
 pub mod hotkey;
@@ -35,14 +36,17 @@ pub mod package_inventory;
 #[cfg(feature = "signing-tools")]
 pub mod package_signing;
 pub mod package_store;
+pub mod panic_guard;
 pub mod privacy;
 pub mod profile_resolver;
+pub mod rate_limit;
 pub mod scoring_model;
 pub mod session;
 pub mod settings;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tray_visual;
+pub mod ui_guard;
 pub mod user_lexicon;
 #[cfg(windows)]
 pub mod windows_input_profiles;

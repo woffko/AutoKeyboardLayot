@@ -4,14 +4,17 @@ param(
     [Parameter(Mandatory=$true)][string]$NewSetupSha256,
     [Parameter(Mandatory=$true)][string]$OldAppSha256,
     [Parameter(Mandatory=$true)][string]$NewAppSha256,
-    [Parameter(Mandatory=$true)][string]$Receipt
+    [Parameter(Mandatory=$true)][string]$Receipt,
+    [Parameter(Mandatory=$true)][string]$ExpectedComputer,
+    [Parameter(Mandatory=$true)][string]$LocalAppData,
+    [Parameter(Mandatory=$true)][string]$TaskUser
 )
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Receipt) { throw 'Receipt already exists.' }
 $oldSetup = Join-Path $Stage 'old-setup.exe'
 $newSetup = Join-Path $Stage 'new-setup.exe'
 $installTarget = Join-Path $Stage ('Installed App ' + [char]0xFC)
-$profile = 'C:\Users\w0w\AppData\Local\AutoKeyboardLayot'
+$profile = Join-Path $LocalAppData 'AutoKeyboardLayot'
 $registration = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{D913907B-2031-4C26-A199-BF60B0E51B6D}_is1'
 $installTask = 'AklUpgradeInstall'; $uninstallTask = 'AklUpgradeUninstall'
 $result = [ordered]@{state='failed'; phase='preflight'; session_id=[Diagnostics.Process]::GetCurrentProcess().SessionId; network_used=$false; typing_acceptance=$false; version_string='0.1.0'}
@@ -30,7 +33,7 @@ function Invoke-Setup([string]$Setup, [string]$Log, [int]$WaitSeconds) {
     Drop-Task $installTask
     $arguments = '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LANG=english /DIR="' + $installTarget + '" /LOG="' + $Log + '"'
     $action = New-ScheduledTaskAction -Execute $Setup -Argument $arguments -WorkingDirectory $Stage
-    $principal = New-ScheduledTaskPrincipal -UserId 'DESKTOP-ELS4LDK\w0w' -LogonType Interactive
+    $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Interactive
     Register-ScheduledTask -TaskName $installTask -Action $action -Principal $principal -Force | Out-Null
     Start-ScheduledTask -TaskName $installTask
     Start-Sleep -Milliseconds 400
@@ -45,13 +48,13 @@ function Resolve-Uninstaller {
 }
 
 try {
-    if ($env:COMPUTERNAME -ne 'DESKTOP-ELS4LDK' -or (Get-CimInstance Win32_ComputerSystem).Manufacturer -notlike '*VMware*') { throw 'Wrong guest' }
+    if ($env:COMPUTERNAME -ne $ExpectedComputer -or (Get-CimInstance Win32_ComputerSystem).Manufacturer -notlike '*VMware*') { throw 'Wrong guest' }
     if ((Hash $oldSetup) -ne $OldSetupSha256) { throw 'Old setup hash' }
     if ((Hash $newSetup) -ne $NewSetupSha256) { throw 'New setup hash' }
     Drop-Task $installTask; Drop-Task $uninstallTask
     if ((& "$env:SystemRoot\System32\query.exe" user 2>&1 | Out-String) -notmatch 'console\s+1\s+Active') { throw 'No active console session' }
     if (@(Get-Process -Name AutoKeyboardLayot -ErrorAction SilentlyContinue).Count) { throw 'App already running' }
-    if (Test-Path -LiteralPath $profile) { throw 'w0w profile not empty' }
+    if (Test-Path -LiteralPath $profile) { throw 'Test profile not empty' }
     if (Test-Path -LiteralPath $installTarget) { Remove-Item -LiteralPath $installTarget -Recurse -Force }
     $result.phase = 'install_old'
     $null = Invoke-Setup $oldSetup (Join-Path $Stage 'old-install.log') 180
@@ -98,7 +101,7 @@ try {
     if ($uninstaller) {
         Drop-Task $uninstallTask
         $uAction = New-ScheduledTaskAction -Execute $uninstaller -Argument '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -WorkingDirectory $installTarget
-        $uPrincipal = New-ScheduledTaskPrincipal -UserId 'DESKTOP-ELS4LDK\w0w' -LogonType Interactive
+        $uPrincipal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Interactive
         Register-ScheduledTask -TaskName $uninstallTask -Action $uAction -Principal $uPrincipal -Force | Out-Null
         Start-ScheduledTask -TaskName $uninstallTask
         $null = Wait-Task $uninstallTask 120
@@ -115,7 +118,7 @@ try {
     Drop-Task $installTask; Drop-Task $uninstallTask
     Get-Process -Name AutoKeyboardLayot -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath 'C:\Users\w0w\AppData\Local\AutoKeyboardLayot.installation.lock' -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $LocalAppData 'AutoKeyboardLayot.installation.lock') -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $installTarget -Recurse -Force -ErrorAction SilentlyContinue
     $result.profile_removed_after_test = -not (Test-Path -LiteralPath $profile)
     $stream = [IO.File]::Open($Receipt, [IO.FileMode]::CreateNew)

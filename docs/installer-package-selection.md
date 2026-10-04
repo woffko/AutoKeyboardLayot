@@ -134,5 +134,7 @@ network download. The network fetch closure is never invoked for a local source,
 so copying `.aklp` files next to the `.aklc` supports an explicit offline install
 without any published release. Failure replies carry a coarse, path-free reason
 code (for example `download_http`, `local_read`, `verification`) that the Inno
-page appends to its generic failure caption.
+page appends to its generic failure caption. An expired catalog, or a system
+clock outside the catalog's validity window, reports `catalog_expired`; for that
+code the page shows the dedicated `AkCatalogExpired` message instead.
 

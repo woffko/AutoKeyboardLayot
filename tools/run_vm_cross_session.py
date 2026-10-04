@@ -1,12 +1,21 @@
-"""Stage the app and candidate3 on the VM and run the cross-session exclusion test."""
+"""Stage the app and candidate3 on the VM and run the cross-session exclusion test.
+
+Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment (see vm_config.py).
+"""
 import base64, json, os, stat, subprocess, sys
 from pathlib import Path
 
+from vm_config import VmSettings, VmSettingsError, sftp_path
+
 ROOT = Path(__file__).resolve().parents[1]
-STAGE_UNIX = '/C:/Users/w0w/AppData/Local/Temp/akl-cross-session'
-STAGE = r'C:\Users\w0w\AppData\Local\Temp\akl-cross-session'
+STAGE_NAME = 'akl-cross-session'
 
 def main():
+    try:
+        vm = VmSettings.from_environment()
+    except VmSettingsError as error:
+        print(error, file=sys.stderr)
+        return 2
     output = Path(sys.argv[1]).resolve()
     output.mkdir()
     raw = bytearray(sys.stdin.buffer.read(4097))
@@ -19,13 +28,13 @@ def main():
         try:
             options = ['-F', '/dev/null', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
                        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
-                       '-o', 'StrictHostKeyChecking=yes', '-o', 'HostKeyAlias=192.168.189.138',
+                       '-o', 'StrictHostKeyChecking=yes', *vm.host_key_option(),
                        '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
                        '-o', 'ClearAllForwardings=yes', '-o', 'ControlMaster=no',
                        '-i', f'/proc/{os.getpid()}/fd/{fd}']
             def remote(script, timeout=30):
                 encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-                run = subprocess.run(['/usr/bin/ssh', *options, 'root@192.168.189.129',
+                run = subprocess.run(['/usr/bin/ssh', *options, vm.login,
                     'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + encoded],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
                 if run.returncode:
@@ -37,38 +46,37 @@ def main():
             script = ROOT / 'tools/test-vm-cross-session.ps1'
             build = json.loads((ROOT / 'target/installer-vm-candidate-20260913-03/build.json').read_text())
             setup_sha = next(a['sha256'] for a in build['artifacts'] if a['file'].endswith('setup-experimental.exe'))
-            preflight = remote(r"""$P='SilentlyContinue'
-'COMPUTER='+$env:COMPUTERNAME
-'APP_PROC='+@(Get-Process -Name AutoKeyboardLayot -ErrorAction SilentlyContinue).Count
-'PROFILE='+(Test-Path -LiteralPath 'C:\Users\w0w\AppData\Local\AutoKeyboardLayot')
-'SESSIONS='+(((& "$env:SystemRoot\System32\query.exe" user 2>&1) | Out-String).Trim())
-""")
+            preflight = remote(vm.preflight_script())
             result['preflight'] = preflight.strip().splitlines()
-            if 'COMPUTER=DESKTOP-ELS4LDK' not in preflight or 'APP_PROC=0' not in preflight or 'PROFILE=False' not in preflight or 'console' not in preflight or 'Active' not in preflight:
+            if not vm.preflight_ok(preflight):
                 raise ValueError('preflight result')
+            stage = vm.stage_directory(STAGE_NAME, preflight)
+            stage_unix = sftp_path(stage)
+            local_app_data = vm.effective_local_app_data(preflight)
             result.update(phase='upload', setup_sha256=setup_sha)
-            remote(r"""$ErrorActionPreference='Stop'
-$s='C:\Users\w0w\AppData\Local\Temp\akl-cross-session'
+            remote(f"""$ErrorActionPreference='Stop'
+$s='{stage}'
 Remove-Item -LiteralPath $s -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $s -Force | Out-Null
 'STAGE_READY'""")
-            batch = (f'put "{setup}" "{STAGE_UNIX}/setup.exe"\n'
-                     f'put "{script}" "{STAGE_UNIX}/test-vm-cross-session.ps1"\n')
-            up = subprocess.run(['/usr/bin/sftp', *options, '-b', '-', 'root@192.168.189.129'],
+            batch = (f'put "{setup}" "{stage_unix}/setup.exe"\n'
+                     f'put "{script}" "{stage_unix}/test-vm-cross-session.ps1"\n')
+            up = subprocess.run(['/usr/bin/sftp', *options, '-b', '-', vm.login],
                                 input=batch.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
             if up.returncode:
                 raise ValueError('upload')
             result.update(phase='execute', execution_requested=True)
             run_script = (r"$ErrorActionPreference='Stop'"
-                rf";$s='{STAGE}'"
+                rf";$s='{stage}'"
                 r";$p=Join-Path $s 'test-vm-cross-session.ps1'"
-                rf";& $p -Stage $s -SetupSha256 '{setup_sha}' -Receipt (Join-Path $s 'result.json') | Out-Null"
+                rf";& $p -Stage $s -SetupSha256 '{setup_sha}' -Receipt (Join-Path $s 'result.json')"
+                rf" -ExpectedComputer '{vm.computer}' -LocalAppData '{local_app_data}' -TaskUser '{vm.scheduled_task_user}' | Out-Null"
                 r";'VM_CROSS_SESSION_RETURNED'")
             returned = remote(run_script, 400)
             result['command_returned'] = 'VM_CROSS_SESSION_RETURNED' in returned
             result['phase'] = 'fetch'
-            batch = f'-get "{STAGE_UNIX}/result.json" "{output / "result.json"}"\n-get "{STAGE_UNIX}/blocked-install.log" "{output / "blocked-install.log"}"\n'
-            subprocess.run(['/usr/bin/sftp', *options, '-b', '-', 'root@192.168.189.129'],
+            batch = f'-get "{stage_unix}/result.json" "{output / "result.json"}"\n-get "{stage_unix}/blocked-install.log" "{output / "blocked-install.log"}"\n'
+            subprocess.run(['/usr/bin/sftp', *options, '-b', '-', vm.login],
                            input=batch.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             final = output / 'result.json'
             if final.is_file():

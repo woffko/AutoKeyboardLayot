@@ -17,6 +17,7 @@ AkPackageCancel=ダウンロードを取り消す
 AkPackageInstall=選択したパックをインストール
 AkPackageBusy=パックを処理中…
 AkPackageFailed=パックの操作に失敗しました。自動再試行は行いません。再試行する前にパックの現在の状態を確認してください。
+AkCatalogExpired=公開されているパックカタログの有効期限が切れているか、このコンピューターの日付と時刻が正しくありません。システム時計を確認するか、しばらくしてからもう一度お試しください。
 AkPackageInput=辞書と入力ルールを含みます。
 AkPackageUnavailable=利用不可: パック API に互換性がないか、保護された英語の基本データです。
 AkPackageIntro=英語は含まれています。追加パッケージは確認後にのみインストールされます。

@@ -33,8 +33,10 @@ converted only when all of the following hold:
 5. the model is at least 90% sure of another layout (97% for three-letter
    words).
 
-Nothing typed is stored, logged or sent anywhere. Diagnostics record only
-`stage=model` or `stage=dictionary` next to the existing candidate counters.
+Typed text is processed in memory only: it is never written to disk, logged or
+sent anywhere. Diagnostics record only `stage=model` or `stage=dictionary` next
+to the existing candidate counters, never the word, its characters or key
+codes.
 
 ## Measured effect
 
@@ -56,7 +58,80 @@ signed packages.
 On real English, Russian, Estonian and foreign (German, French, Spanish)
 words the rate of unwanted changes is the same as the dictionary detector's;
 the small increase comes from random letter strings in the test data. These
-are synthetic measurements, not a substitute for real typing acceptance.
+are synthetic measurements, not a substitute for real typing acceptance; see
+[Limits](#limits) for text that is not a sentence.
+
+## Limits
+
+The model is a statistical second opinion, not a language identifier. Its limits
+are known. The first three are covered by tests in `src/detector.rs`, the
+numbers come from `examples/measure_token_false_positives.rs`, and
+`tests/dev_tokens.rs` stops the real-token numbers from growing unnoticed.
+
+**The five rules above are hard gates.** A confident model cannot override
+them. `kerf` is an English dictionary word whose keys also read as the common
+Russian word `лука`; the model alone is 99% sure of Russian and rule 3 keeps
+the word English. The protection is only as good as the dictionary: a name, a
+command or a rare word that the English lists do not contain has none.
+
+**The thresholds are exact.** Two Russian dictionary words of three letters
+that the dictionary stage leaves alone are not converted when the model is 94%
+and 96% sure, and one is converted at 99.8%. A longer word is converted from
+90%. One- and two-letter words never reach the model, however sure it is.
+
+**Ambiguity is settled by context, and only above the threshold.** English and
+Estonian share the key of every letter, and some key sequences read as a word
+in two languages. The dictionary stage then fails closed. The model may decide
+from the languages of the previous words (never their text), but it still needs
+90%. In the tests the keys `'kke` read as the Russian word `эллу` and as the
+Estonian word `äkke`. After three Estonian words the model is 91% sure of
+Estonian and converts; after an English word it is 81% sure of Estonian, and
+after three Russian words 65% sure of Russian, so nothing is converted. Keys
+whose letter patterns are decisive on their own (`v'he`, the Estonian `vähe`)
+convert in every context. The context is cleared when the focused window or
+field changes, so the first word typed there has none.
+
+**Synthetic and real numbers differ.** The table above measures generated
+sentences of real words and shows about 0.1% unwanted changes. Text that is not
+a sentence behaves differently. Every row is typed correctly in the English
+layout and judged as a first word (no context):
+
+| Input | Dictionary stage converts | Model adds |
+|---|---|---|
+| 1 659 command, tool and package names | 0.36% | 0.06% |
+| Random lowercase letters, 3 letters | 0.36% | 3.3% |
+| 4 letters | 1.5% | 2.4% |
+| 6 letters | 0.05% | 1.7% |
+| 8 letters | 0.5% | 0.75% |
+| 12 letters | 4.6% | 0.17% |
+| 16 letters | 3.3% | 0.05% |
+
+The random rows are a worst case (40 000 uniformly random strings per row), not
+typical typing. They show what no dictionary protects: machine-generated
+lowercase text. Reproduce a row with
+`cargo run --release --example measure_token_false_positives -- --random 6 40000`,
+and the first row with the same command without arguments.
+
+**False-positive classes** seen in these measurements:
+
+- Short names that read as a common word of the other language: `dtc` → `вес`
+  and `dtls` → `веды`, and three-letter abbreviations that the general English
+  list holds but the short-word list does not (`tot` → `еще`, `dbl` → `вид`).
+- Estonian words typed in the English layout (`endi`, `lebe`, `muda`). Letters
+  share their keys in both layouts, so the Estonian reading is the typed text
+  and the conversion changes no letter.
+- Long unknown letter strings: `nfsdclnts` → `таывсдтеы`. The dictionary stage
+  accepts Cyrillic text that merely looks pronounceable ("statistical targets"),
+  which is why random strings of ten letters or more are converted in 3 to 5% of
+  cases.
+- Short unknown strings once the model is on: `gtk` → `пел`.
+
+**What to do about it.** The model is off by default. In a terminal, add the
+terminal's executable to the program exclusions in Settings, or list the
+commands you type often in the word exclusions (`en-US: kubectl`). This page
+documents the behavior; it does not change the detection policy. Lowering a
+class of false positives is a deliberate decision with its own measurement:
+change the budgets in `tests/dev_tokens.rs` only together with that decision.
 
 ## Enabling it
 
@@ -158,4 +233,6 @@ takes about a minute on a GPU and longer on a CPU).
 | `tools/layout_model/export.py` | Binary export and reference check |
 | `tools/layout_model/score.py`, `combine.py` | Evaluation |
 | `examples/evaluate_layout_detection.rs` | Runs the agent's detector on test cases |
+| `examples/measure_token_false_positives.rs` | Counts unwanted conversions on developer tokens or random strings |
+| `tests/dev_tokens.rs`, `tests/fixtures/dev-tokens.txt` | Budget for those conversions on 1 659 real tokens |
 | `tools/layout_model/pipeline.sh` | All steps in order |
