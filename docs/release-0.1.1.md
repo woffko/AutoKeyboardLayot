@@ -39,7 +39,9 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
 - **Pause converts in more cases.** A manual layout switch (for example Alt+Shift) no longer
   makes Pause forget the word typed before it, text typed right after a manual switch can be
   converted with Pause, and digits typed on the numeric keypad no longer stop Pause from
-  reading a word back. In applications whose edit checks the text before the caret
+  reading a word back. Such digits are typed back as keypad keys: sent by scan code alone they
+  arrived as navigation keys (keypad 2 is Down, which clears the line in a terminal), and a
+  keypad digit typed right after a Space could arrive the same way. In applications whose edit checks the text before the caret
   (protected paste, such as messengers), Pause waits longer for the selection of the word
   and tries a second time, and after a switch to another window and back it can still
   convert the last word of that window for two minutes when the word is still exactly

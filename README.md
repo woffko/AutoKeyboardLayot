@@ -154,7 +154,9 @@ manual layout switch ends automatic conversion of the word but not Pause: the
 word typed so far, or else the last completed word, can still be converted and is
 read in the layout it was typed in, and text typed right after a manual switch is
 kept for Pause like text typed after a shortcut. Digits typed on the numeric
-keypad can be part of such a word. When Pause cannot act, the diagnostics log
+keypad can be part of such a word; they are typed back as keypad keys, because a
+keypad scan code sent alone arrives as the navigation key that shares it (keypad
+2 is Down). Keys held after a Space are replayed the same way. When Pause cannot act, the diagnostics log
 names the reason (`event=hotkey result=ignored reason=` `no-word-before-caret`,
 `key-without-character`, `stale-word`, `privacy`, `unsupported-layout`,
 `single-layout` or `identical`).

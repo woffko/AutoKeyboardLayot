@@ -8731,6 +8731,28 @@ fn build_physical_replay_plan(
         step_ends.push(inputs.len());
     }
     for key in replay_keys {
+        // A keypad digit goes out as its virtual key. As a bare scan code it would arrive as the
+        // navigation key that shares it (keypad 2 is Down), which recalls history or clears the
+        // line in a terminal. Digits are never shifted: Shift turns keypad keys into navigation.
+        let keypad = if key.extended {
+            None
+        } else {
+            keypad_digit_key(key.scan_code)
+        };
+        if let Some(keypad) = keypad {
+            inputs.push(keyboard_input(
+                VIRTUAL_KEY(keypad),
+                key.scan_code,
+                Default::default(),
+            ));
+            inputs.push(keyboard_input(
+                VIRTUAL_KEY(keypad),
+                key.scan_code,
+                KEYEVENTF_KEYUP,
+            ));
+            step_ends.push(inputs.len());
+            continue;
+        }
         if key.shift {
             inputs.push(keyboard_input(VK_LSHIFT, 0, Default::default()));
         }
@@ -8898,10 +8920,19 @@ fn build_recovery_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
     Some(inputs)
 }
 
+/// Whether a virtual key is a keypad digit or the keypad decimal key.
+fn is_keypad_digit_key(virtual_key: u32) -> bool {
+    u16::try_from(virtual_key)
+        .is_ok_and(|key| (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&key) || key == VK_DECIMAL.0)
+}
+
 fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<INPUT>> {
     let mut inputs = Vec::with_capacity(held.len() + 2);
     for event in held {
-        let mut flags = if event.scan_code == 0 {
+        // A keypad digit goes out as the virtual key it arrived with; as a bare scan code it
+        // would arrive as the navigation key that shares it (see build_physical_replay_plan).
+        let by_virtual_key = event.scan_code == 0 || is_keypad_digit_key(event.virtual_key);
+        let mut flags = if by_virtual_key {
             Default::default()
         } else {
             KEYEVENTF_SCANCODE
@@ -8914,7 +8945,7 @@ fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<IN
         } else if !matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
             return None;
         }
-        let virtual_key = if event.scan_code == 0 {
+        let virtual_key = if by_virtual_key {
             VIRTUAL_KEY(u16::try_from(event.virtual_key).ok()?)
         } else {
             VIRTUAL_KEY(0)
@@ -11080,6 +11111,38 @@ mod tests {
     }
 
     #[test]
+    fn held_keypad_digits_are_replayed_as_their_virtual_keys() {
+        // A digit typed on the keypad while the gate holds keys after a Space is replayed later.
+        // As a bare scan code it would arrive as Down, End and the like.
+        let mut digit = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(VK_NUMPAD0.0 + 2), 0, 0);
+        digit.scan_code = 0x50;
+        let mut digit_up = digit;
+        digit_up.message = WM_KEYUP;
+        let mut letter = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x41), 0, 0);
+        letter.scan_code = 0x1e;
+        let inputs = build_raw_replay_inputs(&[digit, digit_up, letter], INJECTED_EVENT_MARKER)
+            .expect("replayable");
+        let input = |index: usize| unsafe { inputs[index].Anonymous.ki };
+        assert_eq!(input(0).wVk, VIRTUAL_KEY(VK_NUMPAD0.0 + 2));
+        assert_eq!(input(0).wScan, 0x50);
+        assert_eq!(input(0).dwFlags, Default::default());
+        assert_eq!(input(1).wVk, VIRTUAL_KEY(VK_NUMPAD0.0 + 2));
+        assert_eq!(input(1).dwFlags, KEYEVENTF_KEYUP);
+        // Every other key keeps its scan code.
+        assert_eq!(input(2).wVk, VIRTUAL_KEY(0));
+        assert_eq!(input(2).dwFlags, KEYEVENTF_SCANCODE);
+        for keypad in (0..=9)
+            .map(|digit| VK_NUMPAD0.0 + digit)
+            .chain([VK_DECIMAL.0])
+        {
+            assert!(is_keypad_digit_key(u32::from(keypad)), "{keypad:#x}");
+        }
+        for other in [0x30, 0x41, VK_END.0, VK_DOWN.0, 0x6b, 0x6d] {
+            assert!(!is_keypad_digit_key(u32::from(other)), "{other:#x}");
+        }
+    }
+
+    #[test]
     fn recovery_balances_an_unmatched_modifier_and_never_adds_a_fence() {
         let mut edge = test_raw_key(WM_KEYDOWN, VK_LWIN, 0, 0);
         edge.scan_code = 0x5b;
@@ -11536,6 +11599,45 @@ mod tests {
         unsafe {
             DestroyWindow(window).expect("destroy probe window");
         }
+    }
+
+    #[test]
+    fn keypad_digits_are_replayed_as_keypad_keys_not_as_navigation_scan_codes() {
+        // Sent as a bare scan code, keypad 2 arrives as Down, which recalls history or clears the
+        // line in a terminal: a Pause conversion of a word with a keypad digit deleted it on the
+        // host. Digits are never shifted (Shift turns keypad keys into navigation).
+        let key = |scan_code, shift, extended| ReplayKey {
+            scan_code,
+            shift,
+            caps_lock: false,
+            extended,
+        };
+        let keys = [
+            key(0x1e, false, false),
+            key(0x50, false, false),
+            key(0x53, true, false),
+            key(0x50, false, true),
+        ];
+        let plan = build_physical_replay_plan(0, &keys, None).expect("bounded plan");
+        let input = |index: usize| unsafe { plan.inputs[index].Anonymous.ki };
+        // A letter stays a scan code.
+        assert_eq!(input(0).wVk, VIRTUAL_KEY(0));
+        assert_eq!(input(0).dwFlags, KEYEVENTF_SCANCODE);
+        // Keypad 2 is its virtual key, down and up, with its scan code for the application.
+        assert_eq!(input(2).wVk, VIRTUAL_KEY(VK_NUMPAD0.0 + 2));
+        assert_eq!(input(2).wScan, 0x50);
+        assert_eq!(input(2).dwFlags, Default::default());
+        assert_eq!(input(3).wVk, VIRTUAL_KEY(VK_NUMPAD0.0 + 2));
+        assert_eq!(input(3).dwFlags, KEYEVENTF_KEYUP);
+        // The keypad decimal key, and no Shift around it.
+        assert_eq!(input(4).wVk, VK_DECIMAL);
+        assert_eq!(input(5).wVk, VK_DECIMAL);
+        assert_eq!(input(5).dwFlags, KEYEVENTF_KEYUP);
+        // The extended key with the same scan code is the Down arrow, not a keypad digit.
+        assert_eq!(input(6).wVk, VIRTUAL_KEY(0));
+        assert_eq!(input(6).dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+        assert_eq!(plan.inputs.len(), 8);
+        assert_eq!(plan.step_ends, [2, 4, 6, 8]);
     }
 
     #[test]
