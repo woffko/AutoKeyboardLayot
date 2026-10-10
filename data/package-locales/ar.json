@@ -77,6 +77,7 @@
     "general.recheck_erased": "إعادة فحص الكلمة الأولى بعد مسحها بالكامل",
     "general.single_letter_words": "تحويل الكلمات ذات الحرف الواحد تلقائيًا (مثال z → я)",
     "general.layout_model": "نموذج تخطيط تجريبي لكلمات EN/RU/ET غير الموجودة في القواميس",
+    "general.conversion_sound": "تشغيل صوت ناعم وخافت عند تحويل كلمة",
     "general.offer_exclusion": "اقتراح استثناء الكلمة بعد التراجع",
     "general.offer_dictionary": "اقتراح إضافة الكلمة بعد التحويل القسري",
     "hotkey.enabled": "تفعيل اختصار لوحة المفاتيح",

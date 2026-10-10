@@ -74,6 +74,7 @@
     "general.recheck_erased": "Kontrolli esimest sõna pärast selle täielikku kustutamist uuesti",
     "general.single_letter_words": "Paranda ühetähelised sõnad automaatselt (näiteks z → я)",
     "general.layout_model": "Eksperimentaalne paigutusmudel EN/RU/ET sõnadele, mida sõnastikes pole",
+    "general.conversion_sound": "Vaikne pehme heli sõna teisendamisel",
     "general.offer_exclusion": "Paku pärast tagasivõtmist sõna välistamist",
     "general.offer_dictionary": "Paku pärast sundteisendust sõna lisamist sõnastikku",
     "hotkey.enabled": "Kasuta kiirklahvi",

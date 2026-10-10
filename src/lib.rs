@@ -9,6 +9,7 @@ pub mod bounded_probe;
 pub mod composition;
 pub mod configuration;
 pub mod conversion;
+pub mod conversion_sound;
 pub mod crash_log;
 pub mod detector;
 pub mod dictionary_registry;

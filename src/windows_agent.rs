@@ -16,6 +16,7 @@ use std::{
 };
 
 use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
+use autokeyboardlayot::conversion_sound::{self, SoundCue};
 use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
 use autokeyboardlayot::panic_guard::{FaultWindow, WorkerExit, guarded, run_contained};
 use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
@@ -192,6 +193,8 @@ const CLIPBOARD_OPEN_RETRIES: usize = 10;
 const CLIPBOARD_RESTORE_OPEN_RETRIES: usize = 30;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 2;
 const CLIPBOARD_BROKER_TIMEOUT_MS: u64 = 500;
+/// An automatic conversion waits this long for a busy clipboard, then leaves the word alone.
+const CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS: u64 = 200;
 const VK_V_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
 const LAYOUT_SWITCH_TIMEOUT_MS: u64 = 250;
 const LAYOUT_STABLE_MS: u64 = 50;
@@ -1015,16 +1018,14 @@ struct ProtectedClipboard {
 }
 
 impl ProtectedClipboard {
-    fn begin(text: &str) -> Option<Self> {
+    fn begin(text: &str, install_timeout: Duration) -> Option<Self> {
         let (command_sender, command_receiver) = sync_channel(1);
         let (response_sender, response_receiver) = sync_channel(1);
         let text = text.to_owned();
         let worker = thread::spawn(move || {
             protected_clipboard_broker(text, command_receiver, response_sender);
         });
-        let installed = response_receiver
-            .recv_timeout(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
-            .ok();
+        let installed = response_receiver.recv_timeout(install_timeout).ok();
         let Some(ClipboardBrokerResponse::Installed {
             sequence: temporary_sequence,
             owner,
@@ -4292,7 +4293,7 @@ impl PrivacyGuard {
         &self,
         expected_process_id: u32,
         expected_text: &str,
-        patience: SelectionPatience,
+        patience: PastePatience,
     ) -> TextBarrierStatus {
         let (status, attempts) = retry_unshown_selection(patience.attempts(), || {
             self.select_preceding_text_once(
@@ -4694,17 +4695,18 @@ impl SelectionConfirmation {
     }
 }
 
-/// How patiently a protected paste waits for the field to confirm the selection of the word.
-/// An automatic conversion runs inside the correction gate's time budget and looks once. A
-/// Pause press is waited for by the user, so it waits longer and selects a second time when
-/// the field did not show the first selection.
+/// How patiently a protected paste waits for the field to confirm the selection of the word, and
+/// for the clipboard. An automatic conversion runs while the correction gate holds the keys typed
+/// after it, so it looks once and gives up on a busy clipboard soon. A Pause press is waited for
+/// by the user, so it waits longer and selects a second time when the field did not show the
+/// first selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectionPatience {
+enum PastePatience {
     Automatic,
     Manual,
 }
 
-impl SelectionPatience {
+impl PastePatience {
     const fn confirm_timeout(self) -> Duration {
         Duration::from_millis(match self {
             Self::Automatic => UIA_SELECTION_CONFIRM_TIMEOUT_MS,
@@ -4718,14 +4720,39 @@ impl SelectionPatience {
             Self::Manual => UIA_MANUAL_SELECTION_ATTEMPTS,
         }
     }
+
+    /// How long to wait for the clipboard to take the replacement. The user's clipboard is saved
+    /// first, and an application that owns it and does not answer (a hung window holding
+    /// delayed-rendered data) can block that for as long as it hangs.
+    const fn clipboard_install_timeout(self) -> Duration {
+        Duration::from_millis(match self {
+            Self::Automatic => CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS,
+            Self::Manual => CLIPBOARD_BROKER_TIMEOUT_MS,
+        })
+    }
+}
+
+/// Held keys are the user's own input for the field they were typed in, so handing them back is
+/// refused only on a positive finding: a password field, or an excluded or elevated process. A
+/// field that cannot be inspected right now (a hung or busy window) does not keep them back, as
+/// keeping them back loses them. The target itself is checked separately and exactly.
+const fn recovery_privacy_allows(reason: Option<PrivacyBlockReason>) -> bool {
+    !matches!(
+        reason,
+        Some(
+            PrivacyBlockReason::PasswordField
+                | PrivacyBlockReason::ExcludedProcess
+                | PrivacyBlockReason::ElevatedProcess
+        )
+    )
 }
 
 /// Pause conversions are waited for by the user; automatic ones run inside the gate budget.
-const fn selection_patience(forced: bool) -> SelectionPatience {
+const fn paste_patience(forced: bool) -> PastePatience {
     if forced {
-        SelectionPatience::Manual
+        PastePatience::Manual
     } else {
-        SelectionPatience::Automatic
+        PastePatience::Automatic
     }
 }
 
@@ -5320,6 +5347,8 @@ struct InputProcessor {
     auto_resumes: RateLimit,
     // Replacements of the privacy provider that were already logged.
     reported_probe_respawns: u32,
+    // Plays the conversion sounds; started on the first cue while they are enabled.
+    sound_player: Option<SyncSender<SoundCue>>,
 }
 
 impl InputProcessor {
@@ -5441,6 +5470,7 @@ impl InputProcessor {
             last_gate_release_token: 0,
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
+            sound_player: None,
         }
     }
 
@@ -5890,7 +5920,8 @@ impl InputProcessor {
             thread::sleep(Duration::from_millis(1));
         }
         self.privacy_needs_check = true;
-        if !self.ensure_privacy(record.foreground, ProbeTrigger::Recovery) {
+        self.ensure_privacy(record.foreground, ProbeTrigger::Recovery);
+        if !recovery_privacy_allows(self.privacy_reason) {
             self.diagnostic(
                 "recovery",
                 format!("token={} result=retained reason=privacy", record.token),
@@ -6132,6 +6163,11 @@ impl InputProcessor {
                 self.mark_privacy_dirty(false);
                 return;
             }
+            let kind = shortcut_kind(event.virtual_key, self.modifiers);
+            self.diagnostic(
+                "input",
+                format!("result=suppressed reason=shortcut kind={kind}"),
+            );
             self.session
                 .handle(InputEvent::Shortcut, language, &self.detector);
             self.mark_privacy_dirty(true);
@@ -7196,6 +7232,20 @@ impl InputProcessor {
         }
     }
 
+    /// Asks for a conversion sound when the user enabled them. The sound plays on a thread of its
+    /// own; a cue that arrives while one plays is dropped, never queued.
+    fn request_sound(&mut self, cue: SoundCue) {
+        if !self.settings.conversion_sound {
+            return;
+        }
+        if self.sound_player.is_none() {
+            self.sound_player = start_sound_player();
+        }
+        if let Some(player) = &self.sound_player {
+            let _ = player.try_send(cue);
+        }
+    }
+
     fn mark_privacy_dirty(&mut self, pause_now: bool) {
         self.privacy_needs_check = true;
         // Tab, Enter, a click, a shortcut, injected input and focus changes all come through
@@ -7333,7 +7383,7 @@ impl InputProcessor {
                     target_layout,
                     &pending.transaction.undo.insert_text,
                     &pending.transaction.forward.insert_text,
-                    selection_patience(pending.forced),
+                    paste_patience(pending.forced),
                 );
                 let Some(strategy) = self.apply_paste_attempt_result(attempt, boundary_sequence)
                 else {
@@ -7378,7 +7428,7 @@ impl InputProcessor {
                             target_layout,
                             &pending.transaction.undo.insert_text,
                             &pending.transaction.forward.insert_text,
-                            selection_patience(pending.forced),
+                            paste_patience(pending.forced),
                         );
                         self.diagnostic(
                             "protected_paste",
@@ -7474,6 +7524,7 @@ impl InputProcessor {
                 profile_generation: pending.profile_generation,
             });
         }
+        self.request_sound(SoundCue::Converted);
         self.diagnostic(
             "conversion",
             format!(
@@ -7760,7 +7811,7 @@ impl InputProcessor {
                     source_layout,
                     &record.transaction.forward.insert_text,
                     &record.transaction.undo.insert_text,
-                    SelectionPatience::Manual,
+                    PastePatience::Manual,
                 );
                 if self
                     .apply_paste_attempt_result(attempt, pause_sequence)
@@ -7824,6 +7875,7 @@ impl InputProcessor {
             epoch: self.last_input_epoch,
             profile_generation: record.profile_generation,
         });
+        self.request_sound(SoundCue::Undone);
         self.diagnostic(
             "undo",
             format!(
@@ -7873,7 +7925,7 @@ impl InputProcessor {
         target_layout: HKL,
         expected_source: &str,
         replacement: &str,
-        patience: SelectionPatience,
+        patience: PastePatience,
     ) -> TextEditAttempt {
         let started = Instant::now();
         if !self.edit_guard_is_current(foreground, input_sequence) {
@@ -7901,7 +7953,9 @@ impl InputProcessor {
             return TextEditAttempt::Cancelled;
         }
 
-        let Some(mut clipboard) = ProtectedClipboard::begin(replacement) else {
+        let Some(mut clipboard) =
+            ProtectedClipboard::begin(replacement, patience.clipboard_install_timeout())
+        else {
             self.diagnostic(
                 "paste",
                 format!(
@@ -7911,7 +7965,9 @@ impl InputProcessor {
             );
             self.privacy_guard
                 .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Failed;
+            // Nothing was typed and the user's clipboard was not replaced: a busy clipboard is a
+            // word left alone, not a failed edit, so automatic conversion stays on.
+            return TextEditAttempt::Cancelled;
         };
         let clipboard_current = clipboard.is_current();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_prepare result=ready current={clipboard_current} elapsed_ms={}", started.elapsed().as_millis()));
@@ -8960,6 +9016,44 @@ fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<IN
     Some(inputs)
 }
 
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn PlaySoundW(sound: *const u16, module: *mut c_void, flags: u32) -> i32;
+}
+
+const SND_NODEFAULT: u32 = 0x0002;
+const SND_MEMORY: u32 = 0x0004;
+
+/// Starts the thread that plays conversion sounds, so a conversion never waits for audio.
+fn start_sound_player() -> Option<SyncSender<SoundCue>> {
+    let (sender, receiver) = sync_channel::<SoundCue>(1);
+    thread::Builder::new()
+        .name("autokey-sound".to_owned())
+        .spawn(move || {
+            let converted = conversion_sound::wav(SoundCue::Converted);
+            let undone = conversion_sound::wav(SoundCue::Undone);
+            while let Ok(cue) = receiver.recv() {
+                let image = match cue {
+                    SoundCue::Converted => &converted,
+                    SoundCue::Undone => &undone,
+                };
+                // SAFETY: with SND_MEMORY the first argument is the WAV image itself, owned by
+                // this thread and alive across the call. Without SND_ASYNC the call returns after
+                // playback, so the image is not read afterwards. SND_NODEFAULT keeps Windows from
+                // playing its default sound when the image cannot be played; nothing is played then.
+                unsafe {
+                    PlaySoundW(
+                        image.as_ptr().cast(),
+                        std::ptr::null_mut(),
+                        SND_MEMORY | SND_NODEFAULT,
+                    );
+                }
+            }
+        })
+        .ok()?;
+    Some(sender)
+}
+
 fn keyboard_input(
     virtual_key: VIRTUAL_KEY,
     scan_code: u16,
@@ -9056,6 +9150,23 @@ impl Modifiers {
 
     const fn has_shortcut_modifier(self) -> bool {
         self.control() || self.alt() || self.win_mask != 0
+    }
+}
+
+/// Which kind of shortcut ended a word, for the diagnostics log: the editing command, never a
+/// character the user typed.
+fn shortcut_kind(virtual_key: u32, modifiers: Modifiers) -> &'static str {
+    let control_only = modifiers.control() && !modifiers.alt();
+    match u16::try_from(virtual_key).unwrap_or(0) {
+        key if control_only && key == VK_BACK.0 => "erase-word",
+        0x56 if control_only => "paste",
+        0x43 if control_only => "copy",
+        0x58 if control_only => "cut",
+        0x5a | 0x59 if control_only => "undo",
+        _ if control_only => "ctrl",
+        _ if modifiers.alt() && !modifiers.control() => "alt",
+        _ if modifiers.control() => "ctrl-alt",
+        _ => "win",
     }
 }
 
@@ -10529,17 +10640,17 @@ mod tests {
     fn only_pause_waits_longer_and_selects_again() {
         // Automatic conversions keep the wait that the correction gate's budget accounts for.
         assert_eq!(
-            SelectionPatience::Automatic.confirm_timeout(),
+            PastePatience::Automatic.confirm_timeout(),
             Duration::from_millis(UIA_SELECTION_CONFIRM_TIMEOUT_MS)
         );
-        assert_eq!(SelectionPatience::Automatic.attempts(), 1);
+        assert_eq!(PastePatience::Automatic.attempts(), 1);
         assert_eq!(
-            SelectionPatience::Manual.confirm_timeout(),
+            PastePatience::Manual.confirm_timeout(),
             Duration::from_millis(100)
         );
-        assert_eq!(SelectionPatience::Manual.attempts(), 2);
-        assert_eq!(selection_patience(true), SelectionPatience::Manual);
-        assert_eq!(selection_patience(false), SelectionPatience::Automatic);
+        assert_eq!(PastePatience::Manual.attempts(), 2);
+        assert_eq!(paste_patience(true), PastePatience::Manual);
+        assert_eq!(paste_patience(false), PastePatience::Automatic);
     }
 
     #[test]
@@ -10614,6 +10725,52 @@ mod tests {
             lines[0].contains("sequence=42 result=cancelled strategy=ProtectedPaste edit=none"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_cancelled_paste_keeps_automatic_conversion_and_a_failed_one_pauses_it() {
+        // A busy clipboard ends as Cancelled: nothing was typed, so automatic conversion stays.
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 7)
+                .is_none()
+        );
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::Failed, 8)
+                .is_none()
+        );
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_automatic_paste_gives_up_on_a_busy_clipboard_sooner_than_pause() {
+        assert_eq!(
+            PastePatience::Automatic.clipboard_install_timeout(),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            PastePatience::Manual.clipboard_install_timeout(),
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn held_keys_are_kept_back_only_on_a_positive_privacy_finding() {
+        for (reason, allowed) in [
+            (None, true),
+            (Some(PrivacyBlockReason::FieldInspectionUnavailable), true),
+            (Some(PrivacyBlockReason::InspectionUnavailable), true),
+            (Some(PrivacyBlockReason::PasswordField), false),
+            (Some(PrivacyBlockReason::ExcludedProcess), false),
+            (Some(PrivacyBlockReason::ElevatedProcess), false),
+        ] {
+            assert_eq!(recovery_privacy_allows(reason), allowed, "{reason:?}");
+        }
     }
 
     #[test]
@@ -11576,8 +11733,11 @@ mod tests {
         let original_formats = test_clipboard_formats(window).expect("clipboard formats");
         let original_text = test_clipboard_unicode(window);
 
-        let mut transaction = ProtectedClipboard::begin("akl-clipboard-probe")
-            .expect("protected clipboard transaction");
+        let mut transaction = ProtectedClipboard::begin(
+            "akl-clipboard-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+        )
+        .expect("protected clipboard transaction");
         assert!(transaction.is_current());
         assert_eq!(
             test_clipboard_unicode(window).as_deref(),
@@ -13913,6 +14073,80 @@ mod tests {
         let mut processor = remembered(TextEditBackend::ProtectedPaste);
         let other = ForegroundContext { hwnd: 78, ..target };
         assert_eq!(processor.restore_remembered_word(other, later), None);
+    }
+
+    fn held_modifiers(keys: &[VIRTUAL_KEY]) -> Modifiers {
+        let mut modifiers = Modifiers::default();
+        for key in keys {
+            modifiers.update(u32::from(key.0), true, false);
+        }
+        modifiers
+    }
+
+    #[test]
+    fn a_shortcut_is_logged_by_its_editing_command_only() {
+        let control = held_modifiers(&[VK_CONTROL]);
+        for (key, kind) in [
+            (VK_BACK.0, "erase-word"),
+            (0x56, "paste"),
+            (0x43, "copy"),
+            (0x58, "cut"),
+            (0x5a, "undo"),
+            (0x59, "undo"),
+            (0x41, "ctrl"),
+        ] {
+            assert_eq!(shortcut_kind(u32::from(key), control), kind, "{key:#x}");
+        }
+        assert_eq!(
+            shortcut_kind(u32::from(VK_TAB.0), held_modifiers(&[VK_MENU])),
+            "alt"
+        );
+        assert_eq!(
+            shortcut_kind(0x56, held_modifiers(&[VK_CONTROL, VK_MENU])),
+            "ctrl-alt"
+        );
+        assert_eq!(
+            shortcut_kind(u32::from(VK_SPACE.0), held_modifiers(&[VK_LWIN])),
+            "win"
+        );
+    }
+
+    #[test]
+    fn a_word_ended_by_a_shortcut_leaves_its_kind_in_the_log() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let event = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x56), 7, 0);
+        processor.last_foreground = Some(foreground_identity_key(event.foreground));
+        processor.last_layout = Some(event.foreground.layout);
+        processor.last_process_id = Some(event.foreground.process_id);
+        processor.modifiers = held_modifiers(&[VK_CONTROL]);
+        processor.process_key(event);
+        let lines: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.starts_with("event=input "))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("result=suppressed reason=shortcut kind=paste"),
+            "{lines:?}"
+        );
+        assert_eq!(processor.last_word_reset, "shortcut");
+    }
+
+    #[test]
+    fn a_conversion_sound_is_requested_only_when_enabled_and_never_queued() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let (sender, receiver) = sync_channel(1);
+        processor.sound_player = Some(sender);
+        processor.request_sound(SoundCue::Converted);
+        assert!(receiver.try_recv().is_err(), "off by default");
+        processor.settings.conversion_sound = true;
+        processor.request_sound(SoundCue::Converted);
+        // A cue that arrives while one is waiting is dropped instead of blocking the worker.
+        processor.request_sound(SoundCue::Undone);
+        assert_eq!(receiver.try_recv().ok(), Some(SoundCue::Converted));
+        assert!(receiver.try_recv().is_err());
+        processor.request_sound(SoundCue::Undone);
+        assert_eq!(receiver.try_recv().ok(), Some(SoundCue::Undone));
     }
 
     #[test]

@@ -68,6 +68,9 @@ On a new profile, the alpha defaults to observation-only mode:
   injected correction, and opt-in dictionary additions after manual conversion;
 - configurable suppression after Backspace, Delete, each arrow, Home/End, and a
   manual layout change, plus selectable EN/RU/ET automatic packs;
+- an optional soft, quiet sound after each conversion and a lower one after an
+  undo (`conversion_sound`, off by default), played on a thread of its own so a
+  conversion never waits for audio;
 - no typed-text logging.
 
 Automatic replacement is off at process start by default. A user can explicitly
@@ -187,7 +190,11 @@ codes, kept only until the next word boundary or reset), plus, for Pause, the
 physical keys of the last word of at most eight windows for at most two minutes
 after a window switch, a click or a shortcut ended tracking there. While the correction
 gate is armed after a Space, up to 256 key events are held in memory for at
-most 1.2 seconds and then replayed unchanged. None of this is written to logs,
+most 1.2 seconds and then replayed unchanged. If the gate gives up, the held keys
+are handed back to the same field unless the privacy check finds a password
+field or an excluded or elevated program; a field that merely cannot be inspected
+at that moment (a hung or busy window) does not keep them back, because keeping
+them back would lose them. None of this is written to logs,
 configuration, diagnostics, or network services. Unsupported input, editing,
 navigation, focus changes, layout changes, and queue overflow clear or suppress
 the current context.
@@ -201,6 +208,9 @@ window, pumps OLE messages, and restores those handles only while the temporary
 sequence and owner are unchanged. This preserves delayed, private, GDI, and
 enterprise-protection formats instead of discarding them. Password, excluded,
 elevated, non-materializable clipboard, and ambiguous UIA contexts fail closed.
+A clipboard that cannot be taken in time (it belongs to a window that does not
+answer) leaves the word alone: an automatic conversion waits 0.2 seconds for it,
+Pause 0.5 seconds, and neither counts it as a failed edit.
 Third-party local clipboard readers remain outside the confidentiality
 guarantees of the Win32 clipboard.
 
@@ -274,7 +284,10 @@ not converted (`event=word result=` `no-candidate`, `manual-only`, `privacy`,
 cancelled it (`reset=` `unsupported`, `layout`, `shortcut`, `mouse`, `focus`,
 `backspace`, `delete`, `navigation` or `external-input`), and an unsupported key is
 logged by class only (`class=no-character` for a key that prints nothing,
-`class=other-character` for a digit or symbol a word cannot contain). Privacy
+`class=other-character` for a digit or symbol a word cannot contain). A shortcut
+that ends a word is logged by its editing command only (`reason=shortcut kind=`
+`erase-word`, `paste`, `copy`, `cut`, `undo`, `ctrl`, `alt`, `ctrl-alt` or `win`).
+Privacy
 check lines name what asked for them (`trigger=`) and say when a late answer kept
 an earlier verdict (`source=recent-ok age_ms=`). It never records key codes, scan
 codes, characters, words, clipboard contents, window titles, URLs, file names,

@@ -169,6 +169,7 @@ fn populate_ui(
     ui.set_single_letter_words(settings.single_letter_words);
     ui.set_layout_model(settings.layout_model);
     ui.set_manual_terminal_uia_fallback(settings.manual_terminal_uia_fallback);
+    ui.set_conversion_sound(settings.conversion_sound);
     ui.set_physical_fallback(settings.physical_fallback_for_unsupported_apps);
     ui.set_diagnostics_enabled(settings.diagnostics_enabled);
 
@@ -635,6 +636,7 @@ fn document_from_ui(
     settings.single_letter_words = ui.get_single_letter_words();
     settings.layout_model = ui.get_layout_model();
     settings.manual_terminal_uia_fallback = ui.get_manual_terminal_uia_fallback();
+    settings.conversion_sound = ui.get_conversion_sound();
     settings.physical_fallback_for_unsupported_apps = ui.get_physical_fallback();
     settings.diagnostics_enabled = ui.get_diagnostics_enabled();
 

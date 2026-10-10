@@ -46,6 +46,12 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
   and tries a second time, and after a switch to another window and back it can still
   convert the last word of that window for two minutes when the word is still exactly
   before the caret. When Pause still cannot act, the diagnostics log says why.
+- **A busy clipboard no longer costs a letter.** When the clipboard belongs to a window that
+  does not answer, an automatic conversion now gives up after 0.2 seconds and leaves the word
+  alone instead of counting a failed edit and pausing automatic conversion, and keys held
+  after a Space are handed back to the field even when it cannot be inspected at that moment.
+- **Optional conversion sound.** A soft, quiet tick after each conversion and a lower one
+  after an undo, switched on in Settings (off by default).
 - **Protected paste leaves nothing behind.** The selection made by the program is collapsed
   when the outcome is not the expected one (a selection you made is never touched), and a
   clipboard that could not be restored is counted and logged without switching conversion off.
