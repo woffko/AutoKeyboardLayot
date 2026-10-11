@@ -190,14 +190,18 @@ codes, kept only until the next word boundary or reset), plus, for Pause, the
 physical keys of the last word of at most eight windows for at most two minutes
 after a window switch, a click or a shortcut ended tracking there. While the correction
 gate is armed after a Space, up to 256 key events are held in memory for at
-most 1.2 seconds and then replayed unchanged. If the gate gives up, the held keys
-are handed back to the same field unless the privacy check finds a password
-field or an excluded or elevated program; a field that merely cannot be inspected
-at that moment (a hung or busy window) does not keep them back, because keeping
-them back would lose them. None of this is written to logs,
-configuration, diagnostics, or network services. Unsupported input, editing,
-navigation, focus changes, layout changes, and queue overflow clear or suppress
-the current context.
+most 1.2 seconds and then replayed unchanged. If the gate gives up on its time
+limit, a full buffer, a full queue or a hook reinstall, the held keys are handed
+back to the same field unless the privacy check finds a password field or an
+excluded or elevated program; a field that merely cannot be inspected at that
+moment (a hung or busy window) does not keep them back. Held keys that are not
+handed back (the gate ended at a click, a focus change, injected input, a failed
+submission or an internal fault, or the hand-back was refused) wait in memory
+for an explicit recovery from the tray menu for at most one minute, or one
+minute from preparing that recovery, and are then deleted. None of this is
+written to logs, configuration, diagnostics, or network services. Unsupported
+input, editing, navigation, focus changes, layout changes, and queue overflow
+clear or suppress the current context.
 
 For the protected-paste backend, the replacement is placed on the global
 clipboard only for the bounded paste transaction. The item opts out of Windows
@@ -311,17 +315,21 @@ within a minute it stops, which is reported once and turned into a prompt when
 Exit is chosen. A tray Exit that is declined (an active correction gate,
 retained input, a busy worker, a pending configuration, a hotkey in progress)
 now asks whether to exit anyway and names those reasons; it warns that
-keystrokes held back for recovery are lost. A worker thread that has already
-finished never blocks Exit. Installer-driven closes never force an exit.
+keystrokes held back for recovery are lost. Retained input deletes itself after
+its minute, so it does not block Exit for longer. A worker thread that has
+already finished never blocks Exit. Installer-driven closes never force an exit.
 
 A Space that arms the correction gate is always released once the worker has
 handled it, whichever path it took (stale input epoch, pending configuration,
 automatic conversion switched off, a pending conversion, a shortcut modifier),
 so held keys no longer wait for the 1.2 second deadline that aborts the gate.
 When a gate timeout does happen and its held keys are handed back in full,
-automatic conversion resumes by itself, at most three times an hour; a failed
-or partial recovery, an explicit recovery, or any other pause stays paused. The
+automatic conversion resumes by itself; so it does when held keys that nobody
+recovered are deleted after their minute, which a tray notice reports. Either
+way it resumes at most three times an hour. A failed or partial recovery waits
+for that minute; an explicit recovery or any other pause stays paused. The
 optional diagnostics log records `phase=armed`, `phase=release_forced`,
+`phase=recovery_discarded` (`reason=expired` after the minute),
 `phase=auto_resumed`, `event=ui_stall` (timer ticks more than 700 ms apart) and
 `event=hook_slow` (a hook callback over 50 ms).
 

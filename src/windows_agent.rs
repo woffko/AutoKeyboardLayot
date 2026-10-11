@@ -201,6 +201,10 @@ const LAYOUT_STABLE_MS: u64 = 50;
 const REPLAY_COMMIT_MS: u64 = 50;
 const CORRECTION_GATE_MAX_HOLD_MS: u64 = 1_200;
 const CORRECTION_GATE_CAPACITY: usize = 256;
+/// Held keys that could not be handed back wait this long in memory for an explicit recovery and
+/// are then deleted, so that they cannot keep automatic conversion paused and Exit declined for
+/// hours. Preparing a recovery from the tray menu gives them this long again from then.
+const RETAINED_INPUT_LIFETIME_MS: u64 = 60_000;
 const TO_UNICODE_DO_NOT_CHANGE_KEYBOARD_STATE: u32 = 4;
 const PRIVACY_ALLOWED: u8 = 0;
 // Worker-only wait: the low-level hook never waits for UI Automation.
@@ -506,6 +510,8 @@ struct RetainedInput {
     foreground: ForegroundContext,
     events: Vec<RawKeyEvent>,
     delivery_uncertain: bool,
+    /// When the keys are deleted unless they were recovered first.
+    expires_at: Instant,
 }
 
 struct CorrectionGate {
@@ -650,6 +656,8 @@ enum RawInputEvent {
         sequence: u64,
         explicit: bool,
     },
+    /// Held keys nobody recovered were deleted; automatic conversion may resume (policy D1).
+    RetainedInputExpired,
     GateDrainReady {
         token: u64,
         drained_count: usize,
@@ -1810,6 +1818,7 @@ impl AppState {
                         .unwrap_or(fallback),
                     events: held,
                     delivery_uncertain: cause == GateFailureCause::DownstreamHook,
+                    expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                 });
                 retained = true;
             }
@@ -1929,6 +1938,7 @@ impl AppState {
                     foreground: self.correction_gate.origin.unwrap_or(first.foreground),
                     events: prefix,
                     delivery_uncertain: sent != 0,
+                    expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                 });
             }
         }
@@ -2660,22 +2670,9 @@ fn arm_input_recovery(hwnd: HWND) {
             return;
         }
         let armed = APP_STATE.with(|slot| {
-            let state = slot.borrow();
-            let Some(state) = state.as_ref() else {
-                return false;
-            };
-            let same_record = state
-                .metrics
-                .retained_input
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_ref()
-                .is_some_and(|input| input.token == token);
-            state
-                .metrics
-                .recovery_armed
-                .store(same_record, Ordering::Release);
-            same_record
+            slot.borrow().as_ref().is_some_and(|state| {
+                prepare_retained_recovery(&state.metrics, token, Instant::now())
+            })
         });
         if !armed {
             return;
@@ -2691,6 +2688,27 @@ fn arm_input_recovery(hwnd: HWND) {
     }
 }
 
+/// Marks the retained record `token` for an explicit recovery with the force hotkey and gives it
+/// a full lifetime from `now`, because returning to the field and placing the caret takes time.
+/// False when that record is gone (recovered, deleted or replaced meanwhile).
+fn prepare_retained_recovery(metrics: &ObserverMetrics, token: u64, now: Instant) -> bool {
+    let mut retained = metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let same_record = match retained.as_mut() {
+        Some(input) if input.token == token => {
+            input.expires_at = input
+                .expires_at
+                .max(now + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS));
+            true
+        }
+        _ => false,
+    };
+    metrics.recovery_armed.store(same_record, Ordering::Release);
+    same_record
+}
+
 fn discard_retained_input(hwnd: HWND) {
     let confirmed = unsafe {
         MessageBoxW(
@@ -2703,23 +2721,32 @@ fn discard_retained_input(hwnd: HWND) {
     if confirmed != IDYES {
         return;
     }
-    APP_STATE.with(|slot| {
-        if let Some(state) = slot.borrow().as_ref() {
-            state
-                .metrics
-                .retained_input
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            state.metrics.recovery_armed.store(false, Ordering::Release);
+    // The keys' lifetime may have ended while the question was open.
+    let discarded = APP_STATE.with(|slot| {
+        let state = slot.borrow();
+        let Some(state) = state.as_ref() else {
+            return false;
+        };
+        let discarded = state
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .is_some();
+        state.metrics.recovery_armed.store(false, Ordering::Release);
+        if discarded {
             state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
         }
+        discarded
     });
-    show_tray_information(
-        hwnd,
-        tr("recovery.discarded_title"),
-        tr("recovery.discarded_body"),
-    );
+    if discarded {
+        show_tray_information(
+            hwnd,
+            tr("recovery.discarded_title"),
+            tr("recovery.discarded_body"),
+        );
+    }
 }
 
 fn toggle_auto_enabled() {
@@ -3360,6 +3387,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             finish_configuration_load(hwnd);
             finish_configuration_reload(hwnd);
             expire_correction_gate();
+            expire_retained_input(hwnd, Instant::now());
             expire_lexicon_candidate();
             refresh_tray_state();
             LRESULT(0)
@@ -4030,6 +4058,50 @@ fn fail_open_correction_gate(token: u64) {
             state.break_correction_gate_fail_open(GateFailureCause::WorkerAck);
         }
     });
+}
+
+/// Deletes held keys that were neither handed back nor recovered within their lifetime. They were
+/// never typed, and keeping them would keep automatic conversion paused, the gate disarmed and
+/// Exit declined until someone acted on the tray notice. The worker then decides whether
+/// automatic conversion resumes, under the budget of a recovered gate abort (policy D1).
+fn expire_retained_input(hwnd: HWND, now: Instant) {
+    let expired = APP_STATE.with(|slot| {
+        let state = slot.borrow();
+        let state = state.as_ref()?;
+        let expired = {
+            let mut retained = state
+                .metrics
+                .retained_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if retained
+                .as_ref()
+                .is_some_and(|input| now >= input.expires_at)
+            {
+                retained.take()
+            } else {
+                None
+            }
+        }?;
+        state.metrics.recovery_armed.store(false, Ordering::Release);
+        state.gate_diagnostic(
+            "recovery_discarded",
+            format!(
+                "explicit=false reason=expired token={} held={}",
+                expired.token,
+                expired.events.len()
+            ),
+        );
+        let _ = state.enqueue(RawInputEvent::RetainedInputExpired);
+        Some(())
+    });
+    if expired.is_some() {
+        show_tray_information(
+            hwnd,
+            tr("recovery.discarded_title"),
+            tr("recovery.expired_body"),
+        );
+    }
 }
 
 fn expire_correction_gate() {
@@ -5632,6 +5704,7 @@ impl InputProcessor {
                 RawInputEvent::GateDrainReady { .. } => "gate_ack",
                 RawInputEvent::PrivacyRefresh(_) => "privacy",
                 RawInputEvent::RecoverInput { .. } => "recovery",
+                RawInputEvent::RetainedInputExpired => "recovery_expired",
                 RawInputEvent::Mouse => "mouse",
                 RawInputEvent::ExternalInjection => "external",
                 RawInputEvent::ReloadConfiguration => "configuration",
@@ -5664,6 +5737,11 @@ impl InputProcessor {
                     .configuration_ack
                     .store(reload.revision, Ordering::Release);
             }
+            return;
+        }
+        if matches!(queued.event, RawInputEvent::RetainedInputExpired) {
+            // Not input: a newer input epoch must not drop the decision to resume.
+            self.resume_after_recovered_abort(Instant::now());
             return;
         }
         let current_epoch = self.metrics.input_epoch.load(Ordering::Acquire);
@@ -5740,6 +5818,7 @@ impl InputProcessor {
                 }
             }
             RawInputEvent::ReloadConfiguration => unreachable!(),
+            RawInputEvent::RetainedInputExpired => unreachable!(),
             RawInputEvent::GateDrainReady { .. } => unreachable!(),
         }
     }
@@ -5966,9 +6045,10 @@ impl InputProcessor {
         }
     }
 
-    /// Policy D1: a gate abort whose held input came back in full is no reason to stay off.
-    /// Automatic conversion resumes when that abort was the only reason for the pause, at most
-    /// three times an hour; any other pause, including one the user chose, stays as it is.
+    /// Policy D1: a gate abort whose held input came back in full, or was deleted after nobody
+    /// recovered it within its lifetime, is no reason to stay off. Automatic conversion resumes
+    /// when that abort was the only reason for the pause, at most three times an hour; any other
+    /// pause, including one the user chose, stays as it is.
     fn resume_after_recovered_abort(&mut self, now: Instant) {
         let metrics = &self.metrics;
         let paused_by_the_abort = !metrics.auto_enabled.load(Ordering::Acquire)
@@ -10513,6 +10593,32 @@ mod tests {
     }
 
     #[test]
+    fn deleted_held_keys_resume_automatic_conversion_even_from_an_older_input_epoch() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        metrics.auto_enabled.store(false, Ordering::Release);
+        metrics.safety_paused.store(true, Ordering::Release);
+        metrics
+            .last_failure_reason
+            .store(ConversionFailureReason::GateDrain as u8, Ordering::Release);
+        let queued_epoch = metrics.input_epoch.load(Ordering::Acquire);
+        // Input that arrived after the expiry was queued moved the epoch on.
+        metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        processor.process_event(QueuedInputEvent {
+            epoch: queued_epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::RetainedInputExpired,
+            configuration: None,
+        });
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(!metrics.safety_paused.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::None as u8
+        );
+    }
+
+    #[test]
     fn only_a_complete_automatic_recovery_may_resume() {
         assert!(should_resume_after_recovery(false, 12, 12));
         assert!(!should_resume_after_recovery(true, 12, 12), "explicit");
@@ -11104,6 +11210,7 @@ mod tests {
             foreground: retained_key.foreground,
             events: vec![retained_key],
             delivery_uncertain: false,
+            expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
         });
         assert!(!state.request_shutdown());
         assert_eq!(
@@ -11198,6 +11305,89 @@ mod tests {
         assert!(!state.correction_gate.active);
         assert!(!state.metrics.auto_enabled.load(Ordering::Acquire));
         assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn held_keys_nobody_recovers_are_deleted_after_their_lifetime() {
+        let (state, receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        let start = Instant::now();
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+        });
+        metrics.recovery_armed.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(HWND::default(), start + lifetime - Duration::from_millis(1));
+        assert!(has_retained_input(&metrics), "kept for its whole lifetime");
+        assert!(metrics.recovery_armed.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
+        expire_retained_input(HWND::default(), start + lifetime);
+        assert!(!has_retained_input(&metrics));
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+        // The worker is told, so that automatic conversion can resume, and Exit is no longer
+        // declined for held input.
+        assert!(matches!(
+            receiver.try_recv().unwrap().event,
+            RawInputEvent::RetainedInputExpired
+        ));
+        let state = take_app_state().unwrap();
+        assert!(state.decline_reasons().is_empty());
+        // Nothing is deleted or reported twice.
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(HWND::default(), start + lifetime * 2);
+        assert!(receiver.try_recv().is_err());
+        drop(take_app_state());
+    }
+
+    #[test]
+    fn preparing_a_recovery_gives_the_held_keys_a_full_lifetime_from_then() {
+        let metrics = ObserverMetrics::default();
+        let key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        let start = Instant::now();
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+        });
+        let expiry = || {
+            metrics
+                .retained_input
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .expires_at
+        };
+        // A notice about another record prepares nothing.
+        assert!(!prepare_retained_recovery(
+            &metrics,
+            11,
+            start + lifetime / 2
+        ));
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+        assert_eq!(expiry(), start + lifetime);
+        assert!(prepare_retained_recovery(
+            &metrics,
+            10,
+            start + lifetime / 2
+        ));
+        assert!(metrics.recovery_armed.load(Ordering::Acquire));
+        assert_eq!(expiry(), start + lifetime / 2 + lifetime);
+        // Preparing again never shortens it.
+        assert!(prepare_retained_recovery(&metrics, 10, start));
+        assert_eq!(expiry(), start + lifetime / 2 + lifetime);
+        metrics.retained_input.lock().unwrap().take();
+        assert!(!prepare_retained_recovery(&metrics, 10, start));
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
     }
 
     #[test]

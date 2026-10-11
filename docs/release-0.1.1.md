@@ -50,6 +50,12 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
   does not answer, an automatic conversion now gives up after 0.2 seconds and leaves the word
   alone instead of counting a failed edit and pausing automatic conversion, and keys held
   after a Space are handed back to the field even when it cannot be inspected at that moment.
+- **Held keys no longer keep conversion off for hours.** Keys held after a Space that could
+  not be handed back (for example because a click ended the hold) waited in memory until they
+  were recovered or deleted from the tray menu. Meanwhile automatic conversion stayed paused
+  and Exit was declined, so one unnoticed notice kept conversion off for a whole evening. They
+  are now deleted after one minute (preparing a recovery gives one more minute), a second
+  notice says so, and automatic conversion resumes (up to three times an hour).
 - **Optional conversion sound.** A soft, quiet tick after each conversion and a lower one
   after an undo, switched on in Settings (off by default).
 - **Protected paste leaves nothing behind.** The selection made by the program is collapsed
