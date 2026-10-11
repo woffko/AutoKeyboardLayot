@@ -2,9 +2,9 @@
 
 `tools/deploy-host.ps1` replaces the per-user installation
 (`%LOCALAPPDATA%\Programs\AutoKeyboardLayot\AutoKeyboardLayot.exe`) with a build whose SHA-256 you
-have recorded. It keeps a backup, asks the running agent to close gracefully, verifies the result and
-restores the backup when anything fails. It is meant for development installs from a checkout; the
-installer remains the way to install for other users.
+have recorded. It asks the running agent to close gracefully and stops without changes when it
+declines, keeps a backup, verifies the result and restores the backup when anything fails. It is meant
+for development installs from a checkout; the installer remains the way to install for other users.
 
 ## Build
 
@@ -45,11 +45,17 @@ The script stops before changing anything when:
   close;
 - the candidate's `--verify-profile` preflight does not exit with 0 within 15 seconds.
 
-After the preflight it copies the backup, closes the agent with `WM_CLOSE` (waiting at most 10 seconds),
-replaces the executable, verifies the installed hash, starts the new agent, waits five seconds and
-checks that exactly one agent process runs and its observer window exists. On any failure from the
-closing step on, it stops the new agent, restores the backup and restarts the previous agent when one
-was running.
+After the preflight it closes the agent with `WM_CLOSE` and waits at most 10 seconds. An agent that
+does not close in time keeps running and nothing is changed: the agent declines to exit while it holds
+typed input or is busy (with diagnostics on, its log says `event=gate phase=shutdown result=declined
+blockers=...`), and stopping it by force would lose that input. Run the script again later; held
+keys that nobody recovers are deleted after one minute.
+
+Then it copies the backup, replaces the executable, verifies the installed hash, starts the new agent,
+waits five seconds and checks that exactly one agent process runs and its observer window exists. On
+any failure from the backup on, it stops the new agent and waits for it to exit (the executable stays
+locked until then), restores the backup when the executable was already replaced, and restarts the
+previous agent when one was running.
 
 The last lines are a receipt: `DEPLOYED_PID`, `EXE_SHA256`, `BACKUP`, and the number of pruned and kept
 backups.

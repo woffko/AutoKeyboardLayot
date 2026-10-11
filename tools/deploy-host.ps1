@@ -5,11 +5,14 @@ Replaces the per-user AutoKeyboardLayot.exe with a verified build, keeping a bac
 .DESCRIPTION
 Steps: verify the candidate's SHA-256, refuse to continue when an unexpected agent process or application
 window exists, run the candidate's --verify-profile preflight (it must exit 0), copy the installed
-executable to AutoKeyboardLayot.exe.before-<BackupSuffix>, ask the running agent to close through its
-advertised graceful-close window (WM_CLOSE, at most 10 seconds), replace the executable, verify the
-installed hash, start the new agent, verify exactly one agent process with its observer window, and prune
-older AutoKeyboardLayot.exe.before-* backups so that the newest KeepBackups remain. Any failure after the
-backup was made restores the backup and restarts the previous agent when one was running.
+ask the running agent to close through its advertised graceful-close window (WM_CLOSE, at most 10
+seconds), copy the installed executable to AutoKeyboardLayot.exe.before-<BackupSuffix>, replace the
+executable, verify the installed hash, start the new agent, verify exactly one agent process with its
+observer window, and prune older AutoKeyboardLayot.exe.before-* backups so that the newest KeepBackups
+remain. An agent that does not close in time keeps running and nothing is changed: it declines while it
+holds typed input or is busy, and stopping it by force would lose that input. Any later failure stops
+the new agent and waits for it to exit, restores the backup when the executable was already replaced,
+and restarts the previous agent when one was running.
 
 The installation directory is derived from %LOCALAPPDATA%. With -WhatIf the script performs only read-only
 checks, prints the plan and changes nothing (the candidate preflight is not run). -Confirm asks before
@@ -145,13 +148,19 @@ $check = [System.Diagnostics.Process]::Start($start)
 if (-not $check.WaitForExit(15000)) { throw 'Candidate preflight pending; do not launch another check.' }
 if ($check.ExitCode -ne 0) { throw 'Candidate profile preflight failed; installed application unchanged.' }
 
+# --- Graceful close: an agent that declines keeps running and nothing is changed ---
+foreach ($process in $running) {
+    if (-not (Close-Agent $process)) {
+        throw 'The running agent did not close within 10 seconds (it declines while it holds typed input or is busy); nothing was changed.'
+    }
+}
+
 # --- Replacement with rollback ---
-Copy-Item -LiteralPath $destination -Destination $backup
+$replaced = $false
 $agent = $null
 try {
-    foreach ($process in $running) {
-        if (-not (Close-Agent $process)) { throw 'Agent did not close gracefully; deployment stopped.' }
-    }
+    Copy-Item -LiteralPath $destination -Destination $backup
+    $replaced = $true
     Copy-Item -LiteralPath $Source -Destination $destination -Force
     if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
         throw 'Installed hash mismatch.'
@@ -167,8 +176,12 @@ try {
     $failure = $_.Exception.Message
     foreach ($process in @(Get-AgentProcesses)) {
         if (-not (Close-Agent $process)) { Stop-Process -Id $process.Id -Force }
+        # Stop-Process does not wait, and the executable stays locked until the process is gone.
+        if (-not $process.WaitForExit(10000)) {
+            throw ('Deployment failed (' + $failure + ') and an agent process did not exit; the backup was not restored.')
+        }
     }
-    Copy-Item -LiteralPath $backup -Destination $destination -Force
+    if ($replaced) { Copy-Item -LiteralPath $backup -Destination $destination -Force }
     if ($running.Count -gt 0) { Start-Process -FilePath $destination }
     throw ('Deployment failed and was rolled back: ' + $failure)
 }
