@@ -3,7 +3,8 @@
 The published catalog (`catalog.aklc`) is valid for a window. A client refuses it
 outside `issued_at <= now < expires_at`, and online language installation stops
 until a valid one is published again. The revision 5 catalog expired on
-2026-09-26 and was replaced by revision 6 on 2026-10-03 (see the next section).
+2026-09-26 and was replaced by revision 6 on 2026-10-03, followed by revision 7 on
+2026-10-11 (see the next section).
 This page is the runbook for every renewal. The background is in
 [`package-release-catalog.md`](package-release-catalog.md); the key is described
 in [`package-signing-key.md`](package-signing-key.md).
@@ -13,22 +14,25 @@ signing with the release key, and replacing a published release asset. Nothing i
 this repository, no script and no agent does either on its own. The commands
 below are what the owner runs; reading them authorizes nothing.
 
-## Last renewal: revision 6, 2026-10-03
+## Last renewal: revision 7, 2026-10-11
 
 Done with the owner's approval, following the steps below.
 
 | | |
 |---|---|
-| Candidate | `catalog-r6.unsigned.json`, SHA-256 `7e66cc51c36d7270da7c5de613422b2bc86748149fcd5f409d040b2d230e80bf` |
-| Content | the 13 package records of revision 5, unchanged; revision 6 |
-| Window | 21 days: `issued_at` 2026-10-03 14:39:10 UTC, `expires_at` 2026-10-24 14:39:10 UTC |
-| Signer | `sign-language-package.exe` built from commit `ef2146b`, SHA-256 `1e0b392321bfb50928665697beb66a57a311cfffc5f63936dfdeba2e0cd4a6dc` |
-| Published | `catalog.aklc`, SHA-256 `be12be43683069b4d543cb2bdadff6b050d23c6d00ed54f4c46807ed3325ceda`, signed by `pkg-20260912-01`, uploaded to the release `lang-r5-20260919` (the Latest release) |
-| Checked | offline (`verify_release_catalog`: 13 packages; `check_catalog_expiry`: 502 hours left), then anonymously from the Latest URL: same bytes, and all 13 package URLs match the catalog |
-| Replaced | revision 5, SHA-256 `b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503` (kept as `tests/fixtures/mutation-seed-catalog.aklc`) |
+| Candidate | `catalog-r7.unsigned.json`, SHA-256 `c8b4ff22ae541de53bc3b8c323b629a3a53432b8c210d75d8ab9259cd3eea776` |
+| Content | the 13 package records of revisions 5 and 6, unchanged; revision 7 |
+| Window | 21 days: `issued_at` 2026-10-11 15:19:48 UTC, `expires_at` 2026-11-01 15:19:48 UTC |
+| Signer | `sign-language-package.exe` built from commit `1bed8d8`, SHA-256 `7e49518128ada6d1c199856365f3ba4c3c53658a52d6ca8ecfdd9aadc3c1296b` |
+| Published | `catalog.aklc`, SHA-256 `5556daaab37f4c6ca7a8fa177c58cfcc55bd579d043f46bf1e69f5d5bdf3508d`, signed by `pkg-20260912-01`, uploaded to the release `lang-r5-20260919` (the Latest release) |
+| Checked | offline (`verify_release_catalog`: 13 packages; `check_catalog_expiry`: 502 hours left; `check_catalog_candidate.py` against revision 6), then anonymously from the Latest URL: same bytes, and all 13 package URLs match the catalog |
+| Replaced | revision 6, SHA-256 `be12be43683069b4d543cb2bdadff6b050d23c6d00ed54f4c46807ed3325ceda` (signed 2026-10-03 by a signer built from `ef2146b`, valid until 2026-10-24 14:39:10 UTC) |
 
-**The next renewal is due before about 2026-10-14**, when the daily check starts to
-report fewer than 10 days. Revision 7 is the next revision number.
+Revision 5, SHA-256 `b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503`, is kept as
+`tests/fixtures/mutation-seed-catalog.aklc`.
+
+**The next renewal is due before about 2026-10-22**, when the daily check starts to
+report fewer than 10 days. Revision 8 is the next revision number.
 
 The window starts when the candidate is made, not when it is signed. Every day
 between the two shortens what the signed catalog is good for, so **make the
@@ -40,14 +44,16 @@ candidate whose window started more than three hours earlier.
 Run steps 1, 2 and 5 on any machine with this repository; steps 3 and 4 in the
 Windows profile that owns the signing key. Replace the date in the directory
 name with today's. The revision must be one higher than the catalog that is
-published now (6 after revision 5); equal or lower revisions are refused by every
-client that accepted the earlier one.
+published now (8 after revision 7); equal or lower revisions are refused by every
+client that accepted the earlier one. Download the catalog that is published now
+first (step 6): steps 2 and 5 compare the candidate with it.
 
 ```sh
 TAG=lang-r5-20260919                # the release that holds the package files
-REVISION=6
-PACKAGES=target/catalog-candidates-20260919-05   # the 13 package files and the revision 5 catalog (compare against the one published now)
+REVISION=8
+PACKAGES=target/catalog-candidates-20260919-05   # the 13 package files
 WORK=target/catalog-candidates-$(date -u +%Y%m%d)-0$REVISION
+PREVIOUS="$WORK/rollback/catalog.aklc"           # the catalog published now (step 6)
 ```
 
 ### 1. Make the unsigned candidate
@@ -65,7 +71,7 @@ fresh catalog.
 ### 2. Review it
 
 ```sh
-python3 tools/check_catalog_candidate.py "$PACKAGES/catalog.aklc" "$WORK/catalog-r$REVISION.unsigned.json"
+python3 tools/check_catalog_candidate.py "$PREVIOUS" "$WORK/catalog-r$REVISION.unsigned.json"
 sha256sum "$WORK/catalog-r$REVISION.unsigned.json"
 ```
 
@@ -91,9 +97,9 @@ only in the profile that created it. Do not distribute it.
 ### 4. Sign (needs the owner's approval; uses the release key)
 
 ```powershell
-$work = 'target\catalog-candidates-YYYYMMDD-06'   # the directory of step 1, with today's date
+$work = 'target\catalog-candidates-YYYYMMDD-08'   # the directory of step 1, with today's date
 $exe  = (Resolve-Path target\release\sign-language-package.exe).Path
-$in   = (Resolve-Path "$work\catalog-r6.unsigned.json").Path
+$in   = (Resolve-Path "$work\catalog-r8.unsigned.json").Path
 $exeHash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 $inHash  = (Get-FileHash -Algorithm SHA256 $in).Hash.ToLowerInvariant()
 # $inHash must equal the value written down in step 2.
@@ -113,7 +119,7 @@ verifies its own output before it writes it.
 ```sh
 cargo run --locked --example verify_release_catalog -- "$WORK/catalog.aklc" "$PACKAGES"
 cargo run --locked --example check_catalog_expiry -- "$WORK/catalog.aklc"
-python3 tools/check_catalog_candidate.py "$PACKAGES/catalog.aklc" "$WORK/catalog.aklc" --max-age-hours 24
+python3 tools/check_catalog_candidate.py "$PREVIOUS" "$WORK/catalog.aklc" --max-age-hours 24
 ```
 
 The first command checks the signature against the trust list that is compiled in
@@ -124,14 +130,13 @@ signed catalog still has exactly the reviewed content.
 ### 6. Keep the catalog that is published now
 
 ```sh
-mkdir -p rollback && gh release download "$TAG" --repo woffko/AutoKeyboardLayot \
-  --pattern catalog.aklc --dir rollback
-sha256sum rollback/catalog.aklc
+mkdir -p "$WORK/rollback" && gh release download "$TAG" --repo woffko/AutoKeyboardLayot \
+  --pattern catalog.aklc --dir "$WORK/rollback"
+sha256sum "$PREVIOUS"
 ```
 
-For revision 5 these bytes have the SHA-256
-`b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503` and are also
-kept in `tests/fixtures/mutation-seed-catalog.aklc`.
+Run this before step 1. For revision 7 these bytes have the SHA-256
+`5556daaab37f4c6ca7a8fa177c58cfcc55bd579d043f46bf1e69f5d5bdf3508d` (see the table above).
 
 ### 7. Publish (needs the owner's approval; replaces a published asset)
 

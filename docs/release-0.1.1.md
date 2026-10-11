@@ -99,11 +99,11 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
 ## Language catalog and packages
 
 No package changes in this release: the 13 packages of catalog revision 5 are unchanged, and
-installed packages keep working. The published catalog had expired on 2026-09-26; a renewed one
-(revision 6, signed on 2026-10-03 and valid until 2026-10-24 14:39 UTC) is published, so online
-language installation works again. The catalog has to be renewed before every expiry with the
-owner's signing key; the runbook is [`catalog-renewal.md`](catalog-renewal.md), and the next
-renewal is due before about 2026-10-14.
+installed packages keep working. The published catalog had expired on 2026-09-26; renewed ones
+are published (revision 6 on 2026-10-03, then revision 7, signed on 2026-10-11 and valid until
+2026-11-01 15:19 UTC), so online language installation works again. The catalog has to be
+renewed before every expiry with the owner's signing key; the runbook is
+[`catalog-renewal.md`](catalog-renewal.md), and the next renewal is due before about 2026-10-22.
 
 ## Known limits
 
@@ -124,7 +124,8 @@ that nobody has reviewed.
 
 1. **Review the third-party notices.** The regenerated file includes the layout-model notice
    and the dictionary license, and is bound to the exact `Cargo.toml` and `Cargo.lock` below.
-   Read it, then take its SHA-256 as the reviewed value. A different `Cargo.toml` or
+   Read it, then take its SHA-256 as the reviewed value. The owner reviewed and accepted it on
+   2026-10-11. A different `Cargo.toml` or
    `Cargo.lock`, or any dependency change, makes it stale and the pipeline has to run again.
 
    | | |
@@ -173,7 +174,7 @@ that nobody has reviewed.
    [`audit-remediation-2026-09.md`](audit-remediation-2026-09.md) and, if the installer is the
    change under test, the VM scripts (see `tools/vm_config.py` for the settings they need).
 
-5. **Keep the catalog current.** Revision 6 is published (see above). If the 0.1.1 release is
+5. **Keep the catalog current.** Revision 7 is published (see above). If the 0.1.1 release is
    going to be marked Latest, it must also carry the signed `catalog.aklc` (step 6).
 
 6. **Publish.** Create the release, upload the installer and its checksums, download
@@ -185,4 +186,12 @@ that nobody has reviewed.
 
 ## Checksums
 
-Installer: not built yet.
+Installer: built on 2026-10-11 from `1bed8d8` with the reviewed notices, for acceptance. It is not
+signed with Authenticode, not yet accepted on a desktop, and not published.
+
+| File | Bytes | SHA-256 |
+|---|---|---|
+| `AutoKeyboardLayot-0.1.1-setup-experimental.exe` | 11024611 | `dfb424283899ffb1425fbe78c5efa881bc787d3ceb0a1078995a64b7d792c917` |
+| `AutoKeyboardLayot.exe` (inside) | 22345216 | `ca343db9f81c7ab796e681a4ea6e64575173d60f5a64ff0420d8e6fd93f06027` |
+| `installer-package-helper.exe` (inside) | 1654272 | `86d5699aff779133137834d3954ad500b46c1b6ede7dcaf10a2eb0476e3a07af` |
+| `THIRD-PARTY-NOTICES.txt` (inside) | | `4c62f14d32631cc6f16051201ec7bf83cb8a9fbe6e2403cf307e9c35f1568ae1` |
