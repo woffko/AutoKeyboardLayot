@@ -24,7 +24,7 @@ use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
 use autokeyboardlayot::ui_guard::{
     ForegroundPrivilege, HookWatchdog, TrayThrottle, WatchdogAction, WatchdogFacts,
-    hooks_look_silent, retry_delay,
+    captures_keyboard, hooks_look_silent, retry_delay,
 };
 use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
 use ui_localization::{tr, tr_format};
@@ -103,7 +103,8 @@ use windows::{
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
                 NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFYICON_VERSION_4,
-                NOTIFYICONDATAW, Shell_NotifyIconW,
+                NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+                SHQueryUserNotificationState, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CallNextHookEx, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
@@ -213,6 +214,15 @@ const PRIVACY_PROBE_WAIT_MS: u64 = 300;
 /// How long a failed field check may lean on the last good one for the same input target. The
 /// provider of a busy terminal answers a check late now and then; see `settle_probe_outcome`.
 const PRIVACY_RECENT_OK_MS: u64 = 2_000;
+/// Periodic field checks run every half second while they are fast. A slow one spaces the next
+/// by twenty times its own length, so that periodic checks fill at most a twentieth of the
+/// worker's time, and never more than five seconds apart.
+const PRIVACY_REFRESH_MIN_MS: u64 = 500;
+const PRIVACY_REFRESH_MAX_MS: u64 = 5_000;
+const PRIVACY_REFRESH_COST_FACTOR: u32 = 20;
+/// A field check at least this slow marks a full-screen program (a game answered in about
+/// 150 ms) that is not asked again periodically while its input target stays the same.
+const PRIVACY_SLOW_PROVIDER_MS: u64 = 50;
 const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
 /// A privacy provider that keeps the probe busy this long without answering is replaced.
 const PRIVACY_PROBE_STUCK_AFTER_SECS: u64 = 5;
@@ -374,6 +384,12 @@ struct ObserverMetrics {
     clipboard_restore_failures: AtomicU64,
     retained_input: Mutex<Option<RetainedInput>>,
     recovery_armed: AtomicBool,
+    // How long the last field check took, in milliseconds: the UI thread spaces the periodic
+    // checks by it.
+    privacy_probe_cost_ms: AtomicU64,
+    // The worker's last observation of a full-screen foreground. The hook watchdog runs on the
+    // hook thread and must not ask the shell itself.
+    foreground_full_screen: AtomicBool,
 }
 
 impl Default for ObserverMetrics {
@@ -412,6 +428,8 @@ impl Default for ObserverMetrics {
             clipboard_restore_failures: AtomicU64::new(0),
             retained_input: Mutex::new(None),
             recovery_armed: AtomicBool::new(false),
+            privacy_probe_cost_ms: AtomicU64::new(0),
+            foreground_full_screen: AtomicBool::new(false),
         }
     }
 }
@@ -694,6 +712,8 @@ struct PendingConversion {
     space_down_sequence: u64,
     replay_keys: Vec<ReplayKey>,
     forced: bool,
+    // The hotkey's layout order for this word; empty for automatic conversions.
+    cycle_order: Vec<Language>,
 }
 
 /// The most recent word, retained so the user can still convert it with the manual
@@ -730,6 +750,8 @@ struct TransposeCycle {
     text: String,
     epoch: u64,
     profile_generation: u64,
+    // The order the presses walk through, chosen at the first press: see `layout_cycle_order`.
+    order: Vec<Language>,
 }
 
 #[derive(Debug, Clone)]
@@ -2289,6 +2311,7 @@ fn hook_watchdog_tick(hwnd: HWND) {
         hook_silent,
         foreground: foreground_privilege(),
         input_desktop_is_default: input_desktop_is_default(),
+        foreground_captures_input: foreground_captures_input(),
     };
     let action =
         UI_GUARDS.with(|guards| guards.borrow_mut().watchdog.decide(&facts, Instant::now()));
@@ -2925,6 +2948,59 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
     show_tray_information(hwnd, "AutoKeyboardLayot", message);
 }
 
+/// The wait before the next periodic field check, from how long the last check took: half a
+/// second while checks are fast, otherwise twenty times the last check, at most five seconds.
+fn privacy_refresh_interval(last_check: Duration) -> Duration {
+    last_check
+        .saturating_mul(PRIVACY_REFRESH_COST_FACTOR)
+        .clamp(
+            Duration::from_millis(PRIVACY_REFRESH_MIN_MS),
+            Duration::from_millis(PRIVACY_REFRESH_MAX_MS),
+        )
+}
+
+/// Whether a periodic field check can be left out: a full-screen program is in the foreground
+/// and the last periodic check of this same input target was slow, which is how games answer.
+/// A new input target is checked again, and a click or a change of field is checked on the next
+/// typed key as everywhere; only a focus change made by the program itself, without input,
+/// waits for that.
+fn full_screen_check_is_redundant(
+    full_screen: bool,
+    last_check: Option<(ForegroundContext, Duration)>,
+    foreground: ForegroundContext,
+) -> bool {
+    full_screen
+        && last_check.is_some_and(|(target, took)| {
+            same_input_target(target, foreground)
+                && took >= Duration::from_millis(PRIVACY_SLOW_PROVIDER_MS)
+        })
+}
+
+/// Whether the shell reports a full-screen program in the foreground (most games, a full-screen
+/// video). Asked on the worker only: the shell can take long to answer while Explorer is busy,
+/// and the UI thread serves the hooks.
+fn foreground_is_full_screen() -> bool {
+    // SAFETY: the function only writes the state it returns and has no preconditions; a failure
+    // comes back as an error, which counts as not full-screen.
+    let state = unsafe { SHQueryUserNotificationState() };
+    matches!(state, Ok(state) if state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN)
+}
+
+/// Whether the foreground may take the keyboard before the hooks see it: a full-screen program
+/// as the worker last saw it (asking the shell here could block the hook thread), or a virtual
+/// machine console or Remote Desktop window. Gathered only when the hooks already look silent.
+fn foreground_captures_input() -> bool {
+    let full_screen = APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|state| state.metrics.foreground_full_screen.load(Ordering::Acquire))
+    });
+    full_screen
+        || current_foreground_context()
+            .and_then(|context| process_image_name(context.process_id))
+            .is_some_and(|path| captures_keyboard(&path))
+}
+
 fn refresh_tray_state() {
     if APP_STATE.with(|slot| slot.borrow().as_ref().is_some_and(|state| state.menu_open)) {
         return;
@@ -2935,12 +3011,21 @@ fn refresh_tray_state() {
     let shell_foreground = is_shell_process(context.process_id);
     let now = Instant::now();
     APP_STATE.with(|slot| {
-        if let Some(state) = slot.borrow_mut().as_mut()
-            && !shell_foreground
-            && now >= state.next_privacy_refresh
-        {
+        let mut state = slot.borrow_mut();
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        if shell_foreground {
+            // The desktop is no full-screen program, and no refresh will report it.
+            state
+                .metrics
+                .foreground_full_screen
+                .store(false, Ordering::Release);
+        } else if now >= state.next_privacy_refresh {
             state.enqueue(RawInputEvent::PrivacyRefresh(context));
-            state.next_privacy_refresh = now + Duration::from_millis(500);
+            let last_check = state.metrics.privacy_probe_cost_ms.load(Ordering::Acquire);
+            state.next_privacy_refresh =
+                now + privacy_refresh_interval(Duration::from_millis(last_check));
         }
     });
     let last_input_layout = APP_STATE.with(|slot| {
@@ -5375,6 +5460,8 @@ struct InputProcessor {
     privacy_needs_check: bool,
     privacy_reason: Option<PrivacyBlockReason>,
     recent_privacy_ok: Option<RecentPrivacyOk>,
+    // The input target of the last periodic field check and how long it took.
+    last_refresh_check: Option<(ForegroundContext, Duration)>,
     process_reason: Option<PrivacyBlockReason>,
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
@@ -5515,6 +5602,7 @@ impl InputProcessor {
             privacy_needs_check: true,
             privacy_reason: Some(PrivacyBlockReason::InspectionUnavailable),
             recent_privacy_ok: None,
+            last_refresh_check: None,
             process_reason: None,
             last_process_id: None,
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
@@ -5811,11 +5899,21 @@ impl InputProcessor {
                     return;
                 }
                 self.refresh_input_profiles();
-                if foreground_identity_matches(foreground) {
-                    self.evaluate_privacy(foreground, ProbeTrigger::Refresh);
-                } else {
+                if !foreground_identity_matches(foreground) {
                     self.mark_privacy_dirty(false);
+                    return;
                 }
+                self.observe_full_screen(foreground_is_full_screen());
+                if full_screen_check_is_redundant(
+                    self.metrics.foreground_full_screen.load(Ordering::Acquire),
+                    self.last_refresh_check,
+                    foreground,
+                ) {
+                    return;
+                }
+                let started = Instant::now();
+                self.evaluate_privacy(foreground, ProbeTrigger::Refresh);
+                self.last_refresh_check = Some((foreground, started.elapsed()));
             }
             RawInputEvent::ReloadConfiguration => unreachable!(),
             RawInputEvent::RetainedInputExpired => unreachable!(),
@@ -6359,6 +6457,7 @@ impl InputProcessor {
                         space_down_sequence: event.sequence,
                         replay_keys,
                         forced: false,
+                        cycle_order: Vec::new(),
                     });
                 }
                 if event.drain_token == 0 && self.metrics.auto_enabled.load(Ordering::Acquire) {
@@ -6749,7 +6848,7 @@ impl InputProcessor {
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
-            self.log_word_discard("switching-rule", format!("event={}", event.category()));
+            self.log_word_discard("switching-rule", format!("rule={}", event.category()));
             self.session.clear();
         }
     }
@@ -6911,6 +7010,7 @@ impl InputProcessor {
                 cycle.language,
                 cycle.text,
                 event.sequence,
+                Some(cycle.order),
             );
             return;
         }
@@ -6957,10 +7057,12 @@ impl InputProcessor {
             source_language,
             current_text,
             event.sequence,
+            None,
         );
     }
 
-    /// Convert the word to the next enabled layout on each press.
+    /// Convert the word to the next enabled layout on each press. A first press (no
+    /// `cycle_order`) chooses the order: see `layout_cycle_order`.
     #[allow(clippy::too_many_arguments)]
     fn advance_layout_cycle(
         &mut self,
@@ -6971,9 +7073,10 @@ impl InputProcessor {
         source_language: Language,
         current_text: String,
         sequence: u64,
+        cycle_order: Option<Vec<Language>>,
     ) {
         let profiles = self.resolved_profiles().cloned();
-        let order: Vec<Language> = self
+        let enabled: Vec<Language> = self
             .settings
             .enabled_input_packs
             .iter()
@@ -6988,10 +7091,38 @@ impl InputProcessor {
                     .is_some()
             })
             .collect();
-        if order.len() < 2 {
+        if enabled.len() < 2 {
             self.diagnostic("hotkey", "result=ignored reason=single-layout".to_owned());
             return;
         }
+        if !enabled.contains(&source_language) {
+            self.diagnostic(
+                "hotkey",
+                "result=ignored reason=unsupported-layout".to_owned(),
+            );
+            return;
+        }
+        let order = cycle_order
+            .filter(|order| {
+                order.len() == enabled.len()
+                    && enabled.iter().all(|language| order.contains(language))
+            })
+            .unwrap_or_else(|| {
+                let readings: Vec<(Language, String)> = enabled
+                    .iter()
+                    .copied()
+                    .filter(|language| *language != source_language)
+                    .filter_map(|language| {
+                        let layout = self.find_layout(language)?;
+                        Some((language, map_replay_keys_to_layout(&replay_keys, layout)?))
+                    })
+                    .collect();
+                layout_cycle_order(
+                    source_language,
+                    &enabled,
+                    &self.detector.rank_candidates(&readings),
+                )
+            });
         let Some(position) = order.iter().position(|entry| *entry == source_language) else {
             self.diagnostic(
                 "hotkey",
@@ -7042,7 +7173,12 @@ impl InputProcessor {
         self.diagnostic(
             "candidate",
             format!(
-                "forced=true cycle_index={next_index} source={} target={} original_chars={} replacement_chars={} route={:?}",
+                "forced=true cycle_index={next_index} cycle={} source={} target={} original_chars={} replacement_chars={} route={:?}",
+                order
+                    .iter()
+                    .map(|language| language.id())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 detection.source_language.id(),
                 detection.target_language.id(),
                 detection.original.chars().count(),
@@ -7062,6 +7198,7 @@ impl InputProcessor {
             space_down_sequence: sequence,
             replay_keys,
             forced: true,
+            cycle_order: order,
         });
         self.execute_pending_conversion(sequence);
     }
@@ -7208,6 +7345,10 @@ impl InputProcessor {
                 ),
             );
         }
+        self.metrics.privacy_probe_cost_ms.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
         self.privacy_needs_check = false;
         let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
             && self.manual_privacy_allows_reason(reason, foreground);
@@ -7323,6 +7464,18 @@ impl InputProcessor {
         }
         if let Some(player) = &self.sound_player {
             let _ = player.try_send(cue);
+        }
+    }
+
+    /// Publishes whether a full-screen program is in the foreground, for the hook watchdog, and
+    /// logs each change.
+    fn observe_full_screen(&mut self, full_screen: bool) {
+        let previous = self
+            .metrics
+            .foreground_full_screen
+            .swap(full_screen, Ordering::AcqRel);
+        if previous != full_screen {
+            self.diagnostic("foreground", format!("full_screen={full_screen}"));
         }
     }
 
@@ -7602,6 +7755,7 @@ impl InputProcessor {
                 text: pending.transaction.replacement.clone(),
                 epoch: self.last_input_epoch,
                 profile_generation: pending.profile_generation,
+                order: pending.cycle_order.clone(),
             });
         }
         self.request_sound(SoundCue::Converted);
@@ -8487,6 +8641,26 @@ impl InputProcessor {
 
 fn foreground_identity_matches(expected: ForegroundContext) -> bool {
     current_foreground_context().is_some_and(|current| same_input_target(current, expected))
+}
+
+/// The order in which the hotkey walks a word through the layouts: the language it was typed
+/// in, then the languages from `ranked` (the most plausible reading first), then any other
+/// enabled language in its configured order. The first press goes to the second entry, so a
+/// word typed in English reaches Russian first when it reads as Russian, although Estonian
+/// sorts first; the last press returns to the original.
+fn layout_cycle_order(
+    source: Language,
+    enabled: &[Language],
+    ranked: &[Language],
+) -> Vec<Language> {
+    let mut order = Vec::with_capacity(enabled.len());
+    order.push(source);
+    for language in ranked.iter().chain(enabled) {
+        if !order.contains(language) {
+            order.push(*language);
+        }
+    }
+    order
 }
 
 fn same_input_target(first: ForegroundContext, second: ForegroundContext) -> bool {
@@ -9796,6 +9970,7 @@ mod tests {
                 text: "hello".into(),
                 epoch: 0,
                 profile_generation: processor.input_profiles.generation(),
+                order: Vec::new(),
             });
             processor.apply_profile_refresh(false);
             assert!(processor.last_boundary.is_some());
@@ -9831,6 +10006,7 @@ mod tests {
             space_down_sequence: 7,
             replay_keys: Vec::new(),
             forced: true,
+            cycle_order: Vec::new(),
         });
         // A mismatched boundary is rejected before touching the native target.
         processor.execute_pending_conversion_inner(99);
@@ -9913,6 +10089,7 @@ mod tests {
             space_down_sequence: 7,
             replay_keys: Vec::new(),
             forced: false,
+            cycle_order: Vec::new(),
         };
         assert!(processor.pending_profiles_match(&pending));
         pending.profile_generation = pending.profile_generation.wrapping_add(1);
@@ -10615,6 +10792,91 @@ mod tests {
         assert_eq!(
             metrics.last_failure_reason.load(Ordering::Acquire),
             ConversionFailureReason::None as u8
+        );
+    }
+
+    #[test]
+    fn periodic_field_checks_are_spaced_by_their_cost() {
+        let interval = |ms: u64| privacy_refresh_interval(Duration::from_millis(ms)).as_millis();
+        // Fast providers (a terminal answers in a few milliseconds) keep the half second.
+        assert_eq!(interval(0), 500);
+        assert_eq!(interval(3), 500);
+        assert_eq!(interval(25), 500);
+        assert_eq!(interval(26), 520);
+        // The game of 2026-10-11 answered in about 144 ms: about every three seconds instead
+        // of twice a second.
+        assert_eq!(interval(144), 2_880);
+        // Never more than five seconds apart, even after a check that timed out.
+        assert_eq!(interval(250), 5_000);
+        assert_eq!(interval(300), 5_000);
+        assert_eq!(interval(u64::MAX), 5_000);
+    }
+
+    #[test]
+    fn a_slow_full_screen_program_is_checked_once_per_input_target() {
+        let game = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
+        let slow = Duration::from_millis(PRIVACY_SLOW_PROVIDER_MS);
+        let fast = slow - Duration::from_millis(1);
+        assert!(full_screen_check_is_redundant(
+            true,
+            Some((game, slow)),
+            game
+        ));
+        // A layout switch is no new input target.
+        let other_layout = ForegroundContext {
+            layout: game.layout + 1,
+            ..game
+        };
+        assert!(full_screen_check_is_redundant(
+            true,
+            Some((game, slow)),
+            other_layout
+        ));
+        // Not full-screen, never checked, a fast provider, or another input target: check.
+        assert!(!full_screen_check_is_redundant(
+            false,
+            Some((game, slow)),
+            game
+        ));
+        assert!(!full_screen_check_is_redundant(true, None, game));
+        assert!(!full_screen_check_is_redundant(
+            true,
+            Some((game, fast)),
+            game
+        ));
+        let other_focus = ForegroundContext {
+            focus: game.focus + 1,
+            ..game
+        };
+        assert!(!full_screen_check_is_redundant(
+            true,
+            Some((game, slow)),
+            other_focus
+        ));
+    }
+
+    #[test]
+    fn the_hotkey_cycle_starts_with_the_most_plausible_reading() {
+        let enabled = [Language::English, Language::Estonian, Language::Russian];
+        // 2026-10-12 05:39: a word typed in the English layout went to Estonian first, because
+        // the enabled languages are kept in alphabetical order, and needed a second press.
+        assert_eq!(
+            layout_cycle_order(
+                Language::English,
+                &enabled,
+                &[Language::Russian, Language::Estonian]
+            ),
+            [Language::English, Language::Russian, Language::Estonian]
+        );
+        // Without a ranking the configured order follows the source, as before.
+        assert_eq!(
+            layout_cycle_order(Language::Russian, &enabled, &[]),
+            [Language::Russian, Language::English, Language::Estonian]
+        );
+        // A language the word cannot be read in comes last, and nothing is repeated.
+        assert_eq!(
+            layout_cycle_order(Language::English, &enabled, &[Language::Estonian]),
+            [Language::English, Language::Estonian, Language::Russian]
         );
     }
 
@@ -13329,6 +13591,7 @@ mod tests {
             text: "hello".into(),
             epoch: 0,
             profile_generation: processor.input_profiles.generation(),
+            order: Vec::new(),
         });
 
         processor.set_privacy_reason_with_manual_exception(

@@ -625,6 +625,26 @@ impl Detector {
         }
     }
 
+    /// The languages of `readings` (one word read in several layouts) from the most to the least
+    /// plausible reading. The word score decides, which includes the dictionary bonus; equal
+    /// scores keep the given order. The hotkey sends a word to the first of them.
+    pub fn rank_candidates(&self, readings: &[(Language, String)]) -> Vec<Language> {
+        let mut scored: Vec<(Language, f32)> = readings
+            .iter()
+            .map(|(language, reading)| {
+                let score = score_word(
+                    reading,
+                    *language,
+                    &self.user_dictionary,
+                    &self.dictionaries,
+                );
+                (*language, score)
+            })
+            .collect();
+        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
+        scored.into_iter().map(|(language, _)| language).collect()
+    }
+
     fn dictionary_contains(&self, language: Language, word: &str) -> bool {
         self.base_dictionary_contains(language, word)
             || self.common_short_contains(language, word)
@@ -791,6 +811,37 @@ mod tests {
             .iter()
             .map(|(language, text)| (*language, (*text).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn the_hotkey_ranks_the_plausible_reading_first_whatever_the_language_order() {
+        let detector = crate::test_support::detector();
+        // `ghbdtn` typed in the English layout: the Russian reading is a dictionary word, the
+        // Estonian layout gives the same Latin letters, which are no word.
+        for readings in [
+            mapped(&[
+                (Language::Estonian, "ghbdtn"),
+                (Language::Russian, "привет"),
+            ]),
+            mapped(&[
+                (Language::Russian, "привет"),
+                (Language::Estonian, "ghbdtn"),
+            ]),
+        ] {
+            assert_eq!(
+                detector.rank_candidates(&readings),
+                [Language::Russian, Language::Estonian]
+            );
+        }
+        // `k[simus` typed in the English layout reads as Estonian `küsimus`.
+        assert_eq!(
+            detector.rank_candidates(&mapped(&[
+                (Language::Russian, "лхышьгы"),
+                (Language::Estonian, "küsimus"),
+            ])),
+            [Language::Estonian, Language::Russian]
+        );
+        assert!(detector.rank_candidates(&[]).is_empty());
     }
 
     #[test]

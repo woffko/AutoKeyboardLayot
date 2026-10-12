@@ -19,6 +19,17 @@ pub const REINSTALL_MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// Reinstallations the watchdog may trigger per hour before it reports instability instead.
 pub const REINSTALL_PER_HOUR: usize = 4;
 const HOUR: Duration = Duration::from_secs(60 * 60);
+/// Programs that take the keyboard for a guest or remote session with a low-level hook of their
+/// own, ahead of the agent's: the VMware, VirtualBox and Hyper-V consoles and the Remote Desktop
+/// clients.
+const KEYBOARD_CAPTURING_PROGRAMS: [&str; 6] = [
+    "vmware.exe",
+    "vmplayer.exe",
+    "virtualboxvm.exe",
+    "vmconnect.exe",
+    "mstsc.exe",
+    "msrdc.exe",
+];
 
 /// What is known about the foreground window's privilege compared with the agent's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +48,14 @@ pub enum ForegroundPrivilege {
 /// condition first and gathers the other facts only when it holds.
 pub fn hooks_look_silent(input_idle: Duration, hook_silent: Duration) -> bool {
     input_idle <= INPUT_RECENT && hook_silent > HOOK_SILENT
+}
+
+/// Whether the program at `image_path` (a full path or a file name) takes the keyboard itself.
+pub fn captures_keyboard(image_path: &str) -> bool {
+    let name = image_path.rsplit(['/', '\\']).next().unwrap_or(image_path);
+    KEYBOARD_CAPTURING_PROGRAMS
+        .iter()
+        .any(|program| name.eq_ignore_ascii_case(program))
 }
 
 impl ForegroundPrivilege {
@@ -61,6 +80,11 @@ pub struct WatchdogFacts {
     pub foreground: ForegroundPrivilege,
     /// False on the lock screen and the secure desktop, where typing never reaches the hooks.
     pub input_desktop_is_default: bool,
+    /// A full-screen program (most games), a virtual machine console or a Remote Desktop window
+    /// is in the foreground. These often take the keyboard with a hook of their own before the
+    /// agent's hooks see it, so silence proves nothing there, and reinstalling would only fight
+    /// them. The hooks are judged again once another window is in the foreground.
+    pub foreground_captures_input: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,11 +110,13 @@ impl HookWatchdog {
 
     /// Every condition must hold for the hooks to count as silent: the user is typing now, no hook
     /// callback ran for a while, the input desktop is the default one, and the foreground window
-    /// is one whose input must reach the hooks. An unknown privilege never triggers.
+    /// is one whose input must reach the hooks: not a higher integrity level, and not a program
+    /// that takes the keyboard itself. An unknown privilege never triggers.
     pub fn decide(&mut self, facts: &WatchdogFacts, now: Instant) -> WatchdogAction {
         let silent = hooks_look_silent(facts.input_idle, facts.hook_silent)
             && facts.input_desktop_is_default
-            && facts.foreground == ForegroundPrivilege::NotHigher;
+            && facts.foreground == ForegroundPrivilege::NotHigher
+            && !facts.foreground_captures_input;
         if !silent {
             return WatchdogAction::Nothing;
         }
@@ -167,6 +193,7 @@ mod tests {
             hook_silent: Duration::from_secs(10),
             foreground: ForegroundPrivilege::NotHigher,
             input_desktop_is_default: true,
+            foreground_captures_input: false,
         }
     }
 
@@ -251,6 +278,54 @@ mod tests {
             ..typing_with_silent_hooks()
         };
         assert_eq!(watchdog.decide(&secure, now), WatchdogAction::Nothing);
+    }
+
+    #[test]
+    fn a_program_that_takes_the_keyboard_is_never_fought_and_costs_no_budget() {
+        // 2026-10-11: a game and then VMware kept the hooks silent; the watchdog reinstalled
+        // them again and again and twice warned about unstable hooks over the game.
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut watchdog = HookWatchdog::new();
+        let captured = WatchdogFacts {
+            foreground_captures_input: true,
+            ..typing_with_silent_hooks()
+        };
+        for second in [0, 20, 40, 60, 80, 100] {
+            assert_eq!(
+                watchdog.decide(&captured, at(second)),
+                WatchdogAction::Nothing
+            );
+        }
+        // Back in an ordinary window the whole budget is still there.
+        let facts = typing_with_silent_hooks();
+        assert_eq!(watchdog.decide(&facts, at(120)), WatchdogAction::Reinstall);
+        assert_eq!(watchdog.decide(&facts, at(135)), WatchdogAction::Reinstall);
+        assert_eq!(watchdog.decide(&facts, at(150)), WatchdogAction::Reinstall);
+        assert_eq!(watchdog.decide(&facts, at(165)), WatchdogAction::Reinstall);
+    }
+
+    #[test]
+    fn keyboard_capturing_programs_are_matched_by_file_name_in_any_case() {
+        for path in [
+            r"C:\Program Files (x86)\VMware\VMware Workstation\vmware.exe",
+            r"C:\Program Files\Oracle\VirtualBox\VirtualBoxVM.exe",
+            r"C:\Windows\System32\mstsc.exe",
+            "MSRDC.EXE",
+            "vmconnect.exe",
+            "vmplayer.exe",
+        ] {
+            assert!(captures_keyboard(path), "{path}");
+        }
+        for path in [
+            r"C:\Program Files\WindowsApps\Terminal\WindowsTerminal.exe",
+            r"C:\Program Files (x86)\VMware\VMware Workstation\vmware-tray.exe",
+            r"C:\games\notvmware.exe",
+            r"C:\games\vmware.exe.bak",
+            "",
+        ] {
+            assert!(!captures_keyboard(path), "{path}");
+        }
     }
 
     #[test]

@@ -25,6 +25,12 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
 - **A fault no longer ends the program.** A panic in a hook callback or the window procedure
   passes the event on untouched, releases held keys unchanged, pauses automatic conversion and
   shows a tray notice. A worker that panics three times within a minute stops.
+- **Games and virtual machines are left alone.** While a full-screen program, a VMware,
+  VirtualBox or Hyper-V console or a Remote Desktop window is in the foreground, the hook
+  watchdog no longer reinstalls the hooks or warns that they are unstable: these programs take
+  the keyboard themselves, and during one evening the watchdog reinstalled the hooks six times
+  in a game and warned twice over it. The field check is spaced by its cost: a game that answered in about
+  150 ms was asked about 6,100 times in an evening; it is now asked once per input target.
 - **Hooks come back.** Unlock, reconnect, resume from sleep and an Explorer restart reinstall
   the hooks and the tray icon. A watchdog repairs hooks that stopped receiving input, under
   strict conditions and with rate limits.
@@ -36,6 +42,10 @@ the keyboard hooks silently dead. The reasoning and the test evidence for each i
   verdict of a check that passed less than two seconds earlier for the same window. A password
   field, a changed window, input that can move the focus and a failure that lasts still stop
   automatic conversion.
+- **Pause goes to the likely language first.** The enabled languages are kept in alphabetical
+  order, so a word typed in the English layout went to Estonian first and needed a second
+  press to become Russian. The first press now goes to the language in which the word reads
+  best, then on through the others and back to the original.
 - **Pause converts in more cases.** A manual layout switch (for example Alt+Shift) no longer
   makes Pause forget the word typed before it, text typed right after a manual switch can be
   converted with Pause, and digits typed on the numeric keypad no longer stop Pause from

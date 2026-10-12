@@ -151,7 +151,11 @@ also re-arm the first word when its setting is enabled. An additional Backspace
 on an already empty line still invalidates the context because it joins the
 line with preceding text. Pause/Break is reserved when its setting is enabled:
 it triggers undo when available, otherwise it forces the current buffered word
-through the same replacement pipeline even when automatic mode is off. Repeats
+through the same replacement pipeline even when automatic mode is off. Repeated
+presses walk the word through every enabled layout: the first goes to the
+language in which the word reads best (a dictionary word first), the next ones to
+the remaining languages, and the last one back to the original; without a clear
+reading the configured order is used. Repeats
 and key-up are swallowed so the hotkey cannot leak into the target editor. A
 manual layout switch ends automatic conversion of the word but not Pause: the
 word typed so far, or else the last completed word, can still be converted and is
@@ -181,6 +185,15 @@ Session identity uses the stable top-level window and process, while the
 focused input thread is tracked separately for HKL and focused-child routing.
 Ordinary focus changes and mouse clicks re-check privacy on the first printable
 key without suppressing that first word.
+
+The focused field of the foreground window is also checked periodically: every
+half second while checks are fast, and when a check is slow, after twenty times
+its length (at most five seconds), so that periodic checks fill at most a
+twentieth of the worker's time. A full-screen program whose check is slow, which
+is how most games answer, is checked once per input target and then left alone;
+a new input target, and a click or a change of field on the next typed key, are
+still checked. The log records `event=foreground full_screen=true|false` when
+that state changes.
 
 ## Privacy boundary
 
@@ -359,7 +372,12 @@ within the last 400 ms) but no hook callback ran for more than 3 seconds. It doe
 not act on the lock screen or the UAC desktop, when the foreground window has no
 known or a higher integrity level (its input may legitimately never reach the
 hooks), or when nothing is in the foreground; it acts at most once per 15 seconds
-and four times an hour, after which a tray notice says the hooks are unstable.
+and four times an hour, after which a tray notice says the hooks are unstable. It
+also leaves the hooks alone while a full-screen program (most games), a VMware,
+VirtualBox or Hyper-V console or a Remote Desktop window is in the foreground:
+these take the keyboard with a hook of their own, so silence proves nothing there,
+and reinstalling only fought them. The hooks are judged again once another window
+is in the foreground.
 A failed installation is retried with backoff (1 s up to 30 s) and reported after
 the third failure. Tray updates are limited to two per second and wait while the
 correction gate holds keys, because the shell call can block on an unresponsive
