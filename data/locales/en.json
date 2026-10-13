@@ -188,6 +188,8 @@
     "menu.exclude_word": "Do not correct the last undone word",
     "menu.no_dictionary_offer": "No dictionary suggestion",
     "menu.settings": "Settings…",
+    "menu.layout": "Keyboard layout",
+    "menu.automatic": "Automatic conversion",
     "menu.exit": "Exit",
     "error.read_config": "Could not read the configuration: {error}",
     "error.read_config_hint": "Folder: {folder}\n\nYour settings are stored in config.ini in this folder. To start with the default settings, move that file elsewhere and start the program again. If a copy named like config.schema-1.bak is next to it, renaming that copy to config.ini restores the earlier settings.",

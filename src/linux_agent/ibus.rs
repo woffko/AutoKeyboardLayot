@@ -3,7 +3,10 @@
 //! thread in the order it arrived, and its signals are sent before its reply, so the edits made for
 //! a key reach the application before the key itself could.
 
-use super::engine::{Action, Engine, Shared};
+use super::{
+    engine::{Action, Engine, Shared},
+    localization::tr,
+};
 use autokeyboardlayot::Language;
 use std::{collections::HashMap, path::PathBuf};
 use zbus::{
@@ -210,7 +213,7 @@ pub fn properties_value(shared: &Shared) -> Value<'static> {
         property_value(
             PROP_INPUT_MODE,
             PROP_MENU,
-            "Keyboard layout",
+            &tr("menu.layout"),
             &symbol(layout),
             PROP_UNCHECKED,
             layouts,
@@ -218,7 +221,7 @@ pub fn properties_value(shared: &Shared) -> Value<'static> {
         property_value(
             PROP_AUTOMATIC,
             PROP_TOGGLE,
-            "Automatic conversion",
+            &tr("menu.automatic"),
             "",
             if shared.automatic() {
                 PROP_CHECKED
@@ -230,7 +233,7 @@ pub fn properties_value(shared: &Shared) -> Value<'static> {
         property_value(
             PROP_SETTINGS,
             PROP_NORMAL,
-            "Settings…",
+            &tr("menu.settings"),
             "",
             PROP_UNCHECKED,
             Vec::new(),

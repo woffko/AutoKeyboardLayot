@@ -389,6 +389,9 @@ export component SettingsWindow inherits Window {
     in-out property <bool> manual-terminal-uia-fallback;
     in-out property <bool> conversion-sound;
     in-out property <bool> diagnostics-enabled;
+    // Windows-only controls: the UI Automation fallbacks, per-program edit routes and program
+    // exclusions. The Linux engine opens the window without them.
+    in property <bool> windows-features: true;
 
     in-out property <bool> suppress-after-backspace;
     in-out property <bool> suppress-after-delete;
@@ -466,6 +469,19 @@ export component SettingsWindow inherits Window {
     callback record-hotkey;
     callback cancel-hotkey-recording;
     callback reset-hotkey;
+    // Linux: the key pressed while recording, with Control, Alt, Shift and Meta.
+    callback key-captured(string, bool, bool, bool, bool);
+
+    // On Linux the window records the hotkey itself; on Windows a keyboard hook does.
+    if root.hotkey-recording && !root.windows-features: FocusScope {
+        width: 0px;
+        height: 0px;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            root.key-captured(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta);
+            accept
+        }
+    }
 
     Rectangle {
         width: root.width;
@@ -494,8 +510,8 @@ export component SettingsWindow inherits Window {
                 nav-languages := NavigationItem { label: Localization.text("nav.languages", Localization.revision); selected: root.current-page == 2; activated => { root.current-page = 2; } }
                 nav-dictionary := NavigationItem { label: Localization.text("nav.dictionary", Localization.revision); selected: root.current-page == 3; activated => { root.current-page = 3; } }
                 nav-words := NavigationItem { label: Localization.text("nav.word_exclusions", Localization.revision); selected: root.current-page == 4; activated => { root.current-page = 4; } }
-                nav-processes := NavigationItem { label: Localization.text("nav.process_exclusions", Localization.revision); selected: root.current-page == 5; activated => { root.current-page = 5; } }
-                nav-backends := NavigationItem { label: Localization.text("nav.backends", Localization.revision); selected: root.current-page == 6; activated => { root.current-page = 6; } }
+                if root.windows-features: nav-processes := NavigationItem { label: Localization.text("nav.process_exclusions", Localization.revision); selected: root.current-page == 5; activated => { root.current-page = 5; } }
+                if root.windows-features: nav-backends := NavigationItem { label: Localization.text("nav.backends", Localization.revision); selected: root.current-page == 6; activated => { root.current-page = 6; } }
                 nav-diagnostics := NavigationItem { label: Localization.text("nav.diagnostics", Localization.revision); selected: root.current-page == 7; activated => { root.current-page = 7; } }
 
                 Rectangle { vertical-stretch: 1; }
@@ -544,11 +560,11 @@ export component SettingsWindow inherits Window {
                                 padding: 18px;
                                 spacing: 8px;
                                 DirectionalCheckBox { text: Localization.text("general.auto_start", Localization.revision); checked <=> root.automatic-conversion-on-startup; }
-                                DirectionalCheckBox { text: Localization.text("general.physical_fallback", Localization.revision); checked <=> root.physical-fallback; }
+                                if root.windows-features: DirectionalCheckBox { text: Localization.text("general.physical_fallback", Localization.revision); checked <=> root.physical-fallback; }
                                 DirectionalCheckBox { text: Localization.text("general.recheck_erased", Localization.revision); checked <=> root.recheck-first-word-after-erasing; }
                                 DirectionalCheckBox { text: Localization.text("general.single_letter_words", Localization.revision); checked <=> root.single-letter-words; }
                                 DirectionalCheckBox { text: Localization.text("general.layout_model", Localization.revision); checked <=> root.layout-model; }
-                                DirectionalCheckBox { text: Localization.text("general.manual_terminal_uia_fallback", Localization.revision); checked <=> root.manual-terminal-uia-fallback; }
+                                if root.windows-features: DirectionalCheckBox { text: Localization.text("general.manual_terminal_uia_fallback", Localization.revision); checked <=> root.manual-terminal-uia-fallback; }
                                 DirectionalCheckBox { text: Localization.text("general.conversion_sound", Localization.revision); checked <=> root.conversion-sound; }
                                 DirectionalCheckBox { text: Localization.text("general.offer_exclusion", Localization.revision); checked <=> root.offer-word-exclusion-after-undo; }
                                 DirectionalCheckBox { text: Localization.text("general.offer_dictionary", Localization.revision); checked <=> root.offer-dictionary-after-force; }

@@ -6,8 +6,10 @@ mod e2e_tests;
 mod engine;
 mod ibus;
 mod keymap;
+mod localization;
 mod paths;
 mod runtime;
+mod settings;
 
 use std::process::ExitCode;
 
@@ -23,6 +25,7 @@ Usage: autokeyboardlayot [OPTION]
 
   --ibus                  run as the IBus engine (IBus starts it from its component file)
   --register              run and register the engine with the running IBus (development)
+  --settings              open the settings window
   --print-component EXEC  print the IBus component file for an engine started as EXEC
   --version               print the version
   --help                  print this help
@@ -39,6 +42,13 @@ pub fn main() -> ExitCode {
     {
         ["--ibus"] => run_engine(false),
         ["--register"] => run_engine(true),
+        ["--settings"] => match settings::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("autokeyboardlayot: {error}");
+                ExitCode::FAILURE
+            }
+        },
         ["--print-component", exec] => {
             print!("{}", ibus::component_xml(exec, VERSION));
             ExitCode::SUCCESS

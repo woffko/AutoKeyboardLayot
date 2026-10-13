@@ -48,6 +48,8 @@ pub fn load_shared_from(
         &settings.enabled_input_packs,
     )
     .map_err(io::Error::other)?;
+    // The indicator menu speaks the language chosen in the settings.
+    super::localization::initialize(&document.ui_language, packages.catalogs.as_deref());
     let mut detector = Detector::with_profile_selections(
         DetectorConfig {
             single_letter_words: settings.single_letter_words,

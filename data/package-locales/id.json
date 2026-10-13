@@ -171,6 +171,8 @@
     "menu.exclude_word": "Jangan koreksi kata terakhir yang dipulihkan",
     "menu.no_dictionary_offer": "Tidak ada saran kamus",
     "menu.settings": "Pengaturan…",
+    "menu.layout": "Tata letak keyboard",
+    "menu.automatic": "Konversi otomatis",
     "menu.exit": "Keluar",
     "error.read_config": "Tidak dapat membaca konfigurasi: {error}",
     "error.read_config_hint": "Folder: {folder}\n\nPengaturan Anda disimpan di config.ini dalam folder ini. Untuk memulai dengan pengaturan default, pindahkan file itu ke tempat lain lalu jalankan program lagi. Jika ada salinan bernama seperti config.schema-1.bak di sebelahnya, mengganti namanya menjadi config.ini akan memulihkan pengaturan sebelumnya.",

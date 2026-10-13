@@ -175,6 +175,8 @@
     "menu.exclude_word": "不再纠正最后一个已撤销的词",
     "menu.no_dictionary_offer": "没有词典建议",
     "menu.settings": "设置…",
+    "menu.layout": "键盘布局",
+    "menu.automatic": "自动转换",
     "menu.exit": "退出",
     "error.read_config": "无法读取配置：{error}",
     "error.read_config_hint": "文件夹：{folder}\n\n您的设置保存在此文件夹中的 config.ini 里。若要使用默认设置启动，请将该文件移到其他位置，然后重新启动程序。如果旁边有名为 config.schema-1.bak 之类的副本，将其重命名为 config.ini 即可恢复之前的设置。",

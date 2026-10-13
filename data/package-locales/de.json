@@ -171,6 +171,8 @@
     "menu.exclude_word": "Zuletzt zurückgeändertes Wort nicht korrigieren",
     "menu.no_dictionary_offer": "Kein Wörterbuchvorschlag",
     "menu.settings": "Einstellungen…",
+    "menu.layout": "Tastaturbelegung",
+    "menu.automatic": "Automatische Umwandlung",
     "menu.exit": "Beenden",
     "error.read_config": "Konfiguration konnte nicht gelesen werden: {error}",
     "error.read_config_hint": "Ordner: {folder}\n\nIhre Einstellungen werden in config.ini in diesem Ordner gespeichert. Um mit den Standardeinstellungen zu starten, verschieben Sie diese Datei an einen anderen Ort und starten Sie das Programm erneut. Liegt daneben eine Kopie mit einem Namen wie config.schema-1.bak, stellt das Umbenennen dieser Kopie in config.ini die früheren Einstellungen wieder her.",

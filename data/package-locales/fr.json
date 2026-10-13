@@ -171,6 +171,8 @@
     "menu.exclude_word": "Ne pas corriger le dernier mot rétabli",
     "menu.no_dictionary_offer": "Aucune suggestion pour le dictionnaire",
     "menu.settings": "Paramètres…",
+    "menu.layout": "Disposition du clavier",
+    "menu.automatic": "Conversion automatique",
     "menu.exit": "Quitter",
     "error.read_config": "Impossible de lire la configuration : {error}",
     "error.read_config_hint": "Dossier : {folder}\n\nVos paramètres sont enregistrés dans config.ini, dans ce dossier. Pour redémarrer avec les paramètres par défaut, déplacez ce fichier ailleurs, puis relancez le programme. Si une copie nommée comme config.schema-1.bak se trouve à côté, la renommer en config.ini rétablit les paramètres précédents.",

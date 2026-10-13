@@ -80,9 +80,12 @@ fn main() {
         "cargo:rustc-env=AUTOKEY_BUILD_COMMIT={}",
         build_commit(Path::new(env!("CARGO_MANIFEST_DIR")))
     );
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS");
+    if matches!(target_os.as_deref(), Ok("windows" | "linux")) {
         println!("cargo:rerun-if-changed=ui/settings.slint");
         slint_build::compile("ui/settings.slint").expect("cannot compile settings UI");
+    }
+    if target_os.as_deref() == Ok("windows") {
         // Embed the reviewed application icon resource into every executable
         // target. The tray icon is drawn separately and is not affected.
         let resource = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/app.res");

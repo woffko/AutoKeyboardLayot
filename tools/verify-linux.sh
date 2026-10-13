@@ -22,8 +22,9 @@ Runs the complete local verification gate on Linux, one logged step at a time:
   08 test-signing       cargo test --locked --features signing-tools
   09 validate-locales   cargo run --locked --example validate_locales -- data/package-locales --require-complete
   10 python-tests       python3 -m unittest discover -s tools -p "test_*.py"
-  11 windows-check      cargo check --locked --target x86_64-pc-windows-msvc --all-targets (type-checks the
-                        Windows agent; skipped when the target's standard library is not installed)
+  11 windows-check      cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings, with the
+                        default features and with the installer tools (type-checks the Windows agent without
+                        linking it; skipped when the target's standard library is not installed)
 
 Options:
   --keep-going   run every step even after a failure (default: stop at the first failure)
@@ -35,7 +36,7 @@ Logs and summary.txt are written to target/verify-linux/<UTC timestamp>/. The ex
 when every selected step passed or was skipped for a stated reason.
 
 Test-count floors: AKL_MIN_LINUX_LIB_TESTS (default 332) for the library tests and
-AKL_MIN_LINUX_AGENT_TESTS (default 27) for the Linux agent tests of step 06. Raise them when tests
+AKL_MIN_LINUX_AGENT_TESTS (default 31) for the Linux agent tests of step 06. Raise them when tests
 are added; never lower them to hide a deleted test.
 EOF
 }
@@ -63,7 +64,7 @@ done
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 2
 cd "$repo_root" || exit 2
 min_lib=${AKL_MIN_LINUX_LIB_TESTS:-332}
-min_agent=${AKL_MIN_LINUX_AGENT_TESTS:-27}
+min_agent=${AKL_MIN_LINUX_AGENT_TESTS:-31}
 
 selected() {
     local id=$1 name=$2 item
@@ -110,7 +111,8 @@ step_windows_check() {
         echo "SKIP: the Rust target x86_64-pc-windows-msvc is not installed (rustup target add x86_64-pc-windows-msvc)"
         return 3
     fi
-    run_logged cargo check --locked --target x86_64-pc-windows-msvc --all-targets
+    run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings &&
+        run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --no-default-features --features installer-tools --all-targets -- -D warnings
 }
 
 # The number of passed tests in the result line that follows "Running unittests <source>".
