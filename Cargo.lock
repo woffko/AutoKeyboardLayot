@@ -21,6 +21,8 @@ dependencies = [
  "unicode-script",
  "unicode-segmentation",
  "windows",
+ "xkbcommon",
+ "zbus",
  "zeroize",
 ]
 

@@ -2,10 +2,17 @@
 //!
 //! The Windows agent is compiled only on Windows, but its source is plain text: this test reads
 //! it on every platform and inspects every call to `diagnostic(` and `gate_diagnostic(` in the
-//! production part of the file. A format string that names key codes, characters, words, text or
-//! window titles is a leak, or one step away from one, and fails the test.
+//! production part of the file. The Linux engine is read the same way, with its `log(` and
+//! `record(` calls. A format string that names key codes, characters, words, text or window titles
+//! is a leak, or one step away from one, and fails the test.
 
 const WINDOWS_AGENT: &str = include_str!("../src/windows_agent.rs");
+const LINUX_SOURCES: &[(&str, &str)] = &[
+    ("engine.rs", include_str!("../src/linux_agent/engine.rs")),
+    ("ibus.rs", include_str!("../src/linux_agent/ibus.rs")),
+    ("runtime.rs", include_str!("../src/linux_agent/runtime.rs")),
+    ("mod.rs", include_str!("../src/linux_agent/mod.rs")),
+];
 
 /// Fragments that must not appear in a diagnostic format string (compared case-insensitively).
 const FORBIDDEN_IN_FORMAT: &[&str] = &[
@@ -20,6 +27,12 @@ const FORBIDDEN_IN_FORMAT: &[&str] = &[
 
 /// Identifiers that carry key identity and must not be passed as diagnostic arguments either.
 const FORBIDDEN_IN_ARGUMENTS: &[&str] = &["virtual_key", "scan_code"];
+
+/// The Linux engine names keys by evdev code and X keysym.
+const FORBIDDEN_IN_LINUX: &[&str] = &["keycode", "keyval", "keysym"];
+
+/// As MINIMUM_CALLS, for the Linux engine.
+const MINIMUM_LINUX_CALLS: usize = 15;
 
 /// The scanner must find at least this many calls, so a broken scanner cannot pass silently.
 /// Lower it only when calls were removed on purpose.
@@ -39,6 +52,14 @@ fn production_part(source: &str) -> String {
     let end = normalized
         .find(TEST_MODULE_MARKER)
         .expect("the unit-test module marker is missing; update TEST_MODULE_MARKER");
+    normalized[..end].to_owned()
+}
+
+/// As production_part, for a file that may have no unit-test module or one with a wider `cfg`.
+fn production_part_if_any(source: &str) -> String {
+    let normalized = source.replace("\r\n", "\n");
+    // A test module may carry a wider `cfg` than `#[cfg(test)]`.
+    let end = normalized.find("\nmod tests {").unwrap_or(normalized.len());
     normalized[..end].to_owned()
 }
 
@@ -99,13 +120,18 @@ fn call_parts(text: &str) -> (Vec<String>, String) {
 }
 
 fn audit(source: &str) -> Audit {
-    let production = production_part(source);
+    audit_calls(&production_part(source), "diagnostic(", &[])
+}
+
+/// Audits every call whose name ends with `call` (for example `diagnostic(`), with `extra`
+/// fragments forbidden in its format strings besides the common ones.
+fn audit_calls(production: &str, call: &str, extra: &[&str]) -> Audit {
     let mut calls = 0;
     let mut violations = Vec::new();
     let mut search_from = 0;
-    while let Some(relative) = production[search_from..].find("diagnostic(") {
+    while let Some(relative) = production[search_from..].find(call) {
         let start = search_from + relative;
-        search_from = start + "diagnostic(".len();
+        search_from = start + call.len();
         // Walk back over `gate_` and any other identifier prefix, then skip definitions.
         let identifier_start = production[..start]
             .rfind(|character: char| !is_identifier_character(character))
@@ -118,7 +144,7 @@ fn audit(source: &str) -> Audit {
         let (literals, arguments) = call_parts(&production[search_from..]);
         for literal in &literals {
             let lowered = literal.to_ascii_lowercase();
-            for forbidden in FORBIDDEN_IN_FORMAT {
+            for forbidden in FORBIDDEN_IN_FORMAT.iter().chain(extra) {
                 if lowered.contains(forbidden) {
                     violations.push(format!(
                         "line {line}: format string {literal:?} contains `{forbidden}`"
@@ -150,6 +176,38 @@ fn diagnostics_never_log_key_identity() {
         "diagnostics must never record key codes, scan codes, characters, words, text or titles:\n{}",
         result.violations.join("\n")
     );
+}
+
+#[test]
+fn linux_diagnostics_never_log_key_identity() {
+    let mut calls = 0;
+    let mut violations = Vec::new();
+    for (name, source) in LINUX_SOURCES {
+        let production = production_part_if_any(source);
+        for call in [".log(", ".record("] {
+            let result = audit_calls(&production, call, FORBIDDEN_IN_LINUX);
+            calls += result.calls;
+            violations.extend(
+                result
+                    .violations
+                    .into_iter()
+                    .map(|violation| format!("{name} {violation}")),
+            );
+        }
+    }
+    assert!(
+        calls >= MINIMUM_LINUX_CALLS,
+        "the scanner found only {calls} Linux diagnostic calls (expected at least {MINIMUM_LINUX_CALLS})"
+    );
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn the_linux_scanner_flags_key_identity() {
+    let leak = r#"shared.log("input", &format!("keycode={keycode}"));"#;
+    let result = audit_calls(&production_part_if_any(leak), ".log(", FORBIDDEN_IN_LINUX);
+    assert_eq!(result.calls, 1);
+    assert_eq!(result.violations.len(), 1, "{:?}", result.violations);
 }
 
 fn synthetic(body: &str) -> String {

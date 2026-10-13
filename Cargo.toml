@@ -63,6 +63,12 @@ unicode-general-category = "=1.1.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The Linux front end is an IBus engine (docs/linux-port-plan.md). Both crates are already in
+# Cargo.lock through Slint and winit; here they become direct dependencies on Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+xkbcommon = { version = "0.9", default-features = false }
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+
 [dev-dependencies]
 flate2 = "1.1.2"
 tempfile = "3"

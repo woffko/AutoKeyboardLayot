@@ -3,6 +3,9 @@
 #[cfg(target_os = "windows")]
 mod windows_agent;
 
+#[cfg(target_os = "linux")]
+mod linux_agent;
+
 #[cfg(target_os = "windows")]
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
@@ -61,7 +64,12 @@ fn main() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn main() -> std::process::ExitCode {
+    linux_agent::main()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn main() {
-    println!("AutoKeyboardLayot is a Windows user-session agent.");
+    println!("AutoKeyboardLayot runs on Windows and on Linux with IBus.");
 }
