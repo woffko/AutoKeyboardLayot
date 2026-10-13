@@ -159,6 +159,7 @@ class NoticeInputs(unittest.TestCase):
             self.check()
 
 
+@unittest.skipUnless(sys.platform.startswith('linux'), 'the user installation runs on Linux')
 class UserInstallation(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

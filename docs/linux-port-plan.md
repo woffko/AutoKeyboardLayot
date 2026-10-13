@@ -1,7 +1,8 @@
 # Linux port plan
 
-Status: in progress on branch `linux-port` (from `2408f57`). Owner decisions of 2026-10-13: an
-IBus engine, the whole port in one plan, the Windows agent kept with a shared core.
+Status: L0 to L9 done on branch `linux-port` (from `2408f57`), not pushed; L10 waits for the owner.
+Owner decisions of 2026-10-13: an IBus engine, the whole port in one plan, the Windows agent kept
+with a shared core. How to install and use it: [`linux.md`](linux.md).
 
 ## Target
 
@@ -29,7 +30,8 @@ engine commits the character that layout gives for the key (libxkbcommon compute
 keycode). Alt+Shift switches the engine's layout, and the GNOME indicator shows it through the
 `InputMode` property (`EN`, `RU`, `ET`). After a conversion the engine simply continues in the target
 layout. Programs without input method support only get the base layout; the system `xkb` sources
-can stay configured as a fallback (Super+Space).
+can stay configured as a fallback (Super+Space), but the XKB option `grp:alt_shift_toggle` has to go:
+GNOME turns its key into "next input source", which would leave the engine.
 
 ### How an edit is made
 
@@ -55,13 +57,31 @@ New, under `src/linux_agent/` (compiled on Linux only):
 | Part | Role |
 |---|---|
 | `paths` | XDG directories: configuration `~/.config/autokeyboardlayot`, packages `~/.local/share/autokeyboardlayot`, diagnostics `~/.local/state/autokeyboardlayot` |
+| `profile` | the configuration writers' lock and the English-only profile the modular base creates on its first start (on Windows the installer creates it) |
 | `runtime` | configuration and installed packages to a detector, reload, diagnostics log, crash log |
 | `keymap` | libxkbcommon keymaps per enabled language, keycode and modifiers to text, replay of a word's keys in another layout |
 | `engine` | the per-field state machine (pure, no D-Bus): layout, word, boundary conversion, Pause with cycle and undo, Alt+Shift, privacy, diagnostics |
-| `ibus` | zbus connection to the IBus bus, component, factory and engine objects, IBus text and property serialization |
-| `indicator` | `InputMode` property and the menu: automatic conversion, undo, settings |
-| `settings` | the Slint settings window for Linux (Windows-only sections hidden) and the reload notice to the engine |
-| `packages` | catalog and package download over HTTPS with `curl`, verified by the shared pipeline |
+| `ibus` | zbus connection to the IBus bus, component, factory and engine objects, IBus text and property serialization, the `InputMode` indicator and its menu (layouts, automatic conversion, settings) |
+| `localization` | the display language of the menu and the settings window from the shared catalogs |
+| `settings` | the Slint settings window for Linux (Windows-only sections hidden) with the package pages shared with Windows; the engine reloads when `config.ini` changes |
+| `diagnostics` | the optional diagnostics log on a writer thread |
+
+Package downloads use `curl` (`src/package_download/curl.rs`) with the policy of the Windows
+transport and are verified by the shared pipeline. `tools/linux_package.py` builds the `.deb` and
+installs for one user.
+
+### Packaging
+
+The `.deb` and the user installation are the modular base, as the Windows installer is: English and
+the layout model are compiled in, Russian and Estonian come as signed packages, because the
+Estonian dictionary ships only that way ([`licensing-notes.md`](licensing-notes.md)). No installer
+runs per user on Linux, so the engine and the settings window create the English-only profile when
+they first start, with the rules of the Windows installer (never rewrite, never reset a partial
+store). IBus has no per-user component directory: the user installation adds a drop-in for GNOME's
+IBus service that sets `IBUS_COMPONENT_PATH`, and rewrites the user's IBus engine cache, because an
+IBus with an existing cache does not look in a directory that cache does not list (checked against a
+private `ibus-daemon`). A file added to a directory the cache lists is found at the next start, so
+the `.deb` needs no maintainer scripts.
 
 zbus, xkbcommon and the Linux side of Slint and winit are already in `Cargo.lock` (the lock file is
 resolved for every target), so no new crate version enters it; they become Linux-only direct
@@ -85,6 +105,14 @@ again.
 | L8 | packaging: user install script, `.deb`, IBus component file, desktop entry, uninstall | package built and inspected; installs into a temporary root |
 | L9 | CI job for Linux, README, `docs/linux.md`, threat model | CI green |
 | L10 | acceptance on the owner's desktop | needs the owner at the moment: install, add the input source, test in Terminal, Text Editor, Firefox, a password field |
+
+Progress: L0 `d4f7335`; L1 to L5 `d4f7335` and `e3b24f7`; L6 `e3b24f7`; L7 `99a492e`; L8 `d687220`
+and `a94601f` (package `target/linux-package-inspection-20261013-01`: built, read back, extracted,
+and the extracted program run as an engine against a private `ibus-daemon`, where it created the
+English-only profile in an empty home); L9 the commit after them. The settings window has not been
+opened on a display yet (L10), and CI runs when the branch is pushed. The Linux notices of that
+package (`target/linux-notices-complete-20261013-01`, 421 packages, none missing) are not yet
+reviewed by the owner.
 
 The Windows code cannot be built here (no `cargo-xwin`); shared changes are type-checked for the
 Windows target when the standard library for it is installed, and CI builds and tests Windows.

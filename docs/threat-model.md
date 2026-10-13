@@ -11,6 +11,7 @@ A Windows user-session agent. It installs low-level keyboard and mouse hooks,
 watches the word being typed, and, when a word was typed in the wrong keyboard
 layout, replaces it. It runs with the rights of the signed-in user, not as a
 service and not elevated. Language data comes as signed, data-only packages.
+On Linux it is an IBus input method instead; see [On Linux](#on-linux).
 
 ## Assets
 
@@ -68,9 +69,26 @@ creating it and for responding to a theft is in
 [`package-signing-key.md`](package-signing-key.md). No recovery key has been
 created yet.
 
+## On Linux
+
+On Linux the program is an IBus input method ([`linux.md`](linux.md)). IBus starts it as a
+process of the signed-in user. It receives a key only while its input source is active, and then
+only the keys of the focused field: there are no global hooks. The tables above apply with these
+differences:
+
+| Topic | On Linux |
+|---|---|
+| What the user types | IBus and the compositor see every key anyway; the engine sees the keys of the focused field while its source is active. The current word and, for Pause, the last word and conversion stay in memory and are dropped when the field loses the focus or the application resets its input. |
+| The clipboard | Not used. A replacement deletes the typed word through IBus, only after checking that the text the application reports ends with that word, or sends one BackSpace per typed character, and then commits the replacement. |
+| Conversion of secrets | Fields whose IBus content purpose is password or PIN, and fields with the private hint, are typed but never tracked. An application that reports neither for a secret field is not recognised; there is no UI Automation equivalent. |
+| Excluded programs | Not available: IBus does not tell the engine which program a field belongs to. Switch automatic conversion off, or switch to another input source, for such a program. |
+| Packages and catalogs | The same signatures, trust list and limits. Downloads use `curl` with the same policy as on Windows: HTTPS only, TLS 1.2 or newer, two exact hosts, redirects followed by the program, size limits and a deadline. |
+| Code running as the same user | Out of scope, as on Windows. Such a process can talk to the IBus bus, rewrite `config.ini` or the component file of a user installation in `~/.local/share/ibus/component`, and replace the program in `~/.local/bin`. A `.deb` installation keeps the program and the component file in system directories. |
+
 ## Related pages
 
 - [`../README.md`](../README.md): privacy boundary, diagnostics and crash log.
+- [`linux.md`](linux.md): the Linux input method, its files and its privacy boundary.
 - [`package-signing-key.md`](package-signing-key.md), [`package-release-catalog.md`](package-release-catalog.md): trust list, catalog window and renewal.
 - [`package-store.md`](package-store.md), [`language-package-format.md`](language-package-format.md): what a package may contain and how it is stored.
 - [`../SECURITY.md`](../SECURITY.md): how to report a vulnerability.

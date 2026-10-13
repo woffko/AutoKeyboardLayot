@@ -7,6 +7,10 @@ dictionary-backed direct-layout pack using the installed Windows HKL. Japanese
 is a separate IME pack and remains fail-closed until its composition adapter is
 physically validated.
 
+On Linux, the same core runs as an IBus input method for GNOME that types
+English, Russian and Estonian itself. [`docs/linux.md`](docs/linux.md) covers
+installing it, turning it on, privacy and removal.
+
 ## Current milestone
 
 This repository currently contains an experimental source snapshot, not a stable
@@ -457,7 +461,8 @@ counts may not fall below recorded floors. `--keep-going` runs every step after 
 failure; `--list` and `--only` show and select steps.
 
 The CI workflow (`.github/workflows/checks.yml`) runs the same checks on Linux
-and Windows. On Linux it also checks dependency advisories with
+and Windows. On Linux it installs IBus and the libraries of the Linux front end
+and requires the IBus end-to-end tests. It also checks dependency advisories with
 `cargo audit --deny warnings` (the four accepted notices are listed with their
 reasons in `.cargo/audit.toml`) and dependency licenses and sources with
 `cargo deny check licenses bans sources` (policy in `deny.toml`). A new license
@@ -468,6 +473,14 @@ The settings window and About page show the version as `0.1.0 (abc1234)`, where
 `data`, `ui`, `assets`, `Cargo.toml`, `Cargo.lock`, `build.rs`) differ from that
 commit shows `abc1234-dirty`; builds outside a Git checkout can set
 `AKL_BUILD_COMMIT` and otherwise show `unknown`.
+
+On Linux, `tools/verify-linux.sh` runs the local gate in eleven logged steps
+(formatting, Clippy in four configurations and for the Windows target, tests in
+three configurations including the IBus end-to-end tests against a private
+`ibus-daemon`, the locale catalogs and the Python tests), with the same logs,
+summary and test-count floors in `target/verify-linux/<timestamp>/`.
+`tools/linux_package.py` builds the Debian package and installs for one user;
+see [`docs/linux.md`](docs/linux.md).
 
 `tools/deploy-host.ps1` installs a verified build over the per-user installation
 with a backup, a graceful close and a rollback on failure; `-WhatIf` only prints
@@ -500,7 +513,8 @@ terms:
 - Dependency versions are pinned by `Cargo.lock`; upstream dependency licenses
   remain applicable. `tools/collect_dependency_notices.py` gathers their texts,
   together with the notices of the bundled English dictionary and the layout
-  model, into the installer's `THIRD-PARTY-NOTICES.txt`.
+  model, into the installer's `THIRD-PARTY-NOTICES.txt`, and from the Linux
+  build receipt into the Debian package's.
 - The settings UI uses Slint, declared by its crates as
   `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`.
   Which option applies to the distributed executable is an open item.

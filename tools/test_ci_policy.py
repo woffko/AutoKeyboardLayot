@@ -78,5 +78,15 @@ class SigningToolsInCi(unittest.TestCase):
                 self.assertTrue(line.startswith('      - run: '), line)
                 self.assertFalse(lines[index + 1].lstrip().startswith('if:'), line)
 
+class LinuxInCi(unittest.TestCase):
+    def test_the_linux_job_installs_ibus_and_requires_the_end_to_end_tests(self):
+        self.assertRegex(WORKFLOW, r'apt-get install[^\n]*\bibus\b')
+        self.assertRegex(WORKFLOW, r'apt-get install[^\n]*\blibxkbcommon-dev\b')
+        self.assertIn('AKL_REQUIRE_IBUS: "1"', WORKFLOW)
+
+    def test_clippy_checks_the_default_features_on_both_systems(self):
+        self.assertIn('      - run: cargo clippy --locked --all-targets -- -D warnings\n', WORKFLOW)
+
+
 if __name__ == '__main__':
     unittest.main()

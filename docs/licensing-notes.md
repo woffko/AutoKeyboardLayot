@@ -24,6 +24,12 @@ Where each material ships:
   (sections "Bundled English dictionary" and "Bundled layout model").
 - The Russian and Estonian dictionaries ship only inside signed language packages
   (`.aklp`), each with its own license and notice files.
+- The Linux package (`.deb`, built by `tools/linux_package.py`) is the same modular base: English and
+  the layout model are compiled in, Russian and Estonian come as the same signed packages. Its
+  `THIRD-PARTY-NOTICES.txt` is collected from the Linux build receipt (421 third-party packages on
+  2026-10-13, all with license text) and installed in `/usr/share/doc/autokeyboardlayot` with a
+  machine-readable `copyright` file. The package also installs `assets/app-256.png` as its icon, so
+  question 4 applies to it too.
 
 ## Open questions
 
