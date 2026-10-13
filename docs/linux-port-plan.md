@@ -107,11 +107,13 @@ again.
 | L10 | acceptance on the owner's desktop | needs the owner at the moment: install, add the input source, test in Terminal, Text Editor, Firefox, a password field |
 
 Progress: L0 `d4f7335`; L1 to L5 `d4f7335` and `e3b24f7`; L6 `e3b24f7`; L7 `99a492e`; L8 `d687220`
-and `a94601f` (package `target/linux-package-inspection-20261013-01`: built, read back, extracted,
-and the extracted program run as an engine against a private `ibus-daemon`, where it created the
-English-only profile in an empty home); L9 the commit after them. The settings window has not been
-opened on a display yet (L10), and CI runs when the branch is pushed. The Linux notices of that
-package (`target/linux-notices-complete-20261013-01`, 421 packages, none missing) are not yet
+and `a94601f`; L9 `ed0e8be`. `bafd0ef` fixed the start by IBus itself (the engine lost the
+factory's first call), which the tests had not covered; an end-to-end test covers it now. The
+package `target/linux-package-inspection-20261013-02` (program `bafd0ef`) was built, read back and
+extracted, and a private `ibus-daemon` started the extracted program from its component file: it
+created the English-only profile in an empty home and served the engine. The settings window has
+not been opened on a display yet (L10), and CI runs when the branch is pushed. The Linux notices of
+that package (`target/linux-notices-complete-20261013-01`, 421 packages, none missing) are not yet
 reviewed by the owner.
 
 The Windows code cannot be built here (no `cargo-xwin`); shared changes are type-checked for the
