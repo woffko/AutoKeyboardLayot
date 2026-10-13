@@ -6,7 +6,8 @@
 //! the engine's own keymap (US) keys pass through untouched; in any other layout the engine commits
 //! the character that layout gives for the physical key. A word is replaced by deleting it, through
 //! the surrounding text when the field reports it and it ends with exactly that word, or else with
-//! one forwarded Backspace per character (terminals), and committing the replacement.
+//! one forwarded Backspace per character (terminals), and committing the replacement. After
+//! Backspaces the replacement waits until the application has taken them (see [`Action::Settle`]).
 
 use super::diagnostics::Diagnostics;
 use super::keymap::{KeyOutput, Keymaps, Levels, TypedKey};
@@ -91,6 +92,11 @@ pub enum Action {
     /// The layout changed or must be shown: update the indicator.
     Layout(Language),
     RequireSurrounding,
+    /// Wait until the application has taken the keys forwarded before. GNOME on Wayland delivers
+    /// forwarded keys with its next frame and GTK takes key events with its own next frame, while
+    /// committed text reaches the application at once: without the wait the replacement arrives
+    /// first and the Backspaces erase it instead of the word.
+    Settle,
 }
 
 /// The answer to one key event: whether IBus must keep the key from the application.
@@ -349,6 +355,34 @@ struct Surrounding {
     anchor: usize,
 }
 
+/// What the field reported around the caret when a word is replaced; the diagnostics log names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reported {
+    /// A terminal, whose text is the screen of a program rather than an editable field.
+    Terminal,
+    /// No text since the field took the focus or since the last replacement.
+    Nothing,
+    /// A selection instead of a caret.
+    Selection,
+    /// Text before the caret that does not end with the word, such as a report older than the
+    /// last keys.
+    Mismatch,
+    /// Text before the caret that ends with the word.
+    Word,
+}
+
+impl Reported {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Nothing => "none",
+            Self::Selection => "selection",
+            Self::Mismatch => "mismatch",
+            Self::Word => "verified",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Chord {
     #[default]
@@ -482,6 +516,16 @@ impl Engine {
     /// The application reset the input context: the caret moved, a click, a new text.
     pub fn reset(&mut self) {
         self.forget();
+    }
+
+    /// The settings were reloaded: the word and the languages learned from it go. What the
+    /// application reported about the field stays, so a password field stays private, and so do
+    /// the keys held down.
+    pub fn reload(&mut self, shared: &Shared) {
+        self.forget();
+        self.recent.clear();
+        self.session
+            .set_recheck_first_word_after_erasing(shared.settings.recheck_first_word_after_erasing);
     }
 
     pub fn set_content_type(&mut self, shared: &Shared, purpose: u32, hints: u32) {
@@ -922,7 +966,7 @@ impl Engine {
             shared.log("conversion", "result=refused reason=edit-unit");
             return None;
         };
-        let (mut actions, strategy) =
+        let (mut actions, strategy, reported) =
             self.edit(&detection.original, transaction.forward.insert_text.clone());
         actions.push(Action::Layout(detection.target_language));
         shared.layout = detection.target_language;
@@ -943,7 +987,8 @@ impl Engine {
         shared.log(
             "conversion",
             &format!(
-                "result=applied strategy={strategy} source={} target={} forced=false",
+                "result=applied strategy={strategy} source={} target={} forced=false \
+                 surrounding={reported}",
                 detection.source_language.id(),
                 detection.target_language.id()
             ),
@@ -951,26 +996,34 @@ impl Engine {
         Some(Outcome::consumed(actions))
     }
 
-    /// Replaces `erase`, which ends at the caret, with `insert`.
-    fn edit(&mut self, erase: &str, insert: String) -> (Vec<Action>, &'static str) {
+    /// Replaces `erase`, which ends at the caret, with `insert`. Also returns how the text is
+    /// erased and what the field reported around the caret, for the diagnostics log.
+    fn edit(&mut self, erase: &str, insert: String) -> (Vec<Action>, &'static str, &'static str) {
         let count = erase.chars().count();
-        let verified = self.purpose != PURPOSE_TERMINAL
-            && self.surrounding.as_ref().is_some_and(|surrounding| {
-                surrounding.cursor == surrounding.anchor
-                    && surrounding
-                        .text
-                        .char_indices()
+        let reported = match &self.surrounding {
+            _ if self.purpose == PURPOSE_TERMINAL => Reported::Terminal,
+            None => Reported::Nothing,
+            Some(surrounding) if surrounding.cursor != surrounding.anchor => Reported::Selection,
+            Some(surrounding) => {
+                let text = surrounding.text.as_str();
+                let before = if surrounding.cursor == text.chars().count() {
+                    Some(text)
+                } else {
+                    text.char_indices()
                         .nth(surrounding.cursor)
-                        .map_or(surrounding.text.as_str(), |(index, _)| {
-                            &surrounding.text[..index]
-                        })
-                        .ends_with(erase)
-                    && surrounding.text.chars().count() >= surrounding.cursor
-            });
+                        .map(|(index, _)| &text[..index])
+                };
+                if before.is_some_and(|before| before.ends_with(erase)) {
+                    Reported::Word
+                } else {
+                    Reported::Mismatch
+                }
+            }
+        };
         // The client reports the new text after the edit; until then the old one is stale.
         self.surrounding = None;
-        let mut actions = Vec::with_capacity(count * 2 + 1);
-        let strategy = if verified {
+        let mut actions = Vec::with_capacity(count * 2 + 2);
+        let strategy = if reported == Reported::Word {
             actions.push(Action::DeleteSurrounding {
                 offset: -i32::try_from(count).unwrap_or(i32::MAX),
                 chars: u32::try_from(count).unwrap_or(u32::MAX),
@@ -986,10 +1039,11 @@ impl Engine {
                     });
                 }
             }
+            actions.push(Action::Settle);
             "backspace"
         };
         actions.push(Action::Commit(insert));
-        (actions, strategy)
+        (actions, strategy, reported.id())
     }
 
     /// Pause: undo the last automatic conversion, or else convert the word at the caret (or the
@@ -1006,7 +1060,7 @@ impl Engine {
             if let Some(delimiter) = undo.delimiter {
                 restored.push(delimiter);
             }
-            let (mut actions, strategy) = self.edit(&undo.typed, restored);
+            let (mut actions, strategy, reported) = self.edit(&undo.typed, restored);
             actions.push(Action::Layout(undo.source));
             shared.layout = undo.source;
             self.session.clear();
@@ -1018,7 +1072,7 @@ impl Engine {
             shared.log(
                 "undo",
                 &format!(
-                    "result=applied strategy={strategy} source={} target={}",
+                    "result=applied strategy={strategy} source={} target={} surrounding={reported}",
                     undo.target.id(),
                     undo.source.id()
                 ),
@@ -1081,13 +1135,14 @@ impl Engine {
             erase.push(delimiter);
             insert.push(delimiter);
         }
-        let (mut actions, strategy) = self.edit(&erase, insert);
+        let (mut actions, strategy, reported) = self.edit(&erase, insert);
         actions.push(Action::Layout(target));
         shared.layout = target;
         shared.log(
             "conversion",
             &format!(
-                "result=applied strategy={strategy} source={} target={} forced=true cycle={}",
+                "result=applied strategy={strategy} source={} target={} forced=true cycle={} \
+                 surrounding={reported}",
                 language.id(),
                 target.id(),
                 order
@@ -1271,6 +1326,24 @@ mod tests {
         assert!(outcome.handled);
         assert_eq!(backspaces(&outcome), 6);
         assert_eq!(commits(std::slice::from_ref(&outcome)), "привет ");
+        // The replacement waits until the application has taken the Backspaces.
+        let settle = outcome
+            .actions
+            .iter()
+            .position(|action| *action == Action::Settle);
+        let last_backspace = outcome
+            .actions
+            .iter()
+            .rposition(|action| matches!(action, Action::ForwardKey { .. }));
+        let commit = outcome
+            .actions
+            .iter()
+            .position(|action| matches!(action, Action::Commit(_)));
+        assert!(
+            last_backspace < settle && settle < commit,
+            "{:?}",
+            outcome.actions
+        );
         assert_eq!(
             outcome.actions.last(),
             Some(&Action::Layout(Language::Russian))
@@ -1281,7 +1354,8 @@ mod tests {
         let records: Vec<String> = log.try_iter().collect();
         assert!(
             records.iter().any(|record| record.contains(
-                "event=conversion result=applied strategy=backspace source=en-US target=ru-RU"
+                "event=conversion result=applied strategy=backspace source=en-US target=ru-RU \
+                 forced=false surrounding=none"
             )),
             "{records:?}"
         );
@@ -1306,14 +1380,22 @@ mod tests {
                 chars: 6
             }
         );
+        // The application applies the deletion and the replacement together: no wait.
         assert_eq!(outcome.actions[1], Action::Commit("привет ".into()));
+        assert!(!outcome.actions.contains(&Action::Settle));
         // A surrounding text that does not end with the word (late, or another field) is not used.
-        let (mut shared, _log) = shared_with(Settings::default());
+        let (mut shared, log) = shared_with(Settings::default());
         let mut engine = Engine::new(&shared);
         type_keys(&mut engine, &mut shared, &GHBDTN);
         engine.set_surrounding_text("hi ghbdt".into(), 8, 8);
         let outcome = tap(&mut engine, &mut shared, KEY_SPACE, 0);
         assert_eq!(backspaces(&outcome), 6);
+        assert!(outcome.actions.contains(&Action::Settle));
+        assert!(
+            log.try_iter()
+                .any(|record| record.contains("strategy=backspace")
+                    && record.ends_with("surrounding=mismatch")),
+        );
         // A terminal is always edited with Backspace.
         let (mut shared, _log) = shared_with(Settings::default());
         let mut engine = Engine::new(&shared);
@@ -1321,6 +1403,22 @@ mod tests {
         type_keys(&mut engine, &mut shared, &GHBDTN);
         engine.set_surrounding_text("ghbdtn".into(), 6, 6);
         assert_eq!(backspaces(&tap(&mut engine, &mut shared, KEY_SPACE, 0)), 6);
+    }
+
+    #[test]
+    fn a_reload_of_the_settings_keeps_a_password_field_private() {
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        engine.set_content_type(&shared, PURPOSE_PASSWORD, 0);
+        let (replacement, log) = default_shared();
+        shared = replacement;
+        engine.reload(&shared);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        assert!(!tap(&mut engine, &mut shared, KEY_SPACE, 0).handled);
+        assert!(
+            log.try_iter()
+                .all(|record| !record.contains("event=word") && !record.contains("conversion"))
+        );
     }
 
     #[test]

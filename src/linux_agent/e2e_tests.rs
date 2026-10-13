@@ -373,11 +373,21 @@ fn a_word_typed_in_the_wrong_layout_is_replaced_through_ibus() {
             "the US layout passes keys through"
         );
     }
+    let started = Instant::now();
     assert!(
         client.tap(0x20, KEY_SPACE),
         "the space comes with the replacement"
     );
+    // The replacement waited until the application could take the Backspaces.
+    assert!(started.elapsed() >= ibus::SETTLE);
     let events = client.drain();
+    let last_backspace = events
+        .iter()
+        .rposition(|event| matches!(event, Relayed::Forward { .. }));
+    let commit = events
+        .iter()
+        .position(|event| matches!(event, Relayed::Commit(_)));
+    assert!(last_backspace < commit, "{events:?}");
     let backspaces = events
         .iter()
         .filter(|event| {

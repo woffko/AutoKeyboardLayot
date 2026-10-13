@@ -8,7 +8,7 @@ use super::{
     localization::tr,
 };
 use autokeyboardlayot::Language;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 use zbus::{
     blocking::{Connection, MessageIterator},
     message::{Message, Type as MessageType},
@@ -26,6 +26,10 @@ const ENGINE_INTERFACE: &str = "org.freedesktop.IBus.Engine";
 const SERVICE_INTERFACE: &str = "org.freedesktop.IBus.Service";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const INTROSPECTABLE_INTERFACE: &str = "org.freedesktop.DBus.Introspectable";
+
+/// How long a replacement waits after forwarded Backspaces ([`Action::Settle`]): two frames at
+/// 30 Hz, one of the compositor and one of the application, with room to spare.
+pub const SETTLE: Duration = Duration::from_millis(80);
 
 const PROP_NORMAL: u32 = 0;
 const PROP_TOGGLE: u32 = 1;
@@ -626,7 +630,7 @@ impl Host {
             replacement.carry_over(&self.shared);
             self.shared = replacement;
             for (_, engine) in &mut self.engines {
-                *engine = Engine::new(&self.shared);
+                engine.reload(&self.shared);
             }
         }
     }
@@ -668,6 +672,8 @@ impl Host {
                 Action::RequireSurrounding => {
                     emit(connection, path, "RequireSurroundingText", &())?
                 }
+                // The keys queue in IBus meanwhile and come in their order afterwards.
+                Action::Settle => std::thread::sleep(SETTLE),
             }
         }
         Ok(())

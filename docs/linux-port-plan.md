@@ -123,6 +123,16 @@ showed two GLib warnings when IBus created the engine: the engine answered the f
 both as plain booleans and took them as false. The engine now answers plain booleans, and the
 end-to-end tests fail when the private daemon logs a warning.
 
+The owner's first typing tests (Ptyxis with Claude Code, Firefox) showed the replacement overtaking
+the forwarded Backspaces: `ghbdtn` and Space gave `ghbdtnп`, the six Backspaces erasing six of the
+seven characters of `привет ` instead of the word. GNOME delivers forwarded keys with its next frame
+and GTK takes key events with its next frame, while a commit reaches the application at once. The
+engine now waits 80 ms after Backspaces before it commits; a deletion through the surrounding text
+needs no wait. All conversions in Firefox used Backspaces too, so the conversion record now names
+what the field reported (`surrounding=`). A reload of the settings recreated the engine of every
+field and lost what the application had reported about it, such as a password purpose; the reload
+now keeps that.
+
 The Windows code cannot be built here (no `cargo-xwin`); shared changes are type-checked for the
 Windows target when the standard library for it is installed, and CI builds and tests Windows.
 

@@ -83,7 +83,10 @@ oldest distribution release it has to support.
    GNOME turns the key of that option into "next input source", which would leave the engine. The
    engine types Russian and Estonian itself (with the XKB layouts `ru` and `ee`), so the other input
    sources are not needed. They can stay as a fallback for programs that do not take input methods
-   (Super+Space switches to them).
+   (Super+Space switches to them). While one of them is the input source of a window, the engine
+   sees no keys there and converts nothing. With per-window input sources (on by default in
+   Ubuntu) every window keeps its own source. The indicator shows the engine's layout in capitals
+   (`EN`, `RU`, `ET`) and GNOME's own layouts in lower case (`en`, `ru`, `et`).
 
 The panel indicator shows `EN`, `RU` or `ET`. Its menu has the keyboard layouts, an "Automatic
 conversion" switch and "Settings…".
@@ -114,9 +117,13 @@ modular base". Move `~/.config/autokeyboardlayot/config.ini` aside to start fres
 
 How a word is replaced: if the application reports the text around the caret and that text ends
 with the typed word, the engine deletes exactly that word through IBus and commits the replacement.
-Otherwise, in terminals and in applications that do not report the text, it sends one BackSpace per
-typed character and then commits the replacement. Inside a terminal program that gives BackSpace
-another meaning, switch automatic conversion off.
+Otherwise, in terminals and in applications that do not report the text (or not yet), it sends one
+BackSpace per typed character, waits 80 ms and then commits the replacement. GNOME delivers the
+forwarded keys with its next frame and the application takes them with its own, while committed
+text arrives at once; without the wait the replacement would come first and the BackSpaces would
+erase it. Inside a terminal program that gives BackSpace another meaning, switch automatic
+conversion off. The diagnostics log names the way (`strategy=`) and what the field reported
+(`surrounding=`: `verified`, `none`, `mismatch`, `selection` or `terminal`).
 
 Password and PIN fields, as the application reports them to IBus, and fields marked private are
 typed normally but never tracked.
