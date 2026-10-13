@@ -380,9 +380,18 @@ impl Host {
         self
     }
 
-    /// Serves calls until the connection closes.
-    pub fn serve(&mut self, connection: &Connection) -> zbus::Result<()> {
-        for message in MessageIterator::from(connection) {
+    /// Serves calls until the connection closes. `announce` makes the engine known to IBus (takes the
+    /// component's bus name or registers the component). It runs once the engine listens: IBus asks
+    /// the factory for an engine as soon as it learns of it, and a call that comes before anyone
+    /// listens is lost.
+    pub fn serve(
+        &mut self,
+        connection: &Connection,
+        announce: impl FnOnce() -> zbus::Result<()>,
+    ) -> zbus::Result<()> {
+        let messages = MessageIterator::from(connection);
+        announce()?;
+        for message in messages {
             let message = message?;
             if message.message_type() == MessageType::MethodCall {
                 self.dispatch(connection, &message)?;

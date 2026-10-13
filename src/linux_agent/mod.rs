@@ -103,12 +103,7 @@ fn serve(register: bool) -> Result<(), Box<dyn std::error::Error>> {
     profile::initialize_user_profile()?;
     let shared = runtime::load_shared()?;
     let connection = ibus::connect(&address)?;
-    if register {
-        let exec = std::env::current_exe()?;
-        ibus::register_component(&connection, &format!("{} --ibus", exec.display()), VERSION)?;
-    } else {
-        connection.request_name(ibus::COMPONENT_NAME)?;
-    }
+    let exec = format!("{} --ibus", std::env::current_exe()?.display());
     shared.diagnostics.record(
         "engine",
         &format!("result=started version={}", VERSION.replace(' ', "_")),
@@ -124,7 +119,13 @@ fn serve(register: bool) -> Result<(), Box<dyn std::error::Error>> {
             runtime::load_shared().ok()
         })
         .with_settings(open_settings);
-    host.serve(&connection)?;
+    host.serve(&connection, || {
+        if register {
+            ibus::register_component(&connection, &exec, VERSION)
+        } else {
+            connection.request_name(ibus::COMPONENT_NAME)
+        }
+    })?;
     Ok(())
 }
 

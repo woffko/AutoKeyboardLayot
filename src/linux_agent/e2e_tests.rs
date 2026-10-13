@@ -120,12 +120,51 @@ fn start_engine(address: &str, data: &Path) {
         )
         .unwrap();
         let connection = ibus::connect(&address).unwrap();
-        ibus::register_component(&connection, "/bin/false", "test").unwrap();
-        ready.send(()).unwrap();
-        let _ = ibus::Host::new(shared).serve(&connection);
+        let _ = ibus::Host::new(shared).serve(&connection, || {
+            ibus::register_component(&connection, "/bin/false", "test")?;
+            ready.send(()).unwrap();
+            Ok(())
+        });
     });
     wait.recv_timeout(Duration::from_secs(10))
         .expect("the engine registered");
+}
+
+/// Runs the engine the way IBus starts it from a component file: it takes the component's bus name,
+/// and the daemon then asks its factory for an engine.
+fn start_named_engine(address: &str, data: &Path) {
+    let (ready, wait) = channel();
+    let address = address.to_owned();
+    let data = data.to_owned();
+    thread::spawn(move || {
+        let shared = runtime::load_shared_from(
+            &data.join("config"),
+            &data.join("data"),
+            &data.join("state"),
+        )
+        .unwrap();
+        let connection = ibus::connect(&address).unwrap();
+        let _ = ibus::Host::new(shared).serve(&connection, || {
+            connection.request_name(ibus::COMPONENT_NAME)?;
+            ready.send(()).unwrap();
+            Ok(())
+        });
+    });
+    wait.recv_timeout(Duration::from_secs(10))
+        .expect("the engine took its bus name");
+}
+
+/// Makes the engine the global engine, as GNOME uses IBus; true when IBus created it.
+fn select_engine(connection: &Connection) -> bool {
+    connection
+        .call_method(
+            Some("org.freedesktop.IBus"),
+            "/org/freedesktop/IBus",
+            Some("org.freedesktop.IBus"),
+            "SetGlobalEngine",
+            &(ibus::ENGINE_NAME,),
+        )
+        .is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +212,16 @@ struct Client {
 
 impl Client {
     fn new(address: &str) -> Self {
+        let client = Self::focused(address);
+        assert!(
+            select_engine(&client.connection),
+            "IBus selected the engine"
+        );
+        client
+    }
+
+    /// An input context with the focus, before any engine is selected.
+    fn focused(address: &str) -> Self {
         let connection = ibus::connect(address).unwrap();
         let reply = connection
             .call_method(
@@ -239,17 +288,6 @@ impl Client {
         };
         client.call("SetCapabilities", &(CAPABILITIES,));
         client.call("FocusIn", &());
-        // IBus runs with one global engine, as GNOME uses it.
-        client
-            .connection
-            .call_method(
-                Some("org.freedesktop.IBus"),
-                "/org/freedesktop/IBus",
-                Some("org.freedesktop.IBus"),
-                "SetGlobalEngine",
-                &(ibus::ENGINE_NAME,),
-            )
-            .unwrap();
         client
     }
 
@@ -426,4 +464,26 @@ fn ibus_daemon_reads_the_component_file() {
     assert_eq!(string_field(fields, 9), "us");
     assert_eq!(string_field(fields, 12), "⌨");
     assert_eq!(string_field(fields, 18), "InputMode");
+}
+
+#[test]
+fn ibus_creates_an_engine_that_it_started_from_the_component_file() {
+    // IBus starts the component's program (here a stand-in that only waits) and creates the engine
+    // through the factory of whoever takes the component's bus name: the engine of this test.
+    let component = ibus::component_xml("/bin/sleep 10", "test");
+    let Some(daemon) = start_daemon(Some(&component)) else {
+        return;
+    };
+    let client = Client::focused(&daemon.address);
+    let selecting = {
+        let connection = client.connection.clone();
+        thread::spawn(move || select_engine(&connection))
+    };
+    // The daemon has started the program and waits for the name when the engine takes it.
+    thread::sleep(Duration::from_millis(300));
+    let data = tempfile::tempdir().unwrap();
+    start_named_engine(&daemon.address, data.path());
+    assert!(selecting.join().unwrap(), "IBus created the engine");
+    let events = client.drain();
+    assert!(events.contains(&Relayed::Symbol("EN".into())), "{events:?}");
 }
