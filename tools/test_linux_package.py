@@ -244,13 +244,17 @@ class UserInstallation(unittest.TestCase):
             self.assertTrue((directory / 'kept').is_file())
         self.assertNotIn('IBUS_COMPONENT_PATH', recorder.calls[1][1])
 
-    def test_uninstall_leaves_a_unit_file_it_did_not_write(self):
+    def test_a_unit_file_it_did_not_write_is_neither_replaced_nor_removed(self):
         layout = user_layout(self.environment)
         layout['dropin'].parent.mkdir(parents=True)
-        layout['dropin'].write_text('[Service]\nEnvironment=OTHER=1\n', encoding='utf-8')
+        foreign = '[Service]\nEnvironment=OTHER=1\n'
+        layout['dropin'].write_text(foreign, encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            self.install()
+        self.assertFalse(layout['binary'].exists())
         with self.assertRaises(SystemExit):
             uninstall_user(self.environment, Recorder())
-        self.assertTrue(layout['dropin'].is_file())
+        self.assertEqual(layout['dropin'].read_text(encoding='utf-8'), foreign)
 
 
 if __name__ == '__main__':

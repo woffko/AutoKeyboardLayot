@@ -365,6 +365,7 @@ def install_user(binary, environment, run=subprocess.run, unit_directories=UNIT_
         raise SystemExit(f'{GNOME_IBUS_UNIT} is not installed: this installation needs the IBus of a GNOME '
                          'session. On other desktops, install the .deb instead.')
     layout = user_layout(environment)
+    refuse_foreign_dropin(layout)
     install_files(layout, binary, layout['binary'], strip)
     install_text(layout['dropin'], dropin_text(layout))
     notes = refresh_ibus(run, environment, component_path(layout))
@@ -384,10 +385,14 @@ Next steps (nothing below has been done):
      "Settings" in the input source menu).''')
 
 
-def uninstall_user(environment, run=subprocess.run):
-    layout = user_layout(environment)
+def refuse_foreign_dropin(layout):
     if layout['dropin'].is_file() and DROPIN_MARKER not in layout['dropin'].read_text(encoding='utf-8'):
         raise SystemExit(f'{layout["dropin"]} was not written by install-user; it is left alone.')
+
+
+def uninstall_user(environment, run=subprocess.run):
+    layout = user_layout(environment)
+    refuse_foreign_dropin(layout)
     for key in ('dropin', 'component', 'desktop', 'icon', 'binary'):
         if layout[key].exists():
             layout[key].unlink()

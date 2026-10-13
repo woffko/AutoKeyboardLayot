@@ -99,6 +99,9 @@ pub fn run() -> Result<(), String> {
         .map_err(|error| tr_format("error.read_config", &[("error", &error.to_string())]))?;
     localization::initialize(&document.ui_language, packages.catalogs.as_deref());
     let ui = SettingsWindow::new().map_err(|error| error.to_string())?;
+    // The desktop matches the window to `autokeyboardlayot.desktop` (its icon and name) by this id.
+    // It only labels the window, so a platform without it is no reason to stop.
+    let _ = slint::set_xdg_app_id("autokeyboardlayot");
     ui.global::<Localization>()
         .on_text(|id, _revision| tr(id.as_str()).into());
     ui.global::<Localization>().set_revision(1);
