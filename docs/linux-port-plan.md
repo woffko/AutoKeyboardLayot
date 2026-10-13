@@ -1,6 +1,7 @@
 # Linux port plan
 
-Status: L0 to L9 done on branch `linux-port` (from `2408f57`), not pushed; L10 waits for the owner.
+Status: L0 to L9 done on branch `linux-port` (from `2408f57`), not pushed; L10 in progress on the
+owner's desktop (user installation since 2026-10-13).
 Owner decisions of 2026-10-13: an IBus engine, the whole port in one plan, the Windows agent kept
 with a shared core. How to install and use it: [`linux.md`](linux.md).
 
@@ -115,6 +116,12 @@ created the English-only profile in an empty home and served the engine. The set
 not been opened on a display yet (L10), and CI runs when the branch is pushed. The Linux notices of
 that package (`target/linux-notices-complete-20261013-01`, 421 packages, none missing) are not yet
 reviewed by the owner.
+
+L10 started on 2026-10-13 with the user installation of `dfa67c7`. The journal of the desktop's IBus
+showed two GLib warnings when IBus created the engine: the engine answered the flags `FocusId` and
+`ActiveSurroundingText` as `(b)`, the type the IBus introspection declares, but `ibus-daemon` reads
+both as plain booleans and took them as false. The engine now answers plain booleans, and the
+end-to-end tests fail when the private daemon logs a warning.
 
 The Windows code cannot be built here (no `cargo-xwin`); shared changes are type-checked for the
 Windows target when the standard library for it is installed, and CI builds and tests Windows.

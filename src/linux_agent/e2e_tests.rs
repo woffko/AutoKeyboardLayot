@@ -30,6 +30,19 @@ struct Daemon {
     child: Child,
     _root: tempfile::TempDir,
     address: String,
+    log: PathBuf,
+}
+
+impl Daemon {
+    /// The GLib warnings the daemon wrote, such as a reply of the engine with the wrong type.
+    fn complaints(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("CRITICAL") || line.contains("WARNING"))
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 impl Drop for Daemon {
@@ -65,6 +78,7 @@ fn start_daemon(component: Option<&str>) -> Option<Daemon> {
         std::fs::create_dir_all(&path).unwrap();
         path
     };
+    let log = root.path().join("daemon.log");
     let mut command = Command::new(program);
     command.env_clear();
     if let Some(component) = component {
@@ -89,7 +103,7 @@ fn start_daemon(component: Option<&str>) -> Option<Daemon> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -104,6 +118,7 @@ fn start_daemon(component: Option<&str>) -> Option<Daemon> {
         child,
         _root: root,
         address,
+        log,
     })
 }
 
@@ -384,6 +399,20 @@ fn a_word_typed_in_the_wrong_layout_is_replaced_through_ibus() {
     // The engine now types Russian: the key of "d" commits "в".
     assert!(client.tap(0x64, 32));
     assert_eq!(client.drain(), [Relayed::Commit("в".into())]);
+    assert_eq!(daemon.complaints(), Vec::<String>::new());
+}
+
+#[test]
+fn ibus_reads_the_flags_of_the_engine_without_a_complaint() {
+    let Some(daemon) = start_daemon(None) else {
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    start_engine(&daemon.address, data.path());
+    let client = Client::new(&daemon.address);
+    // IBus asks for the flags when it creates the engine, before the first key reaches it.
+    assert!(!client.tap(0x67, 34));
+    assert_eq!(daemon.complaints(), Vec::<String>::new());
 }
 
 #[test]
@@ -421,6 +450,7 @@ fn a_reported_surrounding_text_is_edited_through_ibus() {
             .any(|event| matches!(event, Relayed::Forward { .. })),
         "{events:?}"
     );
+    assert_eq!(daemon.complaints(), Vec::<String>::new());
 }
 
 /// A string field of a serialized structure.

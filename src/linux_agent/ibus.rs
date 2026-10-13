@@ -539,7 +539,6 @@ impl Host {
         member: &str,
     ) -> zbus::Result<()> {
         let header = message.header();
-        let flag = |value: bool| structure(StructureBuilder::new().add_field(value));
         match member {
             "Set" => {
                 let body = message.body();
@@ -562,17 +561,19 @@ impl Host {
             }
             "Get" => {
                 let (_interface, name): (String, String) = message.body().deserialize()?;
+                // IBus reads both flags as plain booleans, although its introspection declares
+                // "(b)"; a structure makes it log a GLib warning and take the flag as false.
                 match name.as_str() {
                     // FocusIn and FocusOut, not their variants with an input context path.
-                    "FocusId" => connection.reply(&header, &(flag(false),)),
-                    "ActiveSurroundingText" => connection.reply(&header, &(flag(true),)),
+                    "FocusId" => connection.reply(&header, &(Value::Bool(false),)),
+                    "ActiveSurroundingText" => connection.reply(&header, &(Value::Bool(true),)),
                     _ => unknown(connection, message),
                 }
             }
             "GetAll" => {
                 let mut all = HashMap::new();
-                all.insert("FocusId".to_owned(), flag(false));
-                all.insert("ActiveSurroundingText".to_owned(), flag(true));
+                all.insert("FocusId".to_owned(), Value::Bool(false));
+                all.insert("ActiveSurroundingText".to_owned(), Value::Bool(true));
                 connection.reply(&header, &(all,))
             }
             _ => unknown(connection, message),
