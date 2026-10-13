@@ -69,6 +69,19 @@ class LicensePathsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             packages_from_receipt(metadata, receipt, 'lock', 'manifest')
 
+    def test_a_receipt_names_its_target_and_a_windows_receipt_never_serves_linux(self):
+        metadata = {'packages': [{'id': 'root'}, {'id': 'used'}], 'resolve': {'root': 'root'}}
+        windows = {'variant': 'base', 'cargo_lock_sha256': 'lock', 'cargo_toml_sha256': 'manifest',
+                   'compiled_package_ids': ['root', 'used']}
+        linux = {**windows, 'target': 'x86_64-unknown-linux-gnu', 'build': 'package'}
+        self.assertEqual(len(packages_from_receipt(metadata, windows, 'lock', 'manifest')), 2)
+        self.assertEqual(len(packages_from_receipt(metadata, linux, 'lock', 'manifest',
+                                                   'x86_64-unknown-linux-gnu')), 2)
+        with self.assertRaises(ValueError):
+            packages_from_receipt(metadata, windows, 'lock', 'manifest', 'x86_64-unknown-linux-gnu')
+        with self.assertRaises(ValueError):
+            packages_from_receipt(metadata, linux, 'lock', 'manifest')
+
     def test_upstream_binding_hash_and_dirty_status(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

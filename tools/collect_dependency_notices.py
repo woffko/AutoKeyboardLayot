@@ -91,8 +91,13 @@ def upstream_texts(package, entry, directory):
     return result, dirty
 
 
-def packages_from_receipt(metadata, receipt, lock_hash, manifest_hash):
-    if receipt['variant'] != 'base' or receipt['cargo_lock_sha256'] != lock_hash or receipt['cargo_toml_sha256'] != manifest_hash:
+WINDOWS = 'x86_64-pc-windows-msvc'
+
+
+def packages_from_receipt(metadata, receipt, lock_hash, manifest_hash, platform=WINDOWS):
+    # Windows receipts predate the target field; they come from the Windows base test build.
+    if (receipt['variant'] != 'base' or receipt.get('target', WINDOWS) != platform
+            or receipt['cargo_lock_sha256'] != lock_hash or receipt['cargo_toml_sha256'] != manifest_hash):
         raise ValueError('build receipt does not match this base configuration')
     included = set(receipt['compiled_package_ids'])
     available = {package['id'] for package in metadata['packages']}
@@ -119,6 +124,8 @@ def main():
     parser.add_argument('output', type=Path, help='new output directory')
     parser.add_argument('--upstream', type=Path, help='version-pinned upstream-notices.json')
     parser.add_argument('--build-receipt', type=Path, help='actual Cargo compiler-artifact receipt for the base test build')
+    parser.add_argument('--platform', default=WINDOWS,
+                        help='target triple of the base (default: the Windows installer); a receipt must name it')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     metadata_command = [
@@ -128,16 +135,21 @@ def main():
     # The actual build also uses host-platform proc-macro/build dependencies.
     # Resolve their metadata too, then select by compiler-artifact package IDs.
     if not args.build_receipt:
-        metadata_command += ['--filter-platform', 'x86_64-pc-windows-msvc']
+        metadata_command += ['--filter-platform', args.platform]
     metadata = json.loads(subprocess.check_output(metadata_command, cwd=root, timeout=30))
     lock_hash = hashlib.sha256((root / 'Cargo.lock').read_bytes()).hexdigest()
     packages = metadata['packages']
     receipt_hash = None
+    package_build = False
     if args.build_receipt:
         raw_receipt = args.build_receipt.read_bytes()
-        packages = packages_from_receipt(metadata, json.loads(raw_receipt), lock_hash,
-                                        hashlib.sha256((root / 'Cargo.toml').read_bytes()).hexdigest())
+        receipt = json.loads(raw_receipt)
+        packages = packages_from_receipt(metadata, receipt, lock_hash,
+                                        hashlib.sha256((root / 'Cargo.toml').read_bytes()).hexdigest(),
+                                        args.platform)
         receipt_hash = hashlib.sha256(raw_receipt).hexdigest()
+        # The Linux receipt records the release build of the package, not a test build.
+        package_build = receipt.get('build') == 'package'
     upstream = {}
     if args.upstream:
         supplement = json.loads(args.upstream.read_text(encoding='utf-8'))
@@ -147,9 +159,10 @@ def main():
             if entry['package'] in upstream:
                 raise ValueError('duplicate upstream package')
             upstream[entry['package']] = entry
+    graph = 'Windows base' if args.platform == WINDOWS else args.platform + ' base'
     sections = ['AutoKeyboardLayot: collected third-party notices\n',
-        'This collection includes the resolved Windows base dependency graph,\n'
-        'including build/test dependencies. License alternatives are reproduced\n'
+        'This collection includes the resolved ' + graph + ' dependency graph,\n'
+        'including ' + ('build' if package_build else 'build/test') + ' dependencies. License alternatives are reproduced\n'
         'as metadata, not selected. This is not redistribution approval.\n']
     records, missing = [], []
     for package in sorted(packages, key=lambda p: (p['name'], p['version'])):
@@ -182,7 +195,8 @@ def main():
     (args.output / filename).write_text('\n'.join(sections), encoding='utf-8')
     report = {'complete_text_collection': not missing, 'redistribution_approval': False,
               'cargo_lock_sha256': lock_hash,
-              'scope': 'compiled base test graph (host and target)' if receipt_hash else 'Windows metadata projection',
+              'scope': ('compiled base ' + ('package' if package_build else 'test') + ' graph (host and target)'
+                        if receipt_hash else ('Windows' if args.platform == WINDOWS else graph) + ' metadata projection'),
               'build_receipt_sha256': receipt_hash,
               'packages': records, 'missing': missing}
     (args.output / 'notices-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
