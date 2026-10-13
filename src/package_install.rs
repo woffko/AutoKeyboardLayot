@@ -90,7 +90,7 @@ impl PreparedCatalog {
     /// Explicit metadata check only, with an independently chosen/bound source.
     /// The mutable release pointer is safe only because returned metadata is
     /// authenticated and checked against the persisted catalog high-water mark.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn from_github(
         store: &PackageStore,
         repository: &str,

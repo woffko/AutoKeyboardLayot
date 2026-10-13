@@ -761,21 +761,11 @@ fn replace_pointer(source: &Path, destination: &Path) -> Result<(), StoreError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::no_child_spawn;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::sync::{PoisonError, RwLock, RwLockReadGuard};
-
-    // Between its clone and its exec, a child process holds copies of every
-    // descriptor open in this process, including the lock file of a writer lock
-    // that another test has just released, which then looks busy for a moment.
-    // Tests that create stores hold the read side for their whole run; the one
-    // test that spawns a child holds the write side, so the two never overlap.
-    static CHILD_SPAWN: RwLock<()> = RwLock::new(());
-
-    fn no_child_spawn() -> RwLockReadGuard<'static, ()> {
-        CHILD_SPAWN.read().unwrap_or_else(PoisonError::into_inner)
-    }
+    use std::sync::RwLockReadGuard;
 
     /// The temporary directory of a test that also keeps child processes away.
     struct TestDirectory {
@@ -1361,7 +1351,7 @@ mod tests {
             assert!(matches!(store.writer_lock(), Err(StoreError::Busy)));
             return;
         }
-        let _exclusive = CHILD_SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let _exclusive = crate::test_support::spawning_children();
         let (_directory, store, empty) = setup_unguarded();
         let lock = store.writer_lock().unwrap();
         assert!(matches!(store.writer_lock(), Err(StoreError::Busy)));

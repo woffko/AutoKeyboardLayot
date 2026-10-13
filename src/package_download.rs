@@ -14,6 +14,13 @@ pub(crate) use winhttp::catalog_bytes;
 #[cfg(windows)]
 pub use winhttp::download;
 
+#[cfg(target_os = "linux")]
+mod curl;
+#[cfg(target_os = "linux")]
+pub(crate) use curl::catalog_bytes;
+#[cfg(target_os = "linux")]
+pub use curl::download;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadError {
     UrlPolicy,
@@ -65,12 +72,12 @@ impl DownloadedPackage {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 struct Target {
     host: String,
     path: String,
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 impl Target {
     fn parse(url: &str) -> Result<Self, DownloadError> {
         if url.len() > 8192
@@ -100,13 +107,13 @@ impl Target {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 #[derive(Clone, Copy)]
 enum BodySize {
     Exact(u64),
     AtMost(u64),
 }
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn read_sized_body(
     size: BodySize,
     mut check: impl FnMut() -> Result<(), DownloadError>,

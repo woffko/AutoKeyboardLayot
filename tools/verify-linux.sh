@@ -36,7 +36,7 @@ Logs and summary.txt are written to target/verify-linux/<UTC timestamp>/. The ex
 when every selected step passed or was skipped for a stated reason.
 
 Test-count floors: AKL_MIN_LINUX_LIB_TESTS (default 332) for the library tests and
-AKL_MIN_LINUX_AGENT_TESTS (default 31) for the Linux agent tests of step 06. Raise them when tests
+AKL_MIN_LINUX_AGENT_TESTS (default 33) for the Linux agent tests of step 06. Raise them when tests
 are added; never lower them to hide a deleted test.
 EOF
 }
@@ -64,7 +64,7 @@ done
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 2
 cd "$repo_root" || exit 2
 min_lib=${AKL_MIN_LINUX_LIB_TESTS:-332}
-min_agent=${AKL_MIN_LINUX_AGENT_TESTS:-31}
+min_agent=${AKL_MIN_LINUX_AGENT_TESTS:-33}
 
 selected() {
     local id=$1 name=$2 item

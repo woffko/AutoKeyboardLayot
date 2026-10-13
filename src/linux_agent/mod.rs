@@ -11,7 +11,22 @@ mod paths;
 mod runtime;
 mod settings;
 
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
+
+// Names the package pages shared with the Windows settings window look up in their grandparent.
+use localization as ui_localization;
+
+/// The directory that holds the package store (`packages/`): the XDG data directory.
+fn package_root() -> Option<PathBuf> {
+    paths::data_dir()
+}
+
+fn try_load_configuration_document() -> std::io::Result<autokeyboardlayot::ConfigurationDocument> {
+    let directory = paths::config_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
+    autokeyboardlayot::configuration::load_configuration_snapshot(&directory)
+        .map(|loaded| loaded.document)
+}
 
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),

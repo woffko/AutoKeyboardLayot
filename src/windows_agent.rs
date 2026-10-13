@@ -5206,6 +5206,12 @@ fn configuration_directory() -> Option<PathBuf> {
         .map(|path| path.join("AutoKeyboardLayot"))
 }
 
+/// The directory that holds the package store (`packages/`); on Windows it is the configuration
+/// directory. The package pages of the settings window use this name on both platforms.
+fn package_root() -> Option<PathBuf> {
+    configuration_directory()
+}
+
 fn configuration_path() -> Option<PathBuf> {
     configuration_directory().map(|directory| directory.join("config.ini"))
 }

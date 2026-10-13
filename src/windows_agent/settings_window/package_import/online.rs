@@ -25,8 +25,7 @@ fn managed_store() -> Result<PackageStore, InstallError> {
     if document.package_mode != PackageMode::Managed {
         return Err(autokeyboardlayot::package_inventory::InventoryError::InvalidState.into());
     }
-    let directory =
-        super::super::super::configuration_directory().ok_or(StoreError::InvalidFile)?;
+    let directory = super::super::super::package_root().ok_or(StoreError::InvalidFile)?;
     Ok(PackageStore::open(&directory.join("packages"))?)
 }
 

@@ -13,6 +13,8 @@ use autokeyboardlayot::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
+// An explicit path, so that the Linux settings window can include this file too.
+#[path = "package_import/online.rs"]
 mod online;
 
 /// Coarse, path-free reason codes for a failed local package operation, so the
@@ -232,7 +234,7 @@ fn store() -> Result<PackageStore, ImportFailure> {
     if document.package_mode != PackageMode::Managed {
         return Err(ImportFailure::Store);
     }
-    let directory = super::super::configuration_directory().ok_or(ImportFailure::Store)?;
+    let directory = super::super::package_root().ok_or(ImportFailure::Store)?;
     PackageStore::open(&directory.join("packages")).map_err(|_| ImportFailure::Store)
 }
 
@@ -240,7 +242,7 @@ fn store() -> Result<PackageStore, ImportFailure> {
 // not yet be active. Never confirm again and never activate configuration here.
 fn inspect_uncertain_write(trust: &PackageTrust) -> Completed {
     let result = inspect_uncertain_snapshot(|| {
-        super::super::configuration_directory()
+        super::super::package_root()
             .and_then(|directory| PackageStore::open(&directory.join("packages")).ok())
             .and_then(|store| store.load(trust).ok())
     });
@@ -577,8 +579,7 @@ pub(super) fn wire(
                     if current != migration.original {
                         return Err(ImportFailure::Migration);
                     }
-                    let directory =
-                        super::super::configuration_directory().ok_or(ImportFailure::Migration)?;
+                    let directory = super::super::package_root().ok_or(ImportFailure::Migration)?;
                     // A first explicit save/migration may have no app directory
                     // yet. Create only that child of the existing per-user root;
                     // the store still checks its parent and never repairs it.
@@ -628,7 +629,7 @@ pub(super) fn wire(
             let migrated = if let Some((original, next)) = migration_documents {
                 // Saving mode last is the activation point. Failure leaves a
                 // prepared store ignored by the old legacy configuration.
-                let activation = super::super::configuration_directory()
+                let activation = super::super::package_root()
                     .and_then(|directory| PackageStore::open(&directory.join("packages")).ok())
                     .is_some_and(|store| {
                         store
@@ -904,6 +905,12 @@ fn choose_file() -> Option<PathBuf> {
     choose_files(false)?.into_iter().next()
 }
 
+#[cfg(not(windows))]
+fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
+    super::choose_package_files(multiple)
+}
+
+#[cfg(windows)]
 fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
     let filter: Vec<u16> = "*.aklp\0*.aklp\0\0".encode_utf16().collect();
     let title: Vec<u16> = if multiple {
@@ -934,6 +941,7 @@ fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
     decode_selected_files(&file, multiple)
 }
 
+#[cfg(windows)]
 fn decode_selected_files(file: &[u16], multiple: bool) -> Option<Vec<PathBuf>> {
     if file.len() > 32_768 {
         return None;
@@ -1022,6 +1030,7 @@ mod tests {
         assert_eq!(ImportFailure::OutcomeUnknown.key(), "package.uncertain");
     }
 
+    #[cfg(windows)]
     #[test]
     fn native_file_selection_preserves_unicode_spaces_and_single_selection_shape() {
         let buffer: Vec<u16> = "C:\\Языки with spaces\\ru.aklp\0\0"
@@ -1045,6 +1054,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn native_multiple_selection_refuses_non_child_paths_and_missing_termination() {
         for child in [
@@ -1075,6 +1085,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn native_multiple_selection_bounds_buffer_and_number_of_paths() {
         assert!(decode_selected_files(&vec![0; 32_769], true).is_none());

@@ -32,6 +32,10 @@ use std::{
 
 slint::include_modules!();
 
+// The package pages are shared with the Windows settings window.
+#[path = "../windows_agent/settings_window/package_import.rs"]
+mod package_import;
+
 /// An exclusive advisory lock on a file, released when dropped.
 struct FileLock {
     _file: File,
@@ -136,7 +140,7 @@ pub fn run() -> Result<(), String> {
     ui.set_windows_features(false);
     ui.set_app_version(super::VERSION.into());
     populate(&ui, &document, &packages.dictionaries);
-    wire(&ui, config_dir, document, packages.dictionaries);
+    let _package_timer = wire(&ui, config_dir, document, packages.dictionaries);
     ui.run().map_err(|error| error.to_string())
 }
 
@@ -446,6 +450,75 @@ pub fn captured_hotkey(
     Some(Hotkey::new(virtual_key, modifiers).map_err(|error| error.to_string()))
 }
 
+/// The engine reloads the configuration on the next focus change, so it never needs a message.
+fn notify_agent() -> bool {
+    true
+}
+
+fn save_configuration_if_unchanged(
+    document: &ConfigurationDocument,
+    original: &ConfigurationDocument,
+) -> io::Result<()> {
+    let config_dir = paths::config_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    save_if_unchanged(&config_dir, document, original)
+}
+
+fn refresh_ui_language(
+    ui: &SettingsWindow,
+    preference: &UiLanguagePreference,
+    registry: &DictionaryRegistry,
+) {
+    localization::apply_preference(preference);
+    let global = ui.global::<Localization>();
+    global.set_rtl(localization::is_rtl());
+    global.set_revision(global.get_revision().wrapping_add(1));
+    populate_ui_language(ui, preference);
+    if let (Ok(selected), Ok(profiles)) = (selected_input_packs(ui), selected_input_profiles(ui)) {
+        populate_input_packs(ui, &selected, &profiles, registry);
+    }
+    ui.set_hotkey_capture_hint(tr("general.apply_hint").into());
+    ui.invoke_refresh_download_labels();
+    ui.invoke_refresh_package_labels();
+}
+
+/// On Linux the window records the hotkey itself; there is no capture to stop.
+mod hotkey_capture {
+    pub fn stop() {}
+}
+
+/// The package files chosen in a file dialog (zenity), or `None` when the dialog was cancelled.
+fn choose_package_files(multiple: bool) -> Option<Vec<PathBuf>> {
+    let mut command = std::process::Command::new("zenity");
+    command
+        .args([
+            "--file-selection",
+            "--file-filter=*.aklp",
+            "--separator=\n",
+            "--title",
+        ])
+        .arg(tr(if multiple {
+            "migration.choose"
+        } else {
+            "import.choose"
+        }));
+    if multiple {
+        command.arg("--multiple");
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let paths: Vec<PathBuf> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    (!paths.is_empty() && paths.len() <= 64 && paths.iter().all(|path| path.is_absolute()))
+        .then_some(paths)
+}
+
 fn status(ui: &SettingsWindow, error: bool, text: String) {
     ui.set_status_error(error);
     ui.set_status_text(text.into());
@@ -456,9 +529,10 @@ fn wire(
     config_dir: PathBuf,
     document: ConfigurationDocument,
     registry: Arc<DictionaryRegistry>,
-) {
+) -> slint::Timer {
     let document = Rc::new(RefCell::new(document));
-    let registry = Rc::new(registry);
+    let registry = Rc::new(RefCell::new(registry));
+    let package_timer = package_import::wire(ui, Rc::clone(&document), Rc::clone(&registry));
 
     let weak = ui.as_weak();
     let close_document = Rc::clone(&document);
@@ -492,7 +566,7 @@ fn wire(
         } else {
             selected.remove(&id);
         }
-        populate_input_packs(&ui, &selected, &profiles, &toggle_registry);
+        populate_input_packs(&ui, &selected, &profiles, &toggle_registry.borrow());
         status(&ui, false, tr("general.apply_hint"));
     });
 
@@ -513,7 +587,7 @@ fn wire(
             model.set_row_data(row_index, row);
         }
         if let Ok(profiles) = selected_input_profiles(&ui) {
-            populate_input_packs(&ui, &selected, &profiles, &profile_registry);
+            populate_input_packs(&ui, &selected, &profiles, &profile_registry.borrow());
         }
         status(&ui, false, tr("general.apply_hint"));
     });
@@ -617,6 +691,7 @@ fn wire(
             None => status(&ui, true, tr("error.open_log")),
         }
     });
+    package_timer
 }
 
 #[cfg(test)]

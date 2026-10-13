@@ -7,8 +7,25 @@ use crate::{
 };
 use std::{
     io::Read,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
+
+// Between its clone and its exec, a child process holds copies of every descriptor open in this
+// process, including the lock file of a package store writer that another test has just released,
+// which then looks busy for a moment. Tests that rely on those locks hold the read side for their
+// whole run; tests that spawn a child (the package store's own, the curl transport's) hold the
+// write side, so the two never overlap.
+static CHILD_SPAWN: RwLock<()> = RwLock::new(());
+
+/// Held by a test that relies on file locks staying its own.
+pub fn no_child_spawn() -> RwLockReadGuard<'static, ()> {
+    CHILD_SPAWN.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Held by a test that spawns a child process.
+pub fn spawning_children() -> RwLockWriteGuard<'static, ()> {
+    CHILD_SPAWN.write().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub fn registry() -> DictionaryRegistry {
     static FIXTURE: OnceLock<DictionaryRegistry> = OnceLock::new();
