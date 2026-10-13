@@ -5,6 +5,7 @@
 use super::{
     localization::{self, tr, tr_format},
     paths,
+    profile::{self, FileLock},
 };
 use autokeyboardlayot::{
     ConfigurationDocument, DictionaryRegistry, Hotkey, PackId,
@@ -22,9 +23,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::{
     cell::RefCell,
     collections::BTreeSet,
-    fs::File,
     io,
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -35,41 +34,6 @@ slint::include_modules!();
 // The package pages are shared with the Windows settings window.
 #[path = "../windows_agent/settings_window/package_import.rs"]
 mod package_import;
-
-/// An exclusive advisory lock on a file, released when dropped.
-struct FileLock {
-    _file: File,
-}
-
-impl FileLock {
-    fn acquire(path: &Path, wait: bool) -> io::Result<Option<Self>> {
-        if let Some(directory) = path.parent() {
-            std::fs::create_dir_all(directory)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)?;
-        let operation = if wait {
-            libc::LOCK_EX
-        } else {
-            libc::LOCK_EX | libc::LOCK_NB
-        };
-        // SAFETY: the descriptor belongs to `file`, which lives as long as the returned lock; flock
-        // has no other preconditions and reports failure through its return value.
-        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-        if result == 0 {
-            return Ok(Some(Self { _file: file }));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            Ok(None)
-        } else {
-            Err(error)
-        }
-    }
-}
 
 /// Lets one settings window run at a time.
 fn instance_lock_path() -> Option<PathBuf> {
@@ -102,7 +66,7 @@ fn save_if_unchanged(
     document: &ConfigurationDocument,
     original: &ConfigurationDocument,
 ) -> io::Result<()> {
-    let _lock = FileLock::acquire(&config_dir.join("config.lock"), true)?;
+    let _lock = profile::config_lock(config_dir)?;
     if &load_document(config_dir)? != original {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -127,6 +91,8 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     };
     let config_dir = paths::config_dir().ok_or("HOME is not set")?;
+    profile::initialize_user_profile()
+        .map_err(|error| tr_format("error.read_config", &[("error", &error.to_string())]))?;
     let document = load_document(&config_dir)
         .map_err(|error| tr_format("error.read_config", &[("error", &error.to_string())]))?;
     let packages = load_packages(&document)
@@ -755,10 +721,5 @@ mod tests {
         let error = save_if_unchanged(root.path(), &other, &original).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(load_document(root.path()).unwrap(), edited);
-        // The lock of a second window is refused without waiting.
-        let path = root.path().join("instance.lock");
-        let first = FileLock::acquire(&path, false).unwrap();
-        assert!(first.is_some());
-        assert!(FileLock::acquire(&path, false).unwrap().is_none());
     }
 }

@@ -8,6 +8,7 @@ mod ibus;
 mod keymap;
 mod localization;
 mod paths;
+mod profile;
 mod runtime;
 mod settings;
 
@@ -99,6 +100,7 @@ fn run_engine(register: bool) -> ExitCode {
 
 fn serve(register: bool) -> Result<(), Box<dyn std::error::Error>> {
     let address = ibus::address().ok_or("the IBus daemon address is unknown; is IBus running?")?;
+    profile::initialize_user_profile()?;
     let shared = runtime::load_shared()?;
     let connection = ibus::connect(&address)?;
     if register {

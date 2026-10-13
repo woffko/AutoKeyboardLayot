@@ -1,4 +1,7 @@
 //! Explicit first-install profile creation, never a startup recovery fallback.
+//! The Windows installer runs it once per user. On Linux no installer runs per
+//! user, so the engine and the settings window run it when they start; it still
+//! creates a profile only where none exists.
 use crate::{
     ConfigurationDocument, configuration::load_configuration_snapshot,
     language_package::PackageTrust, package_store::PreparedStoreInitialization,
@@ -13,7 +16,18 @@ pub fn initialize_if_absent(
     directory: &Path,
     publish: impl FnOnce(&Path, &str) -> io::Result<()>,
 ) -> io::Result<bool> {
-    if !directory.is_absolute() {
+    initialize_profile_if_absent(directory, &directory.join("packages"), publish)
+}
+
+/// [`initialize_if_absent`] with the package store at `packages` instead of in
+/// the profile directory: on Linux the configuration and the data live in
+/// different XDG directories. The parent of `packages` is created if missing.
+pub fn initialize_profile_if_absent(
+    directory: &Path,
+    packages: &Path,
+    publish: impl FnOnce(&Path, &str) -> io::Result<()>,
+) -> io::Result<bool> {
+    if !directory.is_absolute() || !packages.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "absolute profile directory required",
@@ -38,11 +52,14 @@ pub fn initialize_if_absent(
         return Ok(false);
     }
     std::fs::create_dir_all(directory)?;
+    if let Some(parent) = packages.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let trust = PackageTrust::default();
     let prepared = PreparedStoreInitialization::from_files(&[], &Default::default(), &trust)
         .map_err(io::Error::other)?;
     prepared
-        .confirm(&directory.join("packages"), &trust)
+        .confirm(packages, &trust)
         .map_err(io::Error::other)?;
     let contents = ConfigurationDocument::english_only_managed()
         .to_text()
@@ -74,6 +91,31 @@ mod tests {
             !initialize_if_absent(&root, |_, _| panic!("repair rewrote configuration")).unwrap()
         );
         assert_eq!(std::fs::read(root.join("config.ini")).unwrap(), bytes);
+    }
+    #[test]
+    fn the_package_store_can_live_outside_the_profile_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config/autokeyboardlayot");
+        let packages = temporary.path().join("share/autokeyboardlayot/packages");
+        assert!(initialize_profile_if_absent(&config, &packages, publish).unwrap());
+        assert!(packages.join("CURRENT").is_file());
+        assert!(!config.join("packages").exists());
+        assert_eq!(
+            load_configuration_snapshot(&config).unwrap().document,
+            ConfigurationDocument::english_only_managed()
+        );
+        let bytes = std::fs::read(config.join("config.ini")).unwrap();
+        assert!(
+            !initialize_profile_if_absent(&config, &packages, |_, _| panic!("rewritten")).unwrap()
+        );
+        assert_eq!(std::fs::read(config.join("config.ini")).unwrap(), bytes);
+        let relative = std::path::Path::new("packages");
+        assert_eq!(
+            initialize_profile_if_absent(&config, relative, publish)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
     #[test]
     fn legacy_empty_files_and_malformed_profiles_are_not_reset() {

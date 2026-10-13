@@ -46,7 +46,9 @@ fn ibus_daemon() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-fn start_daemon() -> Option<Daemon> {
+/// Starts a private daemon. With a component file, the daemon reads components from its directory
+/// only (the way a user installation points IBus at it); without one, from the system directory.
+fn start_daemon(component: Option<&str>) -> Option<Daemon> {
     let Some(program) = ibus_daemon() else {
         assert!(
             std::env::var_os("AKL_REQUIRE_IBUS").is_none(),
@@ -63,8 +65,14 @@ fn start_daemon() -> Option<Daemon> {
         std::fs::create_dir_all(&path).unwrap();
         path
     };
-    let child = Command::new(program)
-        .env_clear()
+    let mut command = Command::new(program);
+    command.env_clear();
+    if let Some(component) = component {
+        let components = directory("components");
+        std::fs::write(components.join("autokeyboardlayot.xml"), component).unwrap();
+        command.env("IBUS_COMPONENT_PATH", components);
+    }
+    let child = command
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", directory("home"))
         .env("XDG_CONFIG_HOME", directory("config"))
@@ -297,7 +305,7 @@ const GHBDTN: [(u32, u32); 6] = [
 
 #[test]
 fn a_word_typed_in_the_wrong_layout_is_replaced_through_ibus() {
-    let Some(daemon) = start_daemon() else {
+    let Some(daemon) = start_daemon(None) else {
         return;
     };
     let data = tempfile::tempdir().unwrap();
@@ -342,7 +350,7 @@ fn a_word_typed_in_the_wrong_layout_is_replaced_through_ibus() {
 
 #[test]
 fn a_reported_surrounding_text_is_edited_through_ibus() {
-    let Some(daemon) = start_daemon() else {
+    let Some(daemon) = start_daemon(None) else {
         return;
     };
     let data = tempfile::tempdir().unwrap();
@@ -375,4 +383,47 @@ fn a_reported_surrounding_text_is_edited_through_ibus() {
             .any(|event| matches!(event, Relayed::Forward { .. })),
         "{events:?}"
     );
+}
+
+/// A string field of a serialized structure.
+fn string_field<'a>(fields: &'a [Value<'a>], index: usize) -> &'a str {
+    match &fields[index] {
+        Value::Str(text) => text.as_str(),
+        other => panic!("field {index} is not a string: {other:?}"),
+    }
+}
+
+#[test]
+fn ibus_daemon_reads_the_component_file() {
+    let component = ibus::component_xml("/usr/bin/autokeyboardlayot --ibus", "test");
+    let Some(daemon) = start_daemon(Some(&component)) else {
+        return;
+    };
+    let connection = ibus::connect(&daemon.address).unwrap();
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.IBus"),
+            "/org/freedesktop/IBus",
+            Some("org.freedesktop.IBus"),
+            "GetEnginesByNames",
+            &(vec![ibus::ENGINE_NAME],),
+        )
+        .unwrap();
+    let body = reply.body();
+    let (engines,): (Vec<Value<'_>>,) = body.deserialize().unwrap();
+    assert_eq!(engines.len(), 1, "{engines:?}");
+    let mut engine = &engines[0];
+    while let Value::Value(inner) = engine {
+        engine = inner;
+    }
+    let Value::Structure(description) = engine else {
+        panic!("not an engine description: {engine:?}");
+    };
+    let fields = description.fields();
+    assert_eq!(string_field(fields, 0), "IBusEngineDesc");
+    assert_eq!(string_field(fields, 2), ibus::ENGINE_NAME);
+    assert_eq!(string_field(fields, 3), "AutoKeyboardLayot");
+    assert_eq!(string_field(fields, 9), "us");
+    assert_eq!(string_field(fields, 12), "⌨");
+    assert_eq!(string_field(fields, 18), "InputMode");
 }
