@@ -1,0 +1,41 @@
+# Policy for cargo-deny (CI step "Dependency licenses and sources"):
+#
+#     cargo deny check licenses bans sources
+#
+# Advisories are checked by cargo-audit instead; see .cargo/audit.toml.
+
+[graph]
+# The two CI platforms. The Windows target pulls in the whole UI stack.
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+# A crate passes when its license expression can be satisfied with these
+# licenses, so a dual-licensed crate needs only one of its options listed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unlicense",
+    # Slint is used under its royalty-free desktop license (a license
+    # reference, not an SPDX identifier). See docs/licensing-notes.md.
+    "LicenseRef-Slint-Royalty-free-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# crates.io only: no git dependencies and no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

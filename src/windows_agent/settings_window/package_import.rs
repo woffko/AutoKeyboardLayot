@@ -5,7 +5,7 @@ use autokeyboardlayot::{
     installed_packages::InstalledPackages,
     language_package::PackageTrust,
     language_package::VerifiedLanguagePackage,
-    package_install::{PreparedCatalog, PreparedOnlineInstall},
+    package_install::{InstallError, PreparedCatalog, PreparedOnlineInstall},
     package_inventory::PackageInventory,
     package_store::{
         PackageStore, PreparedImport, PreparedRollback, PreparedStoreInitialization, StoreSnapshot,
@@ -52,6 +52,33 @@ impl ImportFailure {
     }
 }
 
+/// Why an online package operation failed, as far as the status line distinguishes it.
+#[derive(Debug, PartialEq, Eq)]
+enum OnlineFailure {
+    /// The signed catalog is outside its validity window: it has expired, or the clock of this
+    /// computer is wrong.
+    CatalogExpired,
+    /// Any other failure, shown as its path-free error code.
+    Code(String),
+}
+
+impl OnlineFailure {
+    fn from_error(error: &InstallError) -> Self {
+        if error.is_catalog_expired() {
+            Self::CatalogExpired
+        } else {
+            Self::Code(error.to_string())
+        }
+    }
+
+    fn status_text(&self) -> String {
+        match self {
+            Self::CatalogExpired => tr("download.catalog_expired"),
+            Self::Code(code) => tr_format("download.failed", &[("code", code)]),
+        }
+    }
+}
+
 enum Completed {
     Prepared(Box<PreparedImport>),
     Rollback(Box<PreparedRollback>),
@@ -61,7 +88,7 @@ enum Completed {
     Listing(Vec<(String, String, bool)>),
     Catalog(Box<PreparedCatalog>),
     Online(Box<PreparedOnlineInstall>),
-    OnlineFailure(String),
+    OnlineFailure(OnlineFailure),
     UncertainListing(Option<Vec<(String, String, bool)>>),
     Changed {
         packages: InstalledPackages,
@@ -539,7 +566,9 @@ pub(super) fn wire(
                         Err(autokeyboardlayot::package_install::InstallError::Store(error)) => {
                             Err(error)
                         }
-                        Err(error) => return Ok(Completed::OnlineFailure(error.to_string())),
+                        Err(error) => {
+                            return Ok(Completed::OnlineFailure(OnlineFailure::from_error(&error)));
+                        }
                     }
                 }
                 Pending::Migrate(migration) => {
@@ -792,10 +821,10 @@ pub(super) fn wire(
                 }
                 Ok(Completed::Catalog(catalog)) => online::show_catalog(&ui, &mut state, catalog),
                 Ok(Completed::Online(prepared)) => online::show_prepared(&ui, &mut state, prepared),
-                Ok(Completed::OnlineFailure(code)) => {
+                Ok(Completed::OnlineFailure(failure)) => {
                     online::clear_catalog(&ui, &mut state);
                     ui.set_status_error(true);
-                    ui.set_status_text(tr_format("download.failed", &[("code", &code)]).into());
+                    ui.set_status_text(failure.status_text().into());
                 }
                 Ok(Completed::Changed {
                     packages,
@@ -944,6 +973,33 @@ fn decode_selected_files(file: &[u16], multiple: bool) -> Option<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_catalog_has_its_own_status_and_other_errors_keep_their_code() {
+        use autokeyboardlayot::{package_catalog::ReleaseError, package_download::DownloadError};
+        for error in [
+            InstallError::Catalog(ReleaseError::NotCurrent),
+            InstallError::Download(DownloadError::Verification(ReleaseError::NotCurrent)),
+        ] {
+            assert_eq!(
+                OnlineFailure::from_error(&error),
+                OnlineFailure::CatalogExpired
+            );
+        }
+        assert_eq!(
+            OnlineFailure::from_error(&InstallError::Catalog(ReleaseError::Rollback)),
+            OnlineFailure::Code("package_install_Catalog(Rollback)".into())
+        );
+        let expired = OnlineFailure::CatalogExpired.status_text();
+        assert_ne!(
+            expired, "download.catalog_expired",
+            "the message is missing"
+        );
+        assert!(expired.contains("expired"), "{expired}");
+        assert!(!expired.contains('{'), "{expired}");
+        let generic = OnlineFailure::Code("package_install_Cancelled".into()).status_text();
+        assert!(generic.contains("package_install_Cancelled"), "{generic}");
+    }
 
     #[test]
     fn uncertain_reread_is_once_and_does_not_turn_failure_into_an_empty_inventory() {

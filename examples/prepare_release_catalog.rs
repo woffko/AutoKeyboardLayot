@@ -2,7 +2,10 @@
 use autokeyboardlayot::{
     language_package::{MAX_PACKAGE_BYTES, PackageTrust, VerifiedLanguagePackage},
     package_catalog::DEFAULT_PACKAGE_REPOSITORY,
-    package_signing::{PreparedSigningInput, SigningKind},
+    package_signing::{
+        DEFAULT_CATALOG_VALIDITY_DAYS, MAX_CATALOG_VALIDITY_DAYS, PreparedSigningInput,
+        SigningKind, catalog_window,
+    },
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -14,15 +17,26 @@ use std::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 4 {
-        return Err("usage: prepare_release_catalog DIRECTORY TAG REVISION NEW_OUTPUT".into());
+    if !(4..=5).contains(&args.len()) {
+        return Err(format!(
+            "usage: prepare_release_catalog DIRECTORY TAG REVISION NEW_OUTPUT [VALIDITY_DAYS] \
+             (validity defaults to {DEFAULT_CATALOG_VALIDITY_DAYS} days, at most {MAX_CATALOG_VALIDITY_DAYS}; \
+             every renewal needs a new, higher REVISION)"
+        )
+        .into());
     }
     if Path::new(&args[3]).try_exists()? {
         return Err("output already exists".into());
     }
     let tag = args[1].to_str().ok_or("tag encoding")?;
     let revision: u64 = args[2].to_str().ok_or("revision encoding")?.parse()?;
+    let validity_days: u64 = match args.get(4) {
+        Some(value) => value.to_str().ok_or("validity encoding")?.parse()?,
+        None => DEFAULT_CATALOG_VALIDITY_DAYS,
+    };
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let (issued_at, expires_at) = catalog_window(now, validity_days)
+        .map_err(|_| format!("VALIDITY_DAYS must be between 1 and {MAX_CATALOG_VALIDITY_DAYS}"))?;
     let trust = PackageTrust::release()?;
     let mut paths = Vec::new();
     for (index, entry) in std::fs::read_dir(&args[0])?.enumerate() {
@@ -57,16 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "runtime_api":package.runtime_api(),"input":package.input().is_some(),"ui_locale":package.ui_locale()}));
     }
     let catalog = json!({"format":1,"repository":DEFAULT_PACKAGE_REPOSITORY,"revision":revision,
-        "issued_at":now,"expires_at":now.checked_add(7*24*60*60).ok_or("time overflow")?,"packages":packages}).to_string();
+        "issued_at":issued_at,"expires_at":expires_at,"packages":packages})
+    .to_string();
     let bytes = serde_json::to_vec(&json!({"format":1,"catalog":catalog}))?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../data/package-signing/public-key.json"))?;
-    PreparedSigningInput::prepare(
-        SigningKind::Catalog,
-        metadata["signer"].as_str().ok_or("signer")?,
-        &bytes,
-        now,
-    )?;
+    let signer = autokeyboardlayot::language_package::PackageTrust::release_signer()?.signer;
+    PreparedSigningInput::prepare(SigningKind::Catalog, &signer, &bytes, now)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -74,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     file.write_all(&bytes)?;
     file.sync_all()?;
     println!(
-        "UNSIGNED_CATALOG_VALIDATED {} packages; seven-day candidate, NOT published",
+        "UNSIGNED_CATALOG_VALIDATED {} packages; {validity_days}-day candidate, NOT published",
         packages.len()
     );
     Ok(())

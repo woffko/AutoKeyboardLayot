@@ -14,6 +14,32 @@ pub enum SigningKind {
     Catalog,
 }
 
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+/// Validity of a new catalog when the operator does not choose one.
+pub const DEFAULT_CATALOG_VALIDITY_DAYS: u64 = 21;
+/// The longest validity clients accept: `package_catalog` refuses a longer window.
+pub const MAX_CATALOG_VALIDITY_DAYS: u64 =
+    crate::package_catalog::MAX_LIFETIME_SECONDS / SECONDS_PER_DAY;
+/// `issued_at` lies this far in the past, so a client whose clock runs slightly behind still
+/// accepts a catalog that was published a moment ago.
+pub const CATALOG_BACKDATE_SECONDS: u64 = 60 * 60;
+
+/// The `(issued_at, expires_at)` window of a catalog created at `now`. The window is exactly
+/// `validity_days` long, counted from the backdated `issued_at`, so even the maximum stays within
+/// the lifetime clients accept. Validity must be 1 to [`MAX_CATALOG_VALIDITY_DAYS`] days.
+pub fn catalog_window(now: u64, validity_days: u64) -> Result<(u64, u64), SigningInputError> {
+    if !(1..=MAX_CATALOG_VALIDITY_DAYS).contains(&validity_days) {
+        return Err(SigningInputError::InvalidInput);
+    }
+    let issued_at = now
+        .checked_sub(CATALOG_BACKDATE_SECONDS)
+        .ok_or(SigningInputError::InvalidInput)?;
+    let expires_at = issued_at
+        .checked_add(validity_days * SECONDS_PER_DAY)
+        .ok_or(SigningInputError::InvalidInput)?;
+    Ok((issued_at, expires_at))
+}
+
 #[derive(Debug)]
 pub enum SigningInputError {
     InvalidInput,
@@ -286,6 +312,49 @@ mod tests {
             Err(SigningInputError::TooLarge)
         ));
     }
+    #[test]
+    fn catalog_window_backdates_and_bounds_the_validity() {
+        let now = 1_800_000_000;
+        assert_eq!(
+            catalog_window(now, DEFAULT_CATALOG_VALIDITY_DAYS).unwrap(),
+            (now - 3600, now - 3600 + 21 * 86_400)
+        );
+        let (issued_at, expires_at) = catalog_window(now, 1).unwrap();
+        assert_eq!(expires_at - issued_at, 86_400);
+        assert_eq!(MAX_CATALOG_VALIDITY_DAYS, 31);
+        assert!(catalog_window(now, MAX_CATALOG_VALIDITY_DAYS).is_ok());
+        for days in [0, MAX_CATALOG_VALIDITY_DAYS + 1, 365, u64::MAX] {
+            assert!(catalog_window(now, days).is_err(), "{days} days");
+        }
+        // The backdating cannot go before the epoch, and the end cannot overflow.
+        assert!(catalog_window(CATALOG_BACKDATE_SECONDS - 1, 21).is_err());
+        assert!(catalog_window(u64::MAX, MAX_CATALOG_VALIDITY_DAYS).is_err());
+    }
+
+    #[test]
+    fn the_longest_window_is_accepted_by_the_client_rules_and_ends_on_time() {
+        let now = 1_800_000_000;
+        let (issued_at, expires_at) = catalog_window(now, MAX_CATALOG_VALIDITY_DAYS).unwrap();
+        let prepare = |issued_at: u64, expires_at: u64, at: u64| {
+            let document = json!({"format":1,"repository":DEFAULT_PACKAGE_REPOSITORY,"revision":1,"issued_at":issued_at,"expires_at":expires_at,"packages":[]});
+            let draft = json!({"format":1,"catalog":document.to_string()});
+            PreparedSigningInput::prepare(
+                SigningKind::Catalog,
+                "fixture",
+                &serde_json::to_vec(&draft).unwrap(),
+                at,
+            )
+        };
+        // Current when created, and also for a client whose clock is an hour behind.
+        assert!(prepare(issued_at, expires_at, now).is_ok());
+        assert!(prepare(issued_at, expires_at, issued_at).is_ok());
+        // Refused before it was issued and once it has expired.
+        assert!(prepare(issued_at, expires_at, issued_at - 1).is_err());
+        assert!(prepare(issued_at, expires_at, expires_at).is_err());
+        // One second beyond the window is over the client's lifetime limit.
+        assert!(prepare(issued_at, expires_at + 1, now).is_err());
+    }
+
     #[test]
     fn catalog_scope_and_expiry_are_enforced() {
         let document = json!({"format":1,"repository":DEFAULT_PACKAGE_REPOSITORY,"revision":1,"issued_at":100,"expires_at":200,"packages":[]});

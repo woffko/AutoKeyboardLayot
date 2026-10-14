@@ -151,6 +151,54 @@ fn decode_key(der: &[u8], public: &[u8; 32]) -> Result<SigningKey> {
     Ok(key)
 }
 
+pub fn run() -> Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() != 3 {
+        return Err("usage: sign-language-package package|catalog ABS_INPUT ABS_OUTPUT");
+    }
+    let (kind, limit) = match args[0].to_str() {
+        Some("package") => (SigningKind::Package, 64 * 1024 * 1024),
+        Some("catalog") => (SigningKind::Catalog, 1024 * 1024),
+        _ => return Err("input kind"),
+    };
+    // The runtime trust parser validates the embedded metadata/fingerprint first;
+    // the signer is the one key with the role "release", never a recovery key.
+    let trust = PackageTrust::release().map_err(|_| "release trust")?;
+    let release = PackageTrust::release_signer().map_err(|_| "release signer")?;
+    let (signer, hex, public) = (
+        release.signer.as_str(),
+        release.public_key_hex.as_str(),
+        release.public_key,
+    );
+    let output = Path::new(&args[2]);
+    reject_reparse(output.parent().ok_or("output parent")?)?;
+    if !output.is_absolute() || output.try_exists().map_err(|_| "output metadata")? {
+        return Err("output must be new and absolute");
+    }
+    let bytes = read_bounded(Path::new(&args[1]), limit)?;
+    let prepared = PreparedSigningInput::prepare(kind, signer, &bytes, now()?)
+        .map_err(|_| "input validation")?;
+    let key = load_key(signer, &public, hex)?;
+    let signature = key.sign(&prepared.signing_message()).to_bytes();
+    drop(key);
+    let signed = prepared
+        .finalize(signer, signature, &trust, now()?)
+        .map_err(|_| "final verification")?;
+    reject_reparse(output.parent().ok_or("output parent")?)?;
+    let mut file: File = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(output)
+        .map_err(|_| "exclusive output creation")?;
+    file.write_all(&signed)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| "output write; inspect partial file")?;
+    println!("SIGNED_OUTPUT_VERIFIED");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,57 +286,4 @@ mod tests {
         assert_eq!(read_bounded(&path, 5).expect("bounded read"), b"12345");
         assert!(reject_reparse(Path::new("relative")).is_err());
     }
-}
-
-pub fn run() -> Result<()> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 3 {
-        return Err("usage: sign-language-package package|catalog ABS_INPUT ABS_OUTPUT");
-    }
-    let (kind, limit) = match args[0].to_str() {
-        Some("package") => (SigningKind::Package, 64 * 1024 * 1024),
-        Some("catalog") => (SigningKind::Catalog, 1024 * 1024),
-        _ => return Err("input kind"),
-    };
-    // The runtime trust parser validates the embedded metadata/fingerprint first.
-    let trust = PackageTrust::release().map_err(|_| "release trust")?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../data/package-signing/public-key.json"))
-            .map_err(|_| "public metadata")?;
-    let signer = metadata["signer"].as_str().ok_or("public signer")?;
-    let hex = metadata["public_key_hex"].as_str().ok_or("public key")?;
-    if hex.len() != 64 || !hex.is_ascii() {
-        return Err("public key");
-    }
-    let mut public = [0u8; 32];
-    for (index, byte) in public.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| "public key")?;
-    }
-    let output = Path::new(&args[2]);
-    reject_reparse(output.parent().ok_or("output parent")?)?;
-    if !output.is_absolute() || output.try_exists().map_err(|_| "output metadata")? {
-        return Err("output must be new and absolute");
-    }
-    let bytes = read_bounded(Path::new(&args[1]), limit)?;
-    let prepared = PreparedSigningInput::prepare(kind, signer, &bytes, now()?)
-        .map_err(|_| "input validation")?;
-    let key = load_key(signer, &public, hex)?;
-    let signature = key.sign(&prepared.signing_message()).to_bytes();
-    drop(key);
-    let signed = prepared
-        .finalize(signer, signature, &trust, now()?)
-        .map_err(|_| "final verification")?;
-    reject_reparse(output.parent().ok_or("output parent")?)?;
-    let mut file: File = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .share_mode(0)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .open(output)
-        .map_err(|_| "exclusive output creation")?;
-    file.write_all(&signed)
-        .and_then(|()| file.sync_all())
-        .map_err(|_| "output write; inspect partial file")?;
-    println!("SIGNED_OUTPUT_VERIFIED");
-    Ok(())
 }

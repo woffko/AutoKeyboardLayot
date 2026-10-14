@@ -17,6 +17,7 @@ AkPackageCancel=Cancelar transferência
 AkPackageInstall=Instalar pacotes selecionados
 AkPackageBusy=A processar o pacote…
 AkPackageFailed=A operação do pacote falhou. Não haverá nova tentativa automática; verifique o estado atual dos pacotes antes de tentar novamente.
+AkCatalogExpired=O catálogo de pacotes publicado expirou, ou a data e a hora deste computador estão incorretas. Verifique o relógio do sistema ou tente novamente mais tarde.
 AkPackageInput=Inclui dicionário e regras de entrada.
 AkPackageUnavailable=Indisponível: API de pacote incompatível ou base inglesa protegida.
 AkPackageIntro=O inglês está incluído. Pacotes opcionais só são instalados após sua confirmação.

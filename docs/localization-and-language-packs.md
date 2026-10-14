@@ -276,8 +276,11 @@ for older binaries: rollback must restore the compatible configuration backup;
 this source change cannot retrofit fail-closed behavior into a previously installed
 binary. No user installation has been migrated. Seven new tests cover migration,
 missing selections/overlays, conflicting input, read-only loading and backup
-preservation. Save preparation uses exclusive temporary-file creation; a stale
-`config.tmp` or link blocks saving without overwriting that file. Backup failures
+preservation. Save preparation uses exclusive temporary-file creation. At the
+time, a stale `config.tmp` or link blocked saving without being overwritten;
+since 2026-09-30 each save uses a unique `config.tmp-<pid>-<serial>` name,
+skips any taken name, and removes stale `config.tmp*` files older than ten
+minutes. Backup failures
 stop save preparation before the destination can be replaced. All 125 Linux tests
 and strict Clippy pass. The refreshed Windows release build and strict Clippy
 passed in job `259f6c0257244ac18c8b7b256c6adb28` on 2026-09-09. Native execution

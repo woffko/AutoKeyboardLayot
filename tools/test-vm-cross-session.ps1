@@ -1,15 +1,18 @@
 param(
     [Parameter(Mandatory=$true)][string]$Stage,
     [Parameter(Mandatory=$true)][string]$SetupSha256,
-    [Parameter(Mandatory=$true)][string]$Receipt
+    [Parameter(Mandatory=$true)][string]$Receipt,
+    [Parameter(Mandatory=$true)][string]$ExpectedComputer,
+    [Parameter(Mandatory=$true)][string]$LocalAppData,
+    [Parameter(Mandatory=$true)][string]$TaskUser
 )
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $Receipt) { throw 'Receipt already exists.' }
 $setup = Join-Path $Stage 'setup.exe'
 $installTarget = Join-Path $Stage ('Installed App ' + [char]0xFC)
 $log = Join-Path $Stage 'blocked-install.log'
-$profile = 'C:\Users\w0w\AppData\Local\AutoKeyboardLayot'
-$lock = 'C:\Users\w0w\AppData\Local\AutoKeyboardLayot.installation.lock'
+$profile = Join-Path $LocalAppData 'AutoKeyboardLayot'
+$lock = Join-Path $LocalAppData 'AutoKeyboardLayot.installation.lock'
 $registration = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{D913907B-2031-4C26-A199-BF60B0E51B6D}_is1'
 $installTask = 'AklCrossSessionInstall'
 $result = [ordered]@{state='failed'; phase='preflight'; session_id=[Diagnostics.Process]::GetCurrentProcess().SessionId; network_used=$false; typing_acceptance=$false}
@@ -32,11 +35,11 @@ function Drop-Task([string]$Name) { Unregister-ScheduledTask -TaskName $Name -Co
 
 $reader = $null
 try {
-    if ($env:COMPUTERNAME -ne 'DESKTOP-ELS4LDK' -or (Get-CimInstance Win32_ComputerSystem).Manufacturer -notlike '*VMware*') { throw 'Wrong guest' }
+    if ($env:COMPUTERNAME -ne $ExpectedComputer -or (Get-CimInstance Win32_ComputerSystem).Manufacturer -notlike '*VMware*') { throw 'Wrong guest' }
     if ((Hash $setup) -ne $SetupSha256) { throw 'Setup hash' }
     Drop-Task $installTask
     if ((& "$env:SystemRoot\System32\query.exe" user 2>&1 | Out-String) -notmatch 'console\s+1\s+Active') { throw 'No active console session' }
-    if (Test-Path -LiteralPath $profile) { throw 'w0w profile not empty' }
+    if (Test-Path -LiteralPath $profile) { throw 'Test profile not empty' }
     if (Test-Path -LiteralPath $installTarget) { throw 'Install target not clear' }
     Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
     $lockExistedBefore = Test-Path -LiteralPath $lock
@@ -51,7 +54,7 @@ try {
     $result.phase = 'blocked_install_session1'
     $arguments = '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LANG=english /DIR="' + $installTarget + '" /LOG="' + $log + '"'
     $installAction = New-ScheduledTaskAction -Execute $setup -Argument $arguments -WorkingDirectory $Stage
-    $installPrincipal = New-ScheduledTaskPrincipal -UserId 'DESKTOP-ELS4LDK\w0w' -LogonType Interactive
+    $installPrincipal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Interactive
     Register-ScheduledTask -TaskName $installTask -Action $installAction -Principal $installPrincipal -Force | Out-Null
     Start-ScheduledTask -TaskName $installTask
     Start-Sleep -Seconds 1

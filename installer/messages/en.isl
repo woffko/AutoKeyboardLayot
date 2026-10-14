@@ -18,6 +18,7 @@ AkPackageCancel=Cancel download
 AkPackageInstall=Install selected packages
 AkPackageBusy=Processing package…
 AkPackageFailed=Package operation failed. No automatic retry will be made; inspect the current package state before retrying.
+AkCatalogExpired=The published package catalog has expired, or the date and time on this computer are wrong. Check the system clock, or try again later.
 AkPackageInput=Dictionary and input rules included.
 AkPackageUnavailable=Unavailable: incompatible package API or protected English base.
 AkPackageIntro=Choose the languages to add, then click Next. English is always included.

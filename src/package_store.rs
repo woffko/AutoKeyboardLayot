@@ -764,6 +764,30 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use std::collections::BTreeSet;
+    use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+
+    // Between its clone and its exec, a child process holds copies of every
+    // descriptor open in this process, including the lock file of a writer lock
+    // that another test has just released, which then looks busy for a moment.
+    // Tests that create stores hold the read side for their whole run; the one
+    // test that spawns a child holds the write side, so the two never overlap.
+    static CHILD_SPAWN: RwLock<()> = RwLock::new(());
+
+    fn no_child_spawn() -> RwLockReadGuard<'static, ()> {
+        CHILD_SPAWN.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The temporary directory of a test that also keeps child processes away.
+    struct TestDirectory {
+        directory: tempfile::TempDir,
+        _no_child_spawn: RwLockReadGuard<'static, ()>,
+    }
+
+    impl TestDirectory {
+        fn path(&self) -> &Path {
+            self.directory.path()
+        }
+    }
 
     // Public synthetic fixtures only. These keys are never release anchors.
     fn key() -> SigningKey {
@@ -796,11 +820,23 @@ mod tests {
         let package = Arc::new(VerifiedLanguagePackage::verify(bytes, &trust()).unwrap());
         snapshot.inventory().stage_import(&[package]).unwrap()
     }
-    fn setup() -> (tempfile::TempDir, PackageStore, StoreSnapshot) {
+    fn setup_unguarded() -> (tempfile::TempDir, PackageStore, StoreSnapshot) {
         let directory = tempfile::tempdir().unwrap();
         let store = PackageStore::initialize(&directory.path().join("Языки with spaces")).unwrap();
         let snapshot = store.load(&trust()).unwrap();
         (directory, store, snapshot)
+    }
+    fn setup() -> (TestDirectory, PackageStore, StoreSnapshot) {
+        let guard = no_child_spawn();
+        let (directory, store, snapshot) = setup_unguarded();
+        (
+            TestDirectory {
+                directory,
+                _no_child_spawn: guard,
+            },
+            store,
+            snapshot,
+        )
     }
     fn names(store: &PackageStore) -> BTreeSet<PathBuf> {
         fs::read_dir(&store.root)
@@ -973,6 +1009,7 @@ mod tests {
 
     #[test]
     fn store_initialization_preview_preserves_required_inputs_and_exact_bytes() {
+        let _no_child_spawn = no_child_spawn();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("selected.aklp");
         let root = directory.path().join("packages");
@@ -1010,6 +1047,7 @@ mod tests {
 
     #[test]
     fn store_initialization_rejects_missing_inputs_duplicates_and_revoked_trust() {
+        let _no_child_spawn = no_child_spawn();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("selected.aklp");
         let root = directory.path().join("packages");
@@ -1071,6 +1109,7 @@ mod tests {
 
     #[test]
     fn empty_english_initialization_is_explicit_and_does_not_need_optional_artifacts() {
+        let _no_child_spawn = no_child_spawn();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("packages");
         let prepared = PreparedStoreInitialization::from_files(
@@ -1175,6 +1214,7 @@ mod tests {
 
     #[test]
     fn explicit_initialization_and_missing_metadata_never_reset_state() {
+        let _no_child_spawn = no_child_spawn();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("store");
         assert!(PackageStore::open(&root).is_err());
@@ -1321,7 +1361,8 @@ mod tests {
             assert!(matches!(store.writer_lock(), Err(StoreError::Busy)));
             return;
         }
-        let (_directory, store, empty) = setup();
+        let _exclusive = CHILD_SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let (_directory, store, empty) = setup_unguarded();
         let lock = store.writer_lock().unwrap();
         assert!(matches!(store.writer_lock(), Err(StoreError::Busy)));
         let child = std::process::Command::new(std::env::current_exe().unwrap())

@@ -17,6 +17,7 @@ AkPackageCancel=Download abbrechen
 AkPackageInstall=Ausgewählte Pakete installieren
 AkPackageBusy=Paket wird verarbeitet…
 AkPackageFailed=Paketvorgang fehlgeschlagen. Es erfolgt kein automatischer Wiederholungsversuch; prüfen Sie vor einem erneuten Versuch den aktuellen Paketstatus.
+AkCatalogExpired=Der veröffentlichte Paketkatalog ist abgelaufen, oder Datum und Uhrzeit dieses Computers sind falsch. Prüfen Sie die Systemuhr oder versuchen Sie es später erneut.
 AkPackageInput=Wörterbuch und Eingaberegeln enthalten.
 AkPackageUnavailable=Nicht verfügbar: inkompatible Paket-API oder geschützte englische Basis.
 AkPackageIntro=Englisch ist enthalten. Optionale Pakete werden nur nach Ihrer Bestätigung installiert.

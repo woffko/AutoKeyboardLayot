@@ -97,5 +97,7 @@ Failures now report a coarse, path-free reason code next to `AkPackageFailed`
 installing operator can distinguish a missing asset from a network or store
 problem without exposing paths, URLs or secrets. The settings application's
 per-file `.aklp` import and multi-file `.aklp` migration remain the local flows
-outside the installer.
+outside the installer. An expired catalog (or a wrong system clock) has its own
+message in both places: `download.catalog_expired` in Settings and `AkCatalogExpired`
+in the installer, which is selected by the reason code `catalog_expired`.
 
