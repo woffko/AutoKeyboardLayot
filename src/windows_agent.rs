@@ -1634,18 +1634,16 @@ impl AppState {
         })
     }
 
-    /// A contained panic makes the state untrustworthy: release held keys unchanged, end hotkey
-    /// gestures that may be half tracked, discard queued work of the old epoch and pause
-    /// automatic conversion.
+    /// A contained panic makes the state untrustworthy: pause automatic conversion, hand held keys
+    /// back unchanged (or retain them when the input target changed meanwhile), end hotkey
+    /// gestures that may be half tracked and discard queued work of the old epoch.
     fn record_engine_fault(&mut self) {
-        self.break_correction_gate_fail_open(GateFailureCause::InternalFault);
-        self.metrics
-            .undo_hotkey_active
-            .store(false, Ordering::Release);
-        self.metrics
-            .hotkey_waiting_for_release
-            .store(false, Ordering::Release);
-        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.record_engine_fault_with_target(current_foreground_context());
+    }
+
+    fn record_engine_fault_with_target(&mut self, current: Option<ForegroundContext>) {
+        // The fault's own pause comes first: breaking the gate must not record it as a gate
+        // drain, which policy D1 would lift on its own once the retained keys expire.
         if self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
             self.metrics.last_failure_reason.store(
                 ConversionFailureReason::InternalFault as u8,
@@ -1655,6 +1653,21 @@ impl AppState {
             self.metrics
                 .conversion_failures
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        self.break_correction_gate(GateFailureCause::InternalFault, current);
+        self.metrics
+            .undo_hotkey_active
+            .store(false, Ordering::Release);
+        self.metrics
+            .hotkey_waiting_for_release
+            .store(false, Ordering::Release);
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        if self.metrics.worker_dead.load(Ordering::Acquire) {
+            // Nobody can acknowledge a reload any more; it must not keep input and Exit blocked.
+            self.pending_configuration = None;
+            self.metrics
+                .configuration_pending
+                .store(false, Ordering::Release);
         }
         self.gate_diagnostic(
             "fault",
@@ -2750,6 +2763,10 @@ fn arm_input_recovery(hwnd: HWND) {
     let details = APP_STATE.with(|slot| {
         let state = slot.borrow();
         let state = state.as_ref()?;
+        // Only the worker replays retained input; a stopped one can never use the hotkey.
+        if state.metrics.worker_dead.load(Ordering::Acquire) {
+            return None;
+        }
         let retained = state
             .metrics
             .retained_input
@@ -3653,10 +3670,12 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         RECOVERY_NOTICE_MESSAGE => {
+            // A stopped worker gets its own notice; recovery would be an empty promise.
             if APP_STATE.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .is_some_and(|state| has_retained_input(&state.metrics))
+                slot.borrow().as_ref().is_some_and(|state| {
+                    has_retained_input(&state.metrics)
+                        && !state.metrics.worker_dead.load(Ordering::Acquire)
+                })
             }) {
                 show_tray_information(
                     hwnd,
@@ -9956,15 +9975,18 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
         } else {
             tr("menu.auto_off")
         });
-        let retained_count = APP_STATE.with(|slot| {
-            slot.borrow().as_ref().and_then(|state| {
-                state
-                    .metrics
-                    .retained_input
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_ref()
-                    .map(|input| input.events.len())
+        let (retained_count, worker_dead) = APP_STATE.with(|slot| {
+            slot.borrow().as_ref().map_or((None, false), |state| {
+                (
+                    state
+                        .metrics
+                        .retained_input
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                        .map(|input| input.events.len()),
+                    state.metrics.worker_dead.load(Ordering::Acquire),
+                )
             })
         });
         AppendMenuW(
@@ -9979,15 +10001,18 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             &auto_label,
         )?;
         if let Some(count) = retained_count {
-            AppendMenuW(
-                menu,
-                MF_STRING,
-                MENU_RECOVER_INPUT_ID,
-                &HSTRING::from(tr_format(
-                    "menu.recover_input",
-                    &[("count", &count.to_string())],
-                )),
-            )?;
+            // A stopped worker cannot replay anything; only deleting is still possible.
+            if !worker_dead {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    MENU_RECOVER_INPUT_ID,
+                    &HSTRING::from(tr_format(
+                        "menu.recover_input",
+                        &[("count", &count.to_string())],
+                    )),
+                )?;
+            }
             AppendMenuW(
                 menu,
                 MF_STRING,
@@ -15080,5 +15105,89 @@ mod tests {
             virtual_keys(&state.pending_key_releases),
             [(WM_KEYUP, 0x41)]
         );
+    }
+
+    #[test]
+    fn an_engine_fault_hands_held_keys_back_unchanged_to_the_same_target() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let target = test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground;
+        state.correction_gate.activate(10);
+        state.correction_gate.origin = Some(target);
+        let held = [
+            test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0),
+            test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x47), 0, 0),
+            test_raw_key(WM_KEYUP, VK_LCONTROL, 0, 0),
+        ];
+        state.correction_gate.held.extend(held);
+        state.record_engine_fault_with_target(Some(target));
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&state.metrics));
+        assert_eq!(
+            virtual_keys(&state.pending_held_replay),
+            virtual_keys(&held)
+        );
+        assert!(state.pending_key_releases.is_empty());
+        assert_eq!(
+            state.metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::InternalFault as u8
+        );
+    }
+
+    #[test]
+    fn an_engine_fault_keeps_held_keys_for_recovery_when_the_target_changed() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let origin = test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground;
+        let elsewhere = ForegroundContext {
+            hwnd: 9,
+            focus: 9,
+            ..origin
+        };
+        state.correction_gate.activate(10);
+        state.correction_gate.origin = Some(origin);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.record_engine_fault_with_target(Some(elsewhere));
+        assert!(has_retained_input(&state.metrics));
+        assert!(state.pending_held_replay.is_empty());
+        // The fault's own pause is recorded, not a gate drain that policy D1 would lift.
+        assert_eq!(
+            state.metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::InternalFault as u8
+        );
+        assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_stopped_worker_offers_no_recovery_and_drops_its_pending_reload() {
+        let (mut state, _receiver) = test_gate_state(4);
+        state.metrics.worker_dead.store(true, Ordering::Release);
+        state.pending_configuration = Some(ConfigurationReload {
+            revision: 3,
+            snapshot: RuntimeConfiguration::default(),
+        });
+        state
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        state.record_engine_fault_with_target(None);
+        assert!(state.pending_configuration.is_none());
+        assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+
+        let key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        *state.metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+            recovering: false,
+        });
+        let metrics = Arc::clone(&state.metrics);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        arm_input_recovery(HWND::default());
+        drop(take_app_state());
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
     }
 }
