@@ -207,9 +207,14 @@ most 1.2 seconds and then replayed unchanged. If the gate gives up on its time
 limit, a full buffer, a full queue or a hook reinstall, the held keys are handed
 back to the same field unless the privacy check finds a password field or an
 excluded or elevated program; a field that merely cannot be inspected at that
-moment (a hung or busy window) does not keep them back. Held keys that are not
-handed back (the gate ended at a click, a focus change, injected input, a failed
-submission or an internal fault, or the hand-back was refused) wait in memory
+moment (a hung or busy window) does not keep them back. Whenever a gate gives up,
+the key-ups of keys that were pressed before it armed are delivered at once: they
+type nothing, and holding them back would leave Shift, Ctrl or Space pressed; a gate
+that held nothing else keeps nothing back and does not pause automatic conversion.
+After an internal fault the held keys are replayed unchanged to the same field.
+Held keys that are not handed back (the gate ended at a click, physical or injected
+by another program, a focus change, injected input, a failed submission or an
+internal fault after the field changed, or the hand-back was refused) wait in memory
 for an explicit recovery from the tray menu for at most one minute, or one
 minute from preparing that recovery, and are then deleted. None of this is
 written to logs, configuration, diagnostics, or network services. Unsupported
@@ -322,15 +327,19 @@ capped at 256 KiB and rotates to `crash.1.log`.
 
 A panic in a keyboard or mouse hook callback, the window procedure or the input
 worker is contained. Typing is not affected: the event is passed on untouched,
-keys held by the correction gate are released unchanged, automatic conversion is
-paused and a tray notice points to `crash.log`. If the worker panics three times
-within a minute it stops, which is reported once and turned into a prompt when
-Exit is chosen. A tray Exit that is declined (an active correction gate,
+keys held by the correction gate are released unchanged (or kept for recovery when
+the input field changed meanwhile), automatic conversion is paused and a tray notice
+points to `crash.log`. A configuration reload whose application panicked is
+rejected with a notice, and the previous settings stay in force. If the worker
+panics three times within a minute it stops, which is reported once and turned into
+a prompt when Exit is chosen; retained input can then only be deleted, not
+recovered. A tray Exit that is declined (an active correction gate,
 retained input, a busy worker, a pending configuration, a hotkey in progress)
 now asks whether to exit anyway and names those reasons; it warns that
 keystrokes held back for recovery are lost. Retained input deletes itself after
 its minute, so it does not block Exit for longer. A worker thread that has
-already finished never blocks Exit. Installer-driven closes never force an exit.
+already finished never blocks Exit, not even with a configuration reload it can no
+longer acknowledge. Installer-driven closes never force an exit.
 
 A Space that arms the correction gate is always released once the worker has
 handled it, whichever path it took (stale input epoch, pending configuration,
@@ -339,12 +348,17 @@ so held keys no longer wait for the 1.2 second deadline that aborts the gate.
 When a gate timeout does happen and its held keys are handed back in full,
 automatic conversion resumes by itself; so it does when held keys that nobody
 recovered are deleted after their minute, which a tray notice reports. Either
-way it resumes at most three times an hour. A failed or partial recovery waits
-for that minute; an explicit recovery or any other pause stays paused. The
-optional diagnostics log records `phase=armed`, `phase=release_forced`,
-`phase=recovery_discarded` (`reason=expired` after the minute),
-`phase=auto_resumed`, `event=ui_stall` (timer ticks more than 700 ms apart) and
-`event=hook_slow` (a hook callback over 50 ms).
+way it resumes at most three times an hour, and never when an automatic edit
+failed because of the same abort. A failed or partial recovery waits for that
+minute; an explicit recovery or any other pause stays paused. Keys that are being
+replayed when their minute ends are not deleted under the replay. The replayed keys
+bypass the hooks, so the word at the caret is not converted until the next word
+boundary. The optional diagnostics log records `phase=armed`, `phase=abort` (with
+counts of `returned` key-ups and `replayed` keys), `phase=returned`,
+`phase=release_forced`, `phase=recovery_discarded` (`reason=expired` after the
+minute), `phase=auto_resumed`, `phase=auto_resume_declined`, `event=ui_stall`
+(timer ticks more than 700 ms apart) and `event=hook_slow` (a hook callback over
+50 ms).
 
 The protected-paste backend selects the word it is about to replace. If the
 selection cannot be confirmed to hold exactly that word, or the paste does not
@@ -366,7 +380,8 @@ joined.
 The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
 the tray icon is added again, and if Explorer is not ready yet the addition is
 retried with a growing delay. Unlocking the session, reconnecting and resuming
-from sleep reinstall both hooks (held keys are released unchanged first). A
+from sleep reinstall both hooks (held keys are handed back first, as after a gate
+timeout). A
 watchdog on the 250 ms timer also reinstalls them when the user types (input
 within the last 400 ms) but no hook callback ran for more than 3 seconds. It does
 not act on the lock screen or the UAC desktop, when the foreground window has no
