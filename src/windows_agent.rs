@@ -5786,6 +5786,9 @@ struct InputProcessor {
     // Held keys were replayed without the hooks seeing them, so the word at the caret is unknown:
     // the next epoch reset keeps the session suppressed instead of clearing it.
     recovered_mid_word: bool,
+    // The cancelled gate token at the time an automatic edit last failed (0 when none). An edit
+    // that failed because of a gate abort forbids resuming after that abort (policy D1).
+    failed_edit_gate_token: u64,
     // The configuration revision being applied; a contained panic rejects exactly this one.
     applying_configuration: Option<u64>,
 }
@@ -5912,6 +5915,7 @@ impl InputProcessor {
             reported_probe_respawns: 0,
             sound_player: None,
             recovered_mid_word: false,
+            failed_edit_gate_token: 0,
             applying_configuration: None,
         }
     }
@@ -6460,6 +6464,16 @@ impl InputProcessor {
             && metrics.last_failure_reason.load(Ordering::Acquire)
                 == ConversionFailureReason::GateDrain as u8;
         if !paused_by_the_abort {
+            return;
+        }
+        let aborted_gate = metrics.cancelled_gate_token.load(Ordering::Acquire);
+        if aborted_gate != 0 && self.failed_edit_gate_token == aborted_gate {
+            // An automatic edit failed because of this abort, so the text is in an unknown
+            // state: that pause is not the abort's alone.
+            self.diagnostic(
+                "gate",
+                "phase=auto_resume_declined reason=failed-edit".to_owned(),
+            );
             return;
         }
         if !self.auto_resumes.try_take(now) {
@@ -8923,6 +8937,9 @@ impl InputProcessor {
 
     fn record_conversion_failure(&mut self, reason: ConversionFailureReason) {
         self.diagnostic("conversion", format!("result=failed reason={reason:?}"));
+        // Remembered even when automatic conversion is already off: an edit that failed because a
+        // gate was aborted must keep that abort from resuming automatic conversion.
+        self.failed_edit_gate_token = self.metrics.cancelled_gate_token.load(Ordering::Acquire);
         self.invalidate_conversion_state();
         // What the failed edit left in the document is uncertain, so the recent
         // words no longer describe it.
@@ -15446,5 +15463,30 @@ mod tests {
         let epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         processor.reset_for_epoch(epoch);
         assert!(!processor.session.is_suppressed());
+    }
+
+    #[test]
+    fn an_edit_that_failed_because_of_the_abort_keeps_conversion_paused() {
+        let paused_by_abort = |metrics: &ObserverMetrics| {
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.safety_paused.store(true, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(ConversionFailureReason::GateDrain as u8, Ordering::Release);
+            metrics.cancelled_gate_token.store(7, Ordering::Release);
+        };
+        let metrics = Arc::new(ObserverMetrics::default());
+        paused_by_abort(&metrics);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.record_conversion_failure(ConversionFailureReason::PhysicalEdit);
+        processor.resume_after_recovered_abort(Instant::now());
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+
+        // Without a failed edit the same abort resumes.
+        let metrics = Arc::new(ObserverMetrics::default());
+        paused_by_abort(&metrics);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.resume_after_recovered_abort(Instant::now());
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
     }
 }
