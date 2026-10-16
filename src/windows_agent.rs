@@ -164,6 +164,7 @@ const GATE_HANDOFF_BUDGET_MESSAGE: u32 = WM_APP + 6;
 const LEXICON_OFFER_MESSAGE: u32 = WM_APP + 7;
 const SETTINGS_APPLIED_MESSAGE: u32 = WM_APP + 8;
 const RECOVERY_NOTICE_MESSAGE: u32 = WM_APP + 9;
+const HELD_KEYS_RETURN_MESSAGE: u32 = WM_APP + 10;
 const LAYOUT_TIMER_ID: usize = 1;
 const LAYOUT_TIMER_INTERVAL_MS: u32 = 250;
 const MENU_AUTO_ID: usize = 1002;
@@ -505,6 +506,9 @@ struct RawKeyEvent {
     sequence: u64,
     drain_token: u64,
     hotkey_trigger: bool,
+    /// A key-down of a key that was already down: an auto-repeat. Recorded only for edges a
+    /// correction gate holds, where it decides which held key-ups must still be delivered.
+    repeat: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,6 +534,8 @@ struct RetainedInput {
     delivery_uncertain: bool,
     /// When the keys are deleted unless they were recovered first.
     expires_at: Instant,
+    /// The worker is sending these keys right now; the lifetime timer leaves the record alone.
+    recovering: bool,
 }
 
 struct CorrectionGate {
@@ -1582,6 +1588,10 @@ struct AppState {
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
     diagnostic_sender: Option<SyncSender<String>>,
     diagnostic_worker: Option<JoinHandle<()>>,
+    /// Key-ups of keys pressed before a gate, delivered after that gate broke.
+    pending_key_releases: Vec<RawKeyEvent>,
+    /// Held keys handed back unchanged after a contained internal fault.
+    pending_held_replay: Vec<RawKeyEvent>,
 }
 
 impl AppState {
@@ -1809,6 +1819,18 @@ impl AppState {
     }
 
     fn break_correction_gate_fail_open(&mut self, cause: GateFailureCause) {
+        self.break_correction_gate(cause, current_foreground_context());
+    }
+
+    /// Ends the gate without the worker. Key-ups of keys pressed before the gate are delivered,
+    /// because they type nothing and withholding them would leave the key pressed; the rest is
+    /// retained for recovery. After a contained internal fault the held keys go back unchanged
+    /// while `current`, the input target now, is still the gate's target.
+    fn break_correction_gate(
+        &mut self,
+        cause: GateFailureCause,
+        current: Option<ForegroundContext>,
+    ) {
         if !self.correction_gate.active {
             return;
         }
@@ -1817,6 +1839,18 @@ impl AppState {
         let sequence = self.metrics.observed_input_sequence.load(Ordering::Acquire);
         let foreground = self.correction_gate.origin;
         let held = core::mem::take(&mut self.correction_gate.held);
+        let replay_unchanged = cause == GateFailureCause::InternalFault
+            && foreground
+                .is_some_and(|origin| current.is_some_and(|now| same_input_target(origin, now)));
+        let replayed = if replay_unchanged { held.len() } else { 0 };
+        let (held, releases) = if replay_unchanged {
+            self.pending_held_replay.extend(held);
+            (Vec::new(), Vec::new())
+        } else {
+            split_delivered_key_releases(held)
+        };
+        let returned = releases.len();
+        self.pending_key_releases.extend(releases);
         let mut retained = false;
         if !held.is_empty() {
             // There cannot be a second gate while recovery is outstanding.
@@ -1833,14 +1867,15 @@ impl AppState {
                     token,
                     foreground: foreground
                         .map(|origin| {
-                            current_foreground_context()
-                                .filter(|current| same_input_target(origin, *current))
+                            current
+                                .filter(|now| same_input_target(origin, *now))
                                 .unwrap_or(origin)
                         })
                         .unwrap_or(fallback),
                     events: held,
                     delivery_uncertain: cause == GateFailureCause::DownstreamHook,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+                    recovering: false,
                 });
                 retained = true;
             }
@@ -1861,10 +1896,13 @@ impl AppState {
             self.record_gate_failure_without_worker();
         }
         self.gate_diagnostic("abort", format!(
-            "cause={cause:?} token={token} held={held_count} released={} in_flight={} awaiting_ack={} worker_busy={} paused={failed}",
+            "cause={cause:?} token={token} held={held_count} returned={returned} replayed={replayed} released={} in_flight={} awaiting_ack={} worker_busy={} paused={failed}",
             self.correction_gate.released_count, self.correction_gate.drain_in_flight,
             self.correction_gate.awaiting_worker_ack, self.metrics.worker_busy.load(Ordering::Acquire),
         ));
+        if returned != 0 || replayed != 0 {
+            self.post_held_keys_return();
+        }
         let _ = self.enqueue(RawInputEvent::GateDrainReady {
             token,
             drained_count: 0,
@@ -1894,6 +1932,49 @@ impl AppState {
                 );
             }
         }
+    }
+
+    /// Asks the window procedure to send the queued held keys, outside any hook procedure that
+    /// may be running now. The timer sends them as well if this message cannot be posted.
+    fn post_held_keys_return(&self) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.window),
+                HELD_KEYS_RETURN_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+
+    /// Queues the key-ups that leave with a record of retained input (see
+    /// split_delivered_key_releases).
+    fn queue_delivered_key_releases(&mut self, releases: Vec<RawKeyEvent>) {
+        if releases.is_empty() {
+            return;
+        }
+        self.pending_key_releases.extend(releases);
+        self.post_held_keys_return();
+    }
+
+    /// Holds an edge that arrived while the gate is active. A gate that is full or past its
+    /// deadline breaks, and the edge joins the retained input as well: forwarding it now would
+    /// overtake every edge held before it. False when no gate is active, so the edge passes.
+    fn hold_gated_edge(&mut self, raw: RawKeyEvent) -> bool {
+        if self.correction_gate.hold(raw) {
+            return true;
+        }
+        if !self.correction_gate.active {
+            return false;
+        }
+        let cause = if Instant::now() >= self.correction_gate.deadline {
+            GateFailureCause::Deadline
+        } else {
+            GateFailureCause::Capacity
+        };
+        self.correction_gate.held.push(raw);
+        self.break_correction_gate_fail_open(cause);
+        true
     }
 
     fn close_drained_gate(&mut self) {
@@ -1945,6 +2026,8 @@ impl AppState {
             // A hook can cancel the gate while SendInput is returning. Its
             // suffix has already moved to recovery; the unsent prefix still
             // belongs before it and must not be lost or overwrite that suffix.
+            let (mut prefix, releases) = split_delivered_key_releases(prefix);
+            self.queue_delivered_key_releases(releases);
             let mut retained = self
                 .metrics
                 .retained_input
@@ -1961,6 +2044,7 @@ impl AppState {
                     events: prefix,
                     delivery_uncertain: sent != 0,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+                    recovering: false,
                 });
             }
         }
@@ -2746,8 +2830,8 @@ fn discard_retained_input(hwnd: HWND) {
     }
     // The keys' lifetime may have ended while the question was open.
     let discarded = APP_STATE.with(|slot| {
-        let state = slot.borrow();
-        let Some(state) = state.as_ref() else {
+        let mut state = slot.borrow_mut();
+        let Some(state) = state.as_mut() else {
             return false;
         };
         let discarded = state
@@ -2755,13 +2839,16 @@ fn discard_retained_input(hwnd: HWND) {
             .retained_input
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .is_some();
+            .take();
         state.metrics.recovery_armed.store(false, Ordering::Release);
-        if discarded {
-            state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
-        }
-        discarded
+        let Some(discarded) = discarded else {
+            return false;
+        };
+        state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
+        // Deleting a key-up whose key-down was typed would leave that key pressed.
+        let (_, releases) = split_delivered_key_releases(discarded.events);
+        state.queue_delivered_key_releases(releases);
+        true
     });
     if discarded {
         show_tray_information(
@@ -3351,6 +3438,8 @@ pub fn run() -> Result<()> {
                 lexicon_candidate,
                 diagnostic_sender: Some(diagnostic_sender),
                 diagnostic_worker: Some(diagnostic_worker),
+                pending_key_releases: Vec::new(),
+                pending_held_replay: Vec::new(),
             });
         });
 
@@ -3473,6 +3562,8 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             finish_configuration_reload(hwnd);
             expire_correction_gate();
             expire_retained_input(hwnd, Instant::now());
+            // In case the message that normally sends them could not be posted.
+            send_pending_held_keys();
             expire_lexicon_candidate();
             refresh_tray_state();
             LRESULT(0)
@@ -3525,6 +3616,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         GATE_FAIL_OPEN_MESSAGE => {
             fail_open_correction_gate(wparam.0 as u64);
+            LRESULT(0)
+        }
+        HELD_KEYS_RETURN_MESSAGE => {
+            send_pending_held_keys();
             LRESULT(0)
         }
         GATE_HANDOFF_BUDGET_MESSAGE => {
@@ -3764,7 +3859,12 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             0
                         },
                         hotkey_trigger: false,
+                        repeat: false,
                     };
+                    if !drained {
+                        // A newer physical edge of a key supersedes a key-up still queued for it.
+                        cancel_superseded_key_release(&mut state.pending_key_releases, &raw);
+                    }
 
                     let mut claimed_hotkey = false;
                     if !drained {
@@ -3824,21 +3924,15 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         if key_down && hotkey_modifier_bit(event.vkCode as u16).is_none() {
                             state.correction_gate.pending_hotkey = None;
                         }
-                        if state.correction_gate.hold(raw) {
-                            swallow = true;
-                            return;
+                        if state.correction_gate.active && key_down {
+                            // The async state is updated after this hook: it still tells whether
+                            // the key was already down before this edge.
+                            raw.repeat = unsafe { GetAsyncKeyState(event.vkCode as i32) } as u16
+                                & 0x8000
+                                != 0;
                         }
-                        if state.correction_gate.active {
-                            let cause = if Instant::now() >= state.correction_gate.deadline {
-                                GateFailureCause::Deadline
-                            } else {
-                                GateFailureCause::Capacity
-                            };
-                            // Include this edge in recovery as well: forwarding
-                            // it now would overtake all previously swallowed input.
-                            state.correction_gate.held.push(raw);
+                        if state.hold_gated_edge(raw) {
                             swallow = true;
-                            state.break_correction_gate_fail_open(cause);
                             return;
                         }
                     }
@@ -4042,6 +4136,74 @@ fn fail_correction_gate_drain(token: u64, unsent: Vec<RawKeyEvent>, sent: usize)
     });
 }
 
+/// Splits edges that leave a gate without being typed into the ones that stay retained and the
+/// key-ups that must be delivered now. A key-up with no earlier fresh key-down of the same key in
+/// `events` belongs to a key whose key-down reached the application before the gate (directly or
+/// as the first of an auto-repeat): it types nothing, and withholding it would leave the key
+/// logically pressed system-wide.
+fn split_delivered_key_releases(events: Vec<RawKeyEvent>) -> (Vec<RawKeyEvent>, Vec<RawKeyEvent>) {
+    let mut pressed = std::collections::BTreeSet::new();
+    let mut retained = Vec::with_capacity(events.len());
+    let mut releases = Vec::new();
+    for event in events {
+        let key = (event.virtual_key, event.scan_code, event.extended);
+        if matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            if !event.repeat {
+                pressed.insert(key);
+            }
+            retained.push(event);
+        } else if pressed.remove(&key) {
+            retained.push(event);
+        } else {
+            releases.push(event);
+        }
+    }
+    (retained, releases)
+}
+
+/// Drops queued key-ups of the key `event` belongs to: a newer physical edge of that key has
+/// already set its state, and delivering the old key-up afterwards would release it again.
+fn cancel_superseded_key_release(pending: &mut Vec<RawKeyEvent>, event: &RawKeyEvent) {
+    if !pending.is_empty() {
+        pending.retain(|queued| {
+            (queued.virtual_key, queued.scan_code, queued.extended)
+                != (event.virtual_key, event.scan_code, event.extended)
+        });
+    }
+}
+
+/// Sends what a broken gate queued: the held keys handed back unchanged after a contained fault,
+/// then the key-ups of keys pressed before the gate. Runs in the window procedure, never in a hook.
+fn send_pending_held_keys() {
+    let pending = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        if state.pending_held_replay.is_empty() && state.pending_key_releases.is_empty() {
+            return None;
+        }
+        let mut events = core::mem::take(&mut state.pending_held_replay);
+        events.append(&mut state.pending_key_releases);
+        Some(events)
+    });
+    let Some(events) = pending else {
+        return;
+    };
+    let Some(inputs) = build_raw_replay_inputs(&events, INJECTED_EVENT_MARKER) else {
+        return;
+    };
+    let sent = send_input_count(&inputs);
+    APP_STATE.with(|slot| {
+        if let Ok(borrowed) = slot.try_borrow()
+            && let Some(state) = borrowed.as_ref()
+        {
+            state.gate_diagnostic(
+                "returned",
+                format!("requested={} submitted={sent}", inputs.len()),
+            );
+        }
+    });
+}
+
 fn take_held_replay_prefix(held: &mut Vec<RawKeyEvent>) -> Vec<RawKeyEvent> {
     let end = held
         .iter()
@@ -4151,8 +4313,8 @@ fn fail_open_correction_gate(token: u64) {
 /// automatic conversion resumes, under the budget of a recovered gate abort (policy D1).
 fn expire_retained_input(hwnd: HWND, now: Instant) {
     let expired = APP_STATE.with(|slot| {
-        let state = slot.borrow();
-        let state = state.as_ref()?;
+        let mut state = slot.borrow_mut();
+        let state = state.as_mut()?;
         let expired = {
             let mut retained = state
                 .metrics
@@ -4177,6 +4339,9 @@ fn expire_retained_input(hwnd: HWND, now: Instant) {
                 expired.events.len()
             ),
         );
+        // Deleting a key-up whose key-down was typed would leave that key pressed.
+        let (_, releases) = split_delivered_key_releases(expired.events);
+        state.queue_delivered_key_releases(releases);
         let _ = state.enqueue(RawInputEvent::RetainedInputExpired);
         Some(())
     });
@@ -10598,6 +10763,7 @@ mod tests {
             sequence,
             drain_token,
             hotkey_trigger: false,
+            repeat: false,
         }
     }
 
@@ -10628,6 +10794,8 @@ mod tests {
             lexicon_candidate: Arc::new(Mutex::new(None)),
             diagnostic_sender: None,
             diagnostic_worker: None,
+            pending_key_releases: Vec::new(),
+            pending_held_replay: Vec::new(),
         };
         (state, receiver)
     }
@@ -11473,6 +11641,7 @@ mod tests {
             events: vec![retained_key],
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+            recovering: false,
         });
         assert!(!state.request_shutdown());
         assert_eq!(
@@ -11562,8 +11731,19 @@ mod tests {
             .held
             .push(test_raw_key(WM_KEYUP, VK_LCONTROL, 0, 0));
         state.break_correction_gate_fail_open(GateFailureCause::Deadline);
+        // The Ctrl key-down reached the application before the gate, so its key-up is delivered
+        // rather than retained; only the typed key waits for recovery.
         let retained = state.metrics.retained_input.lock().unwrap();
-        assert_eq!(retained.as_ref().unwrap().events.len(), 2);
+        assert_eq!(retained.as_ref().unwrap().events.len(), 1);
+        assert_eq!(
+            retained.as_ref().unwrap().events[0].virtual_key,
+            u32::from(VIRTUAL_KEY(0x47).0)
+        );
+        assert_eq!(state.pending_key_releases.len(), 1);
+        assert_eq!(
+            state.pending_key_releases[0].virtual_key,
+            u32::from(VK_LCONTROL.0)
+        );
         assert!(!state.correction_gate.active);
         assert!(!state.metrics.auto_enabled.load(Ordering::Acquire));
         assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 1);
@@ -11582,6 +11762,7 @@ mod tests {
             events: vec![key],
             delivery_uncertain: false,
             expires_at: start + lifetime,
+            recovering: false,
         });
         metrics.recovery_armed.store(true, Ordering::Release);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
@@ -11619,6 +11800,7 @@ mod tests {
             events: vec![key],
             delivery_uncertain: false,
             expires_at: start + lifetime,
+            recovering: false,
         });
         let expiry = || {
             metrics
@@ -11788,7 +11970,8 @@ mod tests {
         let (mut state, _receiver) = test_gate_state(8);
         state.correction_gate.activate(10);
         let first = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
-        let last = test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x48), 0, 0);
+        // A key-down: a lone key-up of a key pressed before the gate would be delivered instead.
+        let last = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0);
         state.correction_gate.held.push(last);
         state.retain_failed_drain(10, vec![first], 1);
         let retained = state.metrics.retained_input.lock().unwrap();
@@ -11804,7 +11987,8 @@ mod tests {
         let (mut state, _receiver) = test_gate_state(8);
         state.correction_gate.activate(10);
         let first = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
-        let last = test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x48), 0, 0);
+        // A key-down: a lone key-up of a key pressed before the gate would be delivered instead.
+        let last = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0);
         state.correction_gate.held.push(last);
         state.break_correction_gate_fail_open(GateFailureCause::Mouse);
         state.retain_failed_drain(10, vec![first], 0);
@@ -12572,6 +12756,7 @@ mod tests {
             sequence: 0,
             drain_token: 0,
             hotkey_trigger: false,
+            repeat: false,
         };
         let up = RawKeyEvent {
             message: WM_KEYUP,
@@ -14762,5 +14947,138 @@ mod tests {
         let image = process_image_name(process_id).expect("current process image should resolve");
         assert!(!image.is_empty());
         assert!(process_integrity_level(process_id).is_some());
+    }
+
+    fn key_with_repeat(message: u32, virtual_key: VIRTUAL_KEY, repeat: bool) -> RawKeyEvent {
+        RawKeyEvent {
+            repeat,
+            ..test_raw_key(message, virtual_key, 0, 0)
+        }
+    }
+
+    fn virtual_keys(events: &[RawKeyEvent]) -> Vec<(u32, u32)> {
+        events
+            .iter()
+            .map(|event| (event.message, event.virtual_key))
+            .collect()
+    }
+
+    #[test]
+    fn key_ups_of_keys_pressed_before_the_gate_are_delivered_not_retained() {
+        let a = VIRTUAL_KEY(0x41);
+        let g = VIRTUAL_KEY(0x47);
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYDOWN, g, 0, 0),
+            test_raw_key(WM_KEYUP, VK_LCONTROL, 0, 0),
+        ]);
+        assert_eq!(virtual_keys(&retained), [(WM_KEYDOWN, u32::from(g.0))]);
+        assert_eq!(
+            virtual_keys(&releases),
+            [(WM_KEYUP, u32::from(VK_LCONTROL.0))]
+        );
+
+        // A key typed completely while the gate held it stays retained as a whole.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYDOWN, a, 0, 0),
+            test_raw_key(WM_KEYUP, a, 0, 0),
+        ]);
+        assert_eq!(retained.len(), 2);
+        assert!(releases.is_empty());
+
+        // Released, then pressed again: the first key-up leaves, the new press stays.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYUP, a, 0, 0),
+            test_raw_key(WM_KEYDOWN, a, 0, 0),
+        ]);
+        assert_eq!(virtual_keys(&retained), [(WM_KEYDOWN, u32::from(a.0))]);
+        assert_eq!(virtual_keys(&releases), [(WM_KEYUP, u32::from(a.0))]);
+
+        // Auto-repeats of a key pressed before the gate do not make its key-up retained.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            key_with_repeat(WM_KEYDOWN, a, true),
+            key_with_repeat(WM_KEYDOWN, a, true),
+            test_raw_key(WM_KEYUP, a, 0, 0),
+        ]);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(virtual_keys(&releases), [(WM_KEYUP, u32::from(a.0))]);
+
+        // A fresh press followed by repeats owns its key-up.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            key_with_repeat(WM_KEYDOWN, a, false),
+            key_with_repeat(WM_KEYDOWN, a, true),
+            test_raw_key(WM_KEYUP, a, 0, 0),
+        ]);
+        assert_eq!(retained.len(), 3);
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn a_gate_that_held_only_key_ups_retains_nothing_and_keeps_conversion_on() {
+        let (mut state, receiver) = test_gate_state(8);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYUP, VK_SPACE, 0, 0));
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0));
+        state.break_correction_gate_fail_open(GateFailureCause::Mouse);
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&state.metrics));
+        assert!(state.metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 0);
+        assert_eq!(
+            virtual_keys(&state.pending_key_releases),
+            [
+                (WM_KEYUP, u32::from(VK_SPACE.0)),
+                (WM_KEYUP, u32::from(VK_LSHIFT.0))
+            ]
+        );
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+        );
+        assert!(state.decline_reasons().is_empty());
+    }
+
+    #[test]
+    fn a_newer_physical_edge_of_a_key_cancels_its_queued_key_up() {
+        let mut pending = vec![
+            test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0),
+            test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x41), 0, 0),
+        ];
+        cancel_superseded_key_release(&mut pending, &test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0));
+        assert_eq!(virtual_keys(&pending), [(WM_KEYUP, 0x41)]);
+        cancel_superseded_key_release(&mut pending, &test_raw_key(WM_KEYUP, VK_RSHIFT, 0, 0));
+        assert_eq!(pending.len(), 1, "another key cancels nothing");
+    }
+
+    #[test]
+    fn deleting_retained_input_still_releases_keys_pressed_before_the_gate() {
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        let up = test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x41), 0, 0);
+        let down = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x42), 0, 0);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: up.foreground,
+            events: vec![up, down],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+            recovering: false,
+        });
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(HWND::default(), start + lifetime);
+        let state = take_app_state().unwrap();
+        assert!(!has_retained_input(&metrics));
+        assert_eq!(
+            virtual_keys(&state.pending_key_releases),
+            [(WM_KEYUP, 0x41)]
+        );
     }
 }
