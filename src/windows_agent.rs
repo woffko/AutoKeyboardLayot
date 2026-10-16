@@ -354,6 +354,8 @@ struct ObserverMetrics {
     input_epoch: AtomicU64,
     configuration_pending: AtomicBool,
     configuration_ack: AtomicU64,
+    // A revision whose application panicked in the worker; the UI drops it instead of waiting.
+    configuration_rejected: AtomicU64,
     last_input_layout: AtomicUsize,
     privacy_reason: AtomicU8,
     auto_enabled: AtomicBool,
@@ -401,6 +403,7 @@ impl Default for ObserverMetrics {
             input_epoch: AtomicU64::new(0),
             configuration_pending: AtomicBool::new(false),
             configuration_ack: AtomicU64::new(0),
+            configuration_rejected: AtomicU64::new(0),
             last_input_layout: AtomicUsize::new(0),
             privacy_reason: AtomicU8::new(PRIVACY_UNAVAILABLE),
             auto_enabled: AtomicBool::new(false),
@@ -1793,6 +1796,23 @@ impl AppState {
         true
     }
 
+    /// Drops the pending configuration when the worker rejected it after a contained panic; the
+    /// published settings stay as they were. True when it was dropped.
+    fn drop_rejected_configuration(&mut self) -> bool {
+        let Some(pending) = self.pending_configuration.as_ref() else {
+            return false;
+        };
+        if self.metrics.configuration_rejected.load(Ordering::Acquire) != pending.revision {
+            return false;
+        }
+        self.pending_configuration = None;
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
+        true
+    }
+
     fn take_acknowledged_configuration(&mut self) -> Option<RuntimeConfiguration> {
         let pending = self.pending_configuration.as_ref()?;
         if self.metrics.configuration_ack.load(Ordering::Acquire) != pending.revision {
@@ -2729,14 +2749,17 @@ struct ShutdownFacts {
     hotkey_waiting_for_release: bool,
 }
 
-/// The reasons for declining Exit, in reporting order. A finished worker thread cannot be busy,
-/// so the stale flag a crashed worker leaves behind is ignored.
+/// The reasons for declining Exit, in reporting order. A finished worker thread cannot be busy or
+/// acknowledge a reload, so the stale flags a crashed worker leaves behind are ignored.
 fn shutdown_blockers(facts: &ShutdownFacts) -> Vec<&'static str> {
     [
         ("correction-gate", facts.correction_gate_active),
         ("retained-input", facts.retained_input),
         ("worker-busy", facts.worker_busy && !facts.worker_finished),
-        ("configuration-pending", facts.configuration_pending),
+        (
+            "configuration-pending",
+            facts.configuration_pending && !facts.worker_finished,
+        ),
         ("undo-hotkey", facts.undo_hotkey_active),
         ("hotkey-release", facts.hotkey_waiting_for_release),
     ]
@@ -2922,6 +2945,21 @@ fn enqueue_configuration_reload(configuration: RuntimeConfiguration) -> bool {
 }
 
 fn finish_configuration_reload(hwnd: HWND) {
+    let rejected = APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(AppState::drop_rejected_configuration)
+    });
+    if rejected {
+        show_configuration_error(
+            hwnd,
+            &tr_format(
+                "error.read_config",
+                &[("error", "configuration_apply_failed")],
+            ),
+        );
+        return;
+    }
     let configuration = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
@@ -5619,6 +5657,7 @@ fn input_worker(
         |processor, event| processor.process(event),
         |processor| {
             ENGINE_FAULT.store(true, Ordering::Release);
+            processor.reject_faulted_configuration();
             processor.record_conversion_failure(ConversionFailureReason::InternalFault);
         },
     );
@@ -5692,6 +5731,8 @@ struct InputProcessor {
     reported_probe_respawns: u32,
     // Plays the conversion sounds; started on the first cue while they are enabled.
     sound_player: Option<SyncSender<SoundCue>>,
+    // The configuration revision being applied; a contained panic rejects exactly this one.
+    applying_configuration: Option<u64>,
 }
 
 impl InputProcessor {
@@ -5815,6 +5856,7 @@ impl InputProcessor {
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
             sound_player: None,
+            applying_configuration: None,
         }
     }
 
@@ -6003,7 +6045,9 @@ impl InputProcessor {
                 // state before enqueue. This private FIFO carries only accepted
                 // snapshots; adding another rejection path here would require
                 // a negative-ack protocol.
+                self.applying_configuration = Some(reload.revision);
                 self.apply_configuration_reload(Ok(reload.snapshot));
+                self.applying_configuration = None;
                 self.configuration_revision = reload.revision;
                 self.metrics
                     .configuration_ack
@@ -6105,6 +6149,22 @@ impl InputProcessor {
         }
     }
 
+    /// After a contained panic: a reload that was being applied is rejected, so the UI stops
+    /// waiting for it and keeps the published settings that match the policy still in force.
+    fn reject_faulted_configuration(&mut self) {
+        let Some(revision) = self.applying_configuration.take() else {
+            return;
+        };
+        self.configuration_revision = revision;
+        self.metrics
+            .configuration_rejected
+            .store(revision, Ordering::Release);
+        self.diagnostic(
+            "configuration",
+            format!("result=rejected revision={revision} reason=internal-fault"),
+        );
+    }
+
     fn apply_configuration_reload(&mut self, result: std::io::Result<RuntimeConfiguration>) {
         self.invalidate_conversion_state();
         self.session.clear();
@@ -6121,7 +6181,9 @@ impl InputProcessor {
                 return;
             }
         };
-        self.detector = Detector::with_profile_selections(
+        // Everything that can fail is built before anything is replaced: a contained panic here
+        // leaves the previous policy, including every exclusion, in force.
+        let mut detector = Detector::with_profile_selections(
             DetectorConfig {
                 single_letter_words: configuration.settings.single_letter_words,
                 ..Default::default()
@@ -6130,16 +6192,17 @@ impl InputProcessor {
             &configuration.input_profiles,
         );
         let profiles = self.resolved_profiles().cloned();
-        self.detector.set_resolved_profiles(profiles.as_ref());
-        self.detector
+        detector.set_resolved_profiles(profiles.as_ref());
+        detector
             .replace_user_lexicons(configuration.user_dictionary, configuration.word_exclusions);
-        self.detector.set_layout_model(
+        detector.set_layout_model(
             configuration
                 .settings
                 .layout_model
                 .then(autokeyboardlayot::layout_model::embedded)
                 .flatten(),
         );
+        self.detector = detector;
         self.recent_languages.clear();
         self.exclusion_policy = configuration.process_exclusions;
         self.backend_rules = configuration.backend_rules;
@@ -11557,8 +11620,10 @@ mod tests {
             worker_finished: true,
             ..all
         };
-        assert_eq!(shutdown_blockers(&finished).len(), 5);
+        // A finished worker can neither be busy nor acknowledge the pending reload.
+        assert_eq!(shutdown_blockers(&finished).len(), 4);
         assert!(!shutdown_blockers(&finished).contains(&"worker-busy"));
+        assert!(!shutdown_blockers(&finished).contains(&"configuration-pending"));
         let idle = ShutdownFacts {
             correction_gate_active: false,
             retained_input: false,
@@ -15189,5 +15254,51 @@ mod tests {
         arm_input_recovery(HWND::default());
         drop(take_app_state());
         assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_finished_worker_with_a_pending_reload_does_not_block_exit() {
+        let facts = ShutdownFacts {
+            correction_gate_active: false,
+            retained_input: false,
+            worker_busy: false,
+            worker_finished: true,
+            configuration_pending: true,
+            undo_hotkey_active: false,
+            hotkey_waiting_for_release: false,
+        };
+        assert!(shutdown_blockers(&facts).is_empty());
+        assert_eq!(
+            shutdown_blockers(&ShutdownFacts {
+                worker_finished: false,
+                ..facts
+            }),
+            ["configuration-pending"]
+        );
+    }
+
+    #[test]
+    fn a_reload_that_panicked_is_rejected_and_the_ui_stops_waiting_for_it() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.reject_faulted_configuration();
+        assert_eq!(metrics.configuration_rejected.load(Ordering::Acquire), 0);
+        processor.applying_configuration = Some(5);
+        processor.reject_faulted_configuration();
+        assert_eq!(metrics.configuration_rejected.load(Ordering::Acquire), 5);
+        assert_eq!(processor.configuration_revision, 5);
+        assert!(processor.applying_configuration.is_none());
+
+        let (mut state, _receiver) = test_gate_state(4);
+        state.metrics = Arc::clone(&metrics);
+        state.pending_configuration = Some(ConfigurationReload {
+            revision: 5,
+            snapshot: RuntimeConfiguration::default(),
+        });
+        metrics.configuration_pending.store(true, Ordering::Release);
+        assert!(state.drop_rejected_configuration());
+        assert!(state.pending_configuration.is_none());
+        assert!(!metrics.configuration_pending.load(Ordering::Acquire));
+        assert!(!state.drop_rejected_configuration());
     }
 }
