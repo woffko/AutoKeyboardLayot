@@ -1967,6 +1967,13 @@ impl AppState {
         }
     }
 
+    /// Queued input from before a hook reinstall is stale. The epoch moves first: the recovery a
+    /// broken gate queues for its held keys must carry the epoch the worker sees as current.
+    fn invalidate_for_hook_reinstall(&mut self) {
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.break_correction_gate_fail_open(GateFailureCause::HookReinstall);
+    }
+
     /// Asks the window procedure to send the queued held keys, outside any hook procedure that
     /// may be running now. The timer sends them as well if this message cannot be posted.
     fn post_held_keys_return(&self) {
@@ -2512,8 +2519,7 @@ fn reinstall_hooks(reason: &str) -> bool {
         if state.shutdown.load(Ordering::Acquire) {
             return None;
         }
-        state.break_correction_gate_fail_open(GateFailureCause::HookReinstall);
-        state.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        state.invalidate_for_hook_reinstall();
         Some((state.keyboard_hook.take(), state.mouse_hook.take()))
     });
     let Some((keyboard, mouse)) = handles else {
@@ -15254,6 +15260,26 @@ mod tests {
         arm_input_recovery(HWND::default());
         drop(take_app_state());
         assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_hook_reinstall_queues_the_recovery_in_the_current_epoch() {
+        let (mut state, receiver) = test_gate_state(8);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.invalidate_for_hook_reinstall();
+        let epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        let recovery = receiver
+            .try_iter()
+            .find(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+            .expect("the held keys are handed back automatically");
+        assert_eq!(
+            recovery.epoch, epoch,
+            "the worker must not drop it as stale"
+        );
     }
 
     #[test]
