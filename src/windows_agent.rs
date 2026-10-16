@@ -43,8 +43,9 @@ pub use installer_lifecycle::{initialize_installation, prepare_upgrade};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HGLOBAL,
-            HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, GetLastError, GlobalFree, HANDLE,
+            HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WAIT_OBJECT_0,
+            WPARAM,
         },
         Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ},
         Security::{
@@ -4164,20 +4165,27 @@ unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT 
         let event = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         APP_STATE.with(|slot| {
             if let Some(state) = slot.borrow_mut().as_mut() {
-                state
-                    .metrics
-                    .observed_input_sequence
-                    .fetch_add(1, Ordering::AcqRel);
-                if event.flags & LLMHF_INJECTED == 0 {
-                    state.break_correction_gate_fail_open(GateFailureCause::Mouse);
-                    state.enqueue(RawInputEvent::Mouse);
-                } else {
-                    state.enqueue(RawInputEvent::ExternalInjection);
-                }
+                observe_mouse_button(state, event.flags & LLMHF_INJECTED != 0);
             }
         });
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// A mouse button went down. A click, physical or injected by another program, may move the caret,
+/// so held keys must not be replayed after it: the gate breaks either way.
+fn observe_mouse_button(state: &mut AppState, injected: bool) {
+    state
+        .metrics
+        .observed_input_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    if injected {
+        state.break_correction_gate_fail_open(GateFailureCause::ExternalInjection);
+        state.enqueue(RawInputEvent::ExternalInjection);
+    } else {
+        state.break_correction_gate_fail_open(GateFailureCause::Mouse);
+        state.enqueue(RawInputEvent::Mouse);
+    }
 }
 
 fn drain_correction_gate(token: u64) {
@@ -8759,7 +8767,7 @@ impl InputProcessor {
 
     fn handoff_correction_gate(&self, old_token: u64, new_token: u64, required_ms: u64) -> bool {
         self.prepare_gate_handoff_budget(old_token, required_ms)
-            && self.send_gate_drain_ack(old_token, new_token)
+            && self.send_gate_drain_ack(old_token, new_token) == GateAckOutcome::Accepted
     }
 
     fn prepare_gate_handoff_budget(&self, old_token: u64, required_ms: u64) -> bool {
@@ -8785,7 +8793,7 @@ impl InputProcessor {
     }
 
     fn acknowledge_correction_gate_drain(&self, token: u64) {
-        if !self.send_gate_drain_ack(token, 0) && self.gate_window != 0 {
+        if fail_open_after_ack(self.send_gate_drain_ack(token, 0)) && self.gate_window != 0 {
             unsafe {
                 let _ = PostMessageW(
                     Some(HWND(self.gate_window as *mut c_void)),
@@ -8797,12 +8805,12 @@ impl InputProcessor {
         }
     }
 
-    fn send_gate_drain_ack(&self, old_token: u64, new_token: u64) -> bool {
+    fn send_gate_drain_ack(&self, old_token: u64, new_token: u64) -> GateAckOutcome {
         if old_token == 0 || self.gate_window == 0 {
-            return false;
+            return GateAckOutcome::Refused;
         }
         let Ok(new_token) = isize::try_from(new_token) else {
-            return false;
+            return GateAckOutcome::Refused;
         };
         let mut message_result = 0usize;
         let sent = unsafe {
@@ -8816,7 +8824,8 @@ impl InputProcessor {
                 Some(&mut message_result),
             )
         };
-        sent.0 != 0 && message_result == 1
+        let timed_out = sent.0 == 0 && unsafe { GetLastError() } == ERROR_TIMEOUT;
+        gate_ack_outcome(sent.0 != 0, message_result, timed_out)
     }
 
     fn request_gate_release(&mut self, token: u64) {
@@ -8962,6 +8971,42 @@ impl InputProcessor {
             .conversion_failures
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// What a synchronous gate acknowledgement achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAckOutcome {
+    Accepted,
+    Refused,
+    /// Not answered in time. The message can still be handled later, so this is no refusal.
+    Unanswered,
+}
+
+/// Classifies a SendMessageTimeoutW acknowledgement: `returned` is its non-zero return,
+/// `timed_out` a zero return with ERROR_TIMEOUT.
+const fn gate_ack_outcome(
+    returned: bool,
+    message_result: usize,
+    timed_out: bool,
+) -> GateAckOutcome {
+    if returned {
+        if message_result == 1 {
+            GateAckOutcome::Accepted
+        } else {
+            GateAckOutcome::Refused
+        }
+    } else if timed_out {
+        GateAckOutcome::Unanswered
+    } else {
+        GateAckOutcome::Refused
+    }
+}
+
+/// Only a refused acknowledgement fails the gate open. An unanswered one may still be handled,
+/// and a fail-open queued behind it would break a gate that is healthy by then; the gate's
+/// deadline ends it if it is never handled.
+const fn fail_open_after_ack(outcome: GateAckOutcome) -> bool {
+    matches!(outcome, GateAckOutcome::Refused)
 }
 
 fn foreground_identity_matches(expected: ForegroundContext) -> bool {
@@ -15488,5 +15533,39 @@ mod tests {
         let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
         processor.resume_after_recovered_abort(Instant::now());
         assert!(metrics.auto_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_injected_click_ends_the_gate_like_a_physical_one() {
+        for injected in [false, true] {
+            let (mut state, receiver) = test_gate_state(8);
+            state.correction_gate.activate(10);
+            state
+                .correction_gate
+                .held
+                .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+            observe_mouse_button(&mut state, injected);
+            assert!(!state.correction_gate.active, "injected={injected}");
+            assert!(has_retained_input(&state.metrics));
+            let expected = |event: &RawInputEvent| {
+                if injected {
+                    matches!(event, RawInputEvent::ExternalInjection)
+                } else {
+                    matches!(event, RawInputEvent::Mouse)
+                }
+            };
+            assert!(receiver.try_iter().any(|queued| expected(&queued.event)));
+        }
+    }
+
+    #[test]
+    fn an_unanswered_gate_acknowledgement_is_no_refusal() {
+        assert_eq!(gate_ack_outcome(true, 1, false), GateAckOutcome::Accepted);
+        assert_eq!(gate_ack_outcome(true, 0, false), GateAckOutcome::Refused);
+        assert_eq!(gate_ack_outcome(false, 0, true), GateAckOutcome::Unanswered);
+        assert_eq!(gate_ack_outcome(false, 0, false), GateAckOutcome::Refused);
+        assert!(fail_open_after_ack(GateAckOutcome::Refused));
+        assert!(!fail_open_after_ack(GateAckOutcome::Unanswered));
+        assert!(!fail_open_after_ack(GateAckOutcome::Accepted));
     }
 }
