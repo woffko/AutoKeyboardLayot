@@ -2862,6 +2862,45 @@ fn prepare_retained_recovery(metrics: &ObserverMetrics, token: u64, now: Instant
     same_record
 }
 
+/// How long past its lifetime a record stays while the worker is sending it. A worker that died
+/// in the middle must not keep the keys, the pause and the declined Exit forever.
+const RETAINED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+
+/// Marks the retained record `token` as being sent by the worker. False when it is gone (expired,
+/// discarded or replaced) or another recovery is already sending it.
+fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> bool {
+    let mut retained = metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match retained.as_mut() {
+        Some(input) if input.token == token && !input.recovering => {
+            input.recovering = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Ends a recovery that sent `sent` of `requested` inputs: a complete one removes the record, an
+/// incomplete one keeps it for another attempt, marked uncertain when part of it went out.
+fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, requested: usize) {
+    let mut retained = metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(input) = retained.as_mut()
+        && input.token == token
+    {
+        if sent == requested {
+            *retained = None;
+        } else {
+            input.recovering = false;
+            input.delivery_uncertain |= sent != 0;
+        }
+    }
+}
+
 fn discard_retained_input(hwnd: HWND) {
     let confirmed = unsafe {
         MessageBoxW(
@@ -4384,9 +4423,16 @@ fn expire_retained_input(hwnd: HWND, now: Instant) {
                 .retained_input
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let deadline = |input: &RetainedInput| {
+                if input.recovering {
+                    input.expires_at + RETAINED_RECOVERY_GRACE
+                } else {
+                    input.expires_at
+                }
+            };
             if retained
                 .as_ref()
-                .is_some_and(|input| now >= input.expires_at)
+                .is_some_and(|input| now >= deadline(input))
             {
                 retained.take()
             } else {
@@ -5737,6 +5783,9 @@ struct InputProcessor {
     reported_probe_respawns: u32,
     // Plays the conversion sounds; started on the first cue while they are enabled.
     sound_player: Option<SyncSender<SoundCue>>,
+    // Held keys were replayed without the hooks seeing them, so the word at the caret is unknown:
+    // the next epoch reset keeps the session suppressed instead of clearing it.
+    recovered_mid_word: bool,
     // The configuration revision being applied; a contained panic rejects exactly this one.
     applying_configuration: Option<u64>,
 }
@@ -5862,6 +5911,7 @@ impl InputProcessor {
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
             sound_player: None,
+            recovered_mid_word: false,
             applying_configuration: None,
         }
     }
@@ -6298,7 +6348,9 @@ impl InputProcessor {
         let queue_overflowed = dropped_events != self.last_dropped_events;
         self.log_word_discard("epoch", format!("overflow={queue_overflowed}"));
         self.invalidate_conversion_state();
-        if queue_overflowed {
+        // Input the worker never saw (a queue overflow, or keys a recovery replayed past the
+        // hooks) leaves the current word unknown until the next boundary.
+        if queue_overflowed || core::mem::take(&mut self.recovered_mid_word) {
             self.session
                 .handle(InputEvent::QueueOverflow, None, &self.detector);
         } else {
@@ -6368,30 +6420,31 @@ impl InputProcessor {
         {
             return;
         }
-        let sent = send_input_count(&inputs);
-        {
-            let mut retained = self
-                .metrics
-                .retained_input
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(current) = retained.as_mut()
-                && current.token == record.token
-            {
-                if sent == inputs.len() {
-                    *retained = None;
-                } else if sent != 0 {
-                    current.delivery_uncertain = true;
-                }
-            }
+        // Marked under the lock before sending, so that the lifetime timer cannot report keys as
+        // deleted while they are being typed.
+        if !begin_retained_recovery(&self.metrics, record.token) {
+            self.diagnostic(
+                "recovery",
+                format!("token={} result=retained reason=gone", record.token),
+            );
+            return;
         }
+        let sent = send_input_count(&inputs);
+        finish_retained_recovery(&self.metrics, record.token, sent, inputs.len());
+        self.finish_recovery(record.token, explicit, sent, inputs.len());
+    }
+
+    /// Bookkeeping after a recovery sent `sent` of `requested` inputs. The replayed keys bypass
+    /// the hooks, so the word they may have started is unknown: the session stays suppressed until
+    /// the next boundary, also across the epoch reset that an automatic resume causes.
+    fn finish_recovery(&mut self, token: u64, explicit: bool, sent: usize, requested: usize) {
         self.invalidate_conversion_state();
-        self.session.clear();
-        self.replay_keys.clear();
-        self.diagnostic("recovery", format!("token={} explicit={explicit} submitted={sent} requested={} evidence=input-submitted-text-unverified", record.token, inputs.len()));
+        self.suppress_session();
+        self.recovered_mid_word = true;
+        self.diagnostic("recovery", format!("token={token} explicit={explicit} submitted={sent} requested={requested} evidence=input-submitted-text-unverified"));
         // Only the automatic recovery of a gate abort, and only when every held key was handed
         // back, may resume automatic conversion; explicit or partial recovery leaves it paused.
-        if should_resume_after_recovery(explicit, sent, inputs.len()) {
+        if should_resume_after_recovery(explicit, sent, requested) {
             self.resume_after_recovered_abort(Instant::now());
         }
     }
@@ -6904,6 +6957,8 @@ impl InputProcessor {
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
         let manual_only = core::mem::take(&mut self.manual_only_word);
+        // A boundary ends the unknown word a recovery may have left.
+        self.recovered_mid_word = false;
         // What happened to a word that is not converted is logged as a category only, so a
         // missed conversion can be explained from the log without recording the word.
         let suppressed = self.session.is_suppressed();
@@ -15283,6 +15338,55 @@ mod tests {
     }
 
     #[test]
+    fn the_lifetime_timer_leaves_keys_alone_while_the_worker_sends_them() {
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+            recovering: false,
+        });
+        assert!(!begin_retained_recovery(&metrics, 11));
+        assert!(begin_retained_recovery(&metrics, 10));
+        assert!(
+            !begin_retained_recovery(&metrics, 10),
+            "one recovery at a time"
+        );
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(HWND::default(), start + lifetime);
+        assert!(has_retained_input(&metrics), "not deleted while being sent");
+        // An incomplete send keeps the record for another attempt, marked uncertain.
+        finish_retained_recovery(&metrics, 10, 1, 2);
+        {
+            let retained = metrics.retained_input.lock().unwrap();
+            let input = retained.as_ref().unwrap();
+            assert!(!input.recovering);
+            assert!(input.delivery_uncertain);
+        }
+        assert!(begin_retained_recovery(&metrics, 10));
+        finish_retained_recovery(&metrics, 10, 2, 2);
+        assert!(!has_retained_input(&metrics));
+        // A worker that died while sending does not keep the keys forever.
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 12,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+            recovering: true,
+        });
+        expire_retained_input(HWND::default(), start + lifetime + RETAINED_RECOVERY_GRACE);
+        assert!(!has_retained_input(&metrics));
+        drop(take_app_state());
+    }
+
+    #[test]
     fn a_finished_worker_with_a_pending_reload_does_not_block_exit() {
         let facts = ShutdownFacts {
             correction_gate_active: false,
@@ -15326,5 +15430,21 @@ mod tests {
         assert!(state.pending_configuration.is_none());
         assert!(!metrics.configuration_pending.load(Ordering::Acquire));
         assert!(!state.drop_rejected_configuration());
+    }
+
+    #[test]
+    fn a_recovery_leaves_the_word_at_the_caret_suppressed_until_the_next_boundary() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.finish_recovery(10, true, 2, 2);
+        assert!(processor.session.is_suppressed());
+        // The epoch reset of an automatic resume keeps it suppressed.
+        let epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.reset_for_epoch(epoch);
+        assert!(processor.session.is_suppressed());
+        // A later reset without a recovery clears the session as usual.
+        let epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.reset_for_epoch(epoch);
+        assert!(!processor.session.is_suppressed());
     }
 }
