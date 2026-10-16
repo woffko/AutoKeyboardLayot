@@ -97,9 +97,9 @@ use windows::{
                 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
                 MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_BACK,
                 VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME,
-                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMPAD0,
-                VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
-                VK_TAB, VK_UP,
+                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMLOCK,
+                VK_NUMPAD0, VK_PAUSE, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
+                VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -135,10 +135,7 @@ use windows::{
 use windows::Win32::{
     Foundation::{ERROR_SUCCESS, SetLastError},
     System::DataExchange::{EnumClipboardFormats, GetClipboardData},
-    UI::{
-        Accessibility::UIA_TextControlTypeId,
-        Input::KeyboardAndMouse::{VK_F12, VK_PAUSE},
-    },
+    UI::{Accessibility::UIA_TextControlTypeId, Input::KeyboardAndMouse::VK_F12},
 };
 
 const WINDOW_CLASS: PCWSTR = w!("AutoKeyboardLayot.ObserverWindow");
@@ -3970,6 +3967,8 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                     }
 
                     let mut claimed_hotkey = false;
+                    // The claimed hotkey is a modifier key-up that also reaches the application.
+                    let mut passes_through = false;
                     if !drained {
                         match contextual_hotkey_action(
                             &state.metrics,
@@ -4010,6 +4009,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                                     raw.hotkey_trigger = false;
                                 } else {
                                     claimed_hotkey = true;
+                                    passes_through = true;
                                     raw.hotkey_trigger = true;
                                 }
                             }
@@ -4077,18 +4077,16 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             .store(0, Ordering::Release);
                     }
                     let queued = if claimed_hotkey && has_retained_input(&state.metrics) {
-                        if state.metrics.recovery_armed.swap(false, Ordering::AcqRel) {
-                            state.enqueue(RawInputEvent::RecoverInput {
-                                sequence,
-                                explicit: true,
-                            })
-                        } else {
+                        let armed = state.metrics.recovery_armed.swap(false, Ordering::AcqRel);
+                        if !armed {
                             state.gate_diagnostic(
                                 "recovery_not_armed",
                                 format!("sequence={sequence}"),
                             );
-                            true
                         }
+                        let (key, recovery) = retained_hotkey_events(raw, passes_through, armed);
+                        let key_queued = key.is_none_or(|key| state.enqueue(key));
+                        key_queued && recovery.is_none_or(|recovery| state.enqueue(recovery))
                     } else {
                         state.enqueue(RawInputEvent::Key(raw))
                     };
@@ -4246,6 +4244,25 @@ fn fail_correction_gate_drain(token: u64, unsent: Vec<RawKeyEvent>, sent: usize)
     });
 }
 
+/// The events a claimed hotkey queues while held input is retained: the explicit recovery when it
+/// was armed, and, when the hotkey fired on a modifier key-up that also reaches the application,
+/// that key-up as a plain key event, so the worker sees the modifier released.
+fn retained_hotkey_events(
+    raw: RawKeyEvent,
+    passes_through: bool,
+    recovery_armed: bool,
+) -> (Option<RawInputEvent>, Option<RawInputEvent>) {
+    let key = passes_through.then_some(RawInputEvent::Key(RawKeyEvent {
+        hotkey_trigger: false,
+        ..raw
+    }));
+    let recovery = recovery_armed.then_some(RawInputEvent::RecoverInput {
+        sequence: raw.sequence,
+        explicit: true,
+    });
+    (key, recovery)
+}
+
 /// Splits edges that leave a gate without being typed into the ones that stay retained and the
 /// key-ups that must be delivered now. A key-up with no earlier fresh key-down of the same key in
 /// `events` belongs to a key whose key-down reached the application before the gate (directly or
@@ -4325,11 +4342,13 @@ fn take_held_replay_prefix(held: &mut Vec<RawKeyEvent>) -> Vec<RawKeyEvent> {
     held.drain(..end).collect()
 }
 
+/// Whether replaying `held` after a conversion changes the text after the converted word, which
+/// ends its undo. Only a key-down of a non-modifier key types; a key-up never does (a letter
+/// released after the Space while typing fast, or the Space's own key-up).
 fn held_tail_invalidates_undo(held: &[RawKeyEvent]) -> bool {
     held.iter().any(|event| {
         hotkey_modifier_bit(event.virtual_key as u16).is_none()
-            && (event.virtual_key as u16 != VK_SPACE.0
-                || !matches!(event.message, WM_KEYUP | WM_SYSKEYUP))
+            && matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN)
     })
 }
 
@@ -9606,12 +9625,22 @@ fn is_keypad_digit_key(virtual_key: u32) -> bool {
         .is_ok_and(|key| (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&key) || key == VK_DECIMAL.0)
 }
 
+/// Pause and Num Lock: the hook reports both as scan code 0x45, so a replay by scan code alone
+/// could produce the other key.
+fn shares_scan_code_with_another_key(virtual_key: u32) -> bool {
+    u16::try_from(virtual_key).is_ok_and(|key| key == VK_PAUSE.0 || key == VK_NUMLOCK.0)
+}
+
 fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<INPUT>> {
     let mut inputs = Vec::with_capacity(held.len() + 2);
     for event in held {
         // A keypad digit goes out as the virtual key it arrived with; as a bare scan code it
         // would arrive as the navigation key that shares it (see build_physical_replay_plan).
-        let by_virtual_key = event.scan_code == 0 || is_keypad_digit_key(event.virtual_key);
+        // Pause and Num Lock share scan code 0x45 as well, Pause without the E1 prefix the
+        // hook cannot report.
+        let by_virtual_key = event.scan_code == 0
+            || is_keypad_digit_key(event.virtual_key)
+            || shares_scan_code_with_another_key(event.virtual_key);
         let mut flags = if by_virtual_key {
             Default::default()
         } else {
@@ -15567,5 +15596,67 @@ mod tests {
         assert!(fail_open_after_ack(GateAckOutcome::Refused));
         assert!(!fail_open_after_ack(GateAckOutcome::Unanswered));
         assert!(!fail_open_after_ack(GateAckOutcome::Accepted));
+    }
+
+    #[test]
+    fn key_ups_released_after_a_conversion_never_end_its_undo() {
+        let rollover = [
+            test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x4e), 0, 0),
+            test_raw_key(WM_KEYUP, VK_SPACE, 0, 0),
+        ];
+        assert!(!held_tail_invalidates_undo(&rollover));
+        let modifier = [test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0)];
+        assert!(!held_tail_invalidates_undo(&modifier));
+        let typed = [
+            test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0),
+            test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x41), 0, 0),
+        ];
+        assert!(held_tail_invalidates_undo(&typed));
+    }
+
+    #[test]
+    fn held_pause_and_num_lock_are_replayed_as_their_virtual_keys() {
+        let pause = RawKeyEvent {
+            scan_code: 0x45,
+            ..test_raw_key(WM_KEYDOWN, VK_PAUSE, 0, 0)
+        };
+        let num_lock = RawKeyEvent {
+            scan_code: 0x45,
+            extended: true,
+            ..test_raw_key(WM_KEYDOWN, VK_NUMLOCK, 0, 0)
+        };
+        let inputs = build_raw_replay_inputs(&[pause, num_lock], INJECTED_EVENT_MARKER).unwrap();
+        for (input, key) in inputs.iter().zip([VK_PAUSE, VK_NUMLOCK]) {
+            let keyboard = unsafe { input.Anonymous.ki };
+            assert_eq!(keyboard.wVk, key);
+            assert_eq!(keyboard.dwFlags & KEYEVENTF_SCANCODE, Default::default());
+        }
+    }
+
+    #[test]
+    fn a_hotkey_on_a_modifier_key_up_still_reports_the_key_up_during_recovery() {
+        let raw = RawKeyEvent {
+            hotkey_trigger: true,
+            ..test_raw_key(WM_KEYUP, VK_LCONTROL, 9, 0)
+        };
+        let (key, recovery) = retained_hotkey_events(raw, true, true);
+        assert!(matches!(
+            key,
+            Some(RawInputEvent::Key(RawKeyEvent {
+                hotkey_trigger: false,
+                message: WM_KEYUP,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            recovery,
+            Some(RawInputEvent::RecoverInput {
+                sequence: 9,
+                explicit: true
+            })
+        ));
+        let (key, recovery) = retained_hotkey_events(raw, false, false);
+        assert!(key.is_none());
+        assert!(recovery.is_none());
     }
 }
