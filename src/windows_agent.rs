@@ -15659,4 +15659,198 @@ mod tests {
         assert!(key.is_none());
         assert!(recovery.is_none());
     }
+
+    #[test]
+    fn the_gate_timer_retains_held_keys_and_closes_an_empty_gate() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_correction_gate();
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert_eq!(
+            metrics
+                .retained_input
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|input| input.events.len()),
+            Some(1)
+        );
+
+        let (mut state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(11);
+        state.correction_gate.awaiting_worker_ack = true;
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_correction_gate();
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&metrics));
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+
+        // Waiting for the worker does not make held keys disposable: they are retained.
+        let (mut state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(12);
+        state.correction_gate.awaiting_worker_ack = true;
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_correction_gate();
+        drop(take_app_state());
+        assert!(has_retained_input(&metrics));
+    }
+
+    #[test]
+    fn a_late_drain_acknowledgement_with_held_keys_breaks_the_gate() {
+        let (mut state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(10);
+        state.correction_gate.awaiting_worker_ack = true;
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        assert!(!acknowledge_correction_gate_drain(10, 0));
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(has_retained_input(&metrics));
+        assert!(receiver.try_iter().any(|queued| matches!(
+            queued.event,
+            RawInputEvent::RecoverInput {
+                explicit: false,
+                ..
+            }
+        )));
+
+        // In time and with nothing left to replay, the acknowledgement closes the gate.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.correction_gate.activate(12);
+        state.correction_gate.awaiting_worker_ack = true;
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        assert!(acknowledge_correction_gate_drain(12, 0));
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&state.metrics));
+    }
+
+    #[test]
+    fn an_edge_beyond_a_full_gate_joins_the_retained_input() {
+        let (mut state, _receiver) = test_gate_state(8);
+        assert!(!state.hold_gated_edge(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0)));
+        state.correction_gate.activate(10);
+        for _ in 0..CORRECTION_GATE_CAPACITY {
+            assert!(state.hold_gated_edge(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0)));
+        }
+        assert!(state.correction_gate.active);
+        assert!(state.hold_gated_edge(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0)));
+        assert!(!state.correction_gate.active);
+        let retained = state.metrics.retained_input.lock().unwrap();
+        let events = &retained.as_ref().unwrap().events;
+        assert_eq!(events.len(), CORRECTION_GATE_CAPACITY + 1);
+        assert_eq!(events.last().unwrap().virtual_key, 0x48);
+    }
+
+    #[test]
+    fn held_keys_come_back_automatically_only_after_the_four_recoverable_causes() {
+        use GateFailureCause::*;
+        for cause in [
+            Deadline,
+            Capacity,
+            FocusChanged,
+            Mouse,
+            ExternalInjection,
+            WorkerQueue,
+            ReplaySubmit,
+            WorkerAck,
+            DownstreamHook,
+            InternalFault,
+            HookReinstall,
+        ] {
+            let (mut state, receiver) = test_gate_state(8);
+            state.correction_gate.activate(10);
+            state
+                .correction_gate
+                .held
+                .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+            state.break_correction_gate(cause, None);
+            let recovers = receiver.try_iter().any(|queued| {
+                matches!(
+                    queued.event,
+                    RawInputEvent::RecoverInput {
+                        explicit: false,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(
+                recovers,
+                matches!(cause, Deadline | Capacity | WorkerQueue | HookReinstall),
+                "{cause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gate_release_request_posts_exactly_one_message_with_its_token() {
+        let module = unsafe { GetModuleHandleW(None) }.unwrap();
+        // An invisible window owned by this thread, so that its queue can be inspected.
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("AutoKeyboardLayot gate release test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        }
+        .unwrap();
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), window.0 as usize);
+        processor.request_gate_release(77);
+        let mut message = MSG::default();
+        let take = |message: &mut MSG| unsafe {
+            PeekMessageW(
+                message,
+                Some(window),
+                GATE_RELEASE_MESSAGE,
+                GATE_RELEASE_MESSAGE,
+                PM_REMOVE,
+            )
+            .as_bool()
+        };
+        assert!(take(&mut message));
+        assert_eq!(message.wParam.0, 77);
+        assert!(!take(&mut message), "exactly one release request");
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        // A window that is gone cannot release the gate: the request fails it open instead.
+        unsafe { DestroyWindow(window) }.unwrap();
+        processor.request_gate_release(78);
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::GateDrain as u8
+        );
+    }
 }
