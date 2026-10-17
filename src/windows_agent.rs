@@ -95,11 +95,11 @@ use windows::{
                 GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState,
                 GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
                 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
-                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_BACK,
-                VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME,
-                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMLOCK,
-                VK_NUMPAD0, VK_PAUSE, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
-                VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_APPS,
+                VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+                VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
+                VK_MENU, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_RCONTROL, VK_RETURN, VK_RIGHT,
+                VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -3880,6 +3880,7 @@ fn report_slow_hook(started: Instant, hook: &str) {
         // The callback may run while this thread holds the state; skip the record then.
         if let Ok(borrowed) = slot.try_borrow()
             && let Some(state) = borrowed.as_ref()
+            && slow_hook_may_be_logged(hook, state.metrics.privacy_reason.load(Ordering::Acquire))
         {
             state.event_diagnostic(
                 "hook_slow",
@@ -3887,6 +3888,12 @@ fn report_slow_hook(started: Instant, hook: &str) {
             );
         }
     });
+}
+
+/// A slow keyboard callback is one line per key when the system is loaded: while privacy blocks
+/// the field it is not written, as it would give a secret's length and rhythm.
+const fn slow_hook_may_be_logged(hook: &str, privacy_reason: u8) -> bool {
+    privacy_reason == PRIVACY_ALLOWED || !matches!(hook.as_bytes(), b"keyboard")
 }
 
 unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -5796,16 +5803,26 @@ struct InputProcessor {
     input_profiles: KeyboardProfileCache,
     #[cfg(test)]
     profile_override: Option<ResolvedKeyboardProfiles>,
+    // Tests pin the input target that has the focus, instead of the real foreground window.
+    #[cfg(test)]
+    foreground_override: Option<ForegroundContext>,
+    // Tests describe the process behind the input target: its image path and integrity level.
+    #[cfg(test)]
+    process_override: Option<(Option<String>, Option<u32>)>,
     session: InputSession,
     modifiers: Modifiers,
     privacy_guard: PrivacyGuard,
-    privacy_probe: Option<BoundedProbe<(ForegroundContext, u64), Option<PrivacyBlockReason>>>,
+    // Keyed by the input target, the input epoch and the privacy generation.
+    privacy_probe: Option<BoundedProbe<(ForegroundContext, u64, u64), Option<PrivacyBlockReason>>>,
     exclusion_policy: ExclusionPolicy,
     backend_rules: BackendRules,
     settings: Settings,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
     diagnostic_sender: Option<SyncSender<String>>,
     privacy_needs_check: bool,
+    // Moves on with every input that may move the focus (mark_privacy_dirty). It is part of the
+    // probe's key, so an answer requested before such input never decides the field after it.
+    privacy_generation: u64,
     privacy_reason: Option<PrivacyBlockReason>,
     recent_privacy_ok: Option<RecentPrivacyOk>,
     // The input target of the last periodic field check and how long it took.
@@ -5925,6 +5942,10 @@ impl InputProcessor {
             input_profiles: KeyboardProfileCache::default(),
             #[cfg(test)]
             profile_override: None,
+            #[cfg(test)]
+            foreground_override: None,
+            #[cfg(test)]
+            process_override: None,
             session,
             modifiers: Modifiers::default(),
             privacy_guard: PrivacyGuard::new(),
@@ -5935,7 +5956,7 @@ impl InputProcessor {
                 "autokey-privacy",
                 || {
                     let guard = PrivacyGuard::new();
-                    move |(foreground, _epoch): (ForegroundContext, u64)| {
+                    move |(foreground, _epoch, _generation): (ForegroundContext, u64, u64)| {
                         if !foreground_identity_matches(foreground) {
                             return Some(PrivacyBlockReason::InspectionUnavailable);
                         }
@@ -5956,6 +5977,7 @@ impl InputProcessor {
             lexicon_candidate,
             diagnostic_sender,
             privacy_needs_check: true,
+            privacy_generation: 0,
             privacy_reason: Some(PrivacyBlockReason::InspectionUnavailable),
             recent_privacy_ok: None,
             last_refresh_check: None,
@@ -5991,6 +6013,27 @@ impl InputProcessor {
             failed_edit_gate_token: 0,
             applying_configuration: None,
         }
+    }
+
+    /// Whether the input target `expected` still has the focus. Tests pin the focused target.
+    fn foreground_matches(&self, expected: ForegroundContext) -> bool {
+        #[cfg(test)]
+        if let Some(current) = self.foreground_override {
+            return same_input_target(current, expected);
+        }
+        foreground_identity_matches(expected)
+    }
+
+    /// The image path and the integrity level of `process_id`. Tests describe the process.
+    fn process_facts(&self, process_id: u32) -> (Option<String>, Option<u32>) {
+        #[cfg(test)]
+        if let Some((image, integrity)) = &self.process_override {
+            return (image.clone(), *integrity);
+        }
+        (
+            process_image_name(process_id),
+            process_integrity_level(process_id),
+        )
     }
 
     fn resolved_profiles(&self) -> Option<&ResolvedKeyboardProfiles> {
@@ -6062,6 +6105,12 @@ impl InputProcessor {
 
     fn diagnostic(&self, event: &'static str, details: String) {
         if !self.metrics.diagnostics_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        // The owner's decision: while privacy blocks the input target nothing about the typing
+        // there is written. Even a counter or a timestamp per key tells a secret's length and
+        // rhythm.
+        if self.privacy_reason.is_some() && describes_typing(event) {
             return;
         }
         let Some(sender) = &self.diagnostic_sender else {
@@ -6260,7 +6309,7 @@ impl InputProcessor {
                     return;
                 }
                 self.refresh_input_profiles();
-                if !foreground_identity_matches(foreground) {
+                if !self.foreground_matches(foreground) {
                     self.mark_privacy_dirty(false);
                     return;
                 }
@@ -6459,8 +6508,7 @@ impl InputProcessor {
         if record.delivery_uncertain && !explicit {
             return;
         }
-        if !self.input_sequence_is_current(sequence)
-            || !foreground_identity_matches(record.foreground)
+        if !self.input_sequence_is_current(sequence) || !self.foreground_matches(record.foreground)
         {
             self.diagnostic(
                 "recovery",
@@ -6604,6 +6652,9 @@ impl InputProcessor {
             self.modifiers = Modifiers::default();
             self.last_foreground = Some(foreground_key);
             self.last_layout = Some(event.foreground.layout);
+            // A new window may belong to a new process that reuses the previous one's ID: its
+            // image, integrity and exclusion are read again instead of taken from the cache.
+            self.last_process_id = None;
             self.refresh_process_policy(event.foreground.process_id);
             self.mark_privacy_dirty(false);
         } else if self.last_layout != Some(event.foreground.layout) {
@@ -6868,6 +6919,15 @@ impl InputProcessor {
                 self.handle_boundary(language, None, true);
                 self.last_word_reset = "boundary";
             }
+            key if may_move_focus_within_window(key) => {
+                // These keys type nothing but can move the focus inside the window (closing a
+                // dialog, switching panes, opening a menu): the next key gets a fresh privacy
+                // check, and no earlier good check stands for it.
+                self.last_word_reset = "navigation";
+                self.replay_keys.clear();
+                self.handle_switching_rule(InputEvent::Navigation, language, true);
+                self.mark_privacy_dirty(false);
+            }
             key if key == VK_RETURN.0 => {
                 self.last_boundary = None;
                 self.transpose_cycle = None;
@@ -6879,13 +6939,7 @@ impl InputProcessor {
                 if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
-                    self.diagnostic(
-                        "input",
-                        format!(
-                            "result=suppressed reason=privacy pid={} route={:?}",
-                            event.foreground.process_id, self.text_edit_backend
-                        ),
-                    );
+                    // Nothing is logged here: one line per key would give a secret's length.
                     self.last_word_reset = "privacy";
                     self.suppress_session();
                     return;
@@ -7016,7 +7070,7 @@ impl InputProcessor {
         let deadline = Instant::now() + Duration::from_millis(HOOK_FORWARD_TIMEOUT_MS);
         loop {
             if !self.input_sequence_is_current(event.sequence)
-                || !foreground_identity_matches(event.foreground)
+                || !self.foreground_matches(event.foreground)
             {
                 return false;
             }
@@ -7614,7 +7668,7 @@ impl InputProcessor {
         self.refresh_process_policy(foreground.process_id);
         self.evaluate_privacy(foreground, ProbeTrigger::Manual);
         epoch == self.metrics.input_epoch.load(Ordering::Acquire)
-            && foreground_identity_matches(foreground)
+            && self.foreground_matches(foreground)
             && self.manual_privacy_allows_current(foreground)
     }
 
@@ -7630,16 +7684,19 @@ impl InputProcessor {
         let terminal = self.process_reason.is_none()
             && self.last_process_id == Some(foreground.process_id)
             && self.text_edit_backend == TextEditBackend::PhysicalReplay
-            && process_image_name(foreground.process_id).is_some_and(|path| {
-                matches!(
-                    path.rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or("")
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
-                )
-            });
+            && self
+                .process_facts(foreground.process_id)
+                .0
+                .is_some_and(|path| {
+                    matches!(
+                        path.rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
+                    )
+                });
         autokeyboardlayot::privacy::manual_conversion_allowed(
             reason,
             self.settings.manual_terminal_uia_fallback,
@@ -7666,22 +7723,11 @@ impl InputProcessor {
             (Some(reason), "process-policy")
         } else {
             match self.privacy_probe.as_mut() {
-                Some(probe) => match probe.query_result(
-                    (foreground, epoch),
+                Some(probe) => probe_verdict(probe.query_result(
+                    (foreground, epoch, self.privacy_generation),
                     Duration::from_millis(PRIVACY_PROBE_WAIT_MS),
                     Duration::from_millis(500),
-                ) {
-                    Ok(reason) => (reason, "provider"),
-                    Err(failure) => (
-                        Some(PrivacyBlockReason::InspectionUnavailable),
-                        match failure {
-                            ProbeFailure::Timeout => "wait-timeout",
-                            ProbeFailure::Busy => "queue-busy",
-                            ProbeFailure::Disconnected => "provider-disconnected",
-                            ProbeFailure::Expired => "reply-expired",
-                        },
-                    ),
-                },
+                )),
                 None => (
                     Some(PrivacyBlockReason::InspectionUnavailable),
                     "probe-missing",
@@ -7691,7 +7737,7 @@ impl InputProcessor {
         self.report_probe_respawn();
         // A late safe reply cannot authorize a different focus or input epoch.
         let context_current = self.metrics.input_epoch.load(Ordering::Acquire) == epoch
-            && foreground_identity_matches(foreground);
+            && self.foreground_matches(foreground);
         self.apply_probe_answer(
             ProbeAnswer { reason, source },
             context_current,
@@ -7724,7 +7770,17 @@ impl InputProcessor {
         let verdict =
             self.settle_probe_outcome(reason, source, foreground, epoch, Instant::now(), trigger);
         let (reason, source) = (verdict.reason, verdict.source);
-        if reason != self.privacy_reason
+        let changed = reason != self.privacy_reason;
+        self.metrics.privacy_probe_cost_ms.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        self.privacy_needs_check = false;
+        let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
+            && self.manual_privacy_allows_reason(reason, foreground);
+        self.set_privacy_reason_with_manual_exception(reason, manual_exception);
+        // Logged under the new verdict, so a check that blocks the field leaves no line.
+        if changed
             || verdict.recent_ok_age.is_some()
             || started.elapsed() >= Duration::from_millis(SLOW_INPUT_DIAGNOSTIC_MS)
         {
@@ -7740,14 +7796,6 @@ impl InputProcessor {
                 ),
             );
         }
-        self.metrics.privacy_probe_cost_ms.store(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            Ordering::Release,
-        );
-        self.privacy_needs_check = false;
-        let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
-            && self.manual_privacy_allows_reason(reason, foreground);
-        self.set_privacy_reason_with_manual_exception(reason, manual_exception);
     }
 
     fn refresh_process_policy(&mut self, process_id: u32) {
@@ -7755,7 +7803,7 @@ impl InputProcessor {
             return;
         }
         self.last_process_id = Some(process_id);
-        let image = process_image_name(process_id);
+        let (image, integrity) = self.process_facts(process_id);
         let process_name = image
             .as_deref()
             .and_then(|path| path.rsplit(['/', '\\']).next())
@@ -7770,11 +7818,7 @@ impl InputProcessor {
         self.metrics
             .backend_status
             .store(self.text_edit_backend.status_code(), Ordering::Release);
-        self.process_reason = match (
-            image,
-            process_integrity_level(process_id),
-            self.current_integrity_level,
-        ) {
+        self.process_reason = match (image, integrity, self.current_integrity_level) {
             (Some(path), _, _) if self.exclusion_policy.is_excluded(&path) => {
                 Some(PrivacyBlockReason::ExcludedProcess)
             }
@@ -7785,13 +7829,16 @@ impl InputProcessor {
             _ => Some(PrivacyBlockReason::InspectionUnavailable),
         };
         self.privacy_needs_check = true;
-        self.diagnostic(
-            "context",
-            format!(
-                "pid={process_id} process={process_name} route={:?} privacy={:?}",
-                self.text_edit_backend, self.process_reason
-            ),
-        );
+        // A blocked process leaves no line: it would mark when typing there began.
+        if self.process_reason.is_none() {
+            self.diagnostic(
+                "context",
+                format!(
+                    "pid={process_id} process={process_name} route={:?}",
+                    self.text_edit_backend
+                ),
+            );
+        }
     }
 
     /// Applies the recent-good rule to one finished check.
@@ -7876,6 +7923,8 @@ impl InputProcessor {
 
     fn mark_privacy_dirty(&mut self, pause_now: bool) {
         self.privacy_needs_check = true;
+        // A check still running for the field before this input must not decide the next one.
+        self.privacy_generation = self.privacy_generation.wrapping_add(1);
         // Tab, Enter, a click, a shortcut, injected input and focus changes all come through
         // here: the field may be another one now, so no earlier good check applies to it.
         self.recent_privacy_ok = None;
@@ -8248,7 +8297,7 @@ impl InputProcessor {
         {
             let active_gate = self.metrics.active_gate_token.load(Ordering::Acquire);
             if self.metrics.cancelled_gate_token.load(Ordering::Acquire) == input_sequence
-                || !foreground_identity_matches(foreground)
+                || !self.foreground_matches(foreground)
                 || (active_gate != input_sequence
                     && (!self.input_sequence_is_current(input_sequence)
                         || !physical_modifiers_released()))
@@ -8411,7 +8460,7 @@ impl InputProcessor {
         {
             return;
         }
-        if !foreground_identity_matches(record.foreground)
+        if !self.foreground_matches(record.foreground)
             || current_foreground_context()
                 .and_then(|current| self.language_for_layout(current.layout))
                 != Some(record.transaction.target_language)
@@ -8928,7 +8977,7 @@ impl InputProcessor {
     }
 
     fn edit_guard_is_current(&self, foreground: ForegroundContext, input_sequence: u64) -> bool {
-        self.input_guard_is_current(input_sequence) && foreground_identity_matches(foreground)
+        self.input_guard_is_current(input_sequence) && self.foreground_matches(foreground)
     }
 
     fn pre_forward_guard_is_current(
@@ -8937,7 +8986,7 @@ impl InputProcessor {
         input_sequence: u64,
     ) -> bool {
         self.pre_forward_input_guard_is_current(input_sequence)
-            && foreground_identity_matches(foreground)
+            && self.foreground_matches(foreground)
     }
 
     fn pre_forward_input_guard_is_current(&self, input_sequence: u64) -> bool {
@@ -9072,6 +9121,49 @@ const fn gate_ack_outcome(
 /// deadline ends it if it is never handled.
 const fn fail_open_after_ack(outcome: GateAckOutcome) -> bool {
     matches!(outcome, GateAckOutcome::Refused)
+}
+
+/// Diagnostics that describe typing in the current input target. None of them is written while
+/// privacy blocks that target (a password field, or an excluded, elevated or uninspectable
+/// program or field).
+fn describes_typing(event: &str) -> bool {
+    matches!(
+        event,
+        "input"
+            | "input_queue"
+            | "word"
+            | "word_discard"
+            | "candidate"
+            | "hotkey"
+            | "privacy_probe"
+    )
+}
+
+/// What a privacy probe's result means for the field: the provider's answer, or for every
+/// transport failure that the field cannot be inspected, with the failure as the source.
+const fn probe_verdict(
+    result: core::result::Result<Option<PrivacyBlockReason>, ProbeFailure>,
+) -> (Option<PrivacyBlockReason>, &'static str) {
+    match result {
+        Ok(reason) => (reason, "provider"),
+        Err(failure) => (
+            Some(PrivacyBlockReason::InspectionUnavailable),
+            match failure {
+                ProbeFailure::Timeout => "wait-timeout",
+                ProbeFailure::Busy => "queue-busy",
+                ProbeFailure::Disconnected => "provider-disconnected",
+                ProbeFailure::Expired => "reply-expired",
+            },
+        ),
+    }
+}
+
+/// Keys that type nothing but can move the focus within one window: Esc, the function keys and
+/// the menu key. Tab, Enter and shortcuts with Ctrl, Alt or Win are handled on their own paths.
+fn may_move_focus_within_window(virtual_key: u16) -> bool {
+    virtual_key == VK_ESCAPE.0
+        || virtual_key == VK_APPS.0
+        || (VK_F1.0..=VK_F24.0).contains(&virtual_key)
 }
 
 fn foreground_identity_matches(expected: ForegroundContext) -> bool {
@@ -14620,21 +14712,15 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_without_a_good_check_stands_and_is_logged_as_it_was() {
+    fn a_failure_without_a_good_check_stands_and_leaves_no_line() {
         let (mut processor, receiver) = processor_with_diagnostics();
         type_letters(&mut processor, "hel");
         apply(&mut processor, FIELD_FAILURE, true);
         assert_eq!(processor.privacy_reason, FIELD_FAILURE);
         assert!(processor.session.is_suppressed());
+        // The owner's decision: a check that blocks the field is not written.
         let lines = probe_lines(&receiver);
-        let line = lines.last().expect("the failure is logged");
-        assert!(
-            line.contains("result=Some(FieldInspectionUnavailable)"),
-            "{line}"
-        );
-        assert!(line.contains("source=provider"), "{line}");
-        assert!(line.contains("trigger=typing"), "{line}");
-        assert!(!line.contains("age_ms"), "{line}");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     #[test]
@@ -14649,8 +14735,7 @@ mod tests {
         );
         assert!(processor.session.is_suppressed());
         let lines = probe_lines(&receiver);
-        let line = lines.last().expect("the change is logged");
-        assert!(line.contains("source=context-changed"), "{line}");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     fn processor_with_diagnostics() -> (InputProcessor, Receiver<String>) {
@@ -14730,6 +14815,11 @@ mod tests {
             prepare(&mut processor);
             processor.handle_boundary(language, Some(' '), false);
             let lines = word_lines(&receiver);
+            // The owner's decision: nothing is written about a word in a blocked field.
+            if expected == "privacy" {
+                assert!(lines.is_empty(), "{lines:?}");
+                continue;
+            }
             assert_eq!(lines.len(), 1, "{expected}: {lines:?}");
             assert!(
                 lines[0].contains(&format!("result={expected}")),
@@ -16008,5 +16098,385 @@ mod tests {
             metrics.last_failure_reason.load(Ordering::Acquire),
             ConversionFailureReason::GateDrain as u8
         );
+    }
+
+    const EDITOR: &str = r"C:\Program Files\Editor\editor.exe";
+
+    const KEEPASS: &str = r"C:\Program Files\KeePass\KeePass.exe";
+
+    /// The input target of `test_raw_key`.
+    fn test_foreground() -> ForegroundContext {
+        test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground
+    }
+
+    fn letter(virtual_key: u16, sequence: u64) -> RawKeyEvent {
+        test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(virtual_key), sequence, 0)
+    }
+
+    /// A key event queued `waited` ago, so the worker would note a slow queue.
+    fn queued_key(
+        processor: &InputProcessor,
+        event: RawKeyEvent,
+        waited: Duration,
+    ) -> QueuedInputEvent {
+        QueuedInputEvent {
+            epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+            captured_at: Instant::now() - waited,
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        }
+    }
+
+    type TestProbe = BoundedProbe<(ForegroundContext, u64, u64), Option<PrivacyBlockReason>>;
+
+    /// A privacy probe whose provider answers every request with `answer` at once.
+    fn answering_probe(answer: Option<PrivacyBlockReason>) -> TestProbe {
+        BoundedProbe::spawn("test-privacy", move || move |_| answer).unwrap()
+    }
+
+    /// A privacy probe whose provider waits for a message on `gate` (or for its sender to be
+    /// dropped) before each answer. The n-th request it handles is answered with `answer(n)`.
+    fn gated_probe(
+        gate: Receiver<()>,
+        answer: impl Fn(usize) -> Option<PrivacyBlockReason> + Send + 'static,
+    ) -> TestProbe {
+        BoundedProbe::spawn("test-privacy-gated", move || {
+            let mut handled = 0;
+            move |_| {
+                let _ = gate.recv();
+                handled += 1;
+                answer(handled)
+            }
+        })
+        .unwrap()
+    }
+
+    /// A processor with diagnostics whose input target, `test_raw_key`'s, has the focus, in a
+    /// process with `image` at the agent's own integrity level, and whose privacy provider
+    /// answers `answer`.
+    fn processor_in_field(
+        image: &str,
+        answer: Option<PrivacyBlockReason>,
+    ) -> (InputProcessor, Receiver<String>) {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor.foreground_override = Some(test_foreground());
+        processor.process_override = Some((Some(image.to_owned()), Some(0x2000)));
+        processor.current_integrity_level = Some(0x2000);
+        processor.privacy_probe = Some(answering_probe(answer));
+        processor.privacy_needs_check = true;
+        (processor, receiver)
+    }
+
+    #[test]
+    fn typing_in_a_password_field_leaves_no_line_once_the_field_is_known() {
+        let (mut processor, receiver) =
+            processor_in_field(EDITOR, Some(PrivacyBlockReason::PasswordField));
+        processor.process_key(letter(0x53, 1));
+        // Only the program the window belongs to; the check that found the password field is
+        // not written.
+        let first: Vec<String> = receiver.try_iter().collect();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].starts_with("event=context "), "{first:?}");
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::PasswordField)
+        );
+        // Every further key, slow in the queue or not, and the word's end leave nothing.
+        for (index, key) in [0x45u16, 0x43, 0x52, 0x45, 0x54].into_iter().enumerate() {
+            let event = letter(key, index as u64 + 2);
+            let queued = queued_key(&processor, event, Duration::from_millis(100));
+            processor.process(queued);
+        }
+        assert_eq!(processor.last_word_reset, "privacy");
+        let space = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0);
+        let queued = queued_key(&processor, space, Duration::from_millis(100));
+        processor.process(queued);
+        let typed: Vec<String> = receiver.try_iter().collect();
+        assert!(typed.is_empty(), "{typed:?}");
+    }
+
+    #[test]
+    fn typing_in_an_excluded_program_leaves_no_line_at_all() {
+        let (mut processor, receiver) = processor_in_field(KEEPASS, None);
+        for (index, key) in [0x53u16, 0x45, 0x43].into_iter().enumerate() {
+            processor.process_key(letter(key, index as u64 + 1));
+        }
+        processor.process_key(test_raw_key(WM_KEYDOWN, VK_SPACE, 4, 0));
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::ExcludedProcess)
+        );
+    }
+
+    #[test]
+    fn the_privacy_check_of_a_key_tells_an_allowed_field_from_a_blocked_one() {
+        for (image, integrity, answer, blocked) in [
+            (EDITOR, Some(0x2000), None, false),
+            (
+                EDITOR,
+                Some(0x2000),
+                Some(PrivacyBlockReason::PasswordField),
+                true,
+            ),
+            (
+                EDITOR,
+                Some(0x2000),
+                Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                true,
+            ),
+            (KEEPASS, Some(0x2000), None, true),
+            // An elevated program, and one whose integrity cannot be read.
+            (EDITOR, Some(0x3000), None, true),
+            (EDITOR, None, None, true),
+        ] {
+            let (mut processor, _receiver) = processor_in_field(image, answer);
+            processor.process_override = Some((Some(image.to_owned()), integrity));
+            processor.process_key(letter(0x41, 1));
+            let case = format!("{image} {integrity:?} {answer:?}");
+            assert_eq!(processor.privacy_reason.is_some(), blocked, "{case}");
+            assert_eq!(processor.last_word_reset == "privacy", blocked, "{case}");
+            // An allowed key goes on to the word (here a key the test layout cannot type).
+            assert!(!blocked || processor.session.is_suppressed(), "{case}");
+        }
+    }
+
+    #[test]
+    fn every_failed_privacy_check_blocks_the_field() {
+        let unavailable = Some(PrivacyBlockReason::InspectionUnavailable);
+        let mut sources = Vec::new();
+        for failure in [
+            ProbeFailure::Timeout,
+            ProbeFailure::Busy,
+            ProbeFailure::Disconnected,
+            ProbeFailure::Expired,
+        ] {
+            let (reason, source) = probe_verdict(Err(failure));
+            assert_eq!(reason, unavailable, "{failure:?}");
+            sources.push(source);
+        }
+        sources.sort_unstable();
+        sources.dedup();
+        assert_eq!(sources.len(), 4, "each failure names itself");
+        assert_eq!(probe_verdict(Ok(None)), (None, "provider"));
+        assert_eq!(
+            probe_verdict(Ok(Some(PrivacyBlockReason::PasswordField))),
+            (Some(PrivacyBlockReason::PasswordField), "provider")
+        );
+
+        // Through the key: a provider that does not answer in time, one that is gone, and no
+        // provider at all.
+        let (gate, waiting) = sync_channel::<()>(1);
+        let gone: TestProbe = BoundedProbe::spawn("test-privacy-gone", || {
+            |_: (ForegroundContext, u64, u64)| -> Option<PrivacyBlockReason> {
+                panic!("the provider is gone")
+            }
+        })
+        .unwrap();
+        for (case, probe) in [
+            ("timeout", Some(gated_probe(waiting, |_| None))),
+            ("disconnected", Some(gone)),
+            ("missing", None),
+        ] {
+            let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+            processor.privacy_probe = probe;
+            processor.process_key(letter(0x41, 1));
+            assert_eq!(processor.privacy_reason, unavailable, "{case}");
+            assert_eq!(processor.last_word_reset, "privacy", "{case}");
+            assert!(processor.session.is_suppressed(), "{case}");
+        }
+        drop(gate);
+
+        // A reply for another input target never authorizes this one.
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.foreground_override = Some(ForegroundContext {
+            focus: 99,
+            ..test_foreground()
+        });
+        processor.evaluate_privacy(test_foreground(), ProbeTrigger::Typing);
+        assert_eq!(processor.privacy_reason, unavailable);
+    }
+
+    #[test]
+    fn a_pause_check_holds_only_for_the_input_target_and_epoch_it_began_with() {
+        let foreground = test_foreground();
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        assert!(processor.forced_privacy_allows(foreground));
+        // Another control has the focus.
+        processor.foreground_override = Some(ForegroundContext {
+            focus: 99,
+            ..foreground
+        });
+        assert!(!processor.forced_privacy_allows(foreground));
+        // The input epoch moves on while the field is checked.
+        processor.foreground_override = Some(foreground);
+        let metrics = Arc::clone(&processor.metrics);
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-epoch", move || {
+                move |_: (ForegroundContext, u64, u64)| {
+                    metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+                    None
+                }
+            })
+            .unwrap(),
+        );
+        assert!(!processor.forced_privacy_allows(foreground));
+    }
+
+    #[test]
+    fn an_answer_requested_before_tab_never_decides_the_field_after_it() {
+        // The provider answers the first field (before Tab) as an ordinary one and every later
+        // one as a password field, each only when the test lets it.
+        let (release, gate) = sync_channel::<()>(4);
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.privacy_probe = Some(gated_probe(gate, |handled| {
+            (handled > 1).then_some(PrivacyBlockReason::PasswordField)
+        }));
+        processor.process_key(letter(0x41, 1));
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::InspectionUnavailable),
+            "no answer in time"
+        );
+        // The answer for the field before Tab arrives late, and Tab moves to the password field.
+        release.send(()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        processor.process_key(test_raw_key(WM_KEYDOWN, VK_TAB, 2, 0));
+        processor.process_key(letter(0x42, 3));
+        assert!(processor.privacy_reason.is_some());
+        assert_eq!(processor.last_word_reset, "privacy");
+        drop(release);
+    }
+
+    #[test]
+    fn keys_that_can_move_the_focus_within_a_window_ask_for_a_fresh_privacy_check() {
+        // Esc, F1, F6, F24 and the menu key; Tab, Shift+Tab and Enter; Ctrl+Tab and an Alt
+        // accelerator.
+        let none: &[VIRTUAL_KEY] = &[];
+        for (modifiers, key) in [
+            (none, VK_ESCAPE),
+            (none, VK_APPS),
+            (none, VK_F1),
+            (none, VIRTUAL_KEY(0x75)),
+            (none, VK_F24),
+            (none, VK_TAB),
+            (&[VK_LSHIFT][..], VK_TAB),
+            (none, VK_RETURN),
+            (&[VK_CONTROL][..], VK_TAB),
+            (&[VK_MENU][..], VIRTUAL_KEY(0x46)),
+        ] {
+            let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+            processor.process_key(letter(0x41, 1));
+            assert!(processor.privacy_reason.is_none(), "{key:?}");
+            assert!(!processor.privacy_needs_check, "{key:?}");
+            processor.recent_privacy_ok = Some(RecentPrivacyOk {
+                foreground: test_foreground(),
+                epoch: 0,
+                at: Instant::now(),
+            });
+            let generation = processor.privacy_generation;
+            processor.modifiers = held_modifiers(modifiers);
+            processor.process_key(test_raw_key(WM_KEYDOWN, key, 2, 0));
+            assert!(processor.privacy_needs_check, "{key:?}");
+            assert!(processor.recent_privacy_ok.is_none(), "{key:?}");
+            assert_ne!(processor.privacy_generation, generation, "{key:?}");
+        }
+        for typing in [VK_SPACE.0, 0x41, VK_LEFT.0, VK_BACK.0] {
+            assert!(!may_move_focus_within_window(typing), "{typing:#x}");
+        }
+    }
+
+    #[test]
+    fn a_slow_keyboard_hook_is_not_logged_while_privacy_blocks_the_field() {
+        assert!(slow_hook_may_be_logged("keyboard", PRIVACY_ALLOWED));
+        assert!(slow_hook_may_be_logged("mouse", PRIVACY_PASSWORD));
+        for blocked in [
+            PRIVACY_PASSWORD,
+            PRIVACY_EXCLUDED,
+            PRIVACY_UNAVAILABLE,
+            PRIVACY_ELEVATED,
+        ] {
+            assert!(!slow_hook_may_be_logged("keyboard", blocked), "{blocked}");
+        }
+    }
+
+    #[test]
+    fn a_new_window_reads_its_process_again_even_with_the_same_process_id() {
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.process_key(letter(0x41, 1));
+        assert!(processor.process_reason.is_none());
+        // The program closes, and another one gets its process ID and a new window.
+        processor.process_override = Some((Some(KEEPASS.to_owned()), Some(0x2000)));
+        let moved = ForegroundContext {
+            hwnd: 50,
+            focus: 50,
+            ..test_foreground()
+        };
+        processor.foreground_override = Some(moved);
+        let mut event = letter(0x42, 2);
+        event.foreground = moved;
+        processor.process_key(event);
+        assert_eq!(
+            processor.process_reason,
+            Some(PrivacyBlockReason::ExcludedProcess)
+        );
+        assert_eq!(processor.last_word_reset, "privacy");
+    }
+
+    #[test]
+    fn a_pending_configuration_drops_the_word_in_an_allowed_field() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        processor
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        let queued = queued_key(&processor, letter(0x4c, 1), Duration::ZERO);
+        processor.process(queued);
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert!(processor.replay_keys.is_empty());
+        assert!(processor.privacy_reason.is_none());
+        let lines: Vec<String> = receiver.try_iter().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("event=word_discard ")
+                    && line.contains("reason=configuration chars=3")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_worker_takes_a_privacy_refresh_and_lets_the_next_one_be_queued() {
+        let (state, receiver) = test_gate_state(4);
+        let foreground = test_foreground();
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.foreground_override = Some(foreground);
+        processor.process_override = Some((Some(EDITOR.to_owned()), Some(0x2000)));
+        processor.current_integrity_level = Some(0x2000);
+        let asked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&asked);
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-refresh", move || {
+                move |_: (ForegroundContext, u64, u64)| {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                    None
+                }
+            })
+            .unwrap(),
+        );
+        assert!(state.enqueue(RawInputEvent::PrivacyRefresh(foreground)));
+        assert!(state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
+        processor.process(receiver.try_recv().unwrap());
+        assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+        assert!(processor.privacy_reason.is_none());
+        // The next refresh is queued again, and while a gate holds keys it asks nothing.
+        assert!(state.enqueue(RawInputEvent::PrivacyRefresh(foreground)));
+        state.metrics.active_gate_token.store(9, Ordering::Release);
+        processor.process(receiver.try_recv().expect("queued again"));
+        assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
+        assert_eq!(asked.load(Ordering::Acquire), 1);
     }
 }
