@@ -2,12 +2,15 @@
 //! Not installed, published or used by the agent.
 //!
 //! Usage: measure_token_false_positives [--store STORE_COPY] [TOKENS.txt]
+//!        measure_token_false_positives [--store STORE_COPY] --punctuated
 //!        measure_token_false_positives [--store STORE_COPY] --random LENGTH COUNT
 //!
 //! Without a mode it measures tests/fixtures/dev-tokens.txt (real command,
 //! tool and package names) against the bundled EN/RU/ET dictionaries, exactly
 //! as tests/dev_tokens.rs does; run it to see which tokens are converted
-//! before changing the budgets there. With --random it measures COUNT uniformly
+//! before changing the budgets there. With --punctuated it measures
+//! tests/fixtures/punctuated-english.txt (English words with punctuation next
+//! to them) the same way. With --random it measures COUNT uniformly
 //! random lowercase strings of LENGTH letters instead (a fixed seed per
 //! length): machine-generated text such as hashes and identifiers, which no
 //! dictionary knows. With --store the dictionaries come from a copy of an
@@ -20,14 +23,17 @@ use std::{collections::BTreeSet, ffi::OsString, fs, path::Path, sync::Arc};
 
 #[path = "../tests/support/token_measure.rs"]
 mod token_measure;
-use token_measure::{CORPUS, LAYOUTS, Layouts, detectors, measure, parse_tokens};
+use token_measure::{
+    CORPUS, LAYOUTS, Layouts, PUNCTUATED, detectors, measure, parse_punctuated_tokens, parse_tokens,
+};
 
-const USAGE: &str = "usage: measure_token_false_positives [--store STORE_COPY] [TOKENS.txt | --random LENGTH COUNT]";
+const USAGE: &str = "usage: measure_token_false_positives [--store STORE_COPY] [TOKENS.txt | --punctuated | --random LENGTH COUNT]";
 /// Random strings are only counted; this many converted ones are listed.
 const RANDOM_LISTED: usize = 10;
 
 enum Mode {
     Corpus(Option<OsString>),
+    Punctuated,
     Random { length: usize, count: usize },
 }
 
@@ -71,6 +77,8 @@ fn parse_arguments() -> Result<(Option<OsString>, Mode), Box<dyn std::error::Err
     while let Some(argument) = arguments.next() {
         if argument == "--store" && store.is_none() {
             store = Some(arguments.next().ok_or(USAGE)?);
+        } else if argument == "--punctuated" && mode.is_none() {
+            mode = Some(Mode::Punctuated);
         } else if argument == "--random" && mode.is_none() {
             let number = |value: Option<OsString>| -> Result<usize, Box<dyn std::error::Error>> {
                 Ok(value
@@ -105,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             (parse_tokens(&text)?, usize::MAX)
         }
+        Mode::Punctuated => (parse_punctuated_tokens(PUNCTUATED)?, usize::MAX),
         Mode::Random { length, count } => (random_tokens(length, count), RANDOM_LISTED),
     };
     let layouts = Layouts::parse(LAYOUTS)?;

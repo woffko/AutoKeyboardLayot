@@ -29,8 +29,12 @@ converted only when all of the following hold:
    dictionary detector's list-based policy);
 3. it is not excluded and is not a known word of the typed layout (main
    dictionary, short-word list or user dictionary);
-4. the target reading uses the target language's alphabet;
-5. the model is at least 90% sure of another layout (97% for three-letter
+4. it has no character outside the typed language's alphabet at either edge
+   and is not a contraction: an apostrophe after a word the typed language
+   knows (`don't`, `I've`), or a single apostrophe after three or more
+   characters and before one letter (`hadn't`, `Inno's`);
+5. the target reading uses the target language's alphabet;
+6. the model is at least 90% sure of another layout (97% for three-letter
    words).
 
 Typed text is processed in memory only: it is never written to disk, logged or
@@ -44,16 +48,23 @@ Measured with `tools/layout_model` on generated typing: sentences mix the
 three languages, and a word is typed in the wrong layout when the user
 switches language but forgets to switch the layout. "Realistic" samples words
 by real frequency; "rare words" samples each vocabulary uniformly. Words used
-only for testing are held out from training. Both detectors use the installed
-signed packages.
+only for testing are held out from training. Both detectors use the bundled
+English, Russian and Estonian dictionaries.
 
 | | Dictionary detector | With layout model |
 |---|---|---|
-| Realistic: wrong-layout words corrected | 86.5% | 96.2% |
-| — English / Russian / Estonian | 91.8% / 94.8% / 59.8% | 95.3% / 97.8% / 93.3% |
-| Realistic: correct words changed by mistake | 0.09% | 0.11% |
-| Rare words: wrong-layout words corrected | 65.8% | 92.4% |
+| Realistic: wrong-layout words corrected | 86.4% | 95.2% |
+| — English / Russian / Estonian | 91.6% / 94.8% / 59.5% | 95.1% / 97.1% / 90.6% |
+| Realistic: correct words changed by mistake | 0.09% | 0.10% |
+| Rare words: wrong-layout words corrected | 65.8% | 90.6% |
 | Rare words: correct words changed by mistake | 0.06% | 0.10% |
+
+Before rule 4 and the dictionary veto on punctuation after a known word (see
+[Limits](#limits)), the dictionary detector corrected 86.5% and the model
+96.2% (Estonian 93.3%) of the realistic words and 92.4% of the rare ones. The
+generated typing has no punctuation, so here both only cost: words that start
+or end with a key that is a letter in the other layout only, such as `ü` or
+`б`, no longer reach the model. Their gain is in real text with punctuation.
 
 On real English, Russian, Estonian and foreign (German, French, Spanish)
 words the rate of unwanted changes is the same as the dictionary detector's;
@@ -64,11 +75,11 @@ are synthetic measurements, not a substitute for real typing acceptance; see
 ## Limits
 
 The model is a statistical second opinion, not a language identifier. Its limits
-are known. The first three are covered by tests in `src/detector.rs`, the
+are known. The first four are covered by tests in `src/detector.rs`, the
 numbers come from `examples/measure_token_false_positives.rs`, and
 `tests/dev_tokens.rs` stops the real-token numbers from growing unnoticed.
 
-**The five rules above are hard gates.** A confident model cannot override
+**The six rules above are hard gates.** A confident model cannot override
 them. `kerf` is an English dictionary word whose keys also read as the common
 Russian word `лука`; the model alone is 99% sure of Russian and rule 3 keeps
 the word English. The protection is only as good as the dictionary: a name, a
@@ -81,15 +92,31 @@ and 96% sure, and one is converted at 99.8%. A longer word is converted from
 
 **Ambiguity is settled by context, and only above the threshold.** English and
 Estonian share the key of every letter, and some key sequences read as a word
-in two languages. The dictionary stage then fails closed. The model may decide
-from the languages of the previous words (never their text), but it still needs
-90%. In the tests the keys `'kke` read as the Russian word `эллу` and as the
-Estonian word `äkke`. After three Estonian words the model is 91% sure of
-Estonian and converts; after an English word it is 81% sure of Estonian, and
-after three Russian words 65% sure of Russian, so nothing is converted. Keys
-whose letter patterns are decisive on their own (`v'he`, the Estonian `vähe`)
-convert in every context. The context is cleared when the focused window or
-field changes, so the first word typed there has none.
+in two languages or in none that the dictionary stage may use. The model may
+decide from the languages of the previous words (never their text), but it
+still needs its threshold. In the tests the keys `h]i` read as the Estonian
+word `hõi` and as no Russian word, and the dictionary stage leaves
+three-letter words to the short-word lists. After three Estonian words the
+model is 98% sure of Estonian and converts; after an English word it is 94%
+sure and after three Russian words 56% sure, below the 97% a three-letter word
+needs, so nothing is converted. Keys whose letter patterns are decisive on
+their own (`v'he`, the Estonian `vähe`) convert in every context. The context
+is cleared when the focused window or field changes, so the first word typed
+there has none.
+
+**Punctuation next to a word is left to the dictionaries.** The model reads
+every key as a letter of some layout: on its own it turned `don't` into the
+Estonian-looking `donät`, `it.` into the Russian `шею`, a quoted `"Tallinn`
+into `ÄTallinn` and the file name `.png` into `юзтп`. Words with a character
+outside the typed alphabet at an edge, and contractions, therefore never reach
+the model (rule 4), and the dictionary stage ignores punctuation typed after a
+word it knows: `key.` stays English although `луню` is a Russian word. Of the
+punctuated English words in `tests/fixtures/punctuated-english.txt` neither
+stage converts any. The cost is paid by words that start or end with
+a key that is a letter only in the other layout: the Estonian `üle`, `ära` and
+`töö` or the Russian `был` and `мою` are corrected only when the dictionaries
+know them, and `'kke` stays unconverted after Estonian words although the model
+is 91% sure of `äkke` there.
 
 **Synthetic and real numbers differ.** The table above measures generated
 sentences of real words and shows about 0.1% unwanted changes. Text that is not
@@ -99,6 +126,7 @@ layout and judged as a first word (no context):
 | Input | Dictionary stage converts | Model adds |
 |---|---|---|
 | 1 659 command, tool and package names | 0.36% | 0.06% |
+| 3 016 English words with punctuation next to them | 0% | 0% |
 | Random lowercase letters, 3 letters | 0.36% | 3.3% |
 | 4 letters | 1.5% | 2.4% |
 | 6 letters | 0.05% | 1.7% |
@@ -110,7 +138,8 @@ The random rows are a worst case (40 000 uniformly random strings per row), not
 typical typing. They show what no dictionary protects: machine-generated
 lowercase text. Reproduce a row with
 `cargo run --release --example measure_token_false_positives -- --random 6 40000`,
-and the first row with the same command without arguments.
+the first row with the same command without arguments and the second with
+`--punctuated`.
 
 **False-positive classes** seen in these measurements:
 
@@ -235,4 +264,5 @@ takes about a minute on a GPU and longer on a CPU).
 | `examples/evaluate_layout_detection.rs` | Runs the agent's detector on test cases |
 | `examples/measure_token_false_positives.rs` | Counts unwanted conversions on developer tokens or random strings |
 | `tests/dev_tokens.rs`, `tests/fixtures/dev-tokens.txt` | Budget for those conversions on 1 659 real tokens |
+| `tests/fixtures/punctuated-english.txt` | The same for 3 016 English words with punctuation |
 | `tools/layout_model/pipeline.sh` | All steps in order |

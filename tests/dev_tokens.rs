@@ -1,17 +1,19 @@
-//! Ratchet for audit finding F14: unwanted conversions in terminals.
+//! Ratchets for unwanted conversions of text typed correctly in the English
+//! layout: command, tool and package names in terminals (audit finding F14),
+//! and English words with punctuation next to them (findings C1-1 and C1-2).
 //!
-//! Real command, tool and package names, typed correctly in the English
-//! layout, are replayed through the detector as if the same physical keys had
-//! been read in the Russian and Estonian layouts. The detector converts a few
-//! of them; the budgets below are the numbers measured when the corpus was
-//! added (6 of 1659 by the dictionary detector, 1 more by the layout model).
-//! They may only go down.
+//! Each token is replayed through the detector as if the same physical keys
+//! had been read in the Russian and Estonian layouts. The detector converts a
+//! few command names; the budgets below are the numbers measured when that
+//! corpus was added (6 of 1659 by the dictionary detector, 1 more by the layout
+//! model). It converts none of the punctuated words. The budgets may only go
+//! down.
 //!
-//! Re-baselining: run `cargo run --example measure_token_false_positives` to
-//! list the converted tokens, then change the constants in the same commit as
-//! the detector or corpus change and give the reason in the commit message. A
-//! higher budget is a detection-policy decision (D4 of the audit remediation
-//! plan), not a test fix.
+//! Re-baselining: run `cargo run --example measure_token_false_positives` (add
+//! `--punctuated` for the punctuated words) to list the converted tokens, then
+//! change the constants in the same commit as the detector or corpus change and
+//! give the reason in the commit message. A higher budget is a detection-policy
+//! decision (D4 of the audit remediation plan), not a test fix.
 #![cfg(feature = "legacy-bundled-input")]
 
 #[path = "support/token_measure.rs"]
@@ -19,7 +21,9 @@ mod token_measure;
 
 use autokeyboardlayot::{DictionaryRegistry, Language};
 use std::sync::Arc;
-use token_measure::{CORPUS, LAYOUTS, Layouts, detectors, measure, parse_tokens};
+use token_measure::{
+    CORPUS, LAYOUTS, Layouts, PUNCTUATED, detectors, measure, parse_punctuated_tokens, parse_tokens,
+};
 
 /// A smaller corpus would make the percentages meaningless.
 const MINIMUM_TOKENS: usize = 1500;
@@ -27,6 +31,10 @@ const MINIMUM_TOKENS: usize = 1500;
 const DICTIONARY_BUDGET: usize = 6;
 /// Tokens converted only once the layout model is switched on.
 const MODEL_EXTRA_BUDGET: usize = 1;
+/// The same for the punctuated English words.
+const MINIMUM_PUNCTUATED_TOKENS: usize = 2500;
+const PUNCTUATED_DICTIONARY_BUDGET: usize = 0;
+const PUNCTUATED_MODEL_EXTRA_BUDGET: usize = 0;
 
 const REBASELINE: &str = "If the change is intended, follow the re-baselining steps at the top of tests/dev_tokens.rs. \
                           Raising a budget changes detection policy and needs an explicit decision.";
@@ -46,36 +54,63 @@ fn listed(conversions: &[token_measure::Conversion]) -> String {
         .collect()
 }
 
-#[test]
-fn dev_tokens_false_positive_budget() {
-    let tokens = parse_tokens(CORPUS).expect("corpus");
+fn assert_within_budget(tokens: &[String], dictionary_budget: usize, model_extra_budget: usize) {
     let (dictionary_only, with_model) = bundled();
-    let result = measure(&tokens, &layouts(), &dictionary_only, &with_model);
+    let result = measure(tokens, &layouts(), &dictionary_only, &with_model);
     assert_eq!(
         result.tokens,
         tokens.len(),
         "every corpus token must be readable in all three layouts"
     );
     assert!(
-        result.dictionary.len() <= DICTIONARY_BUDGET,
+        result.dictionary.len() <= dictionary_budget,
         "the dictionary detector converts {} of {} tokens typed correctly in the English layout, \
-         budget {DICTIONARY_BUDGET}:{}\n{REBASELINE}",
+         budget {dictionary_budget}:{}\n{REBASELINE}",
         result.dictionary.len(),
         result.tokens,
         listed(&result.dictionary)
     );
     assert!(
-        result.model_extra.len() <= MODEL_EXTRA_BUDGET,
-        "the layout model converts {} more tokens, budget {MODEL_EXTRA_BUDGET}:{}\n{REBASELINE}",
+        result.model_extra.len() <= model_extra_budget,
+        "the layout model converts {} more tokens, budget {model_extra_budget}:{}\n{REBASELINE}",
         result.model_extra.len(),
         listed(&result.model_extra)
     );
-    if result.dictionary.len() < DICTIONARY_BUDGET || result.model_extra.len() < MODEL_EXTRA_BUDGET
+    if result.dictionary.len() < dictionary_budget || result.model_extra.len() < model_extra_budget
     {
         eprintln!(
             "note: fewer unwanted conversions than budgeted ({} + {}); lower the constants to keep the gain",
             result.dictionary.len(),
             result.model_extra.len()
+        );
+    }
+}
+
+#[test]
+fn dev_tokens_false_positive_budget() {
+    let tokens = parse_tokens(CORPUS).expect("corpus");
+    assert_within_budget(&tokens, DICTIONARY_BUDGET, MODEL_EXTRA_BUDGET);
+}
+
+#[test]
+fn punctuated_english_false_positive_budget() {
+    let tokens = parse_punctuated_tokens(PUNCTUATED).expect("punctuated corpus");
+    assert_within_budget(
+        &tokens,
+        PUNCTUATED_DICTIONARY_BUDGET,
+        PUNCTUATED_MODEL_EXTRA_BUDGET,
+    );
+}
+
+fn assert_provenance_header(corpus: &str) {
+    let header: Vec<&str> = corpus
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .collect();
+    for required in ["Sources", "Snapshot taken on", "Format:"] {
+        assert!(
+            header.iter().any(|line| line.contains(required)),
+            "the corpus header must contain {required:?}"
         );
     }
 }
@@ -88,16 +123,7 @@ fn the_corpus_is_a_sorted_unique_list_with_a_provenance_header() {
         "{} tokens, at least {MINIMUM_TOKENS} are needed",
         tokens.len()
     );
-    let header: Vec<&str> = CORPUS
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .collect();
-    for required in ["Sources", "Snapshot taken on", "Format:"] {
-        assert!(
-            header.iter().any(|line| line.contains(required)),
-            "the corpus header must contain {required:?}"
-        );
-    }
+    assert_provenance_header(CORPUS);
     assert!(parse_tokens("abc\nabc\n").is_err(), "repeats are rejected");
     assert!(
         parse_tokens("abd\nabc\n").is_err(),
@@ -106,6 +132,60 @@ fn the_corpus_is_a_sorted_unique_list_with_a_provenance_header() {
     assert!(parse_tokens("ab\n").is_err(), "short tokens are rejected");
     assert!(parse_tokens("Abc\n").is_err(), "capitals are rejected");
     assert!(parse_tokens("ab-c\n").is_err(), "separators are rejected");
+}
+
+#[test]
+fn the_punctuated_corpus_is_a_sorted_unique_list_with_a_provenance_header() {
+    let tokens = parse_punctuated_tokens(PUNCTUATED).expect("punctuated corpus");
+    assert!(
+        tokens.len() >= MINIMUM_PUNCTUATED_TOKENS,
+        "{} tokens, at least {MINIMUM_PUNCTUATED_TOKENS} are needed",
+        tokens.len()
+    );
+    assert_provenance_header(PUNCTUATED);
+    let thousands = tokens.len() / 1000;
+    let documented = format!(
+        "{thousands} {:03} English words with punctuation",
+        tokens.len() % 1000
+    );
+    let docs = include_str!("../docs/layout-model.md");
+    let mentions = docs.matches("English words with punctuation").count();
+    assert!(
+        mentions > 0 && docs.matches(&documented).count() == mentions,
+        "docs/layout-model.md must give the corpus size wherever it names it: {documented:?}"
+    );
+    for required in [
+        "can't", "don't", "e.g.", "i've", "it.", "key.", "me.", "now,",
+    ] {
+        assert!(
+            tokens.binary_search(&required.to_owned()).is_ok(),
+            "{required:?} is part of the corpus"
+        );
+    }
+    assert!(
+        parse_punctuated_tokens("it.\nit.\n").is_err(),
+        "repeats are rejected"
+    );
+    assert!(
+        parse_punctuated_tokens("me.\nit.\n").is_err(),
+        "unsorted input is rejected"
+    );
+    assert!(
+        parse_punctuated_tokens("a.\n").is_err(),
+        "one letter is rejected"
+    );
+    assert!(
+        parse_punctuated_tokens("word\n").is_err(),
+        "a token needs punctuation"
+    );
+    assert!(
+        parse_punctuated_tokens("It.\n").is_err(),
+        "capitals are rejected"
+    );
+    assert!(
+        parse_punctuated_tokens("it!\n").is_err(),
+        "other punctuation is rejected"
+    );
 }
 
 #[test]

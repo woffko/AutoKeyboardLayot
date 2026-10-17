@@ -256,6 +256,12 @@ impl Detector {
     /// word must be long enough, not excluded and not a known word in the typed
     /// layout, and the target must use the target language's alphabet. The
     /// model must be sure of another layout (LAYOUT_MODEL_*THRESHOLD).
+    ///
+    /// The model reads every key as a letter of some layout, so it never sees
+    /// a word with a character outside the typed alphabet at either edge ("it."
+    /// would become "шею", "\"Tallinn" would become "ÄTallinn") or a
+    /// contraction ("don't" would become "donät"). Only the dictionary stage
+    /// judges them.
     fn detect_with_layout_model(
         &self,
         word: &str,
@@ -273,6 +279,8 @@ impl Detector {
         };
         if length < LAYOUT_MODEL_MINIMUM_CHARACTERS
             || self.word_exclusions.contains(current_language, word)
+            || self.letter_core(current_language, word) != word
+            || self.is_contraction(current_language, word)
         {
             return None;
         }
@@ -381,6 +389,20 @@ impl Detector {
             self.dictionary_contains(language, core)
         }
     }
+
+    /// "don't", "I've", "hadn't", "Inno's": an apostrophe after a word the
+    /// language knows, or a single apostrophe after three or more characters
+    /// and before one. Estonian "ä" typed with the apostrophe key rarely sits
+    /// there, and the few such words ("aitäh") are in the dictionary.
+    fn is_contraction(&self, language: Language, word: &str) -> bool {
+        let parts: Vec<&str> = word.split(['\'', '\u{2019}']).collect();
+        let [first, .., last] = parts.as_slice() else {
+            return false;
+        };
+        self.knows_letter_core(language, first)
+            || (parts.len() == 2 && first.chars().count() >= 3 && last.chars().count() == 1)
+    }
+
     fn accepts_character(&self, language: Language, character: char) -> bool {
         self.dictionaries
             .active_language(language)
@@ -1231,14 +1253,94 @@ mod tests {
     }
 
     #[test]
-    fn layout_model_settles_a_dictionary_ambiguity_by_context_and_only_at_the_threshold() {
+    fn layout_model_never_sees_edge_punctuation_or_contractions() {
         let detector = model_detector();
-        // The same keys read as the Russian word "эллу" and the Estonian word
-        // "äkke": two plausible targets, so the dictionary stage fails closed.
+        // On its own the model is sure of another layout for each of these;
+        // only the punctuation at an edge, or the apostrophe after a known word
+        // or after a name and before one letter, keeps them English.
+        for (word, russian, estonian) in [
+            ("don't", "вщтэе", "donät"),
+            ("can't", "сфтэе", "canät"),
+            ("I've", "Шэму", "Iäve"),
+            ("hadn't", "рфвтэе", "hadnät"),
+            ("Inno's", "Шттщэы", "Innoäs"),
+            ("e.g.", "уюпю", "e.g."),
+            ("it.", "шею", "it."),
+            ("me.", "ьую", "me."),
+            ("now,", "тщцб", "now,"),
+            ("\"Tallinn", "ЭЕфддштт", "ÄTallinn"),
+        ] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let probabilities = model_probabilities(&detector, word, &candidates, &[]);
+            let sure = probability_of(&probabilities, Language::Russian)
+                .max(probability_of(&probabilities, Language::Estonian));
+            let threshold = if word.chars().count() == LAYOUT_MODEL_MINIMUM_CHARACTERS {
+                LAYOUT_MODEL_SHORT_THRESHOLD
+            } else {
+                LAYOUT_MODEL_THRESHOLD
+            };
+            assert!(
+                sure >= threshold,
+                "premise: the model alone converts {word} ({sure}); the model changed, pick another word"
+            );
+            assert!(
+                detector
+                    .detect_mapped_candidates_in_context(word, Language::English, &candidates, &[])
+                    .is_none(),
+                "{word}"
+            );
+        }
+        // Also where the model would be right: after Estonian words the keys
+        // 'kke read as "äkke" rather than the Russian "эллу", but the leading
+        // apostrophe keeps them from the model.
         let candidates = russian_or_estonian("эллу", "äkke");
+        let previous = [Language::Estonian; 3];
+        let probabilities = model_probabilities(&detector, "'kke", &candidates, &previous);
+        assert!(
+            probability_of(&probabilities, Language::Estonian) >= LAYOUT_MODEL_THRESHOLD,
+            "premise: the model alone converts 'kke after Estonian words ({probabilities:?})"
+        );
         assert!(
             detector
-                .detect_mapped_candidates("'kke", Language::English, &candidates)
+                .detect_mapped_candidates_in_context(
+                    "'kke",
+                    Language::English,
+                    &candidates,
+                    &previous
+                )
+                .is_none()
+        );
+        // Keys inside a word still reach the model, also the apostrophe key
+        // typed for the Estonian "ä".
+        for (word, russian, estonian) in [
+            ("kuup'ev", "лггзэум", "kuupäev"),
+            ("juurdep''s", "оггквузээы", "juurdepääs"),
+            ("j'i", "оэш", "jäi"),
+            ("p'eval", "зэумфд", "päeval"),
+        ] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let detection = detector
+                .detect_mapped_candidates_in_context(
+                    word,
+                    Language::English,
+                    &candidates,
+                    &[Language::Estonian],
+                )
+                .unwrap_or_else(|| panic!("{word} is converted"));
+            assert_eq!(detection.replacement, estonian);
+        }
+    }
+
+    #[test]
+    fn layout_model_settles_an_ambiguity_by_context_and_only_at_the_threshold() {
+        let detector = model_detector();
+        // The keys read as the Estonian word "hõi" and as no Russian word. The
+        // dictionary stage leaves three-letter words to the short-word lists,
+        // so only the model and the languages of the previous words decide.
+        let candidates = russian_or_estonian("ръш", "hõi");
+        assert!(
+            detector
+                .detect_mapped_candidates("h]i", Language::English, &candidates)
                 .is_none()
         );
         // (previous words, converts)
@@ -1247,16 +1349,16 @@ mod tests {
             (vec![Language::Russian; 3], false),
             (vec![Language::Estonian; 3], true),
         ] {
-            let probabilities = model_probabilities(&detector, "'kke", &candidates, &previous);
+            let probabilities = model_probabilities(&detector, "h]i", &candidates, &previous);
             let best = probabilities.iter().copied().fold(0.0, f32::max);
             assert_eq!(
-                best >= LAYOUT_MODEL_THRESHOLD,
+                best >= LAYOUT_MODEL_SHORT_THRESHOLD,
                 converts,
                 "premise: probabilities {probabilities:?} for context {previous:?}; \
                  the model changed, pick other ambiguous keys"
             );
             let detection = detector.detect_mapped_candidates_in_context(
-                "'kke",
+                "h]i",
                 Language::English,
                 &candidates,
                 &previous,
@@ -1264,7 +1366,7 @@ mod tests {
             assert_eq!(detection.is_some(), converts, "context {previous:?}");
             if let Some(detection) = detection {
                 assert_eq!(detection.target_language, Language::Estonian);
-                assert_eq!(detection.replacement, "äkke");
+                assert_eq!(detection.replacement, "hõi");
             }
         }
         // When the model is sure in every context, context does not matter.
