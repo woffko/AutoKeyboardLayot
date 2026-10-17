@@ -274,6 +274,10 @@ const BACKEND_SELECTION_MISMATCH: u8 = 6;
 const BACKEND_SELECTION_UNSUPPORTED: u8 = 7;
 const INJECTED_EVENT_MARKER: usize = 0x414B_4C59_5458_0001;
 const DRAINED_EVENT_MARKER: usize = 0x414B_4C59_5458_0002;
+/// Keys the desktop acceptance types for the agent. Injected like any program's keys, they count as
+/// the user's typing in test builds only: the agent itself never takes another program's keys.
+#[cfg(test)]
+const ACCEPTANCE_TYPING_MARKER: usize = 0x414B_4C59_5458_0003;
 const GATE_FENCE_MARKER_BASE: usize = 0x414B_4C59_5458_8000;
 const LEXICON_OFFER_SECONDS: u64 = 120;
 const MAX_UIA_EDITABLE_ANCESTOR_DEPTH: usize = 32;
@@ -4533,6 +4537,17 @@ const fn slow_hook_may_be_logged(hook: &str, privacy_reason: u8) -> bool {
     privacy_reason == PRIVACY_ALLOWED || !matches!(hook.as_bytes(), b"keyboard")
 }
 
+/// Whether an injected key is the desktop acceptance typing for the agent (test builds only).
+#[cfg(test)]
+const fn acceptance_typing(marker: usize) -> bool {
+    marker == ACCEPTANCE_TYPING_MARKER
+}
+
+#[cfg(not(test))]
+const fn acceptance_typing(_marker: usize) -> bool {
+    false
+}
+
 unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let mut swallow = false;
     let mut forwarded_sequence = None;
@@ -4588,7 +4603,10 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         return;
                     }
                     drained_event = drained;
-                    if event.flags.contains(LLKHF_INJECTED) && !drained {
+                    if event.flags.contains(LLKHF_INJECTED)
+                        && !drained
+                        && !acceptance_typing(event.dwExtraInfo)
+                    {
                         state.break_correction_gate_fail_open(GateFailureCause::ExternalInjection);
                         state.typed_input = state.typed_input.wrapping_add(1);
                         state
@@ -20132,22 +20150,107 @@ public class AklBusyField : Form {
 [System.Windows.Forms.Application]::Run((New-Object AklBusyField))
 "#;
 
-    #[test]
-    #[ignore = "drives a window on the desktop: run it alone in an interactive session on the test VM"]
-    fn a_protected_paste_on_the_desktop_gives_a_busy_field_the_replacement_and_never_the_clipboard()
-    {
-        use windows::Win32::Foundation::RECT;
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            MOUSEEVENTF_MOVE, MOUSEINPUT,
-        };
-        use windows::Win32::UI::WindowsAndMessaging::{
-            AllowSetForegroundWindow, FindWindowW, GetSystemMetrics, GetWindowRect, SM_CXSCREEN,
-            SM_CYSCREEN, SetForegroundWindow, WM_CLOSE, WM_GETTEXT, WM_SETTEXT,
-        };
-        const EM_SETSEL: u32 = 0x00B1;
-        const FIELD_CONFIGURE: u32 = 0x8040;
-        let send = |window: usize, message: u32, wparam: usize, lparam: isize| {
+    /// The busy field of the desktop acceptance, in front on the interactive session's desktop.
+    /// It is ended however the test ends.
+    struct DesktopField {
+        child: std::process::Child,
+        script: PathBuf,
+        context: ForegroundContext,
+    }
+
+    impl DesktopField {
+        const CONFIGURE: u32 = 0x8040;
+
+        /// Starts the field and brings it to the front. Started by this process it may not take
+        /// the foreground by itself, and Start's search window can keep it after a first sign-in:
+        /// the search is dismissed and the field is clicked, as the user would.
+        fn start() -> Self {
+            use windows::Win32::Foundation::RECT;
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                MOUSEEVENTF_MOVE, MOUSEINPUT,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                AllowSetForegroundWindow, FindWindowW, GetSystemMetrics, GetWindowRect,
+                SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow,
+            };
+            let escape = [
+                keyboard_input(VK_ESCAPE, 0, Default::default()),
+                keyboard_input(VK_ESCAPE, 0, KEYEVENTF_KEYUP),
+            ];
+            assert!(send_input_batch(&escape));
+            thread::sleep(Duration::from_millis(500));
+            let script =
+                std::env::temp_dir().join(format!("akl-busy-field-{}.ps1", std::process::id()));
+            fs::write(&script, DESKTOP_FIELD_SCRIPT).expect("field script");
+            let child = {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(&script)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn()
+                    .expect("start the field")
+            };
+            let mut field = Self {
+                child,
+                script,
+                context: test_foreground(),
+            };
+            unsafe {
+                let _ = AllowSetForegroundWindow(field.child.id());
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(context) = current_foreground_context()
+                    && context.process_id == field.child.id()
+                    && context.focus != 0
+                {
+                    field.context = context;
+                    return field;
+                }
+                if let Ok(window) = unsafe { FindWindowW(None, w!("AutoKeyboardLayot busy field")) }
+                {
+                    unsafe {
+                        let _ = SetForegroundWindow(window);
+                    }
+                    let mut rect = RECT::default();
+                    if unsafe { GetWindowRect(window, &mut rect) }.is_ok() {
+                        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(2);
+                        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(2);
+                        let mouse = |flags| INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dx: (rect.left + rect.right) / 2 * 65_535 / (width - 1),
+                                    dy: (rect.top + rect.bottom) / 2 * 65_535 / (height - 1),
+                                    dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let click = [
+                            mouse(MOUSEEVENTF_MOVE),
+                            mouse(MOUSEEVENTF_LEFTDOWN),
+                            mouse(MOUSEEVENTF_LEFTUP),
+                        ];
+                        assert!(send_input_batch(&click));
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the field did not take the foreground: {:?}",
+                    current_foreground_context()
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn send(window: usize, message: u32, wparam: usize, lparam: isize) -> usize {
             let mut result = 0usize;
             unsafe {
                 let _ = SendMessageTimeoutW(
@@ -20161,115 +20264,115 @@ public class AklBusyField : Form {
                 );
             }
             result
-        };
-        /// Ends the field however the test ends.
-        struct Field(std::process::Child);
-        impl Drop for Field {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
         }
-        // Start or search in front (after a first sign-in) keeps any program from the foreground.
-        let escape = [
-            keyboard_input(VK_ESCAPE, 0, Default::default()),
-            keyboard_input(VK_ESCAPE, 0, KEYEVENTF_KEYUP),
-        ];
-        assert!(send_input_batch(&escape));
-        thread::sleep(Duration::from_millis(500));
-        let script =
-            std::env::temp_dir().join(format!("akl-busy-field-{}.ps1", std::process::id()));
-        fs::write(&script, DESKTOP_FIELD_SCRIPT).expect("field script");
-        let child = Field({
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                .arg(&script)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn()
-                .expect("start the field")
-        });
-        // The field takes the foreground once Windows PowerShell has compiled it. Started by this
-        // process, it may not take it by itself, so this process lets it or gives it.
-        unsafe {
-            let _ = AllowSetForegroundWindow(child.0.id());
-        }
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let field = loop {
-            if let Some(context) = current_foreground_context()
-                && context.process_id == child.0.id()
-                && context.focus != 0
-            {
-                break context;
-            }
-            if let Ok(window) = unsafe { FindWindowW(None, w!("AutoKeyboardLayot busy field")) } {
-                unsafe {
-                    let _ = SetForegroundWindow(window);
-                }
-                // A click brings it to the front the way the user would, also past a search
-                // window that kept the foreground after the first sign-in.
-                let mut rect = RECT::default();
-                if unsafe { GetWindowRect(window, &mut rect) }.is_ok() {
-                    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(2);
-                    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(2);
-                    let mouse = |flags| INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dx: (rect.left + rect.right) / 2 * 65_535 / (width - 1),
-                                dy: (rect.top + rect.bottom) / 2 * 65_535 / (height - 1),
-                                dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
-                                ..Default::default()
-                            },
-                        },
-                    };
-                    let click = [
-                        mouse(MOUSEEVENTF_MOVE),
-                        mouse(MOUSEEVENTF_LEFTDOWN),
-                        mouse(MOUSEEVENTF_LEFTUP),
-                    ];
-                    assert!(send_input_batch(&click));
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the field did not take the foreground: {:?}",
-                current_foreground_context()
-            );
-            thread::sleep(Duration::from_millis(100));
-        };
-        let field_text = || {
+
+        fn text(&self) -> String {
+            use windows::Win32::UI::WindowsAndMessaging::WM_GETTEXT;
             let mut buffer = [0u16; 256];
-            let copied = send(
-                field.focus,
+            let copied = Self::send(
+                self.context.focus,
                 WM_GETTEXT,
                 buffer.len(),
                 buffer.as_mut_ptr() as isize,
             );
             String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
-        };
+        }
+
+        /// Puts `text` in the field with the caret at its end.
+        fn set_text(&self, text: &str) {
+            use windows::Win32::UI::WindowsAndMessaging::WM_SETTEXT;
+            const EM_SETSEL: u32 = 0x00B1;
+            let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            Self::send(self.context.focus, WM_SETTEXT, 0, wide.as_ptr() as isize);
+            let end = wide.len() - 1;
+            Self::send(self.context.focus, EM_SETSEL, end, end as isize);
+        }
+
+        /// How the field behaves when the next paste's replacement arrives (`DESKTOP_FIELD_SCRIPT`).
+        fn configure(&self, busy_ms: usize, read_then_busy_ms: isize) {
+            Self::send(
+                self.context.hwnd,
+                Self::CONFIGURE,
+                busy_ms,
+                read_then_busy_ms,
+            );
+        }
+
+        /// The field's text once it changed from `before` and stopped changing (a busy field
+        /// pastes late), or after five seconds.
+        fn settled_text(&self, before: &str) -> String {
+            let mut text = self.text();
+            let mut changed_at = Instant::now();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline
+                && (text == before || changed_at.elapsed() < Duration::from_millis(700))
+            {
+                thread::sleep(Duration::from_millis(50));
+                let now = self.text();
+                if now != text {
+                    text = now;
+                    changed_at = Instant::now();
+                }
+            }
+            text
+        }
+    }
+
+    impl Drop for DesktopField {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.context.hwnd as *mut c_void)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_file(&self.script);
+        }
+    }
+
+    /// Puts `text` on the clipboard as the user's, from a window that is gone right after.
+    fn put_user_clipboard(text: &str) {
+        let source = clipboard_test_window(w!("AutoKeyboardLayot desktop clipboard source"));
+        put_test_clipboard_text(source, text);
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+    }
+
+    /// The clipboard's text once it is `expected`, or after `timeout`.
+    fn clipboard_once(probe: HWND, expected: &str, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while test_clipboard_unicode(probe).as_deref() != Some(expected)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        test_clipboard_unicode(probe)
+    }
+
+    #[test]
+    #[ignore = "drives a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn a_protected_paste_on_the_desktop_gives_a_busy_field_the_replacement_and_never_the_clipboard()
+    {
+        let field = DesktopField::start();
         let probe = clipboard_test_window(w!("AutoKeyboardLayot desktop paste probe"));
         let mut outcomes = Vec::new();
         // A field that is not busy, one busy for a while or long after the clipboard changed, and
         // one that is busy until the paste stopped waiting, then reads the new clipboard itself
         // and handles the paste a moment later (less than the grace after a target's read).
         for (busy_ms, read_then_busy_ms) in [(0, 0), (300, 0), (1_000, 0), (300, 300)] {
-            let source = clipboard_test_window(w!("AutoKeyboardLayot desktop paste source"));
-            put_test_clipboard_text(source, "akl-password");
-            unsafe {
-                DestroyWindow(source).expect("destroy source window");
-            }
-            let word: Vec<u16> = "ghbdtn".encode_utf16().chain([0]).collect();
-            send(field.focus, WM_SETTEXT, 0, word.as_ptr() as isize);
-            send(field.focus, EM_SETSEL, 6, 6);
-            send(field.hwnd, FIELD_CONFIGURE, busy_ms, read_then_busy_ms);
+            put_user_clipboard("akl-password");
+            field.set_text("ghbdtn");
+            field.configure(busy_ms, read_then_busy_ms);
             let foreground = current_foreground_context().expect("foreground");
             assert!(
-                same_input_target(foreground, field),
+                same_input_target(foreground, field.context),
                 "the field lost the foreground"
             );
             let (mut processor, receiver) = processor_with_diagnostics();
@@ -20287,28 +20390,10 @@ public class AklBusyField : Form {
                 "привет",
                 PastePatience::Manual,
             );
-            // The field settles (a busy one pastes late); the clipboard is read only then, as
-            // reading it earlier would be a read of the replacement by another process.
-            let mut text = field_text();
-            let mut changed_at = Instant::now();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline
-                && (text == "ghbdtn" || changed_at.elapsed() < Duration::from_millis(700))
-            {
-                thread::sleep(Duration::from_millis(50));
-                let now = field_text();
-                if now != text {
-                    text = now;
-                    changed_at = Instant::now();
-                }
-            }
-            let deadline = Instant::now() + Duration::from_secs(4);
-            while test_clipboard_unicode(probe).as_deref() != Some("akl-password")
-                && Instant::now() < deadline
-            {
-                thread::sleep(Duration::from_millis(50));
-            }
-            let clipboard = test_clipboard_unicode(probe);
+            // The clipboard is read only once the field settled: earlier it would be a read of the
+            // replacement by another process than the paste's target.
+            let text = field.settled_text("ghbdtn");
+            let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(4));
             let brokers = reap_all(&processor.clipboard_brokers);
             eprintln!(
                 "busy_ms={busy_ms} read_then_busy_ms={read_then_busy_ms} attempt={attempt:?} \
@@ -20325,22 +20410,166 @@ public class AklBusyField : Form {
             outcomes.push((busy_ms, read_then_busy_ms, attempt, text, clipboard));
         }
         unsafe {
-            let _ = PostMessageW(
-                Some(HWND(field.hwnd as *mut c_void)),
-                WM_CLOSE,
-                WPARAM(0),
-                LPARAM(0),
-            );
             DestroyWindow(probe).expect("destroy probe window");
         }
-        drop(child);
-        let _ = fs::remove_file(&script);
+        drop(field);
         for (busy_ms, read_then_busy_ms, attempt, text, clipboard) in outcomes {
             let case = format!(
                 "busy_ms={busy_ms} read_then_busy_ms={read_then_busy_ms} attempt={attempt:?}"
             );
             assert_eq!(text, "привет", "{case}");
             assert_eq!(clipboard.as_deref(), Some("akl-password"), "{case}");
+        }
+    }
+
+    #[test]
+    #[ignore = "runs the agent on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_a_word_in_a_busy_field_and_never_pastes_the_clipboard() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardLayoutList, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, WM_CLOSE, WM_INPUTLANGCHANGEREQUEST,
+        };
+        // The word is typed in English and converted to Russian: the account needs both layouts.
+        let mut layouts = [HKL::default(); 16];
+        let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) }.max(0) as usize;
+        let languages: Vec<usize> = layouts[..count.min(layouts.len())]
+            .iter()
+            .map(|layout| layout.0 as usize & 0xffff)
+            .collect();
+        assert!(
+            languages.contains(&0x0409) && languages.contains(&0x0419),
+            "the account needs the English and Russian layouts: {languages:x?}"
+        );
+        // A profile of its own: diagnostics on, and a word typed after the test switches the
+        // layout back to English still converted.
+        let profile =
+            std::env::temp_dir().join(format!("akl-agent-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        document.settings.suppress_after_manual_layout_change = false;
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let field = DesktopField::start();
+        let probe = clipboard_test_window(w!("AutoKeyboardLayot agent acceptance probe"));
+        let agent = thread::spawn(run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let agent_window = loop {
+            if let Ok(window) = unsafe { FindWindowW(WINDOW_CLASS, None) } {
+                break window;
+            }
+            assert!(Instant::now() < deadline, "the agent did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        // The agent sends panics to its crash log; the test wants them on screen.
+        drop(std::panic::take_hook());
+        // The worker reads the configuration and the layouts.
+        thread::sleep(Duration::from_secs(2));
+        let type_keys = |keys: &[VIRTUAL_KEY]| {
+            for key in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                for flags in [Default::default(), KEYEVENTF_KEYUP] {
+                    let input =
+                        keyboard_input_with_marker(*key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                    assert!(send_input_batch(&[input]));
+                    thread::sleep(Duration::from_millis(40));
+                }
+            }
+        };
+        let english = 0x0409_0409usize;
+        let mut outcomes = Vec::new();
+        // A field that pastes at once, and one busy when the replacement arrives.
+        for busy_ms in [0usize, 300] {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(field.context.hwnd as *mut c_void)),
+                    WM_INPUTLANGCHANGEREQUEST,
+                    WPARAM(0),
+                    LPARAM(english as isize),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while current_foreground_context().is_none_or(|context| context.layout != english)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            field.set_text("");
+            put_user_clipboard("akl-password");
+            field.configure(busy_ms, 0);
+            thread::sleep(Duration::from_millis(500));
+            // g h b d t n, Space: "привет" typed in the English layout.
+            type_keys(&[
+                VIRTUAL_KEY(0x47),
+                VIRTUAL_KEY(0x48),
+                VIRTUAL_KEY(0x42),
+                VIRTUAL_KEY(0x44),
+                VIRTUAL_KEY(0x54),
+                VIRTUAL_KEY(0x4E),
+                VK_SPACE,
+            ]);
+            let text = field.settled_text("ghbdtn ");
+            let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(4));
+            eprintln!(
+                "busy_ms={busy_ms} converted={} clipboard_back={} text_chars={}",
+                text == "привет ",
+                clipboard.as_deref() == Some("akl-password"),
+                text.chars().count()
+            );
+            outcomes.push((busy_ms, text, clipboard));
+        }
+        // The agent's own record: the gates it armed, the conversions and the pastes.
+        let record = |filter: &dyn Fn(&str) -> bool| {
+            let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+            for line in log.lines().filter(|line| filter(line)) {
+                eprintln!("  {line}");
+            }
+        };
+        record(&|line| {
+            line.contains("event=paste")
+                || line.contains("event=conversion")
+                || line.contains("phase=armed")
+                || line.contains("event=gate_ack")
+        });
+        // A graceful close is declined while the agent holds keys back for recovery, which expire
+        // after RETAINED_INPUT_LIFETIME_MS: it is asked again until it accepts.
+        let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
+        while !agent.is_finished() && Instant::now() < deadline {
+            unsafe {
+                let _ = PostMessageW(Some(agent_window), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+        record(&|line| line.contains("phase=shutdown"));
+        assert!(agent.is_finished(), "the agent declined to stop");
+        let stopped = agent.join();
+        unsafe {
+            DestroyWindow(probe).expect("destroy probe window");
+        }
+        drop(field);
+        let _ = fs::remove_dir_all(&profile);
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the agent did not stop cleanly"
+        );
+        for (busy_ms, text, clipboard) in outcomes {
+            assert_eq!(text, "привет ", "busy_ms={busy_ms}");
+            assert_eq!(
+                clipboard.as_deref(),
+                Some("akl-password"),
+                "busy_ms={busy_ms}"
+            );
         }
     }
 }
