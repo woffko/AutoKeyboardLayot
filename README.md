@@ -168,7 +168,10 @@ through the same replacement pipeline even when automatic mode is off. Repeated
 presses walk the word through every enabled layout: the first goes to the
 language in which the word reads best (a dictionary word first), the next ones to
 the remaining languages, and the last one back to the original; without a clear
-reading the configured order is used. Repeats
+reading the configured order is used. A layout that reads the keys exactly as the
+original text (Estonian for Latin letters typed in English) counts as the
+original, so the presses go back to the original layout instead of stopping in a
+lookalike one. Repeats
 and key-up are swallowed so the hotkey cannot leak into the target editor. A
 manual layout switch (Alt+Shift, Ctrl+Shift or Win+Space) ends automatic
 conversion of the word but not Pause: the word typed so far, or else the last

@@ -8872,6 +8872,12 @@ impl InputProcessor {
         // example Latin Estonian keeps a Latin English word unchanged) so one
         // press always reaches a visibly different representation when one
         // exists.
+        // The presses always pass through the original layout: a layout that reads the keys as
+        // the original text (Estonian for Latin letters typed in English) stands for it, so they
+        // never leave the user in a lookalike layout that types ö or ü for ; and [.
+        let original_text = self
+            .find_layout(order[0])
+            .and_then(|layout| map_to_layout(&replay_keys, layout.0 as usize));
         let mut target = None;
         for step in 1..order.len() {
             let candidate_index = (position + step) % order.len();
@@ -8884,7 +8890,11 @@ impl InputProcessor {
                 continue;
             };
             if candidate_text != current_text {
-                target = Some((candidate_index, candidate_language, candidate_text));
+                target = Some(if original_text.as_ref() == Some(&candidate_text) {
+                    (0, order[0], candidate_text)
+                } else {
+                    (candidate_index, candidate_language, candidate_text)
+                });
                 break;
             }
         }
@@ -20903,6 +20913,24 @@ mod tests {
         diagnostics.try_iter().collect()
     }
 
+    /// The language and text of the word after each of three Pause presses.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn three_pause_presses(
+        processor: &mut InputProcessor,
+        diagnostics: &Receiver<String>,
+    ) -> Vec<(Language, String)> {
+        (0..3)
+            .map(|press| {
+                press_pause(processor, diagnostics, 41 + press);
+                let cycle = processor
+                    .transpose_cycle
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("press {} converts", press + 1));
+                (cycle.language, cycle.text.clone())
+            })
+            .collect()
+    }
+
     const GHBDTN: [u32; 6] = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
 
     #[cfg(feature = "legacy-bundled-input")]
@@ -20942,6 +20970,23 @@ mod tests {
         let cycle = processor.transpose_cycle.as_ref().expect("converted again");
         assert_ne!(cycle.language, Language::Russian, "{lines:?}");
         assert_eq!(cycle.text, "ghbdtn");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_presses_pass_through_the_original_layout() {
+        // English, Russian and Estonian: Estonian reads Latin letters as English does, so the
+        // presses go back to English rather than to a lookalike layout.
+        let (mut processor, diagnostics, _, _) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GHBDTN);
+        assert_eq!(
+            three_pause_presses(&mut processor, &diagnostics),
+            [
+                (Language::Russian, "привет".to_owned()),
+                (Language::English, "ghbdtn".to_owned()),
+                (Language::Russian, "привет".to_owned()),
+            ]
+        );
     }
     #[test]
     fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
