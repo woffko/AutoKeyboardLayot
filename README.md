@@ -196,6 +196,9 @@ first new word; only a real queue overflow keeps suppression until a boundary.
 
 Session identity uses the stable top-level window and process, while the
 focused input thread is tracked separately for HKL and focused-child routing.
+Modifier keys held across a focus change or a new input epoch keep counting: the
+worker takes their physical state from the next key instead of assuming them
+released.
 Ordinary focus changes and mouse clicks re-check privacy on the first printable
 key without suppressing that first word. Esc, the function keys and the menu key,
 which can move the focus inside a window, do the same. A field check that was still

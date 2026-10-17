@@ -557,6 +557,10 @@ struct RawKeyEvent {
     /// A key-down of a key that was already down: an auto-repeat. Recorded only for edges a
     /// correction gate holds, where it decides which held key-ups must still be delivered.
     repeat: bool,
+    /// The modifier keys physically held once this edge is applied, in the layout of
+    /// `PHYSICAL_MODIFIER_KEYS`: the worker takes them over after a focus change or a new input
+    /// epoch instead of assuming every modifier released.
+    held_modifiers: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4748,6 +4752,11 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         },
                         hotkey_trigger: false,
                         repeat: false,
+                        held_modifiers: held_modifiers_for_event(
+                            event.vkCode as u16,
+                            key_down,
+                            key_up,
+                        ),
                     };
                     if !drained {
                         // A newer physical edge of a key supersedes a key-up still queued for it.
@@ -6827,6 +6836,9 @@ struct InputProcessor {
     test_keyboard: Option<fn(ReplayKey, usize) -> Option<char>>,
     session: InputSession,
     modifiers: Modifiers,
+    // After a focus change, a new input epoch or the start the tracked modifiers are unknown: the
+    // next key event's held modifiers replace them.
+    resync_modifiers: bool,
     privacy_guard: PrivacyGuard,
     // Keyed by the input target, the input epoch and the privacy generation.
     privacy_probe: Option<BoundedProbe<(ForegroundContext, u64, u64), Option<PrivacyBlockReason>>>,
@@ -6976,6 +6988,7 @@ impl InputProcessor {
             test_keyboard: None,
             session,
             modifiers: Modifiers::default(),
+            resync_modifiers: true,
             privacy_guard: PrivacyGuard::new(),
             // A UIA call that never returns would leave every later check "queue busy" and
             // privacy unavailable for good. A provider stuck for 5 s is replaced by a fresh one,
@@ -7636,6 +7649,7 @@ impl InputProcessor {
         }
         self.replay_keys.clear();
         self.modifiers = Modifiers::default();
+        self.resync_modifiers = true;
         self.metrics
             .undo_hotkey_active
             .store(false, Ordering::Release);
@@ -7812,7 +7826,9 @@ impl InputProcessor {
             self.transpose_cycle = None;
             self.session
                 .handle(InputEvent::FocusChanged, language, &self.detector);
-            self.modifiers = Modifiers::default();
+            // Keys released in the other window never reached this worker, and keys held across
+            // the switch stay held: the modifiers come from this event.
+            self.resync_modifiers = true;
             self.last_foreground = Some(foreground_key);
             self.last_layout = Some(event.foreground.layout);
             // A new window may belong to a new process that reuses the previous one's ID: its
@@ -7874,6 +7890,9 @@ impl InputProcessor {
             return;
         }
 
+        if core::mem::take(&mut self.resync_modifiers) {
+            self.modifiers = Modifiers::from_held(event.held_modifiers);
+        }
         let modifier_event = self.modifiers.update(event.virtual_key, key_down, key_up);
         if event.hotkey_trigger {
             let released = self.settings.pause_break_undo && self.wait_for_hotkey_release(event);
@@ -10651,6 +10670,36 @@ fn shortcut_modifiers_released() -> bool {
         .all(|key| unsafe { GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 == 0 })
 }
 
+/// The modifier keys of `RawKeyEvent::held_modifiers`, one bit each from bit 0: left and right
+/// Shift, Ctrl, Alt and Windows, every pair in the layout of the `Modifiers` masks.
+const PHYSICAL_MODIFIER_KEYS: [VIRTUAL_KEY; 8] = [
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+];
+
+/// The modifier keys physically held once this key edge is applied. In a low-level hook the
+/// asynchronous key state does not show the edge itself yet.
+fn held_modifiers_for_event(virtual_key: u16, key_down: bool, key_up: bool) -> u8 {
+    let mut held = 0;
+    for (bit, key) in PHYSICAL_MODIFIER_KEYS.into_iter().enumerate() {
+        let pressed = if key.0 == virtual_key {
+            key_down && !key_up
+        } else {
+            unsafe { GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0 }
+        };
+        if pressed {
+            held |= 1 << bit;
+        }
+    }
+    held
+}
+
 fn pressed_hotkey_modifiers_for_event(virtual_key: u16, key_down: bool, key_up: bool) -> u8 {
     let mut modifiers = 0;
     for (key, bit) in [
@@ -11395,6 +11444,16 @@ struct Modifiers {
 }
 
 impl Modifiers {
+    /// The modifiers the hook found held for an event (`RawKeyEvent::held_modifiers`).
+    const fn from_held(held: u8) -> Self {
+        Self {
+            shift_mask: held & 0b11,
+            control_mask: (held >> 2) & 0b11,
+            alt_mask: (held >> 4) & 0b11,
+            win_mask: (held >> 6) & 0b11,
+        }
+    }
+
     fn update(&mut self, virtual_key: u32, key_down: bool, key_up: bool) -> bool {
         let pressed = key_down && !key_up;
         match virtual_key as u16 {
@@ -12014,7 +12073,6 @@ mod tests {
     /// What a key prints, by set-1 scan code, in the US (0x0409), Russian (0x0419) and Estonian
     /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
     /// punctuation key prints nothing here.
-    #[cfg(feature = "legacy-bundled-input")]
     pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
         const KEYS: [(u16, [char; 3]); 33] = [
             (0x10, ['q', 'й', 'q']),
@@ -12798,6 +12856,7 @@ mod tests {
             drain_token,
             hotkey_trigger: false,
             repeat: false,
+            held_modifiers: 0,
         }
     }
 
@@ -15129,6 +15188,7 @@ mod tests {
             drain_token: 0,
             hotkey_trigger: false,
             repeat: false,
+            held_modifiers: 0,
         };
         let up = RawKeyEvent {
             message: WM_KEYUP,
@@ -15302,7 +15362,6 @@ mod tests {
 
     /// A processor typing in an allowed field of an editor whose foreground layout is `layout`,
     /// with the test keyboard and automatic conversion on.
-    #[cfg(feature = "legacy-bundled-input")]
     fn processor_typing_in(layout: usize) -> (InputProcessor, ForegroundContext) {
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(true, Ordering::Release);
@@ -15323,7 +15382,6 @@ mod tests {
     }
 
     /// Types the keys with these scan codes.
-    #[cfg(feature = "legacy-bundled-input")]
     fn type_keys(
         processor: &mut InputProcessor,
         foreground: ForegroundContext,
@@ -15390,6 +15448,125 @@ mod tests {
         assert_eq!(processor.replay_keys.len(), 4);
     }
 
+    #[test]
+    fn the_hook_counts_the_edge_of_its_own_modifier_key() {
+        // No modifier key is physically held while the tests run; the asynchronous key state
+        // does not show the event's own edge yet, so the hook adds it.
+        assert_eq!(held_modifiers_for_event(0x41, true, false), 0);
+        assert_eq!(
+            held_modifiers_for_event(VK_LSHIFT.0, true, false),
+            held_keys(&[VK_LSHIFT])
+        );
+        assert_eq!(
+            held_modifiers_for_event(VK_RCONTROL.0, true, false),
+            held_keys(&[VK_RCONTROL])
+        );
+        assert_eq!(held_modifiers_for_event(VK_LSHIFT.0, false, true), 0);
+        assert_eq!(held_modifiers_for_event(VK_RWIN.0, false, true), 0);
+    }
+
+    #[test]
+    fn the_hooks_held_modifiers_become_the_tracked_ones() {
+        let none = Modifiers::from_held(0);
+        assert!(!none.shift() && !none.has_shortcut_modifier());
+        let shift = Modifiers::from_held(held_keys(&[VK_RSHIFT]));
+        assert!(shift.shift() && !shift.has_shortcut_modifier());
+        // Each side is tracked apart: letting one Shift go keeps the other held.
+        let mut both = Modifiers::from_held(held_keys(&[VK_LSHIFT, VK_RSHIFT]));
+        both.update(u32::from(VK_LSHIFT.0), false, true);
+        assert!(both.shift());
+        both.update(u32::from(VK_RSHIFT.0), false, true);
+        assert!(!both.shift());
+        for key in [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LMENU,
+            VK_RMENU,
+            VK_LWIN,
+            VK_RWIN,
+        ] {
+            let modifiers = Modifiers::from_held(held_keys(&[key]));
+            assert!(
+                modifiers.has_shortcut_modifier() && !modifiers.shift(),
+                "{key:?}"
+            );
+        }
+        let alt_control = Modifiers::from_held(held_keys(&[VK_RMENU, VK_LCONTROL]));
+        assert!(alt_control.alt() && alt_control.control());
+    }
+
+    #[test]
+    fn modifiers_held_across_a_focus_change_come_from_the_key_event() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        // Shift+Tab moves the focus while Shift stays held: the worker saw Shift go down, and
+        // the next key in the other field still has it held.
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2a,
+            held_modifiers: held_keys(&[VK_LSHIFT]),
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LSHIFT, 1, 0)
+        });
+        let field = ForegroundContext {
+            focus: 9,
+            ..foreground
+        };
+        processor.foreground_override = Some(field);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x30,
+            held_modifiers: held_keys(&[VK_LSHIFT]),
+            foreground: field,
+            ..letter(0x42, 2)
+        });
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        assert!(
+            processor.replay_keys[0].shift,
+            "B was typed with Shift held"
+        );
+        // Ctrl held across a switch makes the next key a shortcut, not a typed letter.
+        let other = ForegroundContext {
+            focus: 10,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2f,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            foreground: other,
+            ..letter(0x56, 3)
+        });
+        assert_eq!(processor.last_word_reset, "shortcut");
+        assert_eq!(processor.session.buffered_character_count(), 0);
+    }
+
+    #[test]
+    fn modifiers_held_into_a_new_input_epoch_come_from_the_key_event() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys(&mut processor, foreground, &[0x22]);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2a,
+            held_modifiers: held_keys(&[VK_LSHIFT]),
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LSHIFT, 2, 0)
+        });
+        // A settings Apply starts a new input epoch while Shift stays held.
+        let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.process(QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(RawKeyEvent {
+                scan_code: 0x30,
+                held_modifiers: held_keys(&[VK_LSHIFT]),
+                foreground,
+                ..letter(0x42, 3)
+            }),
+            configuration: None,
+        });
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        assert!(
+            processor.replay_keys[0].shift,
+            "B was typed with Shift held"
+        );
+    }
     #[test]
     fn gate_drain_control_event_bypasses_stale_input_epoch() {
         let metrics = Arc::new(ObserverMetrics::default());
@@ -17084,10 +17261,10 @@ mod tests {
     fn a_shortcut_remembers_the_last_word() {
         let mut processor = processor_at_the_test_target();
         processor.last_boundary = Some(test_last_boundary(&processor, 6));
-        processor
-            .modifiers
-            .update(u32::from(VK_CONTROL.0), true, false);
-        processor.process_key(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x43), 41, 0));
+        processor.process_key(RawKeyEvent {
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x43), 41, 0)
+        });
         let word = remembered_entry(&processor)
             .word
             .as_ref()
@@ -17227,6 +17404,19 @@ mod tests {
         modifiers
     }
 
+    /// `RawKeyEvent::held_modifiers` for these physical modifier keys held.
+    fn held_keys(keys: &[VIRTUAL_KEY]) -> u8 {
+        keys.iter()
+            .map(|key| {
+                let bit = PHYSICAL_MODIFIER_KEYS
+                    .iter()
+                    .position(|candidate| candidate == key)
+                    .expect("a left or right modifier key");
+                1 << bit
+            })
+            .fold(0, |held, bit| held | bit)
+    }
+
     #[test]
     fn a_shortcut_is_logged_by_its_editing_command_only() {
         let control = held_modifiers(&[VK_CONTROL]);
@@ -17258,11 +17448,13 @@ mod tests {
     #[test]
     fn a_word_ended_by_a_shortcut_leaves_its_kind_in_the_log() {
         let (mut processor, receiver) = processor_with_diagnostics();
-        let event = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x56), 7, 0);
+        let event = RawKeyEvent {
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x56), 7, 0)
+        };
         processor.last_foreground = Some(foreground_identity_key(event.foreground));
         processor.last_layout = Some(event.foreground.layout);
         processor.last_process_id = Some(event.foreground.process_id);
-        processor.modifiers = held_modifiers(&[VK_CONTROL]);
         processor.process_key(event);
         let lines: Vec<String> = receiver
             .try_iter()
