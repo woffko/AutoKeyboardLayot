@@ -8670,8 +8670,25 @@ impl InputProcessor {
             .iter()
             .position(|entry| same_input_target(entry.target, target))?;
         let entry = self.remembered_words.remove(position);
-        self.transpose_cycle = entry.cycle;
-        self.last_boundary = entry.word;
+        // The paste checks the text before the caret, so an entry outlives input epochs (a
+        // settings Apply, a mode toggle, an aborted gate). Only changed keyboard profiles make it
+        // stale, and then it goes without touching the word being typed.
+        let generation = self.input_profiles.generation();
+        if entry
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.profile_generation != generation)
+            || entry
+                .word
+                .as_ref()
+                .is_some_and(|word| word.profile_generation != generation)
+        {
+            self.diagnostic("hotkey", "source=remembered result=stale".to_owned());
+            return None;
+        }
+        let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        self.transpose_cycle = entry.cycle.map(|cycle| TransposeCycle { epoch, ..cycle });
+        self.last_boundary = entry.word.map(|word| LastBoundary { epoch, ..word });
         Some(now.saturating_duration_since(entry.at))
     }
 
@@ -21018,6 +21035,50 @@ mod tests {
             ]
         );
         assert_eq!(orders, ["en-US,et-EE,ru-RU"; 3]);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_remembered_word_outlives_a_new_input_epoch_but_not_new_keyboard_profiles() {
+        for profiles_changed in [false, true] {
+            let (mut processor, diagnostics, field, _) = pause_processor(0x0409);
+            type_word_and_space(&mut processor, &GHBDTN);
+            // Another window gets the keys; the field's last word is remembered.
+            let elsewhere = ForegroundContext {
+                hwnd: 8,
+                focus: 8,
+                ..field
+            };
+            processor.foreground_override = Some(elsewhere);
+            type_keys(&mut processor, elsewhere, &[0x1e]);
+            assert_eq!(processor.remembered_words.len(), 1);
+            if profiles_changed && let Some(word) = processor.remembered_words[0].word.as_mut() {
+                word.profile_generation += 1;
+            }
+            // A settings Apply starts a new input epoch.
+            let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            processor.process(QueuedInputEvent {
+                epoch,
+                captured_at: Instant::now(),
+                event: RawInputEvent::Mouse,
+                configuration: None,
+            });
+            processor.foreground_override = Some(field);
+            let lines = press_pause(&mut processor, &diagnostics, 41);
+            assert!(!processor.session.is_suppressed(), "{lines:?}");
+            if profiles_changed {
+                assert!(processor.transpose_cycle.is_none(), "{lines:?}");
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("source=remembered result=stale")),
+                    "{lines:?}"
+                );
+            } else {
+                let cycle = processor.transpose_cycle.as_ref().expect("converted");
+                assert_eq!(cycle.text, "привет", "{lines:?}");
+            }
+        }
     }
     #[test]
     fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {

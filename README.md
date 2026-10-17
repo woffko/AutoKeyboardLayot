@@ -192,7 +192,9 @@ when the field did not show it (automatic conversions keep 50 ms, which the
 correction gate's budget accounts for). After you switch to another window and
 back, or click, Pause can still convert the last word of that window for two
 minutes: the word is used only if it is still exactly before the caret, and
-nothing is typed otherwise (`event=hotkey source=remembered`). A paste the field
+nothing is typed otherwise (`event=hotkey source=remembered`). Applying settings or
+switching the automatic mode in between keeps it; changed keyboard layouts drop it
+(`source=remembered result=stale`). A paste the field
 did not confirm ends with `event=conversion result=cancelled`, and its selection
 line says what the field showed (`confirm=` and `attempts=`).
 Changing automatic mode clears stale queued state without suppressing the
