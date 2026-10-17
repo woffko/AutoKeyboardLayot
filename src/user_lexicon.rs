@@ -70,23 +70,15 @@ impl UserLexicon {
     }
 }
 
+/// `id: word`, the only form: split at a space instead, any first word ("hello world",
+/// "firefox en-US") would be taken for a language and the entry would never match.
 fn parse_entry(line: &str) -> Option<(PackId, &str)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    let (language, word) = if let Some((language, word)) = line.split_once(':') {
-        (language.trim(), word.trim())
-    } else {
-        let mut parts = line.split_whitespace();
-        let language = parts.next()?;
-        let word = parts.next()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        (language, word)
-    };
-    Some((Language::from_id(language)?, word))
+    let (language, word) = line.split_once(':')?;
+    Some((Language::from_id(language.trim())?, word.trim()))
 }
 
 /// The stored form of a word: lowercased, at most 64 characters. The limit applies to the
@@ -110,17 +102,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_colon_tab_and_space_separated_entries() {
+    fn accepts_a_language_a_colon_and_a_word() {
         let lexicon = UserLexicon::from_lines([
             "en-US: RustDesk",
-            "ru\tруддщ",
-            "et-EE klaviatuur",
+            "ru:руддщ",
+            "et-EE :\tklaviatuur",
             "ja-JP: こんにちは",
         ]);
         assert!(lexicon.contains(Language::English, "rustdesk"));
         assert!(lexicon.contains(Language::Russian, "РУДДЩ"));
         assert!(lexicon.contains(Language::Estonian, "klaviatuur"));
         assert!(lexicon.contains(Language::Japanese, "こんにちは"));
+    }
+
+    #[test]
+    fn an_entry_without_the_colon_is_not_read_as_language_and_word() {
+        for line in [
+            "hello world",
+            "firefox en-US",
+            "ru\tруддщ",
+            "et-EE klaviatuur",
+        ] {
+            assert_eq!(UserLexicon::normalize_pack_entry(line), None, "{line}");
+        }
     }
 
     #[test]

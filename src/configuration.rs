@@ -32,6 +32,8 @@ impl PackageMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationError {
+    /// The file the error is in when it is not `config.ini`: a file of an older version.
+    pub file: Option<&'static str>,
     pub line: Option<usize>,
     pub message: String,
 }
@@ -39,6 +41,7 @@ pub struct ConfigurationError {
 impl ConfigurationError {
     fn at(line: usize, message: impl Into<String>) -> Self {
         Self {
+            file: None,
             line: Some(line),
             message: message.into(),
         }
@@ -46,18 +49,28 @@ impl ConfigurationError {
 
     fn global(message: impl Into<String>) -> Self {
         Self {
+            file: None,
             line: None,
             message: message.into(),
+        }
+    }
+
+    /// The same error, placed in `file`.
+    fn in_file(self, file: &'static str) -> Self {
+        Self {
+            file: Some(file),
+            ..self
         }
     }
 }
 
 impl fmt::Display for ConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(line) = self.line {
-            write!(formatter, "line {line}: {}", self.message)
-        } else {
-            formatter.write_str(&self.message)
+        match (self.file, self.line) {
+            (Some(file), Some(line)) => write!(formatter, "{file}, line {line}: {}", self.message),
+            (Some(file), None) => write!(formatter, "{file}: {}", self.message),
+            (None, Some(line)) => write!(formatter, "line {line}: {}", self.message),
+            (None, None) => formatter.write_str(&self.message),
         }
     }
 }
@@ -66,11 +79,48 @@ impl std::error::Error for ConfigurationError {}
 
 impl From<BackendRuleError> for ConfigurationError {
     fn from(error: BackendRuleError) -> Self {
-        Self {
-            line: Some(error.line),
-            message: error.message,
+        Self::at(error.line, error.message)
+    }
+}
+
+/// What `ConfigurationDocument::merge` made of a draft and the configuration as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedConfiguration {
+    /// The configuration as it is now with the draft's changes; in a conflict, the draft's value.
+    pub document: ConfigurationDocument,
+    /// What both the draft and the configuration changed since the draft's base, differently:
+    /// setting keys, `ui_language`, `mode`, a profile's pack ID, a rule's executable, or
+    /// `user_dictionary, word_exclusions` when an entry ends up in both lists.
+    pub conflicts: Vec<String>,
+}
+
+/// One entry of a list as an editor holds it: its stored form and its 1-based line in the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorEntry {
+    pub line: usize,
+    pub entry: String,
+}
+
+fn editor_entries(
+    text: &str,
+    entry: impl Fn(usize, &str) -> Result<String, ConfigurationError>,
+) -> Result<Vec<EditorEntry>, ConfigurationError> {
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let stored = entry(index + 1, line)?;
+        if seen.insert(stored.clone()) {
+            entries.push(EditorEntry {
+                line: index + 1,
+                entry: stored,
+            });
         }
     }
+    Ok(entries)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -114,6 +164,7 @@ impl ConfigurationDocument {
         let mut word_exclusions = Vec::new();
         let mut process_exclusions = Vec::new();
         let mut backend_rules = Vec::new();
+        let mut backend_lines = Vec::new();
         let mut backend_section_seen = false;
         let mut profile_section_seen = false;
         let mut input_profiles = Vec::new();
@@ -244,7 +295,10 @@ impl ConfigurationDocument {
                 Section::ProcessExclusions => {
                     process_exclusions.push((line_number, line.to_owned()));
                 }
-                Section::BackendRules => backend_rules.push(line.to_owned()),
+                Section::BackendRules => {
+                    backend_rules.push(line.to_owned());
+                    backend_lines.push(line_number);
+                }
             }
         }
 
@@ -288,7 +342,10 @@ impl ConfigurationDocument {
             word_exclusions: canonical_lexicon_entries(word_exclusions)?,
             process_exclusions: canonical_process_entries(process_exclusions)?,
             backend_rules: if backend_section_seen {
-                BackendRules::from_lines(backend_rules.iter().map(String::as_str))?
+                // The rules see only their own rows: the error is moved to the document's line.
+                BackendRules::from_lines(backend_rules.iter().map(String::as_str)).map_err(
+                    |error| ConfigurationError::at(backend_lines[error.line - 1], error.message),
+                )?
             } else {
                 BackendRules::default()
             },
@@ -323,7 +380,9 @@ impl ConfigurationDocument {
         document
     }
 
-    /// Migration input must not silently lose malformed dictionary/exclusion rows.
+    /// Migration input must not silently lose malformed dictionary/exclusion rows. The texts are
+    /// those of `user_dictionary.txt`, `word_exclusions.txt` and `exclusions.txt`; an error in a
+    /// row names its file.
     pub fn try_from_legacy(
         settings: Settings,
         user_dictionary: &str,
@@ -346,9 +405,12 @@ impl ConfigurationDocument {
             settings,
             input_profiles: Default::default(),
             ui_language: UiLanguagePreference::default(),
-            user_dictionary: canonical_lexicon_entries(rows(user_dictionary))?,
-            word_exclusions: canonical_lexicon_entries(rows(word_exclusions))?,
-            process_exclusions: canonical_process_entries(rows(process_exclusions))?,
+            user_dictionary: canonical_lexicon_entries(rows(user_dictionary))
+                .map_err(|error| error.in_file("user_dictionary.txt"))?,
+            word_exclusions: canonical_lexicon_entries(rows(word_exclusions))
+                .map_err(|error| error.in_file("word_exclusions.txt"))?,
+            process_exclusions: canonical_process_entries(rows(process_exclusions))
+                .map_err(|error| error.in_file("exclusions.txt"))?,
             backend_rules: BackendRules::default(),
         };
         document.canonicalize_and_validate()?;
@@ -389,6 +451,17 @@ impl ConfigurationDocument {
         Ok(output)
     }
 
+    /// The dictionary or word-exclusion entries an editor holds: one per line, blank lines and
+    /// `#` comments skipped, each with its 1-based line in the editor, which an error names too.
+    /// A repeated entry keeps its first line.
+    pub fn lexicon_editor_entries(text: &str) -> Result<Vec<EditorEntry>, ConfigurationError> {
+        editor_entries(text, lexicon_entry)
+    }
+
+    /// The program exclusions an editor holds, read like `lexicon_editor_entries`.
+    pub fn process_editor_entries(text: &str) -> Result<Vec<EditorEntry>, ConfigurationError> {
+        editor_entries(text, process_entry)
+    }
     /// Fresh installer document only; never use this to replace a user's config.
     /// The caller must initialize/verify the empty managed store before saving it.
     pub fn english_only_managed() -> Self {
@@ -972,6 +1045,62 @@ mod tests {
         assert_eq!(
             document.to_text().unwrap_err().message,
             "the configuration would not read back unchanged; it was not saved"
+        );
+    }
+
+    #[test]
+    fn a_bad_backend_rule_is_reported_at_its_document_line() {
+        let text = "schema_version=4\n[packages]\nmode=legacy\n[backend_rules]\n# note\nnotepad.exe = protected-paste\n\nfirefox.exe = magic\n";
+        let error = ConfigurationDocument::from_text(text).unwrap_err();
+        assert_eq!(error.line, Some(8));
+        assert!(error.message.starts_with("unknown backend"));
+    }
+
+    #[test]
+    fn a_dictionary_row_without_the_colon_is_an_error_at_its_line() {
+        for row in ["hello world", "firefox en-US", "ru-RU привет"] {
+            let text = format!(
+                "schema_version=4\n[packages]\nmode=legacy\n[user_dictionary]\nen-US: firefox\n{row}\n"
+            );
+            assert_eq!(
+                ConfigurationDocument::from_text(&text).unwrap_err().line,
+                Some(6),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_editor_list_names_the_editor_line_of_a_bad_entry() {
+        let dictionary = "# my words\nen-US: Firefox\n\nen-US: two words\n";
+        let error = ConfigurationDocument::lexicon_editor_entries(dictionary).unwrap_err();
+        assert_eq!(error.line, Some(4));
+        let entries = ConfigurationDocument::lexicon_editor_entries(
+            "\nru-RU: Привет\nen-US: x\nru-RU: привет\n",
+        )
+        .unwrap();
+        assert_eq!(
+            entries,
+            [
+                EditorEntry {
+                    line: 2,
+                    entry: "ru-RU: привет".to_owned()
+                },
+                EditorEntry {
+                    line: 3,
+                    entry: "en-US: x".to_owned()
+                },
+            ]
+        );
+        let error = ConfigurationDocument::process_editor_entries(
+            "private.exe\n\n#a comment\n\"#vault.exe\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.line, Some(4));
+        assert_eq!(
+            ConfigurationDocument::process_editor_entries("C:\\Apps\\Vault.exe\n").unwrap()[0]
+                .entry,
+            "vault.exe"
         );
     }
     #[test]

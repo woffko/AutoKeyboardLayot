@@ -2172,13 +2172,13 @@ mod tests {
     fn explicit_short_word_dictionary_and_exclusion_entries_are_authoritative() {
         let mut detector = crate::test_support::detector();
         detector.replace_user_lexicons(
-            UserLexicon::from_lines(["en-US yt"]),
+            UserLexicon::from_lines(["en-US: yt"]),
             UserLexicon::default(),
         );
         assert!(detector.detect("yt", Language::English).is_none());
         detector.replace_user_lexicons(
             UserLexicon::default(),
-            UserLexicon::from_lines(["en-US yt"]),
+            UserLexicon::from_lines(["en-US: yt"]),
         );
         assert!(detector.detect("yt", Language::English).is_none());
     }
@@ -2261,8 +2261,10 @@ mod tests {
             single_letter_words: true,
             ..Default::default()
         });
-        with_user_dictionary
-            .replace_user_lexicons(UserLexicon::from_lines(["ru-RU й"]), UserLexicon::default());
+        with_user_dictionary.replace_user_lexicons(
+            UserLexicon::from_lines(["ru-RU: й"]),
+            UserLexicon::default(),
+        );
         assert_eq!(
             with_user_dictionary
                 .detect("q", Language::English)
@@ -2274,8 +2276,10 @@ mod tests {
             single_letter_words: true,
             ..Default::default()
         });
-        with_exclusion
-            .replace_user_lexicons(UserLexicon::default(), UserLexicon::from_lines(["en-US z"]));
+        with_exclusion.replace_user_lexicons(
+            UserLexicon::default(),
+            UserLexicon::from_lines(["en-US: z"]),
+        );
         assert!(with_exclusion.detect("z", Language::English).is_none());
     }
 
@@ -2306,7 +2310,7 @@ mod tests {
             assert!(detector.detect(target, Language::Russian).is_none());
         }
         detector.replace_user_lexicons(
-            UserLexicon::from_lines(["en-US b", "en-US c"]),
+            UserLexicon::from_lines(["en-US: b", "en-US: c"]),
             UserLexicon::default(),
         );
         for source in ["b", "B", "c", "C"] {
@@ -2332,7 +2336,7 @@ mod tests {
         );
         let mut suppressed = crate::test_support::detector();
         suppressed.replace_user_lexicons(
-            UserLexicon::from_lines(["en-US vs"]),
+            UserLexicon::from_lines(["en-US: vs"]),
             UserLexicon::default(),
         );
         assert!(suppressed.detect("vs", Language::English).is_none());

@@ -329,7 +329,12 @@ fn load_with_sources(
     let settings = settings_text
         .map(|text| Settings::try_from_text(&text))
         .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                super::ConfigurationError::at(error.line, error.message).in_file("settings.ini"),
+            )
+        })?
         .unwrap_or_default();
     ConfigurationDocument::try_from_legacy(
         settings,
@@ -757,12 +762,27 @@ mod tests {
             ("exclusions.txt", "\"\""),
         ] {
             let result = load_with_reader(|name| Ok((name == failed).then(|| contents.to_owned())));
-            assert_eq!(
-                result.unwrap_err().kind(),
-                io::ErrorKind::InvalidData,
-                "{failed}"
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{failed}");
+            // The error names the older file it is in, not config.ini.
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("{failed}, line 1: ")),
+                "{error}"
             );
         }
+        let error = load_with_reader(|name| {
+            Ok((name == "user_dictionary.txt")
+                .then(|| "# mine\n\nen-US: firefox\nhello world\n".to_owned()))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("user_dictionary.txt, line 4: "),
+            "{error}"
+        );
     }
 
     #[test]

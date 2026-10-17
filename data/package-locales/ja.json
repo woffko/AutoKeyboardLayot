@@ -170,7 +170,7 @@
     "menu.settings": "設定…",
     "menu.exit": "終了",
     "error.read_config": "設定を読み込めませんでした: {error}",
-    "error.read_config_hint": "フォルダー: {folder}\n\n設定はこのフォルダーの config.ini に保存されています。既定の設定で起動するには、このファイルを別の場所に移動してからプログラムをもう一度起動してください。config.schema-1.bak のような名前のコピーが同じ場所にある場合は、その名前を config.ini に変更すると以前の設定に戻せます。",
+    "error.read_config_hint": "フォルダー: {folder}\n\n設定はこのフォルダーの config.ini に保存されています。既定の設定で起動するには、このファイルを別の場所に移動してからプログラムをもう一度起動してください。config.schema-1.bak のような名前のコピーが同じ場所にある場合は、その名前を config.ini に変更すると以前の設定に戻せます。 古いバージョンの settings.ini、user_dictionary.txt、word_exclusions.txt、exclusions.txt もこのフォルダーにある場合は、それらも移動してください。config.ini がないと、代わりにそれらが読み込まれます。",
     "error.save_config": "保存できませんでした: {error}",
     "error.invalid_hotkey": "無効なホットキーです: {error}",
     "error.backend_rules": "置換ルールが無効です: {error}",
