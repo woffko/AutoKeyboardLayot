@@ -7932,6 +7932,12 @@ impl InputProcessor {
         if !key_down {
             return;
         }
+        if switches_keyboard_layout(event.virtual_key, self.modifiers) {
+            // Win+Space changes the layout and types nothing. The word stays, so that once the
+            // next key shows the new layout the manual-switch rule keeps it for Pause, as after
+            // Alt+Shift, whose keys are all modifiers.
+            return;
+        }
 
         if self.modifiers.has_shortcut_modifier() {
             // Alt+Tab, Ctrl+Shift+Esc and the like end tracking below; keep the word for Pause.
@@ -11514,6 +11520,14 @@ impl Modifiers {
     const fn has_shortcut_modifier(self) -> bool {
         self.control() || self.alt() || self.win_mask != 0
     }
+}
+
+/// Win+Space or Win+Shift+Space, the Windows chords that switch the keyboard layout.
+fn switches_keyboard_layout(virtual_key: u32, modifiers: Modifiers) -> bool {
+    virtual_key == u32::from(VK_SPACE.0)
+        && modifiers.win_mask != 0
+        && !modifiers.control()
+        && !modifiers.alt()
 }
 
 /// Which kind of shortcut ended a word, for the diagnostics log: the editing command, never a
@@ -15567,6 +15581,73 @@ mod tests {
             "B was typed with Shift held"
         );
     }
+
+    /// Presses and releases `keys` in order, each event with the modifiers held at that moment.
+    fn press_chord(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        keys: &[(VIRTUAL_KEY, u32)],
+        sequence: u64,
+    ) {
+        let modifier_keys: Vec<VIRTUAL_KEY> = keys
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| PHYSICAL_MODIFIER_KEYS.contains(key))
+            .collect();
+        let mut held = Vec::new();
+        let edges = keys
+            .iter()
+            .map(|key| (key, WM_KEYDOWN))
+            .chain(keys.iter().rev().map(|key| (key, WM_KEYUP)));
+        for (index, (&(key, scan_code), message)) in edges.enumerate() {
+            if modifier_keys.contains(&key) {
+                if message == WM_KEYDOWN {
+                    held.push(key);
+                } else {
+                    held.retain(|other| *other != key);
+                }
+            }
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                held_modifiers: held_keys(&held),
+                foreground,
+                ..test_raw_key(message, key, sequence + index as u64, 0)
+            });
+        }
+    }
+
+    #[test]
+    fn a_layout_chord_keeps_the_word_for_pause() {
+        for chord in [
+            &[(VK_LWIN, 0x5b), (VK_SPACE, 0x39)][..],
+            &[(VK_LWIN, 0x5b), (VK_LSHIFT, 0x2a), (VK_SPACE, 0x39)],
+            &[(VK_LMENU, 0x38), (VK_LSHIFT, 0x2a)],
+        ] {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            press_chord(&mut processor, foreground, chord, 7);
+            assert_eq!(
+                processor.replay_keys.len(),
+                6,
+                "{chord:?}: the word is kept"
+            );
+            // The next key shows the Russian layout: the word typed so far stays for Pause, read
+            // in the layout it was typed in.
+            let russian = ForegroundContext {
+                layout: 0x0419,
+                ..foreground
+            };
+            processor.foreground_override = Some(russian);
+            press_chord(&mut processor, russian, &[(VK_LSHIFT, 0x2a)], 20);
+            let kept = processor
+                .last_boundary
+                .as_ref()
+                .unwrap_or_else(|| panic!("{chord:?}: no word for Pause"));
+            assert_eq!(kept.replay_keys.len(), 6, "{chord:?}");
+            assert_eq!(kept.foreground.layout, 0x0409, "{chord:?}");
+        }
+    }
+
     #[test]
     fn gate_drain_control_event_bypasses_stale_input_epoch() {
         let metrics = Arc::new(ObserverMetrics::default());
@@ -16221,10 +16302,9 @@ mod tests {
         // "ghbdtn", "привет" in Russian, ended by a Space with Shift held, with Caps Lock changed
         // since the word, deferred by the gate, or handled at once by a conversion that cannot
         // reach the field here.
-        let ghbdtn = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
         for case in ["shift", "caps", "deferred", "unapplied"] {
             let (mut processor, foreground) = processor_typing_in(0x0409);
-            type_keys(&mut processor, foreground, &ghbdtn);
+            type_keys(&mut processor, foreground, &GHBDTN);
             let mut space = space_key(foreground, 7, 0);
             match case {
                 "shift" => {
@@ -20709,6 +20789,8 @@ mod tests {
         }
     }
 
+
+    const GHBDTN: [u32; 6] = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
     #[test]
     fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
         let (script, _steps, state) = scripted_paste();
