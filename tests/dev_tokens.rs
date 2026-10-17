@@ -158,10 +158,17 @@ fn the_measuring_detectors_can_convert_at_both_stages() {
         .expect("the layout model converts it");
     assert_eq!(detection.replacement, "küsimusele");
 
-    let tokens = vec!["ghbdtn".to_owned(), "hello".to_owned()];
+    // And so does measure() itself, which judges every token with no context.
+    let tokens = vec![
+        "ghbdtn".to_owned(),
+        "hello".to_owned(),
+        "k[simusele".to_owned(),
+    ];
     let result = measure(&tokens, &layouts, &dictionary_only, &with_model);
-    assert_eq!(result.tokens, 2);
+    assert_eq!(result.tokens, 3);
     assert_eq!(result.dictionary.len(), 1);
     assert_eq!(result.dictionary[0].token, "ghbdtn");
-    assert!(result.model_extra.is_empty());
+    assert_eq!(result.model_extra.len(), 1, "{:?}", result.model_extra);
+    assert_eq!(result.model_extra[0].token, "k[simusele");
+    assert_eq!(result.model_extra[0].replacement, "küsimusele");
 }
