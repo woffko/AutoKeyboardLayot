@@ -199,6 +199,17 @@ const CLIPBOARD_OPEN_RETRIES: usize = 10;
 const CLIPBOARD_RESTORE_OPEN_RETRIES: usize = 30;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 2;
 const CLIPBOARD_BROKER_TIMEOUT_MS: u64 = 500;
+/// How long a paste waits for the broker to put the user's clipboard back; the broker opens the
+/// clipboard for up to 60 ms.
+const CLIPBOARD_RESTORE_WAIT_MS: u64 = 100;
+/// The least time worth giving the installation of a paste's replacement.
+const PASTE_MIN_INSTALL_MS: u64 = 50;
+/// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
+/// the user's clipboard, the layout switch, the second commit and the UI Automation calls between.
+const PASTE_AFTER_SUBMIT_MS: u64 = 2 * NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    + CLIPBOARD_RESTORE_WAIT_MS
+    + LAYOUT_SWITCH_TIMEOUT_MS
+    + 100;
 /// An automatic conversion waits this long for a busy clipboard, then leaves the word alone.
 const CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS: u64 = 200;
 const VK_V_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -847,9 +858,11 @@ enum TextEditAttempt {
     Applied,
     /// The edit is confirmed; only the user's previous clipboard could not be restored.
     AppliedClipboardNotRestored,
+    /// Nothing was typed: the field could not be inspected or selected.
     Unsupported,
     Cancelled,
-    Failed,
+    /// Input reached the field but the edit did not complete, for this reason.
+    Failed(ConversionFailureReason),
     /// The edit did not go ahead and the agent's selection of the word could not be shown gone:
     /// keys typed now would replace the word.
     SelectionLeft,
@@ -1137,7 +1150,7 @@ impl ProtectedClipboard {
         }
         let response = self
             .response
-            .recv_timeout(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
+            .recv_timeout(Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS))
             .ok();
         if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
             let _ = self.worker.take().map(JoinHandle::join);
@@ -1371,6 +1384,8 @@ enum ConversionFailureReason {
     ClipboardEdit = 7,
     InternalFault = 8,
     SelectionLeft = 9,
+    /// The replacement was pasted, but the keyboard layout did not switch after it.
+    LayoutSwitch = 10,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5561,7 +5576,7 @@ const fn protected_paste_outcome(
     match (target_confirmed, clipboard_restored) {
         (true, true) => TextEditAttempt::Applied,
         (true, false) => TextEditAttempt::AppliedClipboardNotRestored,
-        (false, _) => TextEditAttempt::Failed,
+        (false, _) => TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
     }
 }
 
@@ -6132,6 +6147,8 @@ struct InputProcessor {
     last_gate_retention_token: u64,
     // The gate whose held keys are kept for recovery when it ends, instead of replayed.
     held_keys_kept_for: Option<u64>,
+    // When the gate holding the keys typed after the word being converted lets them go.
+    edit_deadline: Cell<Option<Instant>>,
     // Policy D1: how often automatic conversion may resume after a recovered gate abort.
     auto_resumes: RateLimit,
     // Replacements of the privacy provider that were already logged.
@@ -6273,6 +6290,7 @@ impl InputProcessor {
             last_gate_release_token: 0,
             last_gate_retention_token: 0,
             held_keys_kept_for: None,
+            edit_deadline: Cell::new(None),
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
             sound_player: None,
@@ -6412,6 +6430,11 @@ impl InputProcessor {
         } else {
             self.gate_bypass_reason(&queued)
         };
+        // The gate armed with this Space lets the held keys go this long after it was armed.
+        self.edit_deadline.set(
+            (armed != 0)
+                .then(|| queued.captured_at + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS)),
+        );
         self.process_event(queued);
         if armed != 0 && self.last_gate_release_token != armed {
             self.diagnostic(
@@ -6705,29 +6728,32 @@ impl InputProcessor {
                 .pending_conversion
                 .as_ref()
                 .is_some_and(|pending| pending.space_down_sequence == deferred.boundary_sequence);
-            let required_ms = self.pending_conversion.as_ref().and_then(|pending| {
-                let step_count = pending
-                    .transaction
-                    .forward
-                    .erase_characters
-                    .checked_add(pending.replay_keys.len())?
-                    .checked_add(1)?;
-                conversion_gate_budget_ms(
-                    step_count,
-                    self.text_edit_backend.requires_text_barrier(),
-                    matches!(self.text_edit_backend, TextEditBackend::CapabilityProbe),
-                    matches!(
-                        self.text_edit_backend,
-                        TextEditBackend::ProtectedPaste | TextEditBackend::CapabilityProbe
-                    ),
-                    false,
-                )
-            });
+            let required_ms =
+                self.pending_conversion
+                    .as_ref()
+                    .and_then(|pending| match self.text_edit_backend {
+                        TextEditBackend::ProtectedPaste => Some(paste_gate_budget_ms(false)),
+                        TextEditBackend::CapabilityProbe => Some(paste_gate_budget_ms(true)),
+                        TextEditBackend::PhysicalReplay | TextEditBackend::ObserveOnly => {
+                            let step_count = pending
+                                .transaction
+                                .forward
+                                .erase_characters
+                                .checked_add(pending.replay_keys.len())?
+                                .checked_add(1)?;
+                            conversion_gate_budget_ms(step_count, false, false)
+                        }
+                    });
             if pending_matches
                 && required_ms.is_some_and(|required_ms| {
                     self.handoff_correction_gate(token, deferred.boundary_sequence, required_ms)
                 })
             {
+                // The handed-over gate had at least `required_ms` left.
+                self.edit_deadline.set(
+                    required_ms
+                        .map(|required_ms| Instant::now() + Duration::from_millis(required_ms)),
+                );
                 self.execute_pending_conversion(deferred.boundary_sequence);
                 return;
             }
@@ -8343,8 +8369,11 @@ impl InputProcessor {
                     &pending.transaction.forward.insert_text,
                     paste_patience(pending.forced),
                 );
-                let Some(strategy) = self.apply_paste_attempt_result(attempt, boundary_sequence)
-                else {
+                let Some(strategy) = self.apply_paste_attempt_result(
+                    attempt,
+                    boundary_sequence,
+                    PasteRoute::Backend,
+                ) else {
                     return;
                 };
                 strategy
@@ -8397,40 +8426,14 @@ impl InputProcessor {
                                 )
                             ),
                         );
-                        match attempt {
-                            TextEditAttempt::Applied
-                            | TextEditAttempt::AppliedClipboardNotRestored => {
-                                if attempt == TextEditAttempt::AppliedClipboardNotRestored {
-                                    self.note_clipboard_not_restored(boundary_sequence);
-                                }
-                                self.metrics
-                                    .backend_status
-                                    .store(BACKEND_PROTECTED_PASTE, Ordering::Release);
-                                EditStrategy::ProtectedPaste
-                            }
-                            TextEditAttempt::Cancelled => {
-                                self.metrics
-                                    .backend_status
-                                    .store(BACKEND_SELECTION_MISMATCH, Ordering::Release);
-                                return;
-                            }
-                            TextEditAttempt::Unsupported => {
-                                self.metrics
-                                    .backend_status
-                                    .store(BACKEND_SELECTION_UNSUPPORTED, Ordering::Release);
-                                return;
-                            }
-                            TextEditAttempt::Failed => {
-                                self.record_conversion_failure(
-                                    ConversionFailureReason::ClipboardEdit,
-                                );
-                                return;
-                            }
-                            TextEditAttempt::SelectionLeft => {
-                                let _ = self.apply_paste_attempt_result(attempt, boundary_sequence);
-                                return;
-                            }
-                        }
+                        let Some(strategy) = self.apply_paste_attempt_result(
+                            attempt,
+                            boundary_sequence,
+                            PasteRoute::CapabilityProbe,
+                        ) else {
+                            return;
+                        };
+                        strategy
                     }
                     CapabilityDecision::CancelMismatch => {
                         self.metrics
@@ -8777,7 +8780,7 @@ impl InputProcessor {
                     PastePatience::Manual,
                 );
                 if self
-                    .apply_paste_attempt_result(attempt, pause_sequence)
+                    .apply_paste_attempt_result(attempt, pause_sequence, PasteRoute::Backend)
                     .is_none()
                 {
                     return;
@@ -8894,11 +8897,18 @@ impl InputProcessor {
         // From the selection on, the field may show the word selected or replaced: the UI thread
         // does not hand held keys back past a worker stuck in here.
         let _edit = BusyGuard::new(&self.metrics.edit_in_flight);
+        let budget = PasteBudget {
+            deadline: self.edit_deadline.get(),
+        };
         if !self.edit_guard_is_current(foreground, input_sequence) {
             self.diagnostic(
                 "paste",
                 format!("sequence={input_sequence} phase=guard result=cancelled"),
             );
+            return TextEditAttempt::Cancelled;
+        }
+        if !budget.allows_selection(Instant::now(), patience) {
+            self.note_paste_budget(input_sequence, "selection", budget);
             return TextEditAttempt::Cancelled;
         }
         let (selection, cleanup) = self.privacy_guard.select_preceding_text(
@@ -8916,13 +8926,11 @@ impl InputProcessor {
             TextBarrierStatus::Mismatch => return TextEditAttempt::Cancelled,
             TextBarrierStatus::Unavailable => return TextEditAttempt::Unsupported,
         }
-        if !self.edit_guard_is_current(foreground, input_sequence) {
+        let Some(install_timeout) = budget.install_timeout(Instant::now(), patience) else {
+            self.note_paste_budget(input_sequence, "install", budget);
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
-        }
-
-        let Some(mut clipboard) =
-            ProtectedClipboard::begin(replacement, patience.clipboard_install_timeout())
-        else {
+        };
+        let Some(mut clipboard) = ProtectedClipboard::begin(replacement, install_timeout) else {
             self.diagnostic(
                 "paste",
                 format!(
@@ -8936,9 +8944,14 @@ impl InputProcessor {
         };
         let clipboard_current = clipboard.is_current();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_prepare result=ready current={clipboard_current} elapsed_ms={}", started.elapsed().as_millis()));
-        if !clipboard_current || !self.edit_guard_is_current(foreground, input_sequence) {
+        let submit_fits = budget.allows_submit(Instant::now());
+        if !clipboard_current
+            || !submit_fits
+            || !self.edit_guard_is_current(foreground, input_sequence)
+        {
+            // Nothing was sent yet, so putting the user's clipboard back cannot reach the field.
             let restored = clipboard.restore();
-            self.diagnostic("paste", format!("sequence={input_sequence} phase=before_submit result=cancelled restored={restored}"));
+            self.diagnostic("paste", format!("sequence={input_sequence} phase=before_submit result=cancelled restored={restored} budget_ok={submit_fits}"));
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         }
 
@@ -8949,7 +8962,11 @@ impl InputProcessor {
             let control_up = [keyboard_input(VK_LCONTROL, 0, KEYEVENTF_KEYUP)];
             let _ = send_input_batch(&control_up);
             let _ = clipboard.restore();
-            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Failed);
+            return self.abandon_selection(
+                foreground,
+                input_sequence,
+                TextEditAttempt::Failed(ConversionFailureReason::ClipboardEdit),
+            );
         }
 
         let paste_commit =
@@ -8960,12 +8977,16 @@ impl InputProcessor {
         let clipboard_restored = clipboard.restore();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
         if !matches!(paste_commit, ReplayAttempt::Applied) {
-            // The paste may not have replaced the selected word: do not leave our selection behind,
-            // unless the user has already moved on.
+            // The paste may not have replaced the selected word: do not leave our selection
+            // behind, unless the user has already moved on.
             if self.edit_guard_is_current(foreground, input_sequence) {
-                return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Failed);
+                return self.abandon_selection(
+                    foreground,
+                    input_sequence,
+                    TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
+                );
             }
-            return TextEditAttempt::Failed;
+            return TextEditAttempt::Failed(ConversionFailureReason::TextCommit);
         }
         let switched = self.switch_layout_and_wait(foreground, target_layout, input_sequence);
         self.diagnostic(
@@ -8979,7 +9000,9 @@ impl InputProcessor {
             ReplayAttempt::Applied => {}
             ReplayAttempt::Cancelled
             | ReplayAttempt::Failed
-            | ReplayAttempt::LayoutSwitchFailed => return TextEditAttempt::Failed,
+            | ReplayAttempt::LayoutSwitchFailed => {
+                return TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch);
+            }
         }
         let target_commit = self.wait_for_text_commit(
             foreground,
@@ -8993,6 +9016,19 @@ impl InputProcessor {
             matches!(target_commit, ReplayAttempt::Applied),
             clipboard_restored,
         )
+    }
+
+    /// A paste step the gate's remaining time does not cover: the paste stops before it.
+    fn note_paste_budget(&self, input_sequence: u64, step: &'static str, budget: PasteBudget) {
+        self.diagnostic(
+            "paste",
+            format!(
+                "sequence={input_sequence} phase=budget result=cancelled step={step} remaining_ms={}",
+                budget
+                    .remaining(Instant::now())
+                    .map_or(0, |remaining| remaining.as_millis())
+            ),
+        );
     }
 
     /// Collapses the agent's selection when a paste does not go ahead after the word was
@@ -9017,34 +9053,50 @@ impl InputProcessor {
         }
     }
 
-    /// Decides what a finished paste attempt means for the conversion. `Some` carries the strategy
-    /// to record when the text edit was made. A confirmed edit whose clipboard could not be
-    /// restored still counts as success (policy D2): it is logged and counted, and automatic
-    /// conversion stays on.
+    /// Decides what a finished paste attempt means for the conversion, on both routes. `Some`
+    /// carries the strategy to record when the text edit was made. A confirmed edit whose clipboard
+    /// could not be restored still counts as success (policy D2): it is logged and counted, and
+    /// automatic conversion stays on. Nothing typed (`Cancelled`, `Unsupported`) is no failure;
+    /// every failure after input reached the field is recorded with its own reason. The capability
+    /// route also records the backend state it found.
     fn apply_paste_attempt_result(
         &mut self,
         attempt: TextEditAttempt,
         sequence: u64,
+        route: PasteRoute,
     ) -> Option<EditStrategy> {
+        if route == PasteRoute::CapabilityProbe {
+            let status = match attempt {
+                TextEditAttempt::Applied | TextEditAttempt::AppliedClipboardNotRestored => {
+                    Some(BACKEND_PROTECTED_PASTE)
+                }
+                TextEditAttempt::Cancelled => Some(BACKEND_SELECTION_MISMATCH),
+                TextEditAttempt::Unsupported => Some(BACKEND_SELECTION_UNSUPPORTED),
+                TextEditAttempt::Failed(_) | TextEditAttempt::SelectionLeft => None,
+            };
+            if let Some(status) = status {
+                self.metrics.backend_status.store(status, Ordering::Release);
+            }
+        }
         match attempt {
             TextEditAttempt::Applied => Some(EditStrategy::ProtectedPaste),
             TextEditAttempt::AppliedClipboardNotRestored => {
                 self.note_clipboard_not_restored(sequence);
                 Some(EditStrategy::ProtectedPaste)
             }
-            TextEditAttempt::Cancelled => {
-                // The field did not confirm the word before the caret, so nothing was typed;
-                // the paste lines of the same sequence say at which step.
+            TextEditAttempt::Cancelled | TextEditAttempt::Unsupported => {
+                // Nothing was typed; the paste lines of the same sequence say at which step.
                 self.diagnostic(
                     "conversion",
                     format!(
-                        "sequence={sequence} result=cancelled strategy=ProtectedPaste edit=none"
+                        "sequence={sequence} result=cancelled strategy=ProtectedPaste edit=none unsupported={}",
+                        attempt == TextEditAttempt::Unsupported
                     ),
                 );
                 None
             }
-            TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
-                self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
+            TextEditAttempt::Failed(reason) => {
+                self.record_conversion_failure(reason);
                 None
             }
             TextEditAttempt::SelectionLeft => {
@@ -9189,7 +9241,13 @@ impl InputProcessor {
                 Some(&mut message_result),
             )
         };
-        sent.0 != 0 && message_result == 1
+        let armed = sent.0 != 0 && message_result == 1;
+        if armed {
+            self.edit_deadline.set(Some(
+                Instant::now() + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS),
+            ));
+        }
+        armed
     }
 
     fn handoff_correction_gate(&self, old_token: u64, new_token: u64, required_ms: u64) -> bool {
@@ -10044,15 +10102,15 @@ where
 }
 
 fn paced_replay_fits_gate(step_count: usize) -> bool {
-    conversion_gate_budget_ms(step_count, true, false, false, true)
+    conversion_gate_budget_ms(step_count, true, true)
         .is_some_and(|total| total <= CORRECTION_GATE_MAX_HOLD_MS)
 }
 
+/// The time a physical replay of `step_count` steps holds the correction gate: paced between text
+/// barriers (Notepad) or sent at once.
 fn conversion_gate_budget_ms(
     step_count: usize,
-    requires_text_barrier: bool,
-    capability_probe: bool,
-    selection_confirmation: bool,
+    paced: bool,
     include_forward_wait: bool,
 ) -> Option<u64> {
     let mut total = if include_forward_wait {
@@ -10060,7 +10118,7 @@ fn conversion_gate_budget_ms(
     } else {
         0
     };
-    if requires_text_barrier {
+    if paced {
         let pacing_ms = u64::try_from(step_count.saturating_sub(1))
             .ok()?
             .checked_mul(NOTEPAD_REPLAY_STEP_DELAY_MS)?;
@@ -10069,17 +10127,6 @@ fn conversion_gate_budget_ms(
             .checked_add(LAYOUT_SWITCH_TIMEOUT_MS)?
             .checked_add(pacing_ms)?
             .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?;
-        if selection_confirmation {
-            total = total.checked_add(UIA_SELECTION_CONFIRM_TIMEOUT_MS)?;
-        }
-    } else if capability_probe {
-        total = total
-            .checked_add(INPUT_SETTLE_AFTER_FORWARD_MS)?
-            .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?
-            .checked_add(UIA_SELECTION_CONFIRM_TIMEOUT_MS)?
-            .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?
-            .checked_add(LAYOUT_SWITCH_TIMEOUT_MS)?
-            .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?;
     } else {
         total = total
             .checked_add(INPUT_SETTLE_AFTER_FORWARD_MS)?
@@ -10087,6 +10134,68 @@ fn conversion_gate_budget_ms(
             .checked_add(REPLAY_COMMIT_MS)?;
     }
     total.checked_add(NOTEPAD_REPLAY_GATE_MARGIN_MS)
+}
+
+/// The time an automatic protected paste needs from the gate: its settle (and a capability
+/// probe's text barrier), one confirmed selection, the least installation of the replacement and
+/// everything after the Ctrl+V. The paste shortens its own waits to what the gate has left and
+/// never sends the Ctrl+V without `PASTE_AFTER_SUBMIT_MS` in hand (`PasteBudget`).
+const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
+    let settle = if capability_probe {
+        INPUT_SETTLE_AFTER_FORWARD_MS + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    } else {
+        NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    };
+    settle + UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS
+}
+
+/// The time a protected paste may take: until the gate holding the keys typed after the word lets
+/// them go. Without such a gate (nothing is held) it is unbounded.
+#[derive(Debug, Clone, Copy)]
+struct PasteBudget {
+    deadline: Option<Instant>,
+}
+
+impl PasteBudget {
+    fn remaining(self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    /// Whether the selection may start: its confirmation, the least installation and everything
+    /// after the Ctrl+V still fit.
+    fn allows_selection(self, now: Instant, patience: PastePatience) -> bool {
+        let needed = patience.confirm_timeout() * patience.attempts()
+            + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS);
+        self.remaining(now)
+            .is_none_or(|remaining| remaining >= needed)
+    }
+
+    /// How long the installation of the replacement may take: the patience's limit, shortened so
+    /// that everything after the Ctrl+V still fits; none when less than `PASTE_MIN_INSTALL_MS`
+    /// would be left for it.
+    fn install_timeout(self, now: Instant, patience: PastePatience) -> Option<Duration> {
+        let limit = patience.clipboard_install_timeout();
+        let Some(remaining) = self.remaining(now) else {
+            return Some(limit);
+        };
+        let left = remaining.checked_sub(Duration::from_millis(PASTE_AFTER_SUBMIT_MS))?;
+        (left >= Duration::from_millis(PASTE_MIN_INSTALL_MS)).then_some(left.min(limit))
+    }
+
+    /// Whether the Ctrl+V may be sent: everything after it fits before the gate lets the keys go.
+    fn allows_submit(self, now: Instant) -> bool {
+        self.remaining(now)
+            .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
+    }
+}
+
+/// Which conversion route made a protected paste: the protected-paste backend, or a capability
+/// probe whose text barrier matched (it records the backend state it found as well).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteRoute {
+    Backend,
+    CapabilityProbe,
 }
 
 fn build_held_replay_inputs(held: &[RawKeyEvent], fence_marker: usize) -> Option<Vec<INPUT>> {
@@ -10517,6 +10626,7 @@ const fn conversion_failure_label(reason: u8) -> &'static str {
         value if value == ConversionFailureReason::ClipboardEdit as u8 => "clipboard-edit",
         value if value == ConversionFailureReason::InternalFault as u8 => "internal-fault",
         value if value == ConversionFailureReason::SelectionLeft as u8 => "selection-left",
+        value if value == ConversionFailureReason::LayoutSwitch as u8 => "layout-switch",
         _ => "unknown",
     }
 }
@@ -12068,7 +12178,7 @@ mod tests {
         let (mut processor, receiver) = processor_with_diagnostics();
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 42)
+                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 42, PasteRoute::Backend)
                 .is_none()
         );
         let lines: Vec<String> = receiver
@@ -12090,13 +12200,17 @@ mod tests {
         let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 7)
+                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 7, PasteRoute::Backend)
                 .is_none()
         );
         assert!(metrics.auto_enabled.load(Ordering::Acquire));
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::Failed, 8)
+                .apply_paste_attempt_result(
+                    TextEditAttempt::Failed(ConversionFailureReason::ClipboardEdit),
+                    8,
+                    PasteRoute::Backend
+                )
                 .is_none()
         );
         assert!(!metrics.auto_enabled.load(Ordering::Acquire));
@@ -12140,11 +12254,11 @@ mod tests {
         );
         assert_eq!(
             protected_paste_outcome(false, true),
-            TextEditAttempt::Failed
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
         );
         assert_eq!(
             protected_paste_outcome(false, false),
-            TextEditAttempt::Failed
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
         );
         // Restoring the user's clipboard waits three times as long as installing the temporary text.
         assert_eq!(CLIPBOARD_RESTORE_OPEN_RETRIES, 3 * CLIPBOARD_OPEN_RETRIES);
@@ -12160,7 +12274,7 @@ mod tests {
         metrics.auto_enabled.store(true, Ordering::Release);
         let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
         assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::Applied, 5),
+            processor.apply_paste_attempt_result(TextEditAttempt::Applied, 5, PasteRoute::Backend),
             Some(EditStrategy::ProtectedPaste)
         );
         assert_eq!(
@@ -12168,7 +12282,11 @@ mod tests {
             0
         );
         assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::AppliedClipboardNotRestored, 6),
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::AppliedClipboardNotRestored,
+                6,
+                PasteRoute::Backend
+            ),
             Some(EditStrategy::ProtectedPaste)
         );
         assert_eq!(
@@ -12176,12 +12294,20 @@ mod tests {
             1
         );
         assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::Cancelled, 7),
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::Cancelled,
+                7,
+                PasteRoute::Backend
+            ),
             None
         );
         assert!(metrics.auto_enabled.load(Ordering::Acquire));
         assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::Failed, 8),
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::Failed(ConversionFailureReason::ClipboardEdit),
+                8,
+                PasteRoute::Backend
+            ),
             None
         );
         assert!(!metrics.auto_enabled.load(Ordering::Acquire));
@@ -13624,17 +13750,19 @@ mod tests {
         assert!(paced_replay_fits_gate(plan.step_ends.len()));
         assert!(!paced_replay_fits_gate(135));
         assert_eq!(
-            conversion_gate_budget_ms(plan.step_ends.len(), true, false, true, false),
+            conversion_gate_budget_ms(plan.step_ends.len(), true, true),
             Some(1_187)
         );
         assert_eq!(
-            conversion_gate_budget_ms(14, true, false, true, false),
-            Some(839)
+            conversion_gate_budget_ms(plan.step_ends.len(), true, false),
+            Some(1_137)
         );
-        assert_eq!(
-            conversion_gate_budget_ms(14, false, true, true, false),
-            Some(985)
-        );
+        assert_eq!(conversion_gate_budget_ms(14, false, false), Some(535));
+        // A protected paste is budgeted from its own waits, not as a paced replay: settle,
+        // selection, the least installation and everything after the Ctrl+V.
+        assert_eq!(paste_gate_budget_ms(false), 1_000);
+        assert_eq!(paste_gate_budget_ms(true), 1_035);
+        assert!(paste_gate_budget_ms(true) <= CORRECTION_GATE_MAX_HOLD_MS);
 
         let mut gate = CorrectionGate::default();
         gate.activate(10);
@@ -17358,7 +17486,7 @@ mod tests {
         let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 42)
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 42, PasteRoute::Backend)
                 .is_none()
         );
         assert!(!metrics.auto_enabled.load(Ordering::Acquire));
@@ -17380,7 +17508,7 @@ mod tests {
         // An undo whose paste may leave the word selected keeps its held keys as well.
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 44)
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 44, PasteRoute::Backend)
                 .is_none()
         );
         processor.execute_undo(44);
@@ -17608,5 +17736,152 @@ mod tests {
         let state = take_app_state().unwrap();
         assert!(metrics.retained_input.lock().unwrap().is_none());
         assert_eq!(state.pending_held_replay.len(), 1);
+    }
+
+    #[test]
+    fn a_paste_fits_its_waits_into_the_time_the_gate_has_left() {
+        let now = Instant::now();
+        let at = |ms: u64| PasteBudget {
+            deadline: Some(now + Duration::from_millis(ms)),
+        };
+        assert_eq!(PASTE_AFTER_SUBMIT_MS, 750);
+        // Without a gate nothing is cut short.
+        let unbounded = PasteBudget { deadline: None };
+        assert!(unbounded.allows_selection(now, PastePatience::Manual));
+        assert_eq!(
+            unbounded.install_timeout(now, PastePatience::Manual),
+            Some(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
+        );
+        assert!(unbounded.allows_submit(now));
+        // A gate armed a settle ago: an automatic paste keeps its installation limit, Pause gets
+        // what is left after everything that follows the Ctrl+V.
+        let fresh = at(CORRECTION_GATE_MAX_HOLD_MS - NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        assert!(fresh.allows_selection(now, PastePatience::Automatic));
+        assert!(fresh.allows_selection(now, PastePatience::Manual));
+        assert_eq!(
+            fresh.install_timeout(now, PastePatience::Automatic),
+            Some(Duration::from_millis(
+                CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS
+            ))
+        );
+        assert_eq!(
+            fresh.install_timeout(now, PastePatience::Manual),
+            Some(Duration::from_millis(1_050 - PASTE_AFTER_SUBMIT_MS))
+        );
+        // The selection starts only with its confirmation, the least installation and
+        // everything after the Ctrl+V in hand.
+        let automatic =
+            UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+        assert!(at(automatic).allows_selection(now, PastePatience::Automatic));
+        assert!(!at(automatic - 1).allows_selection(now, PastePatience::Automatic));
+        let manual = 2 * UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS
+            + PASTE_MIN_INSTALL_MS
+            + PASTE_AFTER_SUBMIT_MS;
+        assert!(at(manual).allows_selection(now, PastePatience::Manual));
+        assert!(!at(manual - 1).allows_selection(now, PastePatience::Manual));
+        // Less than the least installation is no installation.
+        let least = PASTE_AFTER_SUBMIT_MS + PASTE_MIN_INSTALL_MS;
+        assert_eq!(
+            at(least).install_timeout(now, PastePatience::Automatic),
+            Some(Duration::from_millis(PASTE_MIN_INSTALL_MS))
+        );
+        assert_eq!(
+            at(least - 1).install_timeout(now, PastePatience::Automatic),
+            None
+        );
+        // The Ctrl+V needs everything after it in hand.
+        assert!(at(PASTE_AFTER_SUBMIT_MS).allows_submit(now));
+        assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
+    }
+
+    #[test]
+    fn an_armed_space_gives_its_conversion_the_deadline_of_its_gate() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let queued = armed_space(&metrics, 7, 0);
+        let captured_at = queued.captured_at;
+        processor.process(queued);
+        assert_eq!(
+            processor.edit_deadline.get(),
+            Some(captured_at + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS))
+        );
+        // An event that armed no gate carries no deadline.
+        metrics.active_gate_token.store(0, Ordering::Release);
+        processor.process(QueuedInputEvent {
+            epoch: metrics.input_epoch.load(Ordering::Acquire),
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(test_raw_key(WM_KEYUP, VK_SPACE, 8, 0)),
+            configuration: None,
+        });
+        assert_eq!(processor.edit_deadline.get(), None);
+    }
+
+    #[test]
+    fn nothing_typed_is_no_failure_and_each_failure_after_the_paste_names_its_reason() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        for (attempt, status) in [
+            (TextEditAttempt::Unsupported, BACKEND_SELECTION_UNSUPPORTED),
+            (TextEditAttempt::Cancelled, BACKEND_SELECTION_MISMATCH),
+        ] {
+            for route in [PasteRoute::Backend, PasteRoute::CapabilityProbe] {
+                metrics
+                    .backend_status
+                    .store(BACKEND_CAPABILITY_PROBE, Ordering::Release);
+                assert!(
+                    processor
+                        .apply_paste_attempt_result(attempt, 5, route)
+                        .is_none()
+                );
+                assert!(
+                    metrics.auto_enabled.load(Ordering::Acquire),
+                    "{attempt:?} {route:?}"
+                );
+                let expected = if route == PasteRoute::CapabilityProbe {
+                    status
+                } else {
+                    BACKEND_CAPABILITY_PROBE
+                };
+                assert_eq!(metrics.backend_status.load(Ordering::Acquire), expected);
+            }
+        }
+        assert_eq!(
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::Applied,
+                6,
+                PasteRoute::CapabilityProbe
+            ),
+            Some(EditStrategy::ProtectedPaste)
+        );
+        assert_eq!(
+            metrics.backend_status.load(Ordering::Acquire),
+            BACKEND_PROTECTED_PASTE
+        );
+        for reason in [
+            ConversionFailureReason::TextCommit,
+            ConversionFailureReason::LayoutSwitch,
+            ConversionFailureReason::ClipboardEdit,
+        ] {
+            metrics.auto_enabled.store(true, Ordering::Release);
+            assert!(
+                processor
+                    .apply_paste_attempt_result(
+                        TextEditAttempt::Failed(reason),
+                        7,
+                        PasteRoute::Backend
+                    )
+                    .is_none()
+            );
+            assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+            assert_eq!(
+                metrics.last_failure_reason.load(Ordering::Acquire),
+                reason as u8
+            );
+        }
+        assert_eq!(
+            conversion_failure_label(ConversionFailureReason::LayoutSwitch as u8),
+            "layout-switch"
+        );
     }
 }
