@@ -19217,6 +19217,117 @@ mod tests {
         assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
     }
 
+    /// A gate window that arms a gate, prepares a handoff and accepts a drain whenever asked.
+    unsafe extern "system" fn accepting_gate_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            GATE_ARM_MESSAGE | GATE_HANDOFF_BUDGET_MESSAGE | GATE_DRAIN_ACK_MESSAGE => LRESULT(1),
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    #[test]
+    fn a_gate_the_worker_arms_or_hands_over_gives_the_edit_the_time_the_gate_has() {
+        let module = unsafe { GetModuleHandleW(None).expect("module") };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(accepting_gate_procedure),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: w!("AutoKeyboardLayotAcceptingGateTest"),
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&class) };
+        // Created by this thread, the window answers the worker's messages within the call.
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("AutoKeyboardLayotAcceptingGateTest"),
+                w!("AutoKeyboardLayot gate test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+            .expect("gate window")
+        };
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.gate_window = window.0 as usize;
+        let lets_go_after = |before: Instant, ms: u64, processor: &InputProcessor| {
+            let hold = Duration::from_millis(ms);
+            processor.edit_deadline.get().is_some_and(|deadline| {
+                deadline >= before + hold && deadline <= Instant::now() + hold
+            })
+        };
+
+        // Armed by the worker (a Pause conversion, a word whose keys it waited for): the keys go
+        // after the gate's longest hold.
+        let before = Instant::now();
+        assert!(processor.arm_correction_gate(9));
+        assert!(lets_go_after(
+            before,
+            CORRECTION_GATE_MAX_HOLD_MS,
+            &processor
+        ));
+
+        // Handed over to the next word: the gate keeps the keys for what the word's route needs.
+        let detection = Detection {
+            source_language: Language::English,
+            target_language: Language::Russian,
+            original: "z".into(),
+            replacement: "я".into(),
+            source_score: 0.0,
+            target_score: 1.0,
+        };
+        let transaction = ConversionTransaction::without_delimiter(&detection).unwrap();
+        let replay_steps = transaction.forward.erase_characters + 1;
+        for (backend, required_ms) in [
+            (TextEditBackend::ProtectedPaste, paste_gate_budget_ms(false)),
+            (TextEditBackend::CapabilityProbe, paste_gate_budget_ms(true)),
+            (
+                TextEditBackend::PhysicalReplay,
+                conversion_gate_budget_ms(replay_steps, false, false).unwrap(),
+            ),
+        ] {
+            processor.edit_deadline.set(None);
+            processor.text_edit_backend = backend;
+            // Automatic conversion is off: the conversion stops right after the handoff.
+            processor.pending_conversion = Some(PendingConversion {
+                transaction: transaction.clone(),
+                foreground: test_foreground(),
+                source_layout: test_foreground().layout,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 7,
+                replay_keys: Vec::new(),
+                forced: false,
+                cycle_order: Vec::new(),
+            });
+            processor.deferred_drained_conversion = Some(DeferredDrainedConversion {
+                gate_token: 6,
+                boundary_sequence: 7,
+            });
+            let before = Instant::now();
+            processor.process_gate_drain_ready(6, 0, true);
+            assert!(
+                lets_go_after(before, required_ms, &processor),
+                "{backend:?}"
+            );
+        }
+        // The release the conversion posted is not handled here.
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, Some(window), 0, 0, PM_REMOVE) }.as_bool() {}
+        unsafe {
+            DestroyWindow(window).expect("destroy gate window");
+        }
+    }
+
     #[test]
     fn an_armed_space_gives_its_conversion_the_deadline_of_its_gate() {
         let metrics = Arc::new(ObserverMetrics::default());
