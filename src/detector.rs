@@ -2169,6 +2169,21 @@ mod tests {
     }
 
     #[test]
+    fn short_russian_words_whose_keys_spell_english_words_stay_russian() {
+        // Typed in the Russian layout, the same keys spell "her" and "key" in English.
+        let detector = crate::test_support::detector();
+        for (russian, english) in [("рук", "her"), ("лун", "key")] {
+            let candidates = [(Language::English, english.to_owned())];
+            assert!(
+                detector
+                    .detect_mapped_candidates(russian, Language::Russian, &candidates)
+                    .is_none(),
+                "{russian}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_short_word_dictionary_and_exclusion_entries_are_authoritative() {
         let mut detector = crate::test_support::detector();
         detector.replace_user_lexicons(
