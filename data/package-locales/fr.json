@@ -195,6 +195,7 @@
     "tray.backend": "méthode : {backend}",
     "tray.undo_ready": "annulation disponible",
     "tray.failures": "échecs de conversion : {count} (dernier : {reason})",
+    "tray.diagnostic_errors": "erreurs du journal : {count}",
     "lifecycle.close_busy": "L’agent est occupé ou conserve des frappes en attente. Terminez l’opération, récupérez ou supprimez explicitement la saisie retenue, le cas échéant, puis réessayez de fermer.",
     "lifecycle.exit_anyway": "La fermeture a été refusée ({reasons}). Quitter quand même ? Le travail en cours peut être perdu.",
     "lifecycle.exit_anyway_discard": "Les frappes conservées qui n’ont pas encore été transmises à l’application seront perdues.",

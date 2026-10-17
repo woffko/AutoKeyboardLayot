@@ -191,6 +191,7 @@
     "tray.backend": "метод: {backend}",
     "tray.undo_ready": "отмена доступна",
     "tray.failures": "ошибки конвертации: {count} (последняя: {reason})",
+    "tray.diagnostic_errors": "ошибки журнала: {count}",
     "error.startup_title": "Не удалось запустить AutoKeyboardLayot",
     "locale.self_name": "Русский",
     "ui_language.active": "Отображаемый язык: {language}",

@@ -195,6 +195,7 @@
     "tray.backend": "método: {backend}",
     "tray.undo_ready": "pronto para desfazer",
     "tray.failures": "falhas de conversão: {count} (última: {reason})",
+    "tray.diagnostic_errors": "erros do registro: {count}",
     "lifecycle.close_busy": "O agente está ocupado ou mantém teclas pendentes. Conclua a operação, recupere ou exclua explicitamente a entrada retida, se houver, e tente fechar novamente.",
     "lifecycle.exit_anyway": "A saída foi recusada ({reasons}). Sair mesmo assim? O trabalho em andamento pode ser perdido.",
     "lifecycle.exit_anyway_discard": "Os pressionamentos retidos que ainda não foram entregues ao aplicativo serão perdidos.",

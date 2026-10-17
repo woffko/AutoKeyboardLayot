@@ -195,6 +195,7 @@
     "tray.backend": "Methode: {backend}",
     "tray.undo_ready": "Rückgängigmachen bereit",
     "tray.failures": "Umwandlungsfehler: {count} (zuletzt: {reason})",
+    "tray.diagnostic_errors": "Protokollfehler: {count}",
     "lifecycle.close_busy": "Der Agent ist beschäftigt oder hält Tasteneingaben zurück. Beenden Sie den Vorgang, stellen Sie zurückgehaltene Eingaben wieder her oder löschen Sie diese ausdrücklich, und versuchen Sie dann erneut zu schließen.",
     "lifecycle.exit_anyway": "Das Beenden wurde abgelehnt ({reasons}). Trotzdem beenden? Laufende Arbeit kann verloren gehen.",
     "lifecycle.exit_anyway_discard": "Zurückgehaltene Tastendrücke, die noch nicht an die Anwendung übergeben wurden, gehen verloren.",

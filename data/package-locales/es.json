@@ -195,6 +195,7 @@
     "tray.backend": "método: {backend}",
     "tray.undo_ready": "se puede deshacer",
     "tray.failures": "errores de conversión: {count} (último: {reason})",
+    "tray.diagnostic_errors": "errores del registro: {count}",
     "lifecycle.close_busy": "El agente está ocupado o conserva pulsaciones pendientes. Termine la operación, recupere o elimine explícitamente la entrada retenida, si la hay, e intente cerrar de nuevo.",
     "lifecycle.exit_anyway": "Se rechazó la salida ({reasons}). ¿Salir de todos modos? El trabajo en curso puede perderse.",
     "lifecycle.exit_anyway_discard": "Las pulsaciones retenidas que aún no se entregaron a la aplicación se perderán.",

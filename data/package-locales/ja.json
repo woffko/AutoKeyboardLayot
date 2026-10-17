@@ -192,6 +192,7 @@
     "tray.backend": "処理方法: {backend}",
     "tray.undo_ready": "元に戻せます",
     "tray.failures": "変換エラー数: {count}（最新: {reason}）",
+    "tray.diagnostic_errors": "ログのエラー数: {count}",
     "locale.self_name": "日本語",
     "ui_language.active": "表示中の言語: {language}",
     "error.ui_language": "表示言語の選択が無効です。",

@@ -212,6 +212,7 @@
     "tray.backend": "backend: {backend}",
     "tray.undo_ready": "undo ready",
     "tray.failures": "conversion failures: {count} (last: {reason})",
+    "tray.diagnostic_errors": "log errors: {count}",
     "import.failure.store": "The managed package store cannot be opened. Check that the profile directory is available and the configuration still uses managed packages.",
     "import.failure.snapshot": "The current package inventory cannot be read. Another operation may be using it; retry after it finishes.",
     "import.failure.prepare": "The package could not be prepared or verified. Nothing was installed.",

@@ -199,6 +199,7 @@
     "tray.backend": "方式：{backend}",
     "tray.undo_ready": "可撤销",
     "tray.failures": "转换失败：{count}（最近：{reason}）",
+    "tray.diagnostic_errors": "日志错误：{count}",
     "lifecycle.close_busy": "代理正在忙碌或保留了尚未发送的按键。请完成当前操作，恢复或明确删除保留的输入（如有），然后重试关闭。",
     "lifecycle.exit_anyway": "退出被拒绝（{reasons}）。仍要退出吗？正在进行的工作可能会丢失。",
     "lifecycle.exit_anyway_discard": "已保留但尚未传递给应用程序的按键将会丢失。",

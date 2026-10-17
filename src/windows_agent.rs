@@ -370,6 +370,8 @@ struct ObserverMetrics {
     backend_status: AtomicU8,
     diagnostics_enabled: AtomicBool,
     dropped_diagnostics: AtomicU64,
+    // Records the log writer could not write, and full logs it could not move aside.
+    diagnostic_log_errors: AtomicU64,
     gate_replayed_events: AtomicU64,
     observed_input_sequence: AtomicU64,
     forwarded_input_sequence: AtomicU64,
@@ -418,6 +420,7 @@ impl Default for ObserverMetrics {
             backend_status: AtomicU8::new(BACKEND_OBSERVE_ONLY),
             diagnostics_enabled: AtomicBool::new(false),
             dropped_diagnostics: AtomicU64::new(0),
+            diagnostic_log_errors: AtomicU64::new(0),
             gate_replayed_events: AtomicU64::new(0),
             observed_input_sequence: AtomicU64::new(0),
             forwarded_input_sequence: AtomicU64::new(0),
@@ -1547,6 +1550,8 @@ struct TrayStatus {
     failures: u64,
     failure_reason: u8,
     backend_status: u8,
+    // Diagnostics records dropped from a full queue or not written, and failed rotations.
+    diagnostic_errors: u64,
 }
 
 impl TrayStatus {
@@ -1563,6 +1568,7 @@ impl TrayStatus {
             failures: 0,
             failure_reason: ConversionFailureReason::None as u8,
             backend_status: BACKEND_OBSERVE_ONLY,
+            diagnostic_errors: 0,
         }
     }
 }
@@ -3248,6 +3254,7 @@ fn refresh_tray_state() {
             failures: state.metrics.conversion_failures.load(Ordering::Relaxed),
             failure_reason: state.metrics.last_failure_reason.load(Ordering::Acquire),
             backend_status: state.metrics.backend_status.load(Ordering::Acquire),
+            diagnostic_errors: diagnostic_error_count(&state.metrics),
         };
         if status == state.last_tray_status {
             return None;
@@ -3492,7 +3499,14 @@ pub fn run() -> Result<()> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let lexicon_candidate = Arc::new(Mutex::new(None));
         let (diagnostic_sender, diagnostic_receiver) = sync_channel(DIAGNOSTIC_QUEUE_CAPACITY);
-        let diagnostic_worker = thread::spawn(move || diagnostic_worker(diagnostic_receiver));
+        let diagnostic_metrics = Arc::clone(&metrics);
+        let diagnostic_worker = thread::spawn(move || {
+            diagnostic_worker(
+                diagnostic_receiver,
+                diagnostic_log_path(),
+                &diagnostic_metrics,
+            );
+        });
         let correction_gate = CorrectionGate::default();
         let (input_sender, input_receiver) = sync_channel(INPUT_QUEUE_CAPACITY);
         let worker_metrics = Arc::clone(&metrics);
@@ -5665,45 +5679,77 @@ fn diagnostic_log_path() -> Option<PathBuf> {
     configuration_directory().map(|directory| directory.join("diagnostics.log"))
 }
 
-fn diagnostic_worker(receiver: Receiver<String>) {
+fn diagnostic_worker(receiver: Receiver<String>, path: Option<PathBuf>, metrics: &ObserverMetrics) {
     while let Ok(record) = receiver.recv() {
-        let _ = append_diagnostic_record(&record);
+        let failed = match path.as_deref() {
+            Some(path) => !matches!(
+                append_diagnostic_record(path, &record, DIAGNOSTIC_LOG_MAX_BYTES),
+                Ok(DiagnosticAppend::Appended)
+            ),
+            None => true,
+        };
+        if failed {
+            metrics
+                .diagnostic_log_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-fn append_diagnostic_record(record: &str) -> std::io::Result<()> {
-    let Some(path) = diagnostic_log_path() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "LOCALAPPDATA is unavailable",
-        ));
-    };
-    let Some(directory) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "diagnostic path has no parent",
-        ));
-    };
-    fs::create_dir_all(directory)?;
+/// How one record reached the diagnostics log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticAppend {
+    Appended,
+    /// The full log could not be moved aside (a viewer may hold it open without sharing delete
+    /// access), so the record went past the limit.
+    AppendedPastLimit,
+    /// The full log could not be moved aside and had reached twice the limit: it was started
+    /// again with this record.
+    Restarted,
+}
+
+/// Appends one record to the log at `path`. A log that would pass `max_bytes` is first moved
+/// aside to `<name>.1.log`, which replaces the previous one only when the move succeeds. When it
+/// fails, records still land: past the limit up to twice it, then in a restarted log. So the log
+/// neither stops nor grows without bound while something holds it.
+fn append_diagnostic_record(
+    path: &Path,
+    record: &str,
+    max_bytes: u64,
+) -> std::io::Result<DiagnosticAppend> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let record = record.replace(['\r', '\n'], " ");
     let line = format!("{timestamp} {record}\r\n");
-    let current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    if current_size.saturating_add(line.len() as u64) > DIAGNOSTIC_LOG_MAX_BYTES {
-        let rotated = path.with_extension("1.log");
-        if rotated.exists() {
-            fs::remove_file(&rotated)?;
-        }
-        if path.exists() {
-            fs::rename(&path, rotated)?;
-        }
+    let current_size = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    let size_after = current_size.saturating_add(line.len() as u64);
+    let mut outcome = DiagnosticAppend::Appended;
+    if current_size > 0
+        && size_after > max_bytes
+        && fs::rename(path, path.with_extension("1.log")).is_err()
+    {
+        outcome = if size_after > max_bytes.saturating_mul(2) {
+            DiagnosticAppend::Restarted
+        } else {
+            DiagnosticAppend::AppendedPastLimit
+        };
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true);
+    if outcome == DiagnosticAppend::Restarted {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    let mut file = options.open(path)?;
     file.write_all(line.as_bytes())?;
-    file.flush()
+    file.flush()?;
+    Ok(outcome)
 }
 
 fn input_worker(
@@ -10065,7 +10111,23 @@ fn tray_tooltip(status: TrayStatus) -> String {
             ],
         ));
     }
+    if status.diagnostic_errors > 0 {
+        tooltip.push_str("; ");
+        tooltip.push_str(&tr_format(
+            "tray.diagnostic_errors",
+            &[("count", &status.diagnostic_errors.to_string())],
+        ));
+    }
     tooltip
+}
+
+/// Diagnostics records that never reached the log, plus failed log rotations: shown in the tray
+/// while diagnostics are on, so a log with gaps is not taken for a complete one.
+fn diagnostic_error_count(metrics: &ObserverMetrics) -> u64 {
+    metrics
+        .dropped_diagnostics
+        .load(Ordering::Relaxed)
+        .saturating_add(metrics.diagnostic_log_errors.load(Ordering::Relaxed))
 }
 
 fn create_indicator_icon(visual: TrayVisual, indicator: LayoutIndicator) -> Result<HICON> {
@@ -10173,6 +10235,7 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
                 failures: state.metrics.conversion_failures.load(Ordering::Relaxed),
                 failure_reason: state.metrics.last_failure_reason.load(Ordering::Acquire),
                 backend_status: state.metrics.backend_status.load(Ordering::Acquire),
+                diagnostic_errors: diagnostic_error_count(&state.metrics),
             })
         });
         let Some(status) = snapshot else {
@@ -12492,6 +12555,7 @@ mod tests {
             failures: 0,
             failure_reason: ConversionFailureReason::None as u8,
             backend_status: BACKEND_CAPABILITY_UNSUPPORTED,
+            diagnostic_errors: 0,
         });
         let active = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
@@ -12505,6 +12569,7 @@ mod tests {
             failures: 0,
             failure_reason: ConversionFailureReason::None as u8,
             backend_status: BACKEND_PROTECTED_PASTE,
+            diagnostic_errors: 0,
         });
         let failed = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
@@ -12518,6 +12583,7 @@ mod tests {
             failures: 1,
             failure_reason: ConversionFailureReason::TextCommit as u8,
             backend_status: BACKEND_PHYSICAL_REPLAY,
+            diagnostic_errors: 2,
         });
         assert!(paused.contains("privacy paused (password)"));
         assert!(!active.contains("privacy paused"));
@@ -12530,6 +12596,8 @@ mod tests {
         assert!(active.contains("backend: uia-paste"));
         assert!(failed.contains("backend: physical-replay"));
         assert!(failed.contains("conversion failures: 1 (last: text-commit)"));
+        assert!(failed.ends_with("; log errors: 2"));
+        assert!(!active.contains("log errors"));
         assert_eq!(
             conversion_failure_label(ConversionFailureReason::ClipboardEdit as u8),
             "clipboard-edit"
@@ -12546,6 +12614,94 @@ mod tests {
         assert_eq!(String::from_utf16(&complete[..3]).unwrap(), "A😀");
         assert_eq!(complete[3], 0);
         set_wide_text(&mut [0u16; 0], "text");
+    }
+
+    #[test]
+    fn a_full_diagnostics_log_is_moved_aside_over_the_previous_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostics.log");
+        let rotated = directory.path().join("diagnostics.1.log");
+        fs::write(&rotated, "previous rotated log\r\n").unwrap();
+        // Each line is 30 bytes: a 13-digit timestamp, a space, the record and CR LF.
+        for index in 0..4 {
+            assert_eq!(
+                append_diagnostic_record(&path, &format!("event=test n={index}"), 64).unwrap(),
+                DiagnosticAppend::Appended
+            );
+        }
+        let rotated_text = fs::read_to_string(&rotated).unwrap();
+        let active_text = fs::read_to_string(&path).unwrap();
+        assert!(!rotated_text.contains("previous rotated log"));
+        assert!(rotated_text.contains("n=0") && rotated_text.contains("n=1"));
+        assert!(active_text.contains("n=2") && active_text.contains("n=3"));
+        assert!(!active_text.contains("n=1"));
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_moved_aside_keeps_taking_records_within_twice_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostics.log");
+        // A directory where the rotated log belongs makes every move fail, as a viewer that
+        // holds the log open without sharing delete access does.
+        fs::create_dir_all(directory.path().join("diagnostics.1.log").join("blocker")).unwrap();
+        let mut outcomes = Vec::new();
+        for index in 0..6 {
+            outcomes.push(
+                append_diagnostic_record(&path, &format!("event=test n={index}"), 64).unwrap(),
+            );
+            assert!(fs::metadata(&path).unwrap().len() <= 128);
+        }
+        assert_eq!(
+            outcomes,
+            [
+                DiagnosticAppend::Appended,
+                DiagnosticAppend::Appended,
+                DiagnosticAppend::AppendedPastLimit,
+                DiagnosticAppend::AppendedPastLimit,
+                DiagnosticAppend::Restarted,
+                DiagnosticAppend::Appended,
+            ]
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("n=4") && text.contains("n=5"));
+        assert!(!text.contains("n=3"));
+    }
+
+    #[test]
+    fn the_diagnostics_writer_counts_what_it_could_not_write_for_the_tray() {
+        let metrics = ObserverMetrics::default();
+        let directory = tempfile::tempdir().unwrap();
+        // The log's directory is a file: no record can be written.
+        let blocked = directory.path().join("blocked");
+        fs::write(&blocked, "").unwrap();
+        let (sender, receiver) = sync_channel(4);
+        sender.send("event=test n=1".to_owned()).unwrap();
+        sender.send("event=test n=2".to_owned()).unwrap();
+        drop(sender);
+        diagnostic_worker(receiver, Some(blocked.join("diagnostics.log")), &metrics);
+        assert_eq!(metrics.diagnostic_log_errors.load(Ordering::Relaxed), 2);
+
+        // A full log that cannot be moved aside still takes the record, and the failed move is
+        // counted.
+        let path = directory.path().join("diagnostics.log");
+        fs::write(&path, vec![b'x'; DIAGNOSTIC_LOG_MAX_BYTES as usize]).unwrap();
+        fs::create_dir_all(directory.path().join("diagnostics.1.log").join("blocker")).unwrap();
+        let (sender, receiver) = sync_channel(1);
+        sender.send("event=test n=3".to_owned()).unwrap();
+        drop(sender);
+        diagnostic_worker(receiver, Some(path.clone()), &metrics);
+        assert_eq!(metrics.diagnostic_log_errors.load(Ordering::Relaxed), 3);
+        assert!(fs::read_to_string(&path).unwrap().contains("n=3"));
+
+        // Without a log path every record is lost.
+        let (sender, receiver) = sync_channel(1);
+        sender.send("event=test n=4".to_owned()).unwrap();
+        drop(sender);
+        diagnostic_worker(receiver, None, &metrics);
+        assert_eq!(metrics.diagnostic_log_errors.load(Ordering::Relaxed), 4);
+
+        metrics.dropped_diagnostics.store(5, Ordering::Relaxed);
+        assert_eq!(diagnostic_error_count(&metrics), 9);
     }
 
     #[test]

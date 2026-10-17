@@ -195,6 +195,7 @@
     "tray.backend": "metode: {backend}",
     "tray.undo_ready": "pembatalan tersedia",
     "tray.failures": "kegagalan konversi: {count} (terakhir: {reason})",
+    "tray.diagnostic_errors": "kesalahan log: {count}",
     "lifecycle.close_busy": "Agen sedang sibuk atau menyimpan penekanan tombol tertunda. Selesaikan operasi, pulihkan atau hapus secara eksplisit masukan yang ditahan jika ada, lalu coba tutup lagi.",
     "lifecycle.exit_anyway": "Keluar ditolak ({reasons}). Tetap keluar? Pekerjaan yang sedang berjalan dapat hilang.",
     "lifecycle.exit_anyway_discard": "Penekanan tombol yang ditahan dan belum diserahkan ke aplikasi akan hilang.",

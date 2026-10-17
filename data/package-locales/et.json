@@ -192,6 +192,7 @@
     "tray.backend": "meetod: {backend}",
     "tray.undo_ready": "tagasivõtmine on saadaval",
     "tray.failures": "teisendusvigu: {count} (viimane: {reason})",
+    "tray.diagnostic_errors": "logi vigu: {count}",
     "locale.self_name": "Eesti",
     "ui_language.active": "Kuvatav keel: {language}",
     "error.ui_language": "Kasutajaliidese keele valik on vigane.",
