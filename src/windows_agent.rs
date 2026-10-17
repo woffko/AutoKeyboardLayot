@@ -8764,6 +8764,7 @@ impl InputProcessor {
             );
             return;
         }
+        let map_to_layout = self.key_mapper();
         let order = cycle_order
             .filter(|order| {
                 order.len() == enabled.len()
@@ -8776,7 +8777,7 @@ impl InputProcessor {
                     .filter(|language| *language != source_language)
                     .filter_map(|language| {
                         let layout = self.find_layout(language)?;
-                        Some((language, map_replay_keys_to_layout(&replay_keys, layout)?))
+                        Some((language, map_to_layout(&replay_keys, layout.0 as usize)?))
                     })
                     .collect();
                 layout_cycle_order(
@@ -8803,7 +8804,7 @@ impl InputProcessor {
             let Some(candidate_layout) = self.find_layout(candidate_language) else {
                 continue;
             };
-            let Some(candidate_text) = map_replay_keys_to_layout(&replay_keys, candidate_layout)
+            let Some(candidate_text) = map_to_layout(&replay_keys, candidate_layout.0 as usize)
             else {
                 continue;
             };
@@ -12410,17 +12411,64 @@ mod tests {
         );
     }
 
+    /// Presses Pause on "ghbdtn" ("привет" on the Russian layout) typed in the US layout and returns
+    /// the language the processor converts it to, or the reason it ignores the key.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn pause_result(processor: &mut InputProcessor, diagnostics: &Receiver<String>) -> String {
+        let replay_keys = [0x22_u16, 0x23, 0x30, 0x20, 0x14, 0x31]
+            .map(|scan_code| ReplayKey {
+                scan_code,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            })
+            .to_vec();
+        let foreground = ForegroundContext {
+            layout: 0x0409,
+            ..test_foreground()
+        };
+        diagnostics.try_iter().for_each(drop);
+        processor.advance_layout_cycle(
+            replay_keys,
+            Some(' '),
+            foreground,
+            0x0409,
+            Language::English,
+            "ghbdtn".to_owned(),
+            41,
+            None,
+        );
+        diagnostics
+            .try_iter()
+            .find_map(|line| {
+                let field = |name: &str| {
+                    line.split(' ')
+                        .find_map(|field| field.strip_prefix(name).map(str::to_owned))
+                };
+                if line.starts_with("event=candidate ") {
+                    field("target=")
+                } else if line.starts_with("event=hotkey ") {
+                    field("reason=")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+
     // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn worker_dictionary_snapshot_follows_validated_selection_and_reload() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let (mut processor, diagnostics) = processor_with_diagnostics();
+        processor.test_keyboard = Some(test_keyboard);
         assert!(
             processor
                 .detector
                 .detect("ghbdtn", Language::English)
                 .is_some()
         );
+        assert_eq!(pause_result(&mut processor, &diagnostics), "ru-RU");
         let mut snapshot = test_reload_snapshot("private.exe");
         snapshot
             .settings
@@ -12433,16 +12481,9 @@ mod tests {
                 .detect("ghbdtn", Language::English)
                 .is_none()
         );
-        assert!(
-            processor
-                .detector
-                .force_mapped_candidates(
-                    "ghbdtn",
-                    Language::English,
-                    &[(Language::Russian, "привет".to_owned())]
-                )
-                .is_none()
-        );
+        // Pause cycles only through the enabled languages: the Estonian reading of the keys is
+        // the typed text itself.
+        assert_eq!(pause_result(&mut processor, &diagnostics), "identical");
         processor.apply_configuration_reload(Err(std::io::Error::other("invalid configuration")));
         assert!(
             processor
@@ -12450,10 +12491,16 @@ mod tests {
                 .detect("ghbdtn", Language::English)
                 .is_none()
         );
-        for selected in [vec!["ru-RU"], vec!["de-DE"], vec!["en", "ru-RU"]] {
+        // Pause needs two enabled languages with a layout, the typed one among them.
+        for (selected, pause) in [
+            (vec!["ru-RU"], "single-layout"),
+            (vec!["de-DE"], "single-layout"),
+            (vec!["en", "ru-RU"], "single-layout"),
+            (vec!["ru-RU", "et-EE"], "unsupported-layout"),
+        ] {
             let mut snapshot = test_reload_snapshot("private.exe");
             snapshot.settings.enabled_input_packs = selected
-                .into_iter()
+                .iter()
                 .map(|id| autokeyboardlayot::PackId::parse(id).unwrap())
                 .collect();
             snapshot.dictionaries = dictionary_snapshot(&snapshot.settings);
@@ -12479,6 +12526,11 @@ mod tests {
                     .is_none()
             );
             assert!(processor.exclusion_policy.is_excluded("private.exe"));
+            assert_eq!(
+                pause_result(&mut processor, &diagnostics),
+                pause,
+                "{selected:?}"
+            );
         }
         processor.apply_configuration_reload(Ok(test_reload_snapshot("private.exe")));
         assert!(
@@ -12487,6 +12539,7 @@ mod tests {
                 .detect("ghbdtn", Language::English)
                 .is_some()
         );
+        assert_eq!(pause_result(&mut processor, &diagnostics), "ru-RU");
     }
 
     #[test]

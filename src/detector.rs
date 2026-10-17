@@ -626,64 +626,6 @@ impl Detector {
         chosen
     }
 
-    /// Explicitly convert the current word without automatic thresholds or a
-    /// source-dictionary veto. A unique dictionary-backed target is preferred;
-    /// otherwise the best target must have a clear score lead.
-    pub fn force_mapped_candidates(
-        &self,
-        word: &str,
-        current_language: Language,
-        candidates: &[(Language, String)],
-    ) -> Option<Detection> {
-        self.dictionaries.active_language(current_language)?;
-        if word.is_empty() {
-            return None;
-        }
-        let source_score = score_word(
-            word,
-            current_language,
-            &self.user_dictionary,
-            &self.dictionaries,
-        );
-        let mut dictionary_candidates = Vec::new();
-        let mut other_candidates = Vec::new();
-        for (target_language, replacement) in
-            self.resolve_candidates(word, current_language, candidates)
-        {
-            if self.dictionaries.active_language(target_language).is_none()
-                || replacement.is_empty()
-                || !self.accepts_word(target_language, &replacement)
-            {
-                continue;
-            }
-            let target_score = score_word(
-                &replacement,
-                target_language,
-                &self.user_dictionary,
-                &self.dictionaries,
-            );
-            let detection = Detection {
-                source_language: current_language,
-                target_language,
-                original: word.to_owned(),
-                replacement,
-                source_score,
-                target_score,
-            };
-            if self.dictionary_contains(target_language, &detection.replacement) {
-                dictionary_candidates.push(detection);
-            } else {
-                other_candidates.push(detection);
-            }
-        }
-
-        if dictionary_candidates.is_empty() {
-            choose_clear_best(other_candidates)
-        } else {
-            choose_clear_best(dictionary_candidates)
-        }
-    }
-
     /// The languages of `readings` (one word read in several layouts) from the most to the least
     /// plausible reading. The word score decides, which includes the dictionary bonus; equal
     /// scores keep the given order. The hotkey sends a word to the first of them.
@@ -755,18 +697,6 @@ impl Detector {
         }
         resolved
     }
-}
-
-fn choose_clear_best(mut candidates: Vec<Detection>) -> Option<Detection> {
-    candidates.sort_by(|left, right| right.target_score.total_cmp(&left.target_score));
-    let best = candidates.first()?;
-    if candidates
-        .get(1)
-        .is_some_and(|second| best.target_score - second.target_score < 1.0)
-    {
-        return None;
-    }
-    Some(best.clone())
 }
 
 fn score_word(
@@ -1414,6 +1344,12 @@ mod tests {
 
     use crate::{DictionaryPack, PackId};
 
+    /// Pause, the agent's layout cycle, converts only between languages that have an input
+    /// profile, as automatic conversion does.
+    fn pause_cannot_convert(detector: &Detector, source: Language, target: Language) -> bool {
+        detector.input_profile(source).is_none() || detector.input_profile(target).is_none()
+    }
+
     fn custom_us_pack(id: PackId, profiles: &[&str]) -> DictionaryPack {
         let rows: Vec<_> = profiles
             .iter()
@@ -1483,11 +1419,6 @@ mod tests {
         assert!(
             detector
                 .detect_mapped_candidates("жжжжж", Language::Russian, &invalid)
-                .is_none()
-        );
-        assert!(
-            detector
-                .force_mapped_candidates("жжжжж", Language::Russian, &invalid)
                 .is_none()
         );
     }
@@ -1560,11 +1491,6 @@ mod tests {
         assert_eq!(detection.replacement, "hello");
         assert!(
             detector
-                .force_mapped_candidates("ghbdtn", custom, &[])
-                .is_some()
-        );
-        assert!(
-            detector
                 .detect_mapped_candidates(
                     "руддщ",
                     Language::Russian,
@@ -1588,15 +1514,6 @@ mod tests {
         for id in [custom, Language::English] {
             assert_eq!(previous.input_profile(id), None);
             assert!(previous.automatic_targets(id).next().is_none());
-            assert!(
-                previous
-                    .force_mapped_candidates(
-                        "ghbdtn",
-                        id,
-                        &[(Language::Russian, "привет".to_owned())]
-                    )
-                    .is_none()
-            );
         }
         registry.set_enabled([custom, Language::Russian]).unwrap();
         let next = Detector::with_registry(Default::default(), Arc::new(registry));
@@ -1615,11 +1532,6 @@ mod tests {
         let detector = Detector::with_registry(Default::default(), Arc::new(registry));
         assert_eq!(detector.input_profile(custom), None);
         assert!(detector.detect("ghbdtn", custom).is_none());
-        assert!(
-            detector
-                .force_mapped_candidates("ghbdtn", custom, &[])
-                .is_none()
-        );
     }
 
     #[test]
@@ -1647,10 +1559,6 @@ mod tests {
                 Detector::with_profile_selections(Default::default(), registry.clone(), &changed);
             assert_eq!(next.input_profile(custom), None);
             assert!(next.detect("ghbdtn", custom).is_none());
-            assert!(
-                next.force_mapped_candidates("ghbdtn", custom, &[])
-                    .is_none()
-            );
             assert_eq!(selected.input_profile(custom), Some(us));
         }
         selected.set_resolved_profiles(None);
@@ -1777,11 +1685,7 @@ mod tests {
                     .detect_mapped_candidates(word, source, &candidates)
                     .is_none()
             );
-            assert!(
-                detector
-                    .force_mapped_candidates(word, source, &candidates)
-                    .is_none()
-            );
+            assert!(pause_cannot_convert(&detector, source, target));
         }
     }
 
@@ -1843,11 +1747,7 @@ mod tests {
                         .detect_mapped_candidates(word, source, &candidates)
                         .is_none()
                 );
-                assert!(
-                    detector
-                        .force_mapped_candidates(word, source, &candidates)
-                        .is_none()
-                );
+                assert!(pause_cannot_convert(&detector, source, target));
                 assert!(old_detector.detect(word, source).is_some());
             }
         }
@@ -1958,11 +1858,7 @@ mod tests {
                     .detect_mapped_candidates(word, source, &candidates)
                     .is_none()
             );
-            assert!(
-                detector
-                    .force_mapped_candidates(word, source, &candidates)
-                    .is_none()
-            );
+            assert!(pause_cannot_convert(&detector, source, target));
         }
     }
 
@@ -2043,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_source_or_target_fails_closed_even_with_user_words_and_forcing() {
+    fn absent_source_or_target_fails_closed_even_with_user_words() {
         for selected in [
             vec![],
             vec!["en-US"],
@@ -2072,11 +1968,7 @@ mod tests {
                         .detect_mapped_candidates(word, source, &candidates)
                         .is_none()
                 );
-                assert!(
-                    detector
-                        .force_mapped_candidates(word, source, &candidates)
-                        .is_none()
-                );
+                assert!(pause_cannot_convert(&detector, source, target));
             }
         }
     }
@@ -2142,15 +2034,11 @@ mod tests {
             .set_enabled(["en-US", "ja-JP"].map(|id| PackId::parse(id).unwrap()))
             .unwrap();
         let detector = Detector::with_registry(DetectorConfig::default(), Arc::new(registry));
-        assert!(
-            detector
-                .force_mapped_candidates(
-                    "hello",
-                    Language::English,
-                    &[(Language::Japanese, "こんにちは".to_owned())]
-                )
-                .is_none()
-        );
+        assert!(pause_cannot_convert(
+            &detector,
+            Language::English,
+            Language::Japanese
+        ));
         assert!(
             detector
                 .detect_mapped_candidates(
@@ -2313,38 +2201,6 @@ mod tests {
         assert_eq!(
             detector.detect_mapped_candidates("абвгд", Language::Russian, &candidates),
             None
-        );
-    }
-
-    #[test]
-    fn force_conversion_handles_a_short_word_without_automatic_thresholds() {
-        let detector = crate::test_support::configured_detector(DetectorConfig {
-            minimum_word_characters: 4,
-            ..DetectorConfig::default()
-        });
-        let candidates = [
-            (Language::Russian, "не".to_owned()),
-            (Language::Estonian, "yt".to_owned()),
-        ];
-        assert_eq!(detector.detect("yt", Language::English), None);
-        let forced = detector
-            .force_mapped_candidates("yt", Language::English, &candidates)
-            .expect("explicit conversion should select Russian");
-        assert_eq!(forced.target_language, Language::Russian);
-        assert_eq!(forced.replacement, "не");
-    }
-
-    #[test]
-    fn force_conversion_bypasses_an_automatic_word_exclusion() {
-        let mut detector = crate::test_support::detector();
-        let mut exclusions = UserLexicon::default();
-        assert!(exclusions.insert(Language::English, "ghbdtn"));
-        detector.replace_user_lexicons(UserLexicon::default(), exclusions);
-        let candidates = [(Language::Russian, "привет".to_owned())];
-        assert!(
-            detector
-                .force_mapped_candidates("ghbdtn", Language::English, &candidates)
-                .is_some()
         );
     }
 

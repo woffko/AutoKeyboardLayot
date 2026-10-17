@@ -540,13 +540,9 @@ mod tests {
                 .is_none()
         );
         assert!(
-            detector
-                .force_mapped_candidates(
-                    "ghbdtn",
-                    crate::Language::English,
-                    &[(crate::Language::Russian, "привет".to_owned())]
-                )
-                .is_none()
+            !detector
+                .automatic_targets(crate::Language::English)
+                .any(|target| target == crate::Language::Russian)
         );
         detector.set_resolved_profiles(Some(&snapshot));
         assert!(detector.detect("руддщ", crate::Language::Russian).is_some());

@@ -157,18 +157,8 @@ impl InputSession {
     }
 
     /// Finish the current word using target strings mapped from the same
-    /// physical keys by a platform adapter.
-    pub fn finish_boundary_with_candidates(
-        &mut self,
-        current_language: Option<Language>,
-        detector: &Detector,
-        candidates: &[(Language, String)],
-    ) -> SessionAction {
-        self.finish_boundary(current_language, detector, Some((candidates, &[])))
-    }
-
-    /// As finish_boundary_with_candidates, also passing the languages (not
-    /// the text) of recent words to the optional layout model.
+    /// physical keys by a platform adapter, and the languages (not the text)
+    /// of recent words for the optional layout model.
     pub fn finish_boundary_in_context(
         &mut self,
         current_language: Option<Language>,
@@ -177,31 +167,6 @@ impl InputSession {
         previous: &[Language],
     ) -> SessionAction {
         self.finish_boundary(current_language, detector, Some((candidates, previous)))
-    }
-
-    /// Explicitly evaluate the word still under the caret without typing a
-    /// boundary. The buffer is consumed only when a target is selected.
-    pub fn force_current_word_with_candidates(
-        &mut self,
-        current_language: Option<Language>,
-        detector: &Detector,
-        candidates: &[(Language, String)],
-    ) -> SessionAction {
-        if self.suppressed_until_boundary || self.current_word.is_empty() {
-            return SessionAction::None;
-        }
-        let Some(language) = current_language else {
-            return SessionAction::None;
-        };
-        let Some(detection) =
-            detector.force_mapped_candidates(&self.current_word, language, candidates)
-        else {
-            return SessionAction::None;
-        };
-        self.current_word.clear();
-        self.backspace_remaining = None;
-        self.current_word_started_at_line_start = false;
-        SessionAction::Candidate(detection)
     }
 
     pub fn buffered_character_count(&self) -> usize {
@@ -539,41 +504,16 @@ mod tests {
                 SessionAction::None
             );
         }
-        let action = session.finish_boundary_with_candidates(
+        let action = session.finish_boundary_in_context(
             Some(Language::English),
             &detector,
             &[(Language::Estonian, "tere".to_owned())],
+            &[],
         );
         let SessionAction::Candidate(detection) = action else {
             panic!("expected Estonian candidate");
         };
         assert_eq!(detection.target_language, Language::Estonian);
-        assert_eq!(session.buffered_character_count(), 0);
-    }
-
-    #[test]
-    fn force_conversion_consumes_a_short_word_without_a_boundary() {
-        let detector = crate::test_support::detector();
-        let mut session = InputSession::default();
-        for character in "yt".chars() {
-            session.handle(
-                InputEvent::Printable(character),
-                Some(Language::English),
-                &detector,
-            );
-        }
-        let action = session.force_current_word_with_candidates(
-            Some(Language::English),
-            &detector,
-            &[
-                (Language::Russian, "не".to_owned()),
-                (Language::Estonian, "yt".to_owned()),
-            ],
-        );
-        let SessionAction::Candidate(detection) = action else {
-            panic!("expected forced short-word candidate");
-        };
-        assert_eq!(detection.replacement, "не");
         assert_eq!(session.buffered_character_count(), 0);
     }
 
@@ -656,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_word_can_be_forced_and_bounds_are_checked() {
+    fn restored_word_bounds_are_checked() {
         let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.handle(InputEvent::UnsupportedInput, None, &detector);
