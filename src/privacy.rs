@@ -77,9 +77,15 @@ impl ExclusionPolicy {
         }
     }
 
+    /// An entry without an extension ("Signal", "KeePass") names the program by its file stem:
+    /// a Windows image name always has an extension, so the entry alone would never match.
     pub fn is_excluded(&self, path_or_name: &str) -> bool {
-        normalize_executable_name(path_or_name)
-            .is_some_and(|name| self.executable_names.contains(&name))
+        normalize_executable_name(path_or_name).is_some_and(|name| {
+            self.executable_names.contains(&name)
+                || name.rsplit_once('.').is_some_and(|(stem, _)| {
+                    !stem.is_empty() && self.executable_names.contains(stem)
+                })
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -128,6 +134,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_entry_without_an_extension_matches_the_program_by_its_stem() {
+        let policy = ExclusionPolicy::from_lines(["Signal", "keepass.exe", "my.app"]);
+        assert!(policy.is_excluded(r"C:\Users\u\AppData\Local\Programs\signal-desktop\Signal.exe"));
+        assert!(policy.is_excluded("KeePass.exe"));
+        assert!(policy.is_excluded("my.app.exe"));
+        assert!(!policy.is_excluded("SignalR.exe"));
+        assert!(!policy.is_excluded("keepass"));
+        assert!(!policy.is_excluded(".exe"));
     }
 
     #[test]
