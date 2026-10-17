@@ -113,9 +113,11 @@ hosts probe the focused UIA element for one collapsed selection, an editable
 control type, and an exact preceding source string before the clipboard is
 opened. The probe walks a bounded ancestor chain but accepts text access only
 from the exact foreground process; password or property errors fail closed. A
-mismatch never falls back to replay. If UIA is wholly unavailable and the
-explicit fallback setting is enabled, physical replay performs the correction
-without opening the clipboard. Physical keys arriving during a
+mismatch never falls back to replay. Without UIA nothing is converted: no field
+can be checked for a password, so privacy fails closed. The explicit fallback
+setting allows physical replay, without opening the clipboard, only when UIA works
+but the probe cannot resolve the editable control for one of the safe reasons
+listed below. Physical keys arriving during a
 correction are held and replayed after the correction. Held input is
 released only through the
 first Space-down; the worker then either hands the still-closed gate to that
@@ -184,7 +186,11 @@ first new word; only a real queue overflow keeps suppression until a boundary.
 Session identity uses the stable top-level window and process, while the
 focused input thread is tracked separately for HKL and focused-child routing.
 Ordinary focus changes and mouse clicks re-check privacy on the first printable
-key without suppressing that first word.
+key without suppressing that first word. Esc, the function keys and the menu key,
+which can move the focus inside a window, do the same. A field check that was still
+running when such a key, Tab, Enter, a click or a shortcut arrived never decides
+the field after it. A new foreground window always has its program read again, so
+a program that reuses the process ID of a closed one does not inherit its verdict.
 
 The focused field of the foreground window is also checked periodically: every
 half second while checks are fast, and when a check is slow, after twenty times
@@ -301,8 +307,13 @@ bounded queue writes `%LOCALAPPDATA%\AutoKeyboardLayot\diagnostics.log`. The
 log contains timestamps, process basename and PID, backend stages, language
 IDs, word lengths, gate results, edit outcomes, reset and discard categories,
 the reasons that blocked a shutdown, and one result for every typed word that was
-not converted (`event=word result=` `no-candidate`, `manual-only`, `privacy`,
-`suppressed` or `no-language`), never the word. A suppressed word also names what
+not converted (`event=word result=` `no-candidate`, `manual-only`,
+`suppressed` or `no-language`), never the word. While privacy blocks the field (a
+password field, or an excluded, elevated or uninspectable program or field),
+nothing about the typing there is written at all: no key, word, candidate, Pause,
+queue or field-check line, and switching to a blocked program leaves no line
+either, because even a counter or a timestamp per key would tell a secret's length
+and rhythm. A suppressed word also names what
 cancelled it (`reset=` `unsupported`, `layout`, `shortcut`, `mouse`, `focus`,
 `backspace`, `delete`, `navigation` or `external-input`), and an unsupported key is
 logged by class only (`class=no-character` for a key that prints nothing,
@@ -314,8 +325,13 @@ check lines name what asked for them (`trigger=`) and say when a late answer kep
 an earlier verdict (`source=recent-ok age_ms=`). It never records key codes, scan
 codes, characters, words, clipboard contents, window titles, URLs, file names,
 or message text; the test `diagnostics_never_log_key_identity` checks every
-diagnostic format string. The file rotates at 1 MiB and has no network
-transport. Earlier builds logged the virtual-key code of unsupported keys
+diagnostic format string and the functions that build line details, and rejects a
+text value passed other than as a count. The file rotates at 1 MiB and has no
+network transport. When the full log cannot be moved aside (a viewer holds it open
+without allowing that, say), records still go into it up to 2 MiB, and then it
+starts again. Records that could not be written, records dropped from a full queue
+and failed rotations are counted; while that count is not zero the tray tooltip
+shows `log errors: N`. Earlier builds logged the virtual-key code of unsupported keys
 (including digits) as `vk=`; delete `diagnostics*.log` files written by them.
 
 `crash.log` in the same folder is always written, independent of
@@ -363,7 +379,14 @@ minute), `phase=auto_resumed`, `phase=auto_resume_declined`, `event=ui_stall`
 The protected-paste backend selects the word it is about to replace. If the
 selection cannot be confirmed to hold exactly that word, or the paste does not
 complete, the selection is collapsed to its end instead of being left behind to
-be typed over; a selection the user made is never touched. When the text edit is
+be typed over; a selection the user made is never touched. A selection call that
+reports failure is collapsed too, as the field may have applied it, and a second
+Pause attempt collapses the first attempt's selection when it shows up late. The
+collapse is read back: when the field does not show the selection gone within
+200 ms (a busy or hung field), the keys typed after the Space are kept for
+recovery instead of being replayed over the word, automatic conversion pauses
+(`selection-left`), and the log records `phase=cleanup result=Unverified` and
+`cleanup=` in the selection report. When the text edit is
 confirmed but the previous clipboard contents cannot be put back (restoring
 waits up to 60 ms for the clipboard), the conversion still counts as done:
 automatic conversion stays on and the diagnostics log records
@@ -375,7 +398,13 @@ returns), every later check used to report "queue busy" and privacy stayed
 unavailable for good. A provider that keeps the queue busy for 5 seconds is now
 abandoned and replaced by a fresh one on a new thread, at most three times; the
 diagnostics log records `event=probe respawned=N`, and the hung thread is never
-joined.
+joined. The other UI Automation calls of an edit run on the worker itself. When the
+worker is still busy two seconds after a gate broke for a cause that hands its keys
+back without being asked (its deadline, a full gate, a full input queue or a hook
+reinstall), the UI thread hands the keys back itself, provided the input target is
+the same, nothing was typed or clicked since and no modifier key is held, no
+password field or excluded or elevated program was found, and the worker is not
+inside an edit that may have selected or typed text (`phase=recovery_handed_back`).
 
 The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
 the tray icon is added again, and if Explorer is not ready yet the addition is
@@ -427,7 +456,8 @@ to train a model for other languages.
 The Windows adapter blocks known password-manager/system credential processes
 by default. Additional executable names are managed on the
 process-exclusions page; the built-in security list cannot be removed by a
-user profile.
+user profile. An entry without an extension (`Signal`, `KeePass`) matches the
+program of that name whatever its extension.
 
 ## Local checks
 
