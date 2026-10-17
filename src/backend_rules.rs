@@ -172,7 +172,9 @@ fn normalize_process_path(path_or_name: &str) -> Option<String> {
     {
         return None;
     }
-    Some(value.replace('/', "\\").to_ascii_lowercase())
+    // Unicode lowercasing, as for program exclusions: a path with non-ASCII letters (a user
+    // folder in Cyrillic) matches its rule whatever the case Windows reports.
+    Some(value.replace('/', "\\").to_lowercase())
 }
 
 #[cfg(test)]
@@ -229,6 +231,22 @@ mod tests {
         assert_eq!(
             BackendRules::from_lines(["#app.exe = observe-only"]).unwrap(),
             BackendRules::from_lines(std::iter::empty::<&str>()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rule_matches_a_path_whatever_the_case_of_its_non_ascii_letters() {
+        let rules =
+            BackendRules::from_lines(["d:\\профили\\иван\\apps\\editor.exe = physical-replay"])
+                .unwrap();
+        assert_eq!(
+            rules.resolve("D:\\Профили\\Иван\\Apps\\editor.exe"),
+            BackendStrategy::PhysicalReplay
+        );
+        let rules = BackendRules::from_lines(["РЕДАКТОР.EXE = observe-only"]).unwrap();
+        assert_eq!(
+            rules.resolve("D:\\Tools\\редактор.exe"),
+            BackendStrategy::ObserveOnly
         );
     }
 
