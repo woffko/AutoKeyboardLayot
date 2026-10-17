@@ -406,6 +406,9 @@ struct ObserverMetrics {
     worker_busy: AtomicBool,
     // The worker is inside an edit that may have selected or typed text in the field.
     edit_in_flight: AtomicBool,
+    // The gate whose paste may have left the word selected: its held keys come back only when the
+    // user asks for them.
+    selection_left_token: AtomicU64,
     // Set when the input worker gave up after repeated internal faults.
     worker_dead: AtomicBool,
     // Gate release requests made by the worker, counted before any window is involved.
@@ -456,6 +459,7 @@ impl Default for ObserverMetrics {
             privacy_refresh_queued: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
             edit_in_flight: AtomicBool::new(false),
+            selection_left_token: AtomicU64::new(0),
             worker_dead: AtomicBool::new(false),
             gate_release_requests: AtomicU64::new(0),
             clipboard_restore_failures: AtomicU64::new(0),
@@ -5104,6 +5108,8 @@ struct HandBackFacts {
     worker_stalled: bool,
     /// `AppState::typed_input` now.
     typed_input: u64,
+    /// The gate whose paste may have left the word selected (`ObserverMetrics`).
+    selection_left_token: u64,
     modifiers_released: bool,
     current: Option<ForegroundContext>,
     privacy: Option<PrivacyBlockReason>,
@@ -5127,6 +5133,7 @@ fn hand_back_stalled_retained_input(
             worker_stalled: state.metrics.worker_busy.load(Ordering::Acquire)
                 && !state.metrics.edit_in_flight.load(Ordering::Acquire),
             typed_input: state.typed_input,
+            selection_left_token: state.metrics.selection_left_token.load(Ordering::Acquire),
             modifiers_released,
             current,
             privacy: privacy_reason_from_code(state.metrics.privacy_reason.load(Ordering::Acquire)),
@@ -5161,14 +5168,16 @@ fn hand_back_stalled_retained_input(
 /// Whether the UI thread hands a retained record back itself: the record is one that comes back
 /// automatically, is not being sent and was certainly never typed; the worker has been busy for
 /// `STALLED_WORKER_HAND_BACK_MS` since the keys were retained, but not inside an edit that may
-/// have selected or typed text; nothing was typed or clicked since, and no modifier is held; the
-/// input target is still the record's; and no positive privacy finding keeps the keys back.
+/// have selected or typed text; nothing was typed or clicked since, and no modifier is held; no
+/// paste of its gate may have left the word selected; the input target is still the record's;
+/// and no positive privacy finding keeps the keys back.
 fn stalled_worker_may_hand_back(input: &RetainedInput, facts: HandBackFacts) -> bool {
     input.auto_recover
         && !input.recovering
         && !input.delivery_uncertain
         && facts.worker_stalled
         && facts.typed_input == input.input_mark
+        && facts.selection_left_token != input.token
         && facts.modifiers_released
         && facts.now.saturating_duration_since(input.retained_at)
             >= Duration::from_millis(STALLED_WORKER_HAND_BACK_MS)
@@ -7378,6 +7387,18 @@ impl InputProcessor {
         if record.delivery_uncertain && !explicit {
             return;
         }
+        // The paste of this gate may have left the word selected: replaying the keys would type
+        // over it, so only the user brings them back.
+        if !explicit && self.metrics.selection_left_token.load(Ordering::Acquire) == record.token {
+            self.diagnostic(
+                "recovery",
+                format!(
+                    "token={} result=retained reason=selection-left",
+                    record.token
+                ),
+            );
+            return;
+        }
         if !self.input_sequence_is_current(sequence) || !self.foreground_matches(record.foreground)
         {
             self.diagnostic(
@@ -9120,23 +9141,47 @@ impl InputProcessor {
                 return None;
             }
         }
-        match self.wait_for_replay_commit(
+        let commit = self.wait_for_replay_commit(
             pending.foreground,
             input_sequence,
             target_layout.0 as usize,
-        ) {
-            ReplayAttempt::Applied => Some(EditStrategy::PhysicalReplay),
+        );
+        self.finish_replay_commit(
+            commit,
+            input_sequence,
+            target_layout.0 as usize,
+            "conversion",
+        )
+        .then_some(EditStrategy::PhysicalReplay)
+    }
+
+    /// What the commit wait of a physical replay found. Every key was sent by then: a guard lost
+    /// while waiting (new input, a click) leaves the edit applied but unconfirmed, which is logged
+    /// as `applied-uncertain` under `event`. True when the edit is confirmed.
+    fn finish_replay_commit(
+        &mut self,
+        commit: ReplayAttempt,
+        sequence: u64,
+        layout: usize,
+        event: &'static str,
+    ) -> bool {
+        match commit {
+            ReplayAttempt::Applied => true,
             ReplayAttempt::Cancelled => {
-                self.layout_switch_in_flight = Some((
-                    target_layout.0 as usize,
-                    Instant::now() + Duration::from_secs(1),
-                ));
+                self.diagnostic(
+                    event,
+                    format!(
+                        "sequence={sequence} result=applied-uncertain strategy=PhysicalReplay evidence=input-submitted-guard-lost"
+                    ),
+                );
+                self.layout_switch_in_flight =
+                    Some((layout, Instant::now() + Duration::from_secs(1)));
                 self.session.clear();
-                None
+                false
             }
             ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::ReplayCommit);
-                None
+                false
             }
         }
     }
@@ -9378,24 +9423,14 @@ impl InputProcessor {
                         return;
                     }
                 }
-                match self.wait_for_replay_commit(
+                let commit = self.wait_for_replay_commit(
                     record.foreground,
                     pause_sequence,
                     record.source_layout,
-                ) {
-                    ReplayAttempt::Applied => {}
-                    ReplayAttempt::Cancelled => {
-                        self.layout_switch_in_flight = Some((
-                            record.source_layout,
-                            Instant::now() + Duration::from_secs(1),
-                        ));
-                        self.session.clear();
-                        return;
-                    }
-                    ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
-                        self.record_conversion_failure(ConversionFailureReason::ReplayCommit);
-                        return;
-                    }
+                );
+                if !self.finish_replay_commit(commit, pause_sequence, record.source_layout, "undo")
+                {
+                    return;
                 }
             }
         }
@@ -9573,14 +9608,11 @@ impl InputProcessor {
             );
             // The paste may not have replaced the selected word: do not leave our selection
             // behind, unless the user has already moved on.
-            if self.edit_guard_is_current(foreground, input_sequence) {
-                return self.abandon_selection(
-                    foreground,
-                    input_sequence,
-                    TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
-                );
-            }
-            return TextEditAttempt::Failed(ConversionFailureReason::TextCommit);
+            return self.abandon_selection(
+                foreground,
+                input_sequence,
+                TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
+            );
         }
         let owned_before_restore = clipboard.is_current();
         let clipboard_restored = clipboard.restore();
@@ -9628,15 +9660,25 @@ impl InputProcessor {
         );
     }
 
-    /// Collapses the agent's selection when a paste does not go ahead after the word was
-    /// selected. The attempt ends as `outcome` when the field shows the selection gone, and as
-    /// `SelectionLeft` when it cannot be shown gone.
+    /// Ends a paste that does not go ahead after the word was selected. While the input target
+    /// and its input are still the edit's, the selection is collapsed: the attempt ends as
+    /// `outcome` when the field shows it gone, and as `SelectionLeft` when it cannot be shown
+    /// gone. Once the user acted (new input, a click, another field), what is selected may be
+    /// theirs and is left alone; it may still be the agent's selection, so the attempt ends as
+    /// `SelectionLeft` too, which keeps the held keys from being typed over it.
     fn abandon_selection(
         &self,
         foreground: ForegroundContext,
         input_sequence: u64,
         outcome: TextEditAttempt,
     ) -> TextEditAttempt {
+        if !self.edit_guard_is_current(foreground, input_sequence) {
+            self.diagnostic(
+                "paste",
+                format!("sequence={input_sequence} phase=cleanup result=skipped reason=input-or-focus-changed"),
+            );
+            return TextEditAttempt::SelectionLeft;
+        }
         let cleanup = self
             .privacy_guard
             .collapse_selection_to_end(foreground.process_id);
@@ -9698,8 +9740,12 @@ impl InputProcessor {
             }
             TextEditAttempt::SelectionLeft => {
                 // The field may still show the word selected: the keys the gate holds would type
-                // over it, so they are kept for recovery instead of being replayed.
+                // over it, so they are kept for recovery instead of being replayed, and come back
+                // only when the user asks for them.
                 self.held_keys_kept_for = Some(sequence);
+                self.metrics
+                    .selection_left_token
+                    .store(sequence, Ordering::Release);
                 self.record_conversion_failure(ConversionFailureReason::SelectionLeft);
                 None
             }
@@ -18404,6 +18450,7 @@ mod tests {
             now: now + Duration::from_millis(STALLED_WORKER_HAND_BACK_MS),
             worker_stalled: true,
             typed_input: 0,
+            selection_left_token: 0,
             modifiers_released: true,
             current: Some(foreground),
             privacy: None,
@@ -18443,6 +18490,13 @@ mod tests {
                 "modifier held",
                 HandBackFacts {
                     modifiers_released: false,
+                    ..ready
+                },
+            ),
+            (
+                "its paste may have left the word selected",
+                HandBackFacts {
+                    selection_left_token: record.token,
                     ..ready
                 },
             ),
@@ -19092,6 +19146,119 @@ mod tests {
         assert_eq!(
             conversion_failure_label(ConversionFailureReason::LayoutSwitch as u8),
             "layout-switch"
+        );
+    }
+
+    #[test]
+    fn a_replay_that_lost_its_guard_after_sending_is_logged_as_applied_uncertain() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        type_letters(&mut processor, "hel");
+        assert!(!processor.finish_replay_commit(ReplayAttempt::Cancelled, 9, 0x0419, "conversion"));
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert_eq!(
+            processor.layout_switch_in_flight.map(|(layout, _)| layout),
+            Some(0x0419)
+        );
+        // Every key was sent: this is no failed edit.
+        assert!(processor.metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(!processor.finish_replay_commit(ReplayAttempt::Cancelled, 10, 0x0409, "undo"));
+        let lines: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.contains("result=applied-uncertain"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("event=conversion ") && lines[0].contains("sequence=9"));
+        assert!(lines[1].starts_with("event=undo ") && lines[1].contains("sequence=10"));
+        assert!(processor.finish_replay_commit(ReplayAttempt::Applied, 11, 0x0409, "conversion"));
+        assert!(!processor.finish_replay_commit(ReplayAttempt::Failed, 12, 0x0409, "conversion"));
+        assert_eq!(
+            processor
+                .metrics
+                .last_failure_reason
+                .load(Ordering::Acquire),
+            ConversionFailureReason::ReplayCommit as u8
+        );
+    }
+
+    #[test]
+    fn a_paste_abandoned_after_the_user_acted_leaves_the_selection_alone() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        let foreground = test_foreground();
+        processor.privacy_guard = PrivacyGuard {
+            automation: None,
+            com_initialized: false,
+            last_barrier_report: Cell::new(TextBarrierReport::default()),
+        };
+        // The input is still the edit's: the selection is collapsed (here it cannot be shown
+        // gone, without UI Automation).
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(5, Ordering::Release);
+        assert_eq!(
+            processor.abandon_selection(foreground, 5, TextEditAttempt::Cancelled),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().cleanup,
+            Some(SelectionCleanup::Unverified)
+        );
+        // The user typed or clicked since: what is selected may be theirs and is not touched.
+        processor
+            .privacy_guard
+            .last_barrier_report
+            .set(TextBarrierReport::default());
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(6, Ordering::Release);
+        assert_eq!(
+            processor.abandon_selection(foreground, 5, TextEditAttempt::Cancelled),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(processor.privacy_guard.last_barrier_report().cleanup, None);
+        let cleanups: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.contains("phase=cleanup"))
+            .collect();
+        assert_eq!(cleanups.len(), 2, "{cleanups:?}");
+        assert!(cleanups[0].contains("result=Unverified"), "{cleanups:?}");
+        assert!(cleanups[1].contains("result=skipped"), "{cleanups:?}");
+    }
+
+    #[test]
+    fn keys_whose_paste_may_have_left_the_word_selected_come_back_only_when_asked() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        *processor.metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 42,
+            ..stalled_record(Instant::now())
+        });
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 42, PasteRoute::Backend)
+                .is_none()
+        );
+        assert_eq!(
+            processor
+                .metrics
+                .selection_left_token
+                .load(Ordering::Acquire),
+            42
+        );
+        processor.recover_retained_input(50, false);
+        assert!(processor.metrics.retained_input.lock().unwrap().is_some());
+        assert!(
+            receiver
+                .try_iter()
+                .any(|record| record.contains("result=retained reason=selection-left"))
         );
     }
 }
