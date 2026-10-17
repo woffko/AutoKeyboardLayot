@@ -366,7 +366,9 @@ log contains timestamps, process basename and PID, backend stages, language
 IDs, word lengths, gate results, edit outcomes, reset and discard categories,
 the reasons that blocked a shutdown, and one result for every typed word that was
 not converted (`event=word result=` `no-candidate`, `manual-only`,
-`suppressed` or `no-language`), never the word. While privacy blocks the field (a
+`suppressed`, `no-language`, or `not-attempted` for a candidate with `reason=`
+`boundary` when Tab or Enter ended it, `automatic-off`, `shift`, `caps-lock` or
+`keys`), never the word. While privacy blocks the field (a
 password field, or an excluded, elevated or uninspectable program or field),
 nothing about the typing there is written at all: no key, word, candidate, Pause,
 queue or field-check line, and switching to a blocked program leaves no line

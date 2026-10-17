@@ -8095,24 +8095,36 @@ impl InputProcessor {
                 // handle_boundary explains an unconverted word by what cancelled it, so the
                 // boundary itself is recorded only after it.
                 self.last_word_reset = "boundary";
-                if let Some((transaction, replay_keys)) = completed
-                    && self.metrics.auto_enabled.load(Ordering::Acquire)
-                    && !self.modifiers.shift()
-                    && replay_keys.len() == transaction.original.chars().count()
-                    && replay_keys
+                if let Some((transaction, replay_keys)) = completed {
+                    // A candidate that is not converted says why, never what it was.
+                    let not_attempted = if !self.metrics.auto_enabled.load(Ordering::Acquire) {
+                        Some("automatic-off")
+                    } else if self.modifiers.shift() {
+                        Some("shift")
+                    } else if replay_keys.len() != transaction.original.chars().count() {
+                        Some("keys")
+                    } else if replay_keys
                         .iter()
-                        .all(|key| key.caps_lock == event.caps_lock)
-                {
-                    self.pending_conversion = Some(PendingConversion {
-                        transaction,
-                        foreground: event.foreground,
-                        source_layout: event.foreground.layout,
-                        profile_generation: self.input_profiles.generation(),
-                        space_down_sequence: event.sequence,
-                        replay_keys,
-                        forced: false,
-                        cycle_order: Vec::new(),
-                    });
+                        .any(|key| key.caps_lock != event.caps_lock)
+                    {
+                        Some("caps-lock")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = not_attempted {
+                        self.diagnostic("word", format!("result=not-attempted reason={reason}"));
+                    } else {
+                        self.pending_conversion = Some(PendingConversion {
+                            transaction,
+                            foreground: event.foreground,
+                            source_layout: event.foreground.layout,
+                            profile_generation: self.input_profiles.generation(),
+                            space_down_sequence: event.sequence,
+                            replay_keys,
+                            forced: false,
+                            cycle_order: Vec::new(),
+                        });
+                    }
                 }
                 if event.drain_token == 0 && self.metrics.auto_enabled.load(Ordering::Acquire) {
                     self.execute_pending_conversion(event.sequence);
@@ -8386,6 +8398,10 @@ impl InputProcessor {
                 );
                 let transaction = delimiter
                     .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter));
+                if transaction.is_none() {
+                    // Tab or Enter: the edit could not put the word back before them.
+                    self.diagnostic("word", "result=not-attempted reason=boundary".to_owned());
+                }
                 // The following words see this one as typed until its conversion is applied
                 // (finish_applied_conversion).
                 self.remember_word_language(detection.source_language);
@@ -21077,6 +21093,61 @@ mod tests {
             } else {
                 let cycle = processor.transpose_cycle.as_ref().expect("converted");
                 assert_eq!(cycle.text, "привет", "{lines:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_candidate_that_is_not_converted_says_why() {
+        // (automatic conversion on, the key that ends "ghbdtn", the reason logged)
+        let space = |sequence| (VK_SPACE, 0x39, 0, false, sequence);
+        for (automatic, (key, scan_code, held, caps_lock, sequence), reason) in [
+            (false, space(7), Some("automatic-off")),
+            (
+                true,
+                (VK_SPACE, 0x39, held_keys(&[VK_LSHIFT]), false, 8),
+                Some("shift"),
+            ),
+            (true, (VK_SPACE, 0x39, 0, true, 7), Some("caps-lock")),
+            (true, (VK_RETURN, 0x1c, 0, false, 7), Some("boundary")),
+            (true, space(7), None),
+        ] {
+            let (mut processor, diagnostics, foreground, _) = pause_processor(0x0409);
+            processor
+                .metrics
+                .auto_enabled
+                .store(automatic, Ordering::Release);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            if held != 0 {
+                processor.process_key(RawKeyEvent {
+                    scan_code: 0x2a,
+                    held_modifiers: held,
+                    foreground,
+                    ..test_raw_key(WM_KEYDOWN, VK_LSHIFT, 7, 0)
+                });
+            }
+            diagnostics.try_iter().for_each(drop);
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                held_modifiers: held,
+                caps_lock,
+                foreground,
+                ..test_raw_key(WM_KEYDOWN, key, sequence, 0)
+            });
+            let words: Vec<String> = diagnostics
+                .try_iter()
+                .filter(|line| line.starts_with("event=word "))
+                .collect();
+            match reason {
+                Some(reason) => {
+                    assert_eq!(words.len(), 1, "{words:?}");
+                    assert!(
+                        words[0].ends_with(&format!("result=not-attempted reason={reason}")),
+                        "{words:?}"
+                    );
+                }
+                None => assert!(words.is_empty(), "{words:?}"),
             }
         }
     }
