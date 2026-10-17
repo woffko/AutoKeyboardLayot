@@ -18,7 +18,7 @@ use std::{
 use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
 use autokeyboardlayot::conversion_sound::{self, SoundCue};
 use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
-use autokeyboardlayot::panic_guard::{FaultWindow, WorkerExit, guarded, run_contained};
+use autokeyboardlayot::panic_guard::{BusyGuard, FaultWindow, WorkerExit, guarded, run_contained};
 use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
 use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
@@ -205,6 +205,9 @@ const CORRECTION_GATE_CAPACITY: usize = 256;
 /// are then deleted, so that they cannot keep automatic conversion paused and Exit declined for
 /// hours. Preparing a recovery from the tray menu gives them this long again from then.
 const RETAINED_INPUT_LIFETIME_MS: u64 = 60_000;
+/// Held keys that the worker should hand back automatically are handed back by the UI thread
+/// when the worker is still busy this long after they were retained.
+const STALLED_WORKER_HAND_BACK_MS: u64 = 2_000;
 const TO_UNICODE_DO_NOT_CHANGE_KEYBOARD_STATE: u32 = 4;
 const PRIVACY_ALLOWED: u8 = 0;
 // Worker-only wait: the low-level hook never waits for UI Automation.
@@ -379,6 +382,8 @@ struct ObserverMetrics {
     cancelled_gate_token: AtomicU64,
     privacy_refresh_queued: AtomicBool,
     worker_busy: AtomicBool,
+    // The worker is inside an edit that may have selected or typed text in the field.
+    edit_in_flight: AtomicBool,
     // Set when the input worker gave up after repeated internal faults.
     worker_dead: AtomicBool,
     // Gate release requests made by the worker, counted before any window is involved.
@@ -428,6 +433,7 @@ impl Default for ObserverMetrics {
             cancelled_gate_token: AtomicU64::new(0),
             privacy_refresh_queued: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            edit_in_flight: AtomicBool::new(false),
             worker_dead: AtomicBool::new(false),
             gate_release_requests: AtomicU64::new(0),
             clipboard_restore_failures: AtomicU64::new(0),
@@ -540,6 +546,13 @@ struct RetainedInput {
     expires_at: Instant,
     /// The worker is sending these keys right now; the lifetime timer leaves the record alone.
     recovering: bool,
+    /// When the keys were retained.
+    retained_at: Instant,
+    /// The gate broke for a cause that hands its keys back without being asked (see
+    /// `hands_held_keys_back_automatically`).
+    auto_recover: bool,
+    /// `AppState::typed_input` when the keys were retained.
+    input_mark: u64,
 }
 
 struct CorrectionGate {
@@ -1599,6 +1612,10 @@ struct AppState {
     pending_key_releases: Vec<RawKeyEvent>,
     /// Held keys handed back unchanged after a contained internal fault.
     pending_held_replay: Vec<RawKeyEvent>,
+    /// Physical key-downs that reached the application, clicks and input injected by other
+    /// programs, counted by the hooks. Retained keys are handed back past a busy worker only when
+    /// none came after them, as they would land after that newer input.
+    typed_input: u64,
 }
 
 impl AppState {
@@ -1913,6 +1930,9 @@ impl AppState {
                     delivery_uncertain: cause == GateFailureCause::DownstreamHook,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                     recovering: false,
+                    retained_at: Instant::now(),
+                    auto_recover: hands_held_keys_back_automatically(cause),
+                    input_mark: self.typed_input,
                 });
                 retained = true;
             }
@@ -1945,15 +1965,7 @@ impl AppState {
             drained_count: 0,
             replay_succeeded: false,
         });
-        if retained
-            && matches!(
-                cause,
-                GateFailureCause::Deadline
-                    | GateFailureCause::Capacity
-                    | GateFailureCause::WorkerQueue
-                    | GateFailureCause::HookReinstall
-            )
-        {
+        if retained && hands_held_keys_back_automatically(cause) {
             let _ = self.enqueue(RawInputEvent::RecoverInput {
                 sequence,
                 explicit: false,
@@ -2089,6 +2101,9 @@ impl AppState {
                     delivery_uncertain: sent != 0,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                     recovering: false,
+                    retained_at: Instant::now(),
+                    auto_recover: false,
+                    input_mark: self.typed_input,
                 });
             }
         }
@@ -3552,6 +3567,7 @@ pub fn run() -> Result<()> {
                 diagnostic_worker: Some(diagnostic_worker),
                 pending_key_releases: Vec::new(),
                 pending_held_replay: Vec::new(),
+                typed_input: 0,
             });
         });
 
@@ -3674,6 +3690,11 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             finish_configuration_reload(hwnd);
             expire_correction_gate();
             expire_retained_input(hwnd, Instant::now());
+            hand_back_stalled_retained_input(
+                current_foreground_context(),
+                physical_modifiers_released(),
+                Instant::now(),
+            );
             // In case the message that normally sends them could not be posted.
             send_pending_held_keys();
             expire_lexicon_candidate();
@@ -3953,6 +3974,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                     drained_event = drained;
                     if event.flags.contains(LLKHF_INJECTED) && !drained {
                         state.break_correction_gate_fail_open(GateFailureCause::ExternalInjection);
+                        state.typed_input = state.typed_input.wrapping_add(1);
                         state
                             .metrics
                             .observed_input_sequence
@@ -4061,6 +4083,9 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         }
                     }
 
+                    if key_down && !drained {
+                        state.typed_input = state.typed_input.wrapping_add(1);
+                    }
                     let sequence = state
                         .metrics
                         .observed_input_sequence
@@ -4194,6 +4219,7 @@ unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT 
 /// A mouse button went down. A click, physical or injected by another program, may move the caret,
 /// so held keys must not be replayed after it: the gate breaks either way.
 fn observe_mouse_button(state: &mut AppState, injected: bool) {
+    state.typed_input = state.typed_input.wrapping_add(1);
     state
         .metrics
         .observed_input_sequence
@@ -4455,6 +4481,100 @@ fn fail_open_correction_gate(token: u64) {
             state.break_correction_gate_fail_open(GateFailureCause::WorkerAck);
         }
     });
+}
+
+/// Causes after which held keys come back without being asked: the worker recovers them once it
+/// sees the abort, or the UI thread does when the worker stays busy.
+const fn hands_held_keys_back_automatically(cause: GateFailureCause) -> bool {
+    matches!(
+        cause,
+        GateFailureCause::Deadline
+            | GateFailureCause::Capacity
+            | GateFailureCause::WorkerQueue
+            | GateFailureCause::HookReinstall
+    )
+}
+
+/// What the UI thread knows when it considers handing retained keys back past a busy worker.
+#[derive(Debug, Clone, Copy)]
+struct HandBackFacts {
+    now: Instant,
+    /// The worker is busy, and not inside an edit that may have selected or typed text.
+    worker_stalled: bool,
+    /// `AppState::typed_input` now.
+    typed_input: u64,
+    modifiers_released: bool,
+    current: Option<ForegroundContext>,
+    privacy: Option<PrivacyBlockReason>,
+}
+
+/// Hands held keys back from the UI thread when the worker that should recover them stays busy:
+/// a provider call that never returns would otherwise keep them until they are deleted. See
+/// `stalled_worker_may_hand_back` for when this is safe.
+fn hand_back_stalled_retained_input(
+    current: Option<ForegroundContext>,
+    modifiers_released: bool,
+    now: Instant,
+) {
+    APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let Some(state) = borrowed.as_mut() else {
+            return;
+        };
+        let facts = HandBackFacts {
+            now,
+            worker_stalled: state.metrics.worker_busy.load(Ordering::Acquire)
+                && !state.metrics.edit_in_flight.load(Ordering::Acquire),
+            typed_input: state.typed_input,
+            modifiers_released,
+            current,
+            privacy: privacy_reason_from_code(state.metrics.privacy_reason.load(Ordering::Acquire)),
+        };
+        let record = {
+            let mut retained = state
+                .metrics
+                .retained_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if retained
+                .as_ref()
+                .is_some_and(|input| stalled_worker_may_hand_back(input, facts))
+            {
+                retained.take()
+            } else {
+                None
+            }
+        };
+        let Some(record) = record else {
+            return;
+        };
+        state.gate_diagnostic(
+            "recovery_handed_back",
+            format!("token={} held={}", record.token, record.events.len()),
+        );
+        state.pending_held_replay.extend(record.events);
+        state.post_held_keys_return();
+    });
+}
+
+/// Whether the UI thread hands a retained record back itself: the record is one that comes back
+/// automatically, is not being sent and was certainly never typed; the worker has been busy for
+/// `STALLED_WORKER_HAND_BACK_MS` since the keys were retained, but not inside an edit that may
+/// have selected or typed text; nothing was typed or clicked since, and no modifier is held; the
+/// input target is still the record's; and no positive privacy finding keeps the keys back.
+fn stalled_worker_may_hand_back(input: &RetainedInput, facts: HandBackFacts) -> bool {
+    input.auto_recover
+        && !input.recovering
+        && !input.delivery_uncertain
+        && facts.worker_stalled
+        && facts.typed_input == input.input_mark
+        && facts.modifiers_released
+        && facts.now.saturating_duration_since(input.retained_at)
+            >= Duration::from_millis(STALLED_WORKER_HAND_BACK_MS)
+        && facts
+            .current
+            .is_some_and(|current| same_input_target(input.foreground, current))
+        && recovery_privacy_allows(facts.privacy)
 }
 
 /// Deletes held keys that were neither handed back nor recovered within their lifetime. They were
@@ -8606,6 +8726,9 @@ impl InputProcessor {
         patience: PastePatience,
     ) -> TextEditAttempt {
         let started = Instant::now();
+        // From the selection on, the field may show the word selected or replaced: the UI thread
+        // does not hand held keys back past a worker stuck in here.
+        let _edit = BusyGuard::new(&self.metrics.edit_in_flight);
         if !self.edit_guard_is_current(foreground, input_sequence) {
             self.diagnostic(
                 "paste",
@@ -8765,6 +8888,8 @@ impl InputProcessor {
         replay_keys: &[ReplayKey],
         delimiter: Option<char>,
     ) -> ReplayAttempt {
+        // Erasing and retyping may stop halfway: see perform_protected_paste.
+        let _edit = BusyGuard::new(&self.metrics.edit_in_flight);
         if !self.edit_guard_is_current(foreground, input_sequence) {
             return ReplayAttempt::Cancelled;
         }
@@ -10109,6 +10234,18 @@ const fn privacy_reason_code(reason: Option<PrivacyBlockReason>) -> u8 {
     }
 }
 
+/// The privacy finding a metric code stands for. Both kinds of unavailable inspection share one
+/// code, read back as the process-wide one.
+const fn privacy_reason_from_code(code: u8) -> Option<PrivacyBlockReason> {
+    match code {
+        PRIVACY_ALLOWED => None,
+        PRIVACY_PASSWORD => Some(PrivacyBlockReason::PasswordField),
+        PRIVACY_EXCLUDED => Some(PrivacyBlockReason::ExcludedProcess),
+        PRIVACY_ELEVATED => Some(PrivacyBlockReason::ElevatedProcess),
+        _ => Some(PrivacyBlockReason::InspectionUnavailable),
+    }
+}
+
 const fn privacy_reason_label(reason: u8) -> Option<&'static str> {
     match reason {
         PRIVACY_PASSWORD => Some("password"),
@@ -11191,6 +11328,7 @@ mod tests {
             diagnostic_worker: None,
             pending_key_releases: Vec::new(),
             pending_held_replay: Vec::new(),
+            typed_input: 0,
         };
         (state, receiver)
     }
@@ -12039,6 +12177,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         assert!(!state.request_shutdown());
         assert_eq!(
@@ -12160,6 +12301,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         metrics.recovery_armed.store(true, Ordering::Release);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
@@ -12198,6 +12342,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         let expiry = || {
             metrics
@@ -15559,6 +15706,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
         expire_retained_input(HWND::default(), start + lifetime);
@@ -15646,6 +15796,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         let metrics = Arc::clone(&state.metrics);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
@@ -15688,6 +15841,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         assert!(!begin_retained_recovery(&metrics, 11));
         assert!(begin_retained_recovery(&metrics, 10));
@@ -15717,6 +15873,9 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: true,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         expire_retained_input(HWND::default(), start + lifetime + RETAINED_RECOVERY_GRACE);
         assert!(!has_retained_input(&metrics));
@@ -16033,6 +16192,17 @@ mod tests {
                 .held
                 .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
             state.break_correction_gate(cause, None);
+            if cause != InternalFault {
+                let retained = state.metrics.retained_input.lock().unwrap().clone();
+                assert_eq!(
+                    retained.map(|input| input.auto_recover),
+                    Some(matches!(
+                        cause,
+                        Deadline | Capacity | WorkerQueue | HookReinstall
+                    )),
+                    "{cause:?}"
+                );
+            }
             let recovers = receiver.try_iter().any(|queued| {
                 matches!(
                     queued.event,
@@ -16478,5 +16648,157 @@ mod tests {
         processor.process(receiver.try_recv().expect("queued again"));
         assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
         assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    fn stalled_record(retained_at: Instant) -> RetainedInput {
+        RetainedInput {
+            token: 10,
+            foreground: test_foreground(),
+            events: vec![test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0)],
+            delivery_uncertain: false,
+            expires_at: retained_at + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+            recovering: false,
+            retained_at,
+            auto_recover: true,
+            input_mark: 0,
+        }
+    }
+
+    #[test]
+    fn held_keys_come_back_from_the_ui_thread_only_past_a_stalled_worker() {
+        let foreground = test_foreground();
+        let now = Instant::now();
+        let record = stalled_record(now);
+        let unavailable = Some(PrivacyBlockReason::InspectionUnavailable);
+        let ready = HandBackFacts {
+            now: now + Duration::from_millis(STALLED_WORKER_HAND_BACK_MS),
+            worker_stalled: true,
+            typed_input: 0,
+            modifiers_released: true,
+            current: Some(foreground),
+            privacy: None,
+        };
+        assert!(stalled_worker_may_hand_back(&record, ready));
+        assert!(stalled_worker_may_hand_back(
+            &record,
+            HandBackFacts {
+                privacy: unavailable,
+                ..ready
+            }
+        ));
+        // Each condition alone keeps the keys back.
+        for (case, facts) in [
+            (
+                "too early",
+                HandBackFacts {
+                    now: ready.now - Duration::from_millis(1),
+                    ..ready
+                },
+            ),
+            (
+                "worker not stalled",
+                HandBackFacts {
+                    worker_stalled: false,
+                    ..ready
+                },
+            ),
+            (
+                "typed or clicked since",
+                HandBackFacts {
+                    typed_input: 1,
+                    ..ready
+                },
+            ),
+            (
+                "modifier held",
+                HandBackFacts {
+                    modifiers_released: false,
+                    ..ready
+                },
+            ),
+            (
+                "another control",
+                HandBackFacts {
+                    current: Some(ForegroundContext {
+                        focus: 9,
+                        ..foreground
+                    }),
+                    ..ready
+                },
+            ),
+            (
+                "no foreground",
+                HandBackFacts {
+                    current: None,
+                    ..ready
+                },
+            ),
+        ] {
+            assert!(!stalled_worker_may_hand_back(&record, facts), "{case}");
+        }
+        for blocked in [
+            PrivacyBlockReason::PasswordField,
+            PrivacyBlockReason::ExcludedProcess,
+            PrivacyBlockReason::ElevatedProcess,
+        ] {
+            let facts = HandBackFacts {
+                privacy: Some(blocked),
+                ..ready
+            };
+            assert!(!stalled_worker_may_hand_back(&record, facts), "{blocked:?}");
+            assert_eq!(
+                privacy_reason_from_code(privacy_reason_code(Some(blocked))),
+                Some(blocked)
+            );
+        }
+        for changed in [
+            RetainedInput {
+                auto_recover: false,
+                ..record.clone()
+            },
+            RetainedInput {
+                recovering: true,
+                ..record.clone()
+            },
+            RetainedInput {
+                delivery_uncertain: true,
+                ..record.clone()
+            },
+        ] {
+            assert!(!stalled_worker_may_hand_back(&changed, ready));
+        }
+        assert_eq!(privacy_reason_from_code(PRIVACY_ALLOWED), None);
+        assert_eq!(privacy_reason_from_code(PRIVACY_UNAVAILABLE), unavailable);
+    }
+
+    #[test]
+    fn the_timer_hands_back_keys_a_stalled_worker_holds_but_not_from_inside_an_edit() {
+        let (state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(retained_at));
+        metrics.worker_busy.store(true, Ordering::Release);
+        metrics.edit_in_flight.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        // Inside an edit the field may show the word selected: the keys stay retained.
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        assert!(metrics.retained_input.lock().unwrap().is_some());
+        metrics.edit_in_flight.store(false, Ordering::Release);
+        // A click since the keys were retained: they would land after it.
+        APP_STATE.with(|slot| {
+            let mut borrowed = slot.borrow_mut();
+            observe_mouse_button(borrowed.as_mut().unwrap(), false);
+        });
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        assert!(metrics.retained_input.lock().unwrap().is_some());
+        APP_STATE.with(|slot| {
+            let mut borrowed = slot.borrow_mut();
+            borrowed.as_mut().unwrap().typed_input = 0;
+        });
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let state = take_app_state().unwrap();
+        assert!(metrics.retained_input.lock().unwrap().is_none());
+        assert_eq!(state.pending_held_replay.len(), 1);
     }
 }
