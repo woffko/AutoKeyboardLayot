@@ -93,6 +93,11 @@ and exposes a technical failure counter in the tray status.
   clipboard back only after its target read the replacement, and a whole
   protected paste (its UI Automation and input steps scripted) into a field that
   reads the clipboard late;
+- a protected paste on the desktop of the test VM's interactive session into a
+  field of another process that is busy when the paste arrives (real UI
+  Automation, input and clipboard): the field ends with the replacement and the
+  user's clipboard comes back. It needs that desktop, so it is run alone by its
+  name there; other runs pass `--skip on_the_desktop`;
 - native Windows 11 MSVC test and release builds;
 - an interactive-session launch without a visible error window;
 - readable `EN` and `RU` tray icons and live foreground-layout updates;

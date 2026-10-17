@@ -20053,4 +20053,294 @@ mod tests {
             DestroyWindow(window).expect("destroy probe window");
         }
     }
+
+    /// The field of the desktop paste acceptance: a WinForms rich edit in a process of its own,
+    /// which Windows PowerShell compiles on the spot. It listens to the clipboard; the first time
+    /// the agent's broker puts something there, it stays busy for a while, as a program that
+    /// handles its paste late does. `WM_APP + 0x40` sets for the next paste how long it is busy
+    /// (wparam, in milliseconds) and, when lparam is not zero, that it then reads the new
+    /// clipboard itself (a clipboard listener) and is busy lparam milliseconds more.
+    const DESKTOP_FIELD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+public class AklBusyField : Form {
+    [DllImport("user32.dll")] static extern bool AddClipboardFormatListener(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr window, StringBuilder name, int size);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr process);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    readonly RichTextBox box = new RichTextBox();
+    int busyMs;
+    int readThenBusyMs;
+    public AklBusyField() {
+        Text = "AutoKeyboardLayot busy field";
+        StartPosition = FormStartPosition.Manual;
+        SetBounds(80, 80, 640, 140);
+        box.Multiline = false;
+        box.Dock = DockStyle.Fill;
+        box.Font = new System.Drawing.Font("Segoe UI", 16f);
+        Controls.Add(box);
+        Shown += delegate { TakeForeground(); };
+    }
+    void TakeForeground() {
+        uint other = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint own = GetCurrentThreadId();
+        bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+        SetForegroundWindow(Handle);
+        Activate();
+        box.Focus();
+        if (attached) { AttachThreadInput(own, other, false); }
+    }
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        AddClipboardFormatListener(Handle);
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x8040) {
+            busyMs = m.WParam.ToInt32();
+            readThenBusyMs = m.LParam.ToInt32();
+            m.Result = new IntPtr(1);
+            return;
+        }
+        if (m.Msg == 0x031D) {
+            StringBuilder owner = new StringBuilder(128);
+            GetClassName(GetClipboardOwner(), owner, owner.Capacity);
+            if (owner.ToString() == "AutoKeyboardLayotClipboardBroker") {
+                int busy = busyMs;
+                int after = readThenBusyMs;
+                busyMs = 0;
+                readThenBusyMs = 0;
+                if (busy > 0) { Thread.Sleep(busy); }
+                if (after > 0) {
+                    try { Clipboard.GetText(); } catch (Exception) { }
+                    Thread.Sleep(after);
+                }
+            }
+        }
+        base.WndProc(ref m);
+    }
+}
+'@
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::Run((New-Object AklBusyField))
+"#;
+
+    #[test]
+    #[ignore = "drives a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn a_protected_paste_on_the_desktop_gives_a_busy_field_the_replacement_and_never_the_clipboard()
+    {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_MOVE, MOUSEINPUT,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            AllowSetForegroundWindow, FindWindowW, GetSystemMetrics, GetWindowRect, SM_CXSCREEN,
+            SM_CYSCREEN, SetForegroundWindow, WM_CLOSE, WM_GETTEXT, WM_SETTEXT,
+        };
+        const EM_SETSEL: u32 = 0x00B1;
+        const FIELD_CONFIGURE: u32 = 0x8040;
+        let send = |window: usize, message: u32, wparam: usize, lparam: isize| {
+            let mut result = 0usize;
+            unsafe {
+                let _ = SendMessageTimeoutW(
+                    HWND(window as *mut c_void),
+                    message,
+                    WPARAM(wparam),
+                    LPARAM(lparam),
+                    SMTO_BLOCK,
+                    5_000,
+                    Some(&mut result),
+                );
+            }
+            result
+        };
+        /// Ends the field however the test ends.
+        struct Field(std::process::Child);
+        impl Drop for Field {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // Start or search in front (after a first sign-in) keeps any program from the foreground.
+        let escape = [
+            keyboard_input(VK_ESCAPE, 0, Default::default()),
+            keyboard_input(VK_ESCAPE, 0, KEYEVENTF_KEYUP),
+        ];
+        assert!(send_input_batch(&escape));
+        thread::sleep(Duration::from_millis(500));
+        let script =
+            std::env::temp_dir().join(format!("akl-busy-field-{}.ps1", std::process::id()));
+        fs::write(&script, DESKTOP_FIELD_SCRIPT).expect("field script");
+        let child = Field({
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(&script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("start the field")
+        });
+        // The field takes the foreground once Windows PowerShell has compiled it. Started by this
+        // process, it may not take it by itself, so this process lets it or gives it.
+        unsafe {
+            let _ = AllowSetForegroundWindow(child.0.id());
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let field = loop {
+            if let Some(context) = current_foreground_context()
+                && context.process_id == child.0.id()
+                && context.focus != 0
+            {
+                break context;
+            }
+            if let Ok(window) = unsafe { FindWindowW(None, w!("AutoKeyboardLayot busy field")) } {
+                unsafe {
+                    let _ = SetForegroundWindow(window);
+                }
+                // A click brings it to the front the way the user would, also past a search
+                // window that kept the foreground after the first sign-in.
+                let mut rect = RECT::default();
+                if unsafe { GetWindowRect(window, &mut rect) }.is_ok() {
+                    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(2);
+                    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(2);
+                    let mouse = |flags| INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            mi: MOUSEINPUT {
+                                dx: (rect.left + rect.right) / 2 * 65_535 / (width - 1),
+                                dy: (rect.top + rect.bottom) / 2 * 65_535 / (height - 1),
+                                dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    let click = [
+                        mouse(MOUSEEVENTF_MOVE),
+                        mouse(MOUSEEVENTF_LEFTDOWN),
+                        mouse(MOUSEEVENTF_LEFTUP),
+                    ];
+                    assert!(send_input_batch(&click));
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the field did not take the foreground: {:?}",
+                current_foreground_context()
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        let field_text = || {
+            let mut buffer = [0u16; 256];
+            let copied = send(
+                field.focus,
+                WM_GETTEXT,
+                buffer.len(),
+                buffer.as_mut_ptr() as isize,
+            );
+            String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
+        };
+        let probe = clipboard_test_window(w!("AutoKeyboardLayot desktop paste probe"));
+        let mut outcomes = Vec::new();
+        // A field that is not busy, one busy for a while or long after the clipboard changed, and
+        // one that is busy until the paste stopped waiting, then reads the new clipboard itself
+        // and handles the paste a moment later (less than the grace after a target's read).
+        for (busy_ms, read_then_busy_ms) in [(0, 0), (300, 0), (1_000, 0), (300, 300)] {
+            let source = clipboard_test_window(w!("AutoKeyboardLayot desktop paste source"));
+            put_test_clipboard_text(source, "akl-password");
+            unsafe {
+                DestroyWindow(source).expect("destroy source window");
+            }
+            let word: Vec<u16> = "ghbdtn".encode_utf16().chain([0]).collect();
+            send(field.focus, WM_SETTEXT, 0, word.as_ptr() as isize);
+            send(field.focus, EM_SETSEL, 6, 6);
+            send(field.hwnd, FIELD_CONFIGURE, busy_ms, read_then_busy_ms);
+            let foreground = current_foreground_context().expect("foreground");
+            assert!(
+                same_input_target(foreground, field),
+                "the field lost the foreground"
+            );
+            let (mut processor, receiver) = processor_with_diagnostics();
+            processor.foreground_override = Some(foreground);
+            processor
+                .metrics
+                .observed_input_sequence
+                .store(5, Ordering::Release);
+            let attempt = processor.perform_protected_paste(
+                foreground,
+                5,
+                foreground.layout,
+                HKL(foreground.layout as *mut c_void),
+                "ghbdtn",
+                "привет",
+                PastePatience::Manual,
+            );
+            // The field settles (a busy one pastes late); the clipboard is read only then, as
+            // reading it earlier would be a read of the replacement by another process.
+            let mut text = field_text();
+            let mut changed_at = Instant::now();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline
+                && (text == "ghbdtn" || changed_at.elapsed() < Duration::from_millis(700))
+            {
+                thread::sleep(Duration::from_millis(50));
+                let now = field_text();
+                if now != text {
+                    text = now;
+                    changed_at = Instant::now();
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while test_clipboard_unicode(probe).as_deref() != Some("akl-password")
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let clipboard = test_clipboard_unicode(probe);
+            let brokers = reap_all(&processor.clipboard_brokers);
+            eprintln!(
+                "busy_ms={busy_ms} read_then_busy_ms={read_then_busy_ms} attempt={attempt:?} \
+                 replaced={} clipboard_back={} brokers={brokers:?}",
+                text == "привет",
+                clipboard.as_deref() == Some("akl-password")
+            );
+            for line in receiver
+                .try_iter()
+                .filter(|line| line.starts_with("event=paste"))
+            {
+                eprintln!("  {line}");
+            }
+            outcomes.push((busy_ms, read_then_busy_ms, attempt, text, clipboard));
+        }
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(field.hwnd as *mut c_void)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+            DestroyWindow(probe).expect("destroy probe window");
+        }
+        drop(child);
+        let _ = fs::remove_file(&script);
+        for (busy_ms, read_then_busy_ms, attempt, text, clipboard) in outcomes {
+            let case = format!(
+                "busy_ms={busy_ms} read_then_busy_ms={read_then_busy_ms} attempt={attempt:?}"
+            );
+            assert_eq!(text, "привет", "{case}");
+            assert_eq!(clipboard.as_deref(), Some("akl-password"), "{case}");
+        }
+    }
 }
