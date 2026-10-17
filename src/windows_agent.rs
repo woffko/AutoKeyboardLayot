@@ -20988,6 +20988,37 @@ mod tests {
             ]
         );
     }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_presses_follow_the_stored_order_through_every_enabled_layout() {
+        // "k[simus" reads differently in all three layouts; the first press orders them by how
+        // plausible each reading is (the Estonian "küsimus" is a dictionary word), and the next
+        // presses keep that order.
+        let (mut processor, diagnostics, _, _) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &[0x25, 0x1a, 0x1f, 0x17, 0x32, 0x16, 0x1f]);
+        let mut orders = Vec::new();
+        let mut words = Vec::new();
+        for press in 0..3 {
+            let lines = press_pause(&mut processor, &diagnostics, 41 + press);
+            orders.extend(lines.iter().filter_map(|line| {
+                line.split(' ')
+                    .find_map(|field| field.strip_prefix("cycle="))
+                    .map(str::to_owned)
+            }));
+            let cycle = processor.transpose_cycle.as_ref().expect("converted");
+            words.push((cycle.language, cycle.text.clone()));
+        }
+        assert_eq!(
+            words,
+            [
+                (Language::Estonian, "küsimus".to_owned()),
+                (Language::Russian, "лхышьгы".to_owned()),
+                (Language::English, "k[simus".to_owned()),
+            ]
+        );
+        assert_eq!(orders, ["en-US,et-EE,ru-RU"; 3]);
+    }
     #[test]
     fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
         let (script, _steps, state) = scripted_paste();
