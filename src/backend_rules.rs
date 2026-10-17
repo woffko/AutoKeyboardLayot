@@ -90,6 +90,13 @@ impl BackendRules {
                 line: line_number,
                 message: "invalid executable name or path".to_owned(),
             })?;
+            // Written back without its quotes, such a rule would read as a comment.
+            if pattern.starts_with('#') {
+                return Err(BackendRuleError {
+                    line: line_number,
+                    message: "an executable name cannot start with #".to_owned(),
+                });
+            }
             let strategy = BackendStrategy::from_id(strategy).ok_or_else(|| BackendRuleError {
                 line: line_number,
                 message: "unknown backend; use capability-probe, protected-paste, physical-replay, or observe-only".to_owned(),
@@ -210,6 +217,18 @@ mod tests {
         assert_eq!(
             BackendRules::from_lines(rules.to_text().lines()).unwrap(),
             rules
+        );
+    }
+
+    #[test]
+    fn a_rule_for_a_name_that_starts_with_a_hash_is_refused_and_a_comment_stays_one() {
+        let error =
+            BackendRules::from_lines(["notepad.exe = paste", "\"#app.exe\" = observe-only"])
+                .unwrap_err();
+        assert_eq!(error.line, 2);
+        assert_eq!(
+            BackendRules::from_lines(["#app.exe = observe-only"]).unwrap(),
+            BackendRules::from_lines(std::iter::empty::<&str>()).unwrap()
         );
     }
 

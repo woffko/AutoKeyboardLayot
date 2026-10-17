@@ -93,7 +93,11 @@ impl Settings {
     }
 
     fn parse_text(text: &str, strict: bool) -> Result<Self, SettingsError> {
+        // An editor may save the file with a byte order mark.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut settings = Self::default();
+        // In strict mode a known key may appear once: a second one would silently win.
+        let mut seen = std::collections::BTreeSet::new();
         let mut hotkey_key = None;
         let mut hotkey_modifiers = None;
         let mut hotkey_line = 1;
@@ -114,6 +118,12 @@ impl Settings {
                 continue;
             };
             let key = key.trim();
+            if strict && is_known_key(key) && !seen.insert(key) {
+                return Err(SettingsError {
+                    line: index + 1,
+                    message: "duplicate setting",
+                });
+            }
             if key == "enabled_input_packs" {
                 if strict && (pack_selection_seen || legacy_selection_seen) {
                     return Err(SettingsError {
@@ -297,6 +307,38 @@ impl Settings {
     }
 }
 
+/// The keys this version reads. Others are left alone for later versions.
+fn is_known_key(key: &str) -> bool {
+    matches!(
+        key,
+        "enabled_input_packs"
+            | "enable_english"
+            | "enable_russian"
+            | "enable_estonian"
+            | "force_hotkey_key"
+            | "force_hotkey_modifiers"
+            | "automatic_conversion_on_startup"
+            | "pause_break_undo"
+            | "offer_word_exclusion_after_undo"
+            | "offer_dictionary_after_forced_conversion"
+            | "recheck_first_word_after_erasing"
+            | "physical_fallback_for_unsupported_apps"
+            | "single_letter_words"
+            | "layout_model"
+            | "manual_terminal_uia_fallback"
+            | "conversion_sound"
+            | "diagnostics_enabled"
+            | "suppress_after_backspace"
+            | "suppress_after_delete"
+            | "suppress_after_left"
+            | "suppress_after_right"
+            | "suppress_after_up"
+            | "suppress_after_down"
+            | "suppress_after_home_end"
+            | "suppress_after_manual_layout_change"
+    )
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -321,6 +363,47 @@ fn parse_pack_selection(value: &str) -> Result<BTreeSet<PackId>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_known_key_given_twice_is_an_error_with_its_line_in_strict_mode() {
+        for (text, line) in [
+            ("layout_model=true\n# note\nlayout_model=false\n", 3),
+            ("force_hotkey_key=F12\nforce_hotkey_key=F11\n", 2),
+            ("enable_russian=true\nenable_russian=false\n", 2),
+            ("enabled_input_packs=en-US\nenabled_input_packs=ru-RU\n", 2),
+        ] {
+            let error = Settings::try_from_text(text).unwrap_err();
+            assert_eq!(error.line, line, "{text}");
+        }
+        assert_eq!(
+            Settings::try_from_text("layout_model=true\nlayout_model=false\n")
+                .unwrap_err()
+                .message,
+            "duplicate setting"
+        );
+        // Lenient reading keeps the last one, and keys of later versions may repeat.
+        assert!(!Settings::from_text("layout_model=true\nlayout_model=false\n").layout_model);
+        assert!(Settings::try_from_text("future_key=1\nfuture_key=2\n").is_ok());
+    }
+
+    #[test]
+    fn every_key_this_version_writes_is_a_known_key() {
+        for line in Settings::default().to_text().lines() {
+            if let Some((key, _)) = line.split_once('=') {
+                assert!(is_known_key(key.trim()), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_byte_order_mark_before_the_settings_is_ignored() {
+        let marked = Settings::try_from_text("\u{feff}layout_model=true\n").unwrap();
+        assert!(marked.layout_model);
+        assert_eq!(
+            marked,
+            Settings::try_from_text("layout_model=true\n").unwrap()
+        );
+    }
 
     #[test]
     fn legacy_language_flags_migrate_to_ids_without_changing_other_settings() {

@@ -96,13 +96,20 @@ enum Section {
     BackendRules,
 }
 
+/// An editor may save a file with a byte order mark; one at the start is not part of the text.
+fn without_byte_order_mark(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 impl ConfigurationDocument {
     pub fn from_text(text: &str) -> Result<Self, ConfigurationError> {
+        let text = without_byte_order_mark(text);
         let mut schema_version = None;
         let mut section = None;
         let mut settings = String::new();
         let mut settings_lines = Vec::new();
         let mut ui_language = UiLanguagePreference::default();
+        let mut ui_language_seen = false;
         let mut user_dictionary = Vec::new();
         let mut word_exclusions = Vec::new();
         let mut process_exclusions = Vec::new();
@@ -222,6 +229,10 @@ impl ConfigurationDocument {
                     if let Some((key, value)) = line.split_once('=')
                         && key.trim().eq_ignore_ascii_case("ui_language")
                     {
+                        if ui_language_seen {
+                            return Err(ConfigurationError::at(line_number, "duplicate setting"));
+                        }
+                        ui_language_seen = true;
                         ui_language = UiLanguagePreference::from_config(value);
                     }
                     settings.push_str(line);
@@ -297,9 +308,15 @@ impl ConfigurationDocument {
             settings,
             input_profiles: Default::default(),
             ui_language: UiLanguagePreference::default(),
-            user_dictionary: canonical_lexicon_entries_lossy(user_dictionary),
-            word_exclusions: canonical_lexicon_entries_lossy(word_exclusions),
-            process_exclusions: canonical_process_entries_lossy(process_exclusions),
+            user_dictionary: canonical_lexicon_entries_lossy(without_byte_order_mark(
+                user_dictionary,
+            )),
+            word_exclusions: canonical_lexicon_entries_lossy(without_byte_order_mark(
+                word_exclusions,
+            )),
+            process_exclusions: canonical_process_entries_lossy(without_byte_order_mark(
+                process_exclusions,
+            )),
             backend_rules: BackendRules::default(),
         };
         let _ = document.canonicalize_and_validate();
@@ -314,7 +331,8 @@ impl ConfigurationDocument {
         process_exclusions: &str,
     ) -> Result<Self, ConfigurationError> {
         fn rows(text: &str) -> Vec<(usize, String)> {
-            text.lines()
+            without_byte_order_mark(text)
+                .lines()
                 .enumerate()
                 .filter_map(|(index, line)| {
                     let line = line.trim();
@@ -361,6 +379,13 @@ impl ConfigurationDocument {
         );
         output.push_str("[backend_rules]\n");
         output.push_str(&document.backend_rules.to_text());
+        // What is written must read back the same: a line taken as a comment or a section would
+        // drop an entry without a word.
+        if Self::from_text(&output).ok().as_ref() != Some(&document) {
+            return Err(ConfigurationError::global(
+                "the configuration would not read back unchanged; it was not saved",
+            ));
+        }
         Ok(output)
     }
 
@@ -463,15 +488,32 @@ fn canonical_process_entries(
 ) -> Result<Vec<String>, ConfigurationError> {
     let mut entries = BTreeSet::new();
     for (line_number, line) in lines {
-        let Some(name) = ExclusionPolicy::normalize_entry(&line) else {
-            return Err(ConfigurationError::at(
-                line_number,
-                "expected one executable name or path",
-            ));
-        };
-        entries.insert(name);
+        entries.insert(process_entry(line_number, &line)?);
     }
     Ok(entries.into_iter().collect())
+}
+
+/// The stored form of one program-exclusion row.
+fn process_entry(line_number: usize, line: &str) -> Result<String, ConfigurationError> {
+    let Some(name) = ExclusionPolicy::normalize_entry(line) else {
+        return Err(ConfigurationError::at(
+            line_number,
+            "expected one executable name or path",
+        ));
+    };
+    if !process_name_reads_back(&name) {
+        return Err(ConfigurationError::at(
+            line_number,
+            "a program name cannot start with # or be in square brackets",
+        ));
+    }
+    Ok(name)
+}
+
+/// Whether a program name, written on a line of its own, reads back as that name: a line that
+/// starts with `#` is a comment, and one in square brackets starts a section.
+fn process_name_reads_back(name: &str) -> bool {
+    !name.starts_with('#') && !(name.starts_with('[') && name.ends_with(']'))
 }
 
 fn canonical_lexicon_entries_lossy(text: &str) -> Vec<String> {
@@ -495,6 +537,7 @@ fn canonical_process_entries_lossy(text: &str) -> Vec<String> {
             !line.is_empty() && !line.starts_with('#')
         })
         .filter_map(ExclusionPolicy::normalize_entry)
+        .filter(|name| process_name_reads_back(name))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -818,6 +861,118 @@ mod tests {
             let lossy = ConfigurationDocument::from_legacy(Settings::default(), &row, &row, "");
             assert!(lossy.user_dictionary.is_empty() && lossy.word_exclusions.is_empty());
         }
+    }
+
+    #[test]
+    fn a_byte_order_mark_at_the_start_of_a_file_is_ignored() {
+        let document = ConfigurationDocument {
+            user_dictionary: vec!["en-US: firefox".to_owned()],
+            process_exclusions: vec!["private.exe".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        let text = document.to_text().unwrap();
+        assert_eq!(
+            ConfigurationDocument::from_text(&format!("\u{feff}{text}")).unwrap(),
+            document
+        );
+        // Only one: a second one is text on the first line.
+        assert_eq!(
+            ConfigurationDocument::from_text(&format!("\u{feff}\u{feff}{text}"))
+                .unwrap_err()
+                .line,
+            Some(1)
+        );
+        let legacy = ConfigurationDocument::try_from_legacy(
+            Settings::default(),
+            "\u{feff}en-US: firefox\n",
+            "\u{feff}ru-RU: руддщ\n",
+            "\u{feff}private.exe\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.user_dictionary, ["en-US: firefox"]);
+        assert_eq!(legacy.word_exclusions, ["ru-RU: руддщ"]);
+        assert_eq!(legacy.process_exclusions, ["private.exe"]);
+        let lossy = ConfigurationDocument::from_legacy(
+            Settings::default(),
+            "\u{feff}en-US: firefox\n",
+            "",
+            "\u{feff}private.exe\n",
+        );
+        assert_eq!(lossy.user_dictionary, ["en-US: firefox"]);
+        assert_eq!(lossy.process_exclusions, ["private.exe"]);
+    }
+
+    #[test]
+    fn a_setting_given_twice_is_an_error_at_its_document_line() {
+        let head = "schema_version=4\n[packages]\nmode=legacy\n[settings]\n";
+        for (body, line) in [
+            ("layout_model=true\n\nlayout_model=false\n", 7),
+            (
+                "layout_model=true\n[user_dictionary]\n[settings]\nlayout_model=false\n",
+                8,
+            ),
+            ("ui_language=ru\nui_language=et\n", 6),
+        ] {
+            let error = ConfigurationDocument::from_text(&format!("{head}{body}")).unwrap_err();
+            assert_eq!(error.line, Some(line), "{body}");
+            assert_eq!(error.message, "duplicate setting");
+        }
+    }
+
+    #[test]
+    fn a_program_name_that_would_read_as_a_comment_or_a_section_is_refused() {
+        for name in [
+            "C:\\Tools\\#vault.exe",
+            "#vault.exe",
+            "[settings]",
+            "D:\\[x]",
+        ] {
+            let document = ConfigurationDocument {
+                process_exclusions: vec![name.to_owned()],
+                ..ConfigurationDocument::default()
+            };
+            assert!(document.to_text().is_err(), "{name}");
+            let text = format!(
+                "schema_version=4\n[packages]\nmode=legacy\n[process_exclusions]\n\"{name}\"\n"
+            );
+            assert_eq!(
+                ConfigurationDocument::from_text(&text).unwrap_err().line,
+                Some(5),
+                "{name}"
+            );
+            assert!(
+                ConfigurationDocument::from_legacy(Settings::default(), "", "", name)
+                    .process_exclusions
+                    .is_empty()
+            );
+        }
+        // Brackets or # inside a name read back as they are.
+        for name in ["[x].exe", "a#b.exe"] {
+            let document = ConfigurationDocument {
+                process_exclusions: vec![name.to_owned()],
+                ..ConfigurationDocument::default()
+            };
+            let text = document.to_text().unwrap();
+            assert_eq!(
+                ConfigurationDocument::from_text(&text)
+                    .unwrap()
+                    .process_exclusions,
+                [name]
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_that_would_not_read_back_unchanged_is_not_written() {
+        // A line break inside a name would read back as two names.
+        let document = ConfigurationDocument {
+            process_exclusions: vec!["evil\nname.exe".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        assert_eq!(
+            document.to_text().unwrap_err().message,
+            "the configuration would not read back unchanged; it was not saved"
+        );
     }
     #[test]
     fn rejects_unknown_or_future_schema() {
