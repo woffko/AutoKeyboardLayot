@@ -363,13 +363,32 @@ impl Detector {
     /// Whether a visible character can still be part of a word after the same
     /// physical key is interpreted under an enabled target layout.
     pub fn can_extend_word(&self, character: char, current_language: Language) -> bool {
+        self.can_extend_word_with_readings(character, current_language, &[])
+    }
+
+    /// As `can_extend_word`, given what the platform reports the same key
+    /// prints in target layouts. A target without such a reading falls back to
+    /// the offline English/Russian key table, which knows no other layout: "["
+    /// typed for the Estonian "ü" continues a word only with a reading.
+    pub fn can_extend_word_with_readings(
+        &self,
+        character: char,
+        current_language: Language,
+        readings: &[(Language, char)],
+    ) -> bool {
         if !self.input_pack_is_eligible(current_language) {
             return false;
         }
         self.accepts_character(current_language, character)
             || self.automatic_targets(current_language).any(|target| {
-                self.input_bindings[&current_language]
-                    .transpose_character(character, self.input_bindings[&target])
+                readings
+                    .iter()
+                    .find(|(language, _)| *language == target)
+                    .map(|&(_, reading)| reading)
+                    .or_else(|| {
+                        self.input_bindings[&current_language]
+                            .transpose_character(character, self.input_bindings[&target])
+                    })
                     .is_some_and(|mapped| self.accepts_character(target, mapped))
             })
     }

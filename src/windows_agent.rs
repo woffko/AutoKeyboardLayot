@@ -6808,6 +6808,10 @@ struct InputProcessor {
     // SendInput and the keyboard layout.
     #[cfg(test)]
     paste_seam: Option<RefCell<Box<dyn PasteSeam + Send>>>,
+    // Tests give what each key prints in each layout (by handle), instead of the layouts Windows
+    // has loaded.
+    #[cfg(test)]
+    test_keyboard: Option<fn(ReplayKey, usize) -> Option<char>>,
     session: InputSession,
     modifiers: Modifiers,
     privacy_guard: PrivacyGuard,
@@ -6955,6 +6959,8 @@ impl InputProcessor {
             process_override: None,
             #[cfg(test)]
             paste_seam: None,
+            #[cfg(test)]
+            test_keyboard: None,
             session,
             modifiers: Modifiers::default(),
             privacy_guard: PrivacyGuard::new(),
@@ -8078,11 +8084,26 @@ impl InputProcessor {
                 if language.is_none() {
                     self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
-                let printable = translate_printable(event, self.modifiers);
-                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
-                    if language
-                        .is_some_and(|language| self.detector.can_extend_word(character, language))
+                let printable = self.printable_character(event);
+                // Only a key the offline tables cannot place needs its readings in the target
+                // layouts, such as the Estonian "ü" typed as "[" in the English layout.
+                let readings = match (
+                    printable,
+                    language,
+                    replay_key_from_event(event, self.modifiers),
+                ) {
+                    (Some(character), Some(language), Some(key))
+                        if !self.detector.can_extend_word(character, language) =>
                     {
+                        self.key_readings(key, language, &mut self.key_mapper())
+                    }
+                    _ => Vec::new(),
+                };
+                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
+                    if language.is_some_and(|language| {
+                        self.detector
+                            .can_extend_word_with_readings(character, language, &readings)
+                    }) {
                         InputEvent::Printable(character)
                     } else if character.is_whitespace() || character.is_ascii_punctuation() {
                         InputEvent::Boundary
@@ -8119,7 +8140,12 @@ impl InputProcessor {
                     // word without passing through a boundary or suppression.
                     self.manual_only_word = self.privacy_reason.is_some();
                 }
-                let action = self.session.handle(input_event, language, &self.detector);
+                let action = self.session.handle_with_readings(
+                    input_event,
+                    language,
+                    &self.detector,
+                    &readings,
+                );
                 match action {
                     SessionAction::Candidate(_) => {
                         // Deliberately retain only a counter. The candidate's
@@ -8235,14 +8261,18 @@ impl InputProcessor {
         // missed conversion can be explained from the log without recording the word.
         let suppressed = self.session.is_suppressed();
         let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
+        let map_to_layout = self.key_mapper();
         let candidates = language
             .map(|language| {
-                mapped_layout_candidates(
-                    &replay_keys,
+                mapped_layout_candidates_with(
                     language,
                     &self.settings,
                     &self.detector,
-                    self.resolved_profiles(),
+                    |target_language| {
+                        let profile = self.detector.input_profile(target_language)?;
+                        let handle = self.resolved_profiles()?.unique_layout(profile)?;
+                        map_to_layout(&replay_keys, handle)
+                    },
                 )
             })
             .unwrap_or_default();
@@ -8350,9 +8380,60 @@ impl InputProcessor {
         event: RawKeyEvent,
         language: Option<Language>,
     ) -> bool {
-        self.erase_or_resume_word_with(previous_boundary, event, language, |keys, layout| {
+        let map_to_layout = self.key_mapper();
+        self.erase_or_resume_word_with(previous_boundary, event, language, map_to_layout)
+    }
+
+    /// Maps keys to what they print in a layout (by handle), as for the word's candidates.
+    fn key_mapper(&self) -> impl Fn(&[ReplayKey], usize) -> Option<String> + use<> {
+        #[cfg(test)]
+        let keyboard = self.test_keyboard;
+        move |keys, layout| {
+            #[cfg(test)]
+            if let Some(keyboard) = keyboard {
+                return keys.iter().map(|&key| keyboard(key, layout)).collect();
+            }
             map_replay_keys_to_layout(keys, HKL(layout as *mut c_void))
-        })
+        }
+    }
+
+    /// The character a key event prints in its foreground layout.
+    fn printable_character(&self, event: RawKeyEvent) -> Option<char> {
+        #[cfg(test)]
+        if let Some(keyboard) = self.test_keyboard {
+            return keyboard(
+                replay_key_from_event(event, self.modifiers)?,
+                event.foreground.layout,
+            );
+        }
+        translate_printable(event, self.modifiers)
+    }
+
+    /// What `key` prints in the layout of each enabled automatic target of `language`, from the
+    /// same mapping that gives the word's candidates at its boundary.
+    fn key_readings(
+        &self,
+        key: ReplayKey,
+        language: Language,
+        map_to_layout: &mut impl FnMut(&[ReplayKey], usize) -> Option<String>,
+    ) -> Vec<(Language, char)> {
+        let mut readings = Vec::new();
+        for target in self.detector.automatic_targets(language) {
+            if !self.settings.language_enabled(target) {
+                continue;
+            }
+            let Some(layout) = self.find_layout(target) else {
+                continue;
+            };
+            let Some(text) = map_to_layout(core::slice::from_ref(&key), layout.0 as usize) else {
+                continue;
+            };
+            let mut characters = text.chars();
+            if let (Some(character), None) = (characters.next(), characters.next()) {
+                readings.push((target, character));
+            }
+        }
+        readings
     }
 
     /// With Backspace suppression disabled, a plain Backspace edits the tracked
@@ -8365,7 +8446,7 @@ impl InputProcessor {
         previous_boundary: Option<LastBoundary>,
         event: RawKeyEvent,
         language: Option<Language>,
-        map_to_layout: impl FnOnce(&[ReplayKey], usize) -> Option<String>,
+        mut map_to_layout: impl FnMut(&[ReplayKey], usize) -> Option<String>,
     ) -> bool {
         if self.session.is_suppressed() && !self.replay_keys.is_empty() {
             // Manual token (see take_manual_token_keys). Erasing all of it
@@ -8407,7 +8488,14 @@ impl InputProcessor {
         if word.chars().count() != last.replay_keys.len()
             || !word
                 .chars()
-                .all(|character| self.detector.can_extend_word(character, language))
+                .zip(&last.replay_keys)
+                .all(|(character, &key)| {
+                    self.detector.can_extend_word(character, language) || {
+                        let readings = self.key_readings(key, language, &mut map_to_layout);
+                        self.detector
+                            .can_extend_word_with_readings(character, language, &readings)
+                    }
+                })
             || !self.session.restore_word(&word)
         {
             return false;
@@ -10803,20 +10891,6 @@ fn map_replay_key_to_layout(key: ReplayKey, layout: HKL) -> Option<char> {
     char::decode_utf16(output[..1].iter().copied()).next()?.ok()
 }
 
-fn mapped_layout_candidates(
-    replay_keys: &[ReplayKey],
-    current_language: Language,
-    settings: &Settings,
-    detector: &Detector,
-    profiles: Option<&ResolvedKeyboardProfiles>,
-) -> Vec<(Language, String)> {
-    mapped_layout_candidates_with(current_language, settings, detector, |target_language| {
-        let handle = profiles?.unique_layout(detector.input_profile(target_language)?)?;
-        let layout = HKL(handle as *mut c_void);
-        map_replay_keys_to_layout(replay_keys, layout)
-    })
-}
-
 fn mapped_layout_candidates_with(
     current_language: Language,
     settings: &Settings,
@@ -11894,6 +11968,64 @@ mod tests {
             }
         }
         resolve_keyboard_profiles(&mut Fixture(0x0409)).unwrap()
+    }
+
+    /// What a key prints, by set-1 scan code, in the US (0x0409), Russian (0x0419) and Estonian
+    /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
+    /// punctuation key prints nothing here.
+    pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
+        const KEYS: [(u16, [char; 3]); 33] = [
+            (0x10, ['q', 'й', 'q']),
+            (0x11, ['w', 'ц', 'w']),
+            (0x12, ['e', 'у', 'e']),
+            (0x13, ['r', 'к', 'r']),
+            (0x14, ['t', 'е', 't']),
+            (0x15, ['y', 'н', 'y']),
+            (0x16, ['u', 'г', 'u']),
+            (0x17, ['i', 'ш', 'i']),
+            (0x18, ['o', 'щ', 'o']),
+            (0x19, ['p', 'з', 'p']),
+            (0x1a, ['[', 'х', 'ü']),
+            (0x1b, [']', 'ъ', 'õ']),
+            (0x1e, ['a', 'ф', 'a']),
+            (0x1f, ['s', 'ы', 's']),
+            (0x20, ['d', 'в', 'd']),
+            (0x21, ['f', 'а', 'f']),
+            (0x22, ['g', 'п', 'g']),
+            (0x23, ['h', 'р', 'h']),
+            (0x24, ['j', 'о', 'j']),
+            (0x25, ['k', 'л', 'k']),
+            (0x26, ['l', 'д', 'l']),
+            (0x27, [';', 'ж', 'ö']),
+            (0x28, ['\'', 'э', 'ä']),
+            (0x2c, ['z', 'я', 'z']),
+            (0x2d, ['x', 'ч', 'x']),
+            (0x2e, ['c', 'с', 'c']),
+            (0x2f, ['v', 'м', 'v']),
+            (0x30, ['b', 'и', 'b']),
+            (0x31, ['n', 'т', 'n']),
+            (0x32, ['m', 'ь', 'm']),
+            (0x33, [',', 'б', ',']),
+            (0x34, ['.', 'ю', '.']),
+            (0x39, [' ', ' ', ' ']),
+        ];
+        let column = match layout {
+            0x0409 => 0,
+            0x0419 => 1,
+            0x0425 => 2,
+            _ => return None,
+        };
+        let (_, characters) = KEYS
+            .iter()
+            .find(|(scan_code, _)| *scan_code == key.scan_code)?;
+        let character = characters[column];
+        if key.shift == key.caps_lock {
+            Some(character)
+        } else if character.is_alphabetic() {
+            character.to_uppercase().next()
+        } else {
+            None
+        }
     }
 
     #[test]
@@ -15052,20 +15184,9 @@ mod tests {
                 extended: false,
             });
         }
-        // The mapped-candidate path needs real installed layouts for the resolved
-        // handles; test_profiles() supplies synthetic handles, so only assert on a
-        // machine that can actually map the replay keys to the target layout.
-        if mapped_layout_candidates(
-            &processor.replay_keys,
-            Language::English,
-            &processor.settings,
-            &processor.detector,
-            processor.resolved_profiles(),
-        )
-        .is_empty()
-        {
-            return;
-        }
+        // test_profiles() supplies synthetic layout handles; the test keyboard maps the replay
+        // keys in them.
+        processor.test_keyboard = Some(test_keyboard);
         let event = RawKeyEvent {
             foreground,
             ..test_raw_key(WM_KEYDOWN, VK_SPACE, 40, 7)
@@ -15081,6 +15202,96 @@ mod tests {
                 boundary_sequence: 40,
             })
         );
+    }
+
+    /// A processor typing in an allowed field of an editor whose foreground layout is `layout`,
+    /// with the test keyboard and automatic conversion on.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn processor_typing_in(layout: usize) -> (InputProcessor, ForegroundContext) {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(metrics, 0);
+        let foreground = ForegroundContext {
+            layout,
+            ..test_foreground()
+        };
+        processor.test_keyboard = Some(test_keyboard);
+        processor.last_foreground = Some(foreground_identity_key(foreground));
+        processor.last_layout = Some(foreground.layout);
+        processor.foreground_override = Some(foreground);
+        processor.process_override = Some((Some(EDITOR.to_owned()), Some(0x2000)));
+        processor.current_integrity_level = Some(0x2000);
+        processor.privacy_probe = Some(answering_probe(None));
+        processor.privacy_needs_check = true;
+        (processor, foreground)
+    }
+
+    /// Types the keys with these scan codes.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn type_keys(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        scan_codes: &[u32],
+    ) {
+        for (index, &scan_code) in scan_codes.iter().enumerate() {
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                foreground,
+                ..letter(0x41, index as u64 + 1)
+            });
+        }
+    }
+
+    /// A Space; a drained one (`drain_token` other than 0) defers the edit.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn space_key(foreground: ForegroundContext, sequence: u64, drain_token: u64) -> RawKeyEvent {
+        RawKeyEvent {
+            scan_code: 0x39,
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_SPACE, sequence, drain_token)
+        }
+    }
+
+    /// Types the keys with these scan codes, then a drained Space that defers the edit.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn type_keys_and_drained_space(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        scan_codes: &[u32],
+    ) {
+        type_keys(processor, foreground, scan_codes);
+        processor.process_key(space_key(foreground, scan_codes.len() as u64 + 1, 9));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_key_that_prints_a_letter_of_a_target_layout_continues_the_word() {
+        // Russian typed with the Estonian layout active: the comma key prints "б" in Russian, so
+        // ",skj" is one word, "было".
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x33, 0x1f, 0x25, 0x24]);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, ",skj");
+        assert_eq!(pending.transaction.replacement, "было");
+        assert_eq!(pending.transaction.target_language, Language::Russian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn backspace_resumes_a_word_with_a_key_that_prints_a_letter_of_a_target_layout() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x33, 0x1f, 0x25, 0x24]);
+        let last = processor.last_boundary.take();
+        let backspace = RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 6, 0)
+        };
+        assert!(processor.erase_or_resume_word(last, backspace, Some(Language::Estonian)));
+        assert_eq!(processor.session.buffered_character_count(), 4);
+        assert_eq!(processor.replay_keys.len(), 4);
     }
 
     #[test]

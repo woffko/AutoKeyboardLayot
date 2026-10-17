@@ -563,8 +563,12 @@ requirements instead of comparing descriptors to embedded package identities.
 An arbitrary stable pack ID can use an approved exact profile and its scoring
 model. The offline US/Russian transposition table is selected through those exact
 profile bindings, so custom IDs work as both source and target; ET still requires
-native scan-code mapping. Neither a package ID nor a language match selects an
-unrelated keyboard variant.
+native scan-code mapping. While a word is typed, the agent reads every key the
+offline table cannot place in each enabled target layout with that native
+mapping (`Detector::can_extend_word_with_readings`), so `[` typed for the
+Estonian `ü` in the English layout, or the comma key typed for the Russian `б`
+in the Estonian layout, stays inside the word. Neither a package ID nor a
+language match selects an unrelated keyboard variant.
 
 All current bindings explicitly have `ConservativePhysicalKeys` scope. The ET
 binding preserves its physical subset only when the known full requirements are
