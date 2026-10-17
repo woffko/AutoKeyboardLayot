@@ -89,8 +89,10 @@ and exposes a technical failure counter in the tray status.
   rejection in an isolated temporary profile;
 - native protected-clipboard checks on the real clipboard, run on the test VM
   with `--include-ignored`: format and text restoration with the opt-outs, content
-  rendered on request by its owner, and an unconfirmed paste that gives the
-  clipboard back only after its target read the replacement;
+  rendered on request by its owner, an unconfirmed paste that gives the
+  clipboard back only after its target read the replacement, and a whole
+  protected paste (its UI Automation and input steps scripted) into a field that
+  reads the clipboard late;
 - native Windows 11 MSVC test and release builds;
 - an interactive-session launch without a visible error window;
 - readable `EN` and `RU` tray icons and live foreground-layout updates;

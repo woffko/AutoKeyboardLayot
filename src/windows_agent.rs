@@ -6655,6 +6655,10 @@ struct InputProcessor {
     // Tests describe the process behind the input target: its image path and integrity level.
     #[cfg(test)]
     process_override: Option<(Option<String>, Option<u32>)>,
+    // Tests script the steps of a protected paste that reach UI Automation, the clipboard,
+    // SendInput and the keyboard layout.
+    #[cfg(test)]
+    paste_seam: Option<RefCell<Box<dyn PasteSeam + Send>>>,
     session: InputSession,
     modifiers: Modifiers,
     privacy_guard: PrivacyGuard,
@@ -6800,6 +6804,8 @@ impl InputProcessor {
             foreground_override: None,
             #[cfg(test)]
             process_override: None,
+            #[cfg(test)]
+            paste_seam: None,
             session,
             modifiers: Modifiers::default(),
             privacy_guard: PrivacyGuard::new(),
@@ -6892,6 +6898,92 @@ impl InputProcessor {
             process_image_name(process_id),
             process_integrity_level(process_id),
         )
+    }
+
+    /// Selects the text before the caret for a paste. Tests script it.
+    fn paste_select(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        patience: PastePatience,
+    ) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().select();
+        }
+        self.privacy_guard
+            .select_preceding_text(process_id, expected_text, patience)
+    }
+
+    /// Puts a paste's replacement on the clipboard. Tests give it a clipboard of their own.
+    fn paste_clipboard(
+        &self,
+        text: &str,
+        install_timeout: Duration,
+        target_process: u32,
+    ) -> core::result::Result<ProtectedClipboard<'_>, ClipboardBeginFailure> {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().begin(
+                text,
+                install_timeout,
+                &self.clipboard_brokers,
+                target_process,
+            );
+        }
+        ProtectedClipboard::begin(
+            text,
+            install_timeout,
+            &self.clipboard_brokers,
+            target_process,
+        )
+    }
+
+    /// Sends a paste's keys and says how many SendInput took. Tests script it.
+    fn paste_submit(&self, inputs: &[INPUT]) -> usize {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().submit(inputs.len());
+        }
+        send_input_count(inputs)
+    }
+
+    /// Waits for the field to show a paste's text. Tests script it.
+    fn paste_commit(
+        &self,
+        foreground: ForegroundContext,
+        input_sequence: u64,
+        expected_layout: usize,
+        expected_text: &str,
+    ) -> ReplayAttempt {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().commit();
+        }
+        self.wait_for_text_commit(foreground, input_sequence, expected_layout, expected_text)
+    }
+
+    /// Switches the layout after a paste. Tests script it.
+    fn paste_switch_layout(
+        &self,
+        foreground: ForegroundContext,
+        target_layout: HKL,
+        input_sequence: u64,
+    ) -> ReplayAttempt {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().switch_layout();
+        }
+        self.switch_layout_and_wait(foreground, target_layout, input_sequence)
+    }
+
+    /// Collapses a paste's selection. Tests script it.
+    fn paste_collapse(&self, process_id: u32) -> SelectionCleanup {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().collapse();
+        }
+        self.privacy_guard.collapse_selection_to_end(process_id)
     }
 
     fn resolved_profiles(&self) -> Option<&ResolvedKeyboardProfiles> {
@@ -9518,11 +9610,8 @@ impl InputProcessor {
             self.note_paste_budget(input_sequence, "selection", budget);
             return TextEditAttempt::Cancelled;
         }
-        let (selection, cleanup) = self.privacy_guard.select_preceding_text(
-            foreground.process_id,
-            expected_source,
-            patience,
-        );
+        let (selection, cleanup) =
+            self.paste_select(foreground.process_id, expected_source, patience);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=selection result={selection:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
         if cleanup == Some(SelectionCleanup::Unverified) {
@@ -9537,10 +9626,9 @@ impl InputProcessor {
             self.note_paste_budget(input_sequence, "install", budget);
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         };
-        let mut clipboard = match ProtectedClipboard::begin(
+        let mut clipboard = match self.paste_clipboard(
             replacement,
             install_timeout,
-            &self.clipboard_brokers,
             foreground.process_id,
         ) {
             Ok(clipboard) => clipboard,
@@ -9577,11 +9665,11 @@ impl InputProcessor {
 
         clipboard.mark_submitted();
         let paste_inputs = build_paste_inputs();
-        let submitted = send_input_count(&paste_inputs);
+        let submitted = self.paste_submit(&paste_inputs);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=submit submitted={submitted} requested={} elapsed_ms={}", paste_inputs.len(), started.elapsed().as_millis()));
         if submitted != paste_inputs.len() {
             let control_up = [keyboard_input(VK_LCONTROL, 0, KEYEVENTF_KEYUP)];
-            let _ = send_input_batch(&control_up);
+            let _ = self.paste_submit(&control_up);
             // Part of the chord reached the field and may still paste: the replacement stays until
             // the field reads it.
             clipboard.defer();
@@ -9597,7 +9685,7 @@ impl InputProcessor {
         }
 
         let paste_commit =
-            self.wait_for_text_commit(foreground, input_sequence, source_layout, replacement);
+            self.paste_commit(foreground, input_sequence, source_layout, replacement);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
         if clipboard_after_paste(paste_commit) == ClipboardAfterPaste::Defer {
@@ -9617,7 +9705,7 @@ impl InputProcessor {
         let owned_before_restore = clipboard.is_current();
         let clipboard_restored = clipboard.restore();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
-        let switched = self.switch_layout_and_wait(foreground, target_layout, input_sequence);
+        let switched = self.paste_switch_layout(foreground, target_layout, input_sequence);
         self.diagnostic(
             "paste",
             format!(
@@ -9633,7 +9721,7 @@ impl InputProcessor {
                 return TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch);
             }
         }
-        let target_commit = self.wait_for_text_commit(
+        let target_commit = self.paste_commit(
             foreground,
             input_sequence,
             target_layout.0 as usize,
@@ -9679,9 +9767,7 @@ impl InputProcessor {
             );
             return TextEditAttempt::SelectionLeft;
         }
-        let cleanup = self
-            .privacy_guard
-            .collapse_selection_to_end(foreground.process_id);
+        let cleanup = self.paste_collapse(foreground.process_id);
         self.diagnostic(
             "paste",
             format!("sequence={input_sequence} phase=cleanup result={cleanup:?}"),
@@ -10792,6 +10878,24 @@ const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
     settle + UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS
 }
 
+/// The steps of a protected paste that reach UI Automation, the clipboard, SendInput and the
+/// keyboard layout, as tests script them.
+#[cfg(test)]
+trait PasteSeam {
+    fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>);
+    fn begin<'a>(
+        &mut self,
+        text: &str,
+        install_timeout: Duration,
+        brokers: &'a ClipboardBrokers,
+        target_process: u32,
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure>;
+    fn submit(&mut self, requested: usize) -> usize;
+    fn commit(&mut self) -> ReplayAttempt;
+    fn switch_layout(&mut self) -> ReplayAttempt;
+    fn collapse(&mut self) -> SelectionCleanup;
+}
+
 /// The time a protected paste may take: until the gate holding the keys typed after the word lets
 /// them go. Without such a gate (nothing is held) it is unbounded.
 #[derive(Debug, Clone, Copy)]
@@ -11605,6 +11709,7 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     pub(super) fn test_profiles() -> ResolvedKeyboardProfiles {
         use autokeyboardlayot::profile_resolver::{
@@ -18791,13 +18896,31 @@ mod tests {
         install_timeout: Duration,
         deferred_wait: Duration,
     ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+        begin_fake_for(
+            state,
+            brokers,
+            "привет",
+            install_timeout,
+            (FAKE_TARGET, deferred_wait),
+        )
+    }
+
+    /// Begins a protected clipboard on `state` that puts `text` there for a paste to `target.0`
+    /// which, unconfirmed, waits `target.1` for it; the worker's checks read the same state.
+    fn begin_fake_for<'a>(
+        state: &Arc<Mutex<FakeClipboardState>>,
+        brokers: &'a ClipboardBrokers,
+        text: &str,
+        install_timeout: Duration,
+        target: (u32, Duration),
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
         let broker_state = Arc::clone(state);
         let probe_state = Arc::clone(state);
         ProtectedClipboard::begin_with(
-            "привет",
+            text,
             install_timeout,
             brokers,
-            (FAKE_TARGET, deferred_wait),
+            target,
             move || Some(FakeClipboard(broker_state)),
             Box::new(move || {
                 let state = probe_state.lock().unwrap();
@@ -19280,5 +19403,523 @@ mod tests {
                 .try_iter()
                 .any(|record| record.contains("result=retained reason=selection-left"))
         );
+    }
+
+    const PASTE_SEQUENCE: u64 = 5;
+
+    /// What the outside steps of a scripted paste saw: each step in order (`submit:N` for a
+    /// SendInput call of N keys), the installation's time limit, and the clipboard's text when
+    /// the Ctrl+V went out.
+    #[derive(Default)]
+    struct PasteSteps {
+        steps: Vec<String>,
+        install_timeout: Option<Duration>,
+        clipboard_at_submit: Option<String>,
+    }
+
+    /// The clipboard of a scripted paste: a scripted one whose unconfirmed paste waits the given
+    /// time for its target, or the real one (test VM only).
+    enum PasteClipboard {
+        Fake(Arc<Mutex<FakeClipboardState>>, Duration),
+        System,
+    }
+
+    /// Something that happens right after a step of a scripted paste: the user clicks, the step
+    /// takes long, another program writes the clipboard, the field reads it.
+    type PasteEvent = Box<dyn FnOnce() + Send>;
+
+    /// The outside steps of a protected paste as a test scripts them: the selection's finding,
+    /// the clipboard, how many keys of a chord SendInput takes (all of them when `None`), the
+    /// field's answers to the commit waits (shown once they run out), the layout switch and the
+    /// collapse.
+    struct ScriptedPaste {
+        steps: Arc<Mutex<PasteSteps>>,
+        selection: (TextBarrierStatus, Option<SelectionCleanup>),
+        clipboard: PasteClipboard,
+        taken: Option<usize>,
+        commits: VecDeque<ReplayAttempt>,
+        layout: ReplayAttempt,
+        collapse: SelectionCleanup,
+        events: Vec<(&'static str, PasteEvent)>,
+    }
+
+    impl ScriptedPaste {
+        /// A paste that goes through: the word is selected and the field shows each change.
+        fn new(clipboard: PasteClipboard) -> (Self, Arc<Mutex<PasteSteps>>) {
+            let steps = Arc::new(Mutex::new(PasteSteps::default()));
+            let script = Self {
+                steps: Arc::clone(&steps),
+                selection: (TextBarrierStatus::Match, None),
+                clipboard,
+                taken: None,
+                commits: VecDeque::new(),
+                layout: ReplayAttempt::Applied,
+                collapse: SelectionCleanup::Collapsed,
+                events: Vec::new(),
+            };
+            (script, steps)
+        }
+
+        fn after(mut self, step: &'static str, event: impl FnOnce() + Send + 'static) -> Self {
+            self.events.push((step, Box::new(event)));
+            self
+        }
+
+        /// Notes `step` and lets what follows it happen.
+        fn step(&mut self, step: &str) {
+            self.steps.lock().unwrap().steps.push(step.to_owned());
+            while let Some(index) = self.events.iter().position(|(name, _)| *name == step) {
+                let (_, event) = self.events.remove(index);
+                event();
+            }
+        }
+    }
+
+    impl PasteSeam for ScriptedPaste {
+        fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+            self.step("select");
+            self.selection
+        }
+
+        fn begin<'a>(
+            &mut self,
+            text: &str,
+            install_timeout: Duration,
+            brokers: &'a ClipboardBrokers,
+            target_process: u32,
+        ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+            self.steps.lock().unwrap().install_timeout = Some(install_timeout);
+            let clipboard = match &self.clipboard {
+                PasteClipboard::Fake(state, deferred_wait) => begin_fake_for(
+                    state,
+                    brokers,
+                    text,
+                    install_timeout,
+                    (target_process, *deferred_wait),
+                ),
+                PasteClipboard::System => {
+                    ProtectedClipboard::begin(text, install_timeout, brokers, target_process)
+                }
+            };
+            self.step("begin");
+            clipboard
+        }
+
+        fn submit(&mut self, requested: usize) -> usize {
+            // Reading the real clipboard here would count as the field's paste.
+            if let PasteClipboard::Fake(state, _) = &self.clipboard {
+                let text = state.lock().unwrap().text.clone();
+                self.steps
+                    .lock()
+                    .unwrap()
+                    .clipboard_at_submit
+                    .get_or_insert(text);
+            }
+            self.step(&format!("submit:{requested}"));
+            self.taken.take().unwrap_or(requested)
+        }
+
+        fn commit(&mut self) -> ReplayAttempt {
+            self.step("commit");
+            self.commits.pop_front().unwrap_or(ReplayAttempt::Applied)
+        }
+
+        fn switch_layout(&mut self) -> ReplayAttempt {
+            self.step("layout");
+            self.layout
+        }
+
+        fn collapse(&mut self) -> SelectionCleanup {
+            self.step("collapse");
+            self.collapse
+        }
+    }
+
+    /// A scripted paste on a scripted clipboard holding `password`; unconfirmed, it waits two
+    /// seconds for its target.
+    fn scripted_paste() -> (
+        ScriptedPaste,
+        Arc<Mutex<PasteSteps>>,
+        Arc<Mutex<FakeClipboardState>>,
+    ) {
+        let state = fake_clipboard("password");
+        let (script, steps) = ScriptedPaste::new(PasteClipboard::Fake(
+            Arc::clone(&state),
+            Duration::from_secs(2),
+        ));
+        (script, steps, state)
+    }
+
+    /// A processor whose edit of input `PASTE_SEQUENCE` still holds its gate in the field of
+    /// `foreground`, with the outside steps of its protected paste scripted by `script`.
+    fn paste_processor(
+        foreground: ForegroundContext,
+        script: impl FnOnce(&Arc<ObserverMetrics>) -> ScriptedPaste,
+    ) -> InputProcessor {
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.foreground_override = Some(foreground);
+        let metrics = &processor.metrics;
+        metrics
+            .active_gate_token
+            .store(PASTE_SEQUENCE, Ordering::Release);
+        metrics
+            .forwarded_input_sequence
+            .store(PASTE_SEQUENCE, Ordering::Release);
+        let script = script(metrics);
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor
+    }
+
+    /// A click: the edit's input is no longer current.
+    fn user_clicks(metrics: &Arc<ObserverMetrics>) -> impl FnOnce() + Send + 'static {
+        let metrics = Arc::clone(metrics);
+        move || {
+            metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Converts `ghbdtn` to `привет` by a protected paste in the processor's field.
+    fn run_paste(processor: &InputProcessor, patience: PastePatience) -> TextEditAttempt {
+        processor.perform_protected_paste(
+            processor.foreground_override.unwrap(),
+            PASTE_SEQUENCE,
+            0x0409,
+            HKL(0x0419 as *mut c_void),
+            "ghbdtn",
+            "привет",
+            patience,
+        )
+    }
+
+    #[test]
+    fn a_paste_gives_the_users_clipboard_back_only_once_the_field_showed_the_replacement() {
+        let target = test_foreground().process_id;
+        // Shown in the field: the user's clipboard comes back before the paste ends.
+        let (script, steps, state) = scripted_paste();
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout", "commit"]
+        );
+        assert_eq!(
+            steps.lock().unwrap().clipboard_at_submit.as_deref(),
+            Some("привет")
+        );
+        assert_eq!(state.lock().unwrap().text, "password");
+        assert!(processor.clipboard_brokers.reap().is_empty());
+
+        // A busy field that showed nothing in time, and a chord sent only in part (Ctrl is let go):
+        // either may still paste, so the replacement stays until the field reads it.
+        for (taken, commits, reason, expected) in [
+            (
+                None,
+                vec![ReplayAttempt::Failed],
+                ConversionFailureReason::TextCommit,
+                &["select", "begin", "submit:4", "commit", "collapse"][..],
+            ),
+            (
+                Some(2),
+                Vec::new(),
+                ConversionFailureReason::ClipboardEdit,
+                &["select", "begin", "submit:4", "submit:1", "collapse"][..],
+            ),
+        ] {
+            let (mut script, steps, state) = scripted_paste();
+            script.taken = taken;
+            script.commits = commits.into();
+            let processor = paste_processor(test_foreground(), |_| script);
+            assert_eq!(
+                run_paste(&processor, PastePatience::Automatic),
+                TextEditAttempt::Failed(reason)
+            );
+            assert_eq!(steps.lock().unwrap().steps, expected, "{reason:?}");
+            // Another program reading it proves nothing.
+            state.lock().unwrap().readers.push(99);
+            thread::sleep(Duration::from_millis(30));
+            assert_eq!(state.lock().unwrap().text, "привет", "{reason:?}");
+            assert!(processor.clipboard_brokers.busy(), "{reason:?}");
+            // The field handles its Ctrl+V late and gets the replacement; then the password is
+            // back.
+            state.lock().unwrap().readers.push(target);
+            assert_eq!(
+                reap_all(&processor.clipboard_brokers),
+                [BrokerEnd::Restored]
+            );
+            assert_eq!(state.lock().unwrap().text, "password");
+        }
+    }
+
+    #[test]
+    fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
+        let (script, _steps, state) = scripted_paste();
+        let script = script.after("submit:4", || panic!("the worker fails after the chord"));
+        let processor = paste_processor(test_foreground(), |_| script);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_paste(&processor, PastePatience::Automatic)
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(state.lock().unwrap().text, "привет");
+        state
+            .lock()
+            .unwrap()
+            .readers
+            .push(test_foreground().process_id);
+        assert_eq!(
+            reap_all(&processor.clipboard_brokers),
+            [BrokerEnd::Restored]
+        );
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_confirmed_paste_whose_clipboard_another_program_took_meanwhile_says_so() {
+        let (script, _steps, state) = scripted_paste();
+        let writer = Arc::clone(&state);
+        let script = script.after("commit", move || {
+            let mut state = writer.lock().unwrap();
+            state.text = "theirs".to_owned();
+            state.sequence += 1;
+            state.owner = 99;
+        });
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::AppliedClipboardNotRestored
+        );
+        assert_eq!(state.lock().unwrap().text, "theirs");
+        assert_eq!(state.lock().unwrap().restores, 0);
+    }
+
+    #[test]
+    fn a_layout_that_does_not_switch_after_the_paste_fails_with_its_own_reason() {
+        let (mut script, steps, state) = scripted_paste();
+        script.layout = ReplayAttempt::LayoutSwitchFailed;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch)
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout"]
+        );
+        // The replacement was shown, so the user's clipboard was already back.
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_paste_that_types_nothing_ends_by_what_it_found() {
+        use SelectionCleanup::{Collapsed, Unverified};
+        for (selection, open_fails, outcome, expected) in [
+            (
+                (TextBarrierStatus::Unavailable, None),
+                false,
+                TextEditAttempt::Unsupported,
+                &["select"][..],
+            ),
+            (
+                (TextBarrierStatus::Mismatch, Some(Collapsed)),
+                false,
+                TextEditAttempt::Cancelled,
+                &["select"][..],
+            ),
+            (
+                (TextBarrierStatus::Mismatch, Some(Unverified)),
+                false,
+                TextEditAttempt::SelectionLeft,
+                &["select"][..],
+            ),
+            // The clipboard did not take the replacement: a busy clipboard is a word left alone.
+            (
+                (TextBarrierStatus::Match, None),
+                true,
+                TextEditAttempt::Cancelled,
+                &["select", "begin", "collapse"][..],
+            ),
+        ] {
+            let (mut script, steps, state) = scripted_paste();
+            script.selection = selection;
+            state.lock().unwrap().open_fails = open_fails;
+            let processor = paste_processor(test_foreground(), |_| script);
+            assert_eq!(
+                run_paste(&processor, PastePatience::Automatic),
+                outcome,
+                "{selection:?}"
+            );
+            assert_eq!(steps.lock().unwrap().steps, expected, "{selection:?}");
+            assert_eq!(state.lock().unwrap().text, "password");
+            assert_eq!(state.lock().unwrap().empties, 0);
+        }
+    }
+
+    #[test]
+    fn a_paste_stops_before_each_step_the_gate_has_no_time_left_for() {
+        let paste = |budget_ms: u64, slow_step: Option<&'static str>| {
+            let (mut script, steps, state) = scripted_paste();
+            if let Some(step) = slow_step {
+                script = script.after(step, || thread::sleep(Duration::from_millis(300)));
+            }
+            let processor = paste_processor(test_foreground(), |_| script);
+            processor
+                .edit_deadline
+                .set(Some(Instant::now() + Duration::from_millis(budget_ms)));
+            let attempt = run_paste(&processor, PastePatience::Automatic);
+            let steps = std::mem::take(&mut *steps.lock().unwrap());
+            (attempt, steps, state)
+        };
+        // No time left: not even the selection starts.
+        let (attempt, steps, _) = paste(0, None);
+        assert_eq!(attempt, TextEditAttempt::Cancelled);
+        assert!(steps.steps.is_empty(), "{:?}", steps.steps);
+        // Time for the selection and a shortened installation (the gate's 900 ms less everything
+        // after the Ctrl+V leave 150 ms of the usual 200).
+        let (attempt, steps, _) = paste(900, None);
+        assert_eq!(attempt, TextEditAttempt::Applied);
+        let install = steps.install_timeout.unwrap();
+        assert!(
+            install >= Duration::from_millis(PASTE_MIN_INSTALL_MS)
+                && install < Duration::from_millis(CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS),
+            "{install:?}"
+        );
+        // A slow selection leaves no time for the installation: the clipboard is not touched.
+        let (attempt, steps, state) = paste(1_000, Some("select"));
+        assert_eq!(attempt, TextEditAttempt::Cancelled);
+        assert_eq!(steps.steps, ["select", "collapse"]);
+        assert_eq!(state.lock().unwrap().empties, 0);
+        // A slow installation leaves no time for what follows the Ctrl+V: it is not sent, and the
+        // user's clipboard comes back at once.
+        let (attempt, steps, state) = paste(1_000, Some("begin"));
+        assert_eq!(attempt, TextEditAttempt::Cancelled);
+        assert_eq!(steps.steps, ["select", "begin", "collapse"]);
+        assert_eq!(state.lock().unwrap().text, "password");
+        assert_eq!(state.lock().unwrap().restores, 1);
+    }
+
+    #[test]
+    fn a_paste_the_user_interrupted_leaves_the_selection_alone() {
+        // A click before the Ctrl+V: nothing was sent, so the user's clipboard comes back at once;
+        // what is selected may be the user's by now and is not touched.
+        let (script, steps, state) = scripted_paste();
+        let processor = paste_processor(test_foreground(), |metrics| {
+            script.after("begin", user_clicks(metrics))
+        });
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(steps.lock().unwrap().steps, ["select", "begin"]);
+        assert_eq!(state.lock().unwrap().text, "password");
+        assert_eq!(state.lock().unwrap().restores, 1);
+
+        // A click while the field had not shown the paste: the replacement waits for the field,
+        // and the selection is left alone as well.
+        let (mut script, steps, state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Cancelled]);
+        let processor = paste_processor(test_foreground(), |metrics| {
+            script.after("commit", user_clicks(metrics))
+        });
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit"]
+        );
+        assert_eq!(state.lock().unwrap().text, "привет");
+
+        // Without a click, a collapse the field does not show ends the same way.
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Failed]);
+        script.collapse = SelectionCleanup::Unverified;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "collapse"]
+        );
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn a_paste_on_the_real_clipboard_gives_a_late_field_the_replacement_and_the_user_their_clipboard()
+     {
+        let _com = PrivacyGuard::new();
+        let source = clipboard_test_window(w!("AutoKeyboardLayot paste source"));
+        put_test_clipboard_text(source, "akl-user-clipboard");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot paste probe"));
+        // This process plays the field the paste goes to.
+        let foreground = ForegroundContext {
+            process_id: unsafe { GetCurrentProcessId() },
+            ..test_foreground()
+        };
+
+        // A field that pastes at once and shows it: the user's clipboard is back when the paste
+        // ends.
+        let pasted = Arc::new(Mutex::new(None));
+        let field = Arc::clone(&pasted);
+        let reader = window.0 as usize;
+        let (script, steps) = ScriptedPaste::new(PasteClipboard::System);
+        let script = script.after("commit", move || {
+            *field.lock().unwrap() = test_clipboard_unicode(HWND(reader as *mut c_void));
+        });
+        let processor = paste_processor(foreground, |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Manual),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout", "commit"]
+        );
+        assert_eq!(pasted.lock().unwrap().as_deref(), Some("привет"));
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-user-clipboard")
+        );
+        assert!(processor.clipboard_brokers.reap().is_empty());
+
+        // A busy field that handles its Ctrl+V only after the paste stopped waiting: it gets the
+        // replacement, never the user's clipboard, which comes back right after.
+        let (mut script, steps) = ScriptedPaste::new(PasteClipboard::System);
+        script.commits = VecDeque::from([ReplayAttempt::Failed]);
+        let processor = paste_processor(foreground, |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Manual),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "collapse"]
+        );
+        assert!(processor.clipboard_brokers.busy());
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while test_clipboard_unicode(window).as_deref() != Some("akl-user-clipboard")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-user-clipboard")
+        );
+        assert_eq!(
+            reap_all(&processor.clipboard_brokers),
+            [BrokerEnd::Restored]
+        );
+        unsafe {
+            DestroyWindow(window).expect("destroy probe window");
+        }
     }
 }
