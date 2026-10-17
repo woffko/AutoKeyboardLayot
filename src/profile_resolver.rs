@@ -55,6 +55,14 @@ impl ResolvedKeyboardProfiles {
     }
 }
 
+/// How long a resolved snapshot (and a provider's reply) stays usable; a transient provider
+/// failure keeps the last snapshot until then.
+pub const PROFILE_MAX_AGE: Duration = Duration::from_secs(6);
+/// The wait before the next refresh after a successful one.
+pub const PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// The wait before the next refresh after a failed one.
+pub const PROFILE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Worker-owned freshness boundary. Unchanged successful refreshes preserve a
 /// word/transaction generation; loss of evidence or changed bindings invalidate it.
 #[derive(Debug, Default)]
@@ -232,6 +240,34 @@ pub fn resolve_keyboard_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "one", "two", ... for the documentation's spelled-out durations.
+    fn spelled(seconds: u64) -> &'static str {
+        [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        ][usize::try_from(seconds).unwrap_or(usize::MAX).min(10)]
+    }
+
+    #[test]
+    fn the_documented_profile_cache_timing_is_the_cache_timing() {
+        let doc = include_str!("../docs/localization-and-language-packs.md");
+        let age = spelled(PROFILE_MAX_AGE.as_secs());
+        for statement in [
+            format!(
+                "refreshes after {} second",
+                spelled(PROFILE_REFRESH_INTERVAL.as_secs())
+            ),
+            format!("expires cached replies\nafter {age} seconds"),
+            format!("Transport replies themselves have a {age}-second age limit"),
+            format!(
+                "retries are throttled\nto {} ms",
+                PROFILE_RETRY_INTERVAL.as_millis()
+            ),
+            "keeps the last snapshot until it is too old".to_owned(),
+        ] {
+            assert!(doc.contains(&statement), "{statement:?}");
+        }
+    }
     const US: usize = 0x04090409;
     const VARIANT: usize = 0xf0020409;
     const IME: usize = 0xe0010411;

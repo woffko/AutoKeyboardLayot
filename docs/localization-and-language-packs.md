@@ -483,15 +483,18 @@ example). No native execution or physical acceptance was performed.
 
 The input worker now owns one persistent `KeyboardProfileCache`. It polls the
 provider with zero wait, refreshes after one second, and expires cached replies
-after two seconds. Transport replies themselves have a two-second age limit;
+after six seconds. Transport replies themselves have a six-second age limit;
 the cache lifetime starts at receipt, not at the earliest per-layout observation.
-Provider failures clear availability, retries are throttled to 250 ms, and a
-disconnected provider is not replaced with new threads. Hooks do not enumerate,
-activate or resolve layouts. No refresh request is started while an input gate
-is active; freshness checks can still reject an expired snapshot.
+A transient provider failure (an error answer, or a busy, timed-out or expired
+request) keeps the last snapshot until it is too old, and retries are throttled
+to 250 ms; only a disconnected provider clears availability, and it is not
+replaced with new threads. Hooks do not enumerate, activate or resolve layouts.
+No refresh request is started while an input gate is active; freshness checks
+can still reject an expired snapshot.
 
-An identical fresh snapshot preserves its generation and buffered word. Changed,
-failed or expired bindings invalidate pending conversion and undo state. A
+An identical fresh snapshot preserves its generation and buffered word. Changed
+or expired bindings, and a disconnected provider, invalidate pending conversion
+and undo state; a transient failure alone does not. A
 partially typed word is suppressed until its boundary instead of treating its
 tail as a new word; an initial snapshot with no buffered word does not itself
 suppress the first word. Config reload rebinds the detector to current evidence.

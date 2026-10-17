@@ -6,7 +6,8 @@ use crate::WindowsKeyboardProfile;
 use crate::{
     bounded_probe::{BoundedProbe, ProbeFailure},
     profile_resolver::{
-        KeyboardProfileProbe, MAX_LOADED_KEYBOARD_LAYOUTS, ProfileResolutionError,
+        KeyboardProfileProbe, MAX_LOADED_KEYBOARD_LAYOUTS, PROFILE_MAX_AGE,
+        PROFILE_REFRESH_INTERVAL, PROFILE_RETRY_INTERVAL, ProfileResolutionError,
         ProfileSnapshotCache, ResolvedKeyboardProfiles, resolve_keyboard_profiles,
     },
 };
@@ -84,10 +85,6 @@ pub fn spawn_keyboard_profile_resolver() -> std::io::Result<KeyboardProfileResol
         move |()| resolve_keyboard_profiles(&mut probe)
     })
 }
-
-const PROFILE_MAX_AGE: Duration = Duration::from_secs(6);
-const PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const PROFILE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Persistent single-provider cache. Call `poll` outside hooks; it never waits
 /// for the provider. A timeout cannot start an additional provider thread.
