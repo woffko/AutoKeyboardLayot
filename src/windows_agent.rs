@@ -6538,7 +6538,7 @@ impl InputProcessor {
         }
 
         if self.metrics.configuration_pending.load(Ordering::Acquire) {
-            self.log_word_discard("configuration", String::new());
+            self.log_word_discard("configuration", WordDiscardDetail::None);
             self.invalidate_conversion_state();
             self.session.clear();
             self.replay_keys.clear();
@@ -6550,7 +6550,7 @@ impl InputProcessor {
                 if let Some(target) = self.last_key_foreground {
                     self.remember_word(target, self.last_layout, Instant::now());
                 }
-                self.log_word_discard("mouse", String::new());
+                self.log_word_discard("mouse", WordDiscardDetail::None);
                 self.last_word_reset = "mouse";
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
@@ -6739,7 +6739,12 @@ impl InputProcessor {
     fn reset_for_epoch(&mut self, epoch: u64) {
         let dropped_events = self.metrics.dropped_events.load(Ordering::Acquire);
         let queue_overflowed = dropped_events != self.last_dropped_events;
-        self.log_word_discard("epoch", format!("overflow={queue_overflowed}"));
+        self.log_word_discard(
+            "epoch",
+            WordDiscardDetail::Epoch {
+                overflow: queue_overflowed,
+            },
+        );
         self.invalidate_conversion_state();
         // Input the worker never saw (a queue overflow, or keys a recovery replayed past the
         // hooks) leaves the current word unknown until the next boundary.
@@ -6897,14 +6902,13 @@ impl InputProcessor {
                 // recorded, to explain words split by transient focus changes.
                 self.log_word_discard(
                     "focus",
-                    format!(
-                        "window_changed={} focus_changed={} process_changed={} focus_was_null={} focus_is_null={}",
-                        hwnd != foreground_key.0,
-                        focus != foreground_key.1,
-                        process_id != foreground_key.2,
-                        focus == 0,
-                        foreground_key.1 == 0,
-                    ),
+                    WordDiscardDetail::Focus {
+                        window_changed: hwnd != foreground_key.0,
+                        focus_changed: focus != foreground_key.1,
+                        process_changed: process_id != foreground_key.2,
+                        focus_was_null: focus == 0,
+                        focus_is_null: foreground_key.1 == 0,
+                    },
                 );
             }
             self.last_word_reset = "focus";
@@ -7564,15 +7568,15 @@ impl InputProcessor {
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
-            self.log_word_discard("switching-rule", format!("rule={}", event.category()));
+            self.log_word_discard("switching-rule", WordDiscardDetail::Rule(event.category()));
             self.session.clear();
         }
     }
 
     /// Record that a buffered word was dropped without suppressing the rest of
     /// it, so the following letters would start a new word. Only the category
-    /// and length are logged, never text.
-    fn log_word_discard(&self, reason: &str, detail: String) {
+    /// and length are logged, never text: the detail is typed and holds no string.
+    fn log_word_discard(&self, reason: &'static str, detail: WordDiscardDetail) {
         let chars = self
             .session
             .buffered_character_count()
@@ -7580,7 +7584,7 @@ impl InputProcessor {
         if chars != 0 {
             self.diagnostic(
                 "word_discard",
-                format!("reason={reason} chars={chars} {detail}"),
+                format!("reason={reason} chars={chars} {}", detail.describe()),
             );
         }
     }
@@ -9486,6 +9490,46 @@ const fn probe_verdict(
                 ProbeFailure::Expired => "reply-expired",
             },
         ),
+    }
+}
+
+/// What a word-discard line adds to its reason: flags and fixed labels only, so no text can
+/// reach the log through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordDiscardDetail {
+    None,
+    /// Which parts of the input target changed (handles are opaque identities).
+    Focus {
+        window_changed: bool,
+        focus_changed: bool,
+        process_changed: bool,
+        focus_was_null: bool,
+        focus_is_null: bool,
+    },
+    /// An input epoch change, and whether the input queue had overflowed.
+    Epoch {
+        overflow: bool,
+    },
+    /// The category of the input event that ended the word.
+    Rule(&'static str),
+}
+
+impl WordDiscardDetail {
+    fn describe(self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Focus {
+                window_changed,
+                focus_changed,
+                process_changed,
+                focus_was_null,
+                focus_is_null,
+            } => format!(
+                "window_changed={window_changed} focus_changed={focus_changed} process_changed={process_changed} focus_was_null={focus_was_null} focus_is_null={focus_is_null}"
+            ),
+            Self::Epoch { overflow } => format!("overflow={overflow}"),
+            Self::Rule(rule) => format!("rule={rule}"),
+        }
     }
 }
 
@@ -15704,6 +15748,7 @@ mod tests {
                 .iter()
                 .any(|record| record.starts_with("event=word "))
         );
+        assert_no_record_contains(&records, &["ghbdtn", "привет"]);
     }
 
     #[test]
@@ -16517,6 +16562,14 @@ mod tests {
 
     const KEEPASS: &str = r"C:\Program Files\KeePass\KeePass.exe";
 
+    fn assert_no_record_contains(records: &[String], texts: &[&str]) {
+        for record in records {
+            for text in texts {
+                assert!(!record.contains(text), "{text:?} in {record}");
+            }
+        }
+    }
+
     /// The input target of `test_raw_key`.
     fn test_foreground() -> ForegroundContext {
         test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground
@@ -16891,6 +16944,46 @@ mod tests {
         processor.process(receiver.try_recv().expect("queued again"));
         assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
         assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_pause_press_over_a_word_never_writes_the_word() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.settings.pause_break_undo = true;
+        type_letters(&mut processor, "secret");
+        let pause = RawKeyEvent {
+            hotkey_trigger: true,
+            ..test_raw_key(WM_KEYDOWN, VK_PAUSE, 5, 0)
+        };
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(5, Ordering::Release);
+        processor.last_foreground = Some(foreground_identity_key(pause.foreground));
+        processor.last_layout = Some(pause.foreground.layout);
+        processor.last_process_id = Some(pause.foreground.process_id);
+        processor.process_key(pause);
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.starts_with("event=hotkey ")),
+            "{records:?}"
+        );
+        assert_no_record_contains(&records, &["secret"]);
+    }
+
+    #[test]
+    fn the_barrier_report_never_carries_the_text_it_compared() {
+        let report = classify_text_barrier(
+            "привет\u{a0}",
+            "привет ",
+            TextBarrierStage::TextCompared,
+            -7,
+        );
+        let line = format_text_barrier_report(report);
+        assert!(line.contains("nbsp_equiv=true"), "{line}");
+        assert_no_record_contains(&[line], &["привет"]);
     }
 
     /// A scripted text field. The caret is at the end of `text`, and `selected` characters
