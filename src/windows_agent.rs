@@ -413,6 +413,7 @@ struct ObserverMetrics {
     active_gate_token: AtomicU64,
     cancelled_gate_token: AtomicU64,
     privacy_refresh_queued: AtomicBool,
+    profile_refresh_queued: AtomicBool,
     worker_busy: AtomicBool,
     // The worker is inside an edit that may have selected or typed text in the field.
     edit_in_flight: AtomicBool,
@@ -467,6 +468,7 @@ impl Default for ObserverMetrics {
             active_gate_token: AtomicU64::new(0),
             cancelled_gate_token: AtomicU64::new(0),
             privacy_refresh_queued: AtomicBool::new(false),
+            profile_refresh_queued: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
             edit_in_flight: AtomicBool::new(false),
             selection_left_token: AtomicU64::new(0),
@@ -730,6 +732,10 @@ enum RawInputEvent {
     Mouse,
     ExternalInjection,
     PrivacyRefresh(ForegroundContext),
+    /// Keeps the keyboard profile snapshot fresh on every timer tick, also while no privacy
+    /// refresh runs (the shell in the foreground): without it the first key after six quiet
+    /// seconds finds the snapshot expired and the word, undo and remembered words are dropped.
+    ProfileRefresh,
     ReloadConfiguration,
     RecoverInput {
         sequence: u64,
@@ -2342,13 +2348,13 @@ impl AppState {
         let Some(sender) = &self.input_sender else {
             return false;
         };
-        let privacy_refresh = matches!(event, RawInputEvent::PrivacyRefresh(_));
-        if privacy_refresh
-            && self
-                .metrics
-                .privacy_refresh_queued
-                .swap(true, Ordering::AcqRel)
-        {
+        // At most one refresh of each kind waits in the queue, and a full queue only drops it.
+        let refresh_queued = match event {
+            RawInputEvent::PrivacyRefresh(_) => Some(&self.metrics.privacy_refresh_queued),
+            RawInputEvent::ProfileRefresh => Some(&self.metrics.profile_refresh_queued),
+            _ => None,
+        };
+        if refresh_queued.is_some_and(|queued| queued.swap(true, Ordering::AcqRel)) {
             return true;
         }
         if let RawInputEvent::Key(key) = event {
@@ -2365,18 +2371,14 @@ impl AppState {
         match sender.try_send(queued) {
             Ok(()) => true,
             Err(TrySendError::Disconnected(_)) => {
-                if privacy_refresh {
-                    self.metrics
-                        .privacy_refresh_queued
-                        .store(false, Ordering::Release);
+                if let Some(queued) = refresh_queued {
+                    queued.store(false, Ordering::Release);
                 }
                 false
             }
             Err(TrySendError::Full(_)) => {
-                if privacy_refresh {
-                    self.metrics
-                        .privacy_refresh_queued
-                        .store(false, Ordering::Release);
+                if let Some(queued) = refresh_queued {
+                    queued.store(false, Ordering::Release);
                     return false;
                 }
                 self.metrics.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -3920,6 +3922,29 @@ fn foreground_captures_input() -> bool {
             .is_some_and(|path| captures_keyboard(&path))
 }
 
+/// The worker's periodic refreshes for a timer tick: the keyboard profiles on every tick, and the
+/// focused field's privacy check at its own interval, except for the shell.
+fn queue_periodic_refreshes(
+    state: &mut AppState,
+    context: ForegroundContext,
+    shell_foreground: bool,
+    now: Instant,
+) {
+    state.enqueue(RawInputEvent::ProfileRefresh);
+    if shell_foreground {
+        // The desktop is no full-screen program, and no refresh will report it.
+        state
+            .metrics
+            .foreground_full_screen
+            .store(false, Ordering::Release);
+    } else if now >= state.next_privacy_refresh {
+        state.enqueue(RawInputEvent::PrivacyRefresh(context));
+        let last_check = state.metrics.privacy_probe_cost_ms.load(Ordering::Acquire);
+        state.next_privacy_refresh =
+            now + privacy_refresh_interval(Duration::from_millis(last_check));
+    }
+}
+
 fn refresh_tray_state() {
     if APP_STATE.with(|slot| slot.borrow().as_ref().is_some_and(|state| state.menu_open)) {
         return;
@@ -3931,20 +3956,8 @@ fn refresh_tray_state() {
     let now = Instant::now();
     APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
-        let Some(state) = state.as_mut() else {
-            return;
-        };
-        if shell_foreground {
-            // The desktop is no full-screen program, and no refresh will report it.
-            state
-                .metrics
-                .foreground_full_screen
-                .store(false, Ordering::Release);
-        } else if now >= state.next_privacy_refresh {
-            state.enqueue(RawInputEvent::PrivacyRefresh(context));
-            let last_check = state.metrics.privacy_probe_cost_ms.load(Ordering::Acquire);
-            state.next_privacy_refresh =
-                now + privacy_refresh_interval(Duration::from_millis(last_check));
+        if let Some(state) = state.as_mut() {
+            queue_periodic_refreshes(state, context, shell_foreground, now);
         }
     });
     let last_input_layout = APP_STATE.with(|slot| {
@@ -7317,6 +7330,7 @@ impl InputProcessor {
                 RawInputEvent::Key(_) => "key",
                 RawInputEvent::GateDrainReady { .. } => "gate_ack",
                 RawInputEvent::PrivacyRefresh(_) => "privacy",
+                RawInputEvent::ProfileRefresh => "profiles",
                 RawInputEvent::RecoverInput { .. } => "recovery",
                 RawInputEvent::RetainedInputExpired => "recovery_expired",
                 RawInputEvent::Mouse => "mouse",
@@ -7331,10 +7345,16 @@ impl InputProcessor {
                 ),
             );
         }
-        if matches!(queued.event, RawInputEvent::PrivacyRefresh(_)) {
-            self.metrics
+        match queued.event {
+            RawInputEvent::PrivacyRefresh(_) => self
+                .metrics
                 .privacy_refresh_queued
-                .store(false, Ordering::Release);
+                .store(false, Ordering::Release),
+            RawInputEvent::ProfileRefresh => self
+                .metrics
+                .profile_refresh_queued
+                .store(false, Ordering::Release),
+            _ => {}
         }
         if matches!(queued.event, RawInputEvent::ReloadConfiguration) {
             // Configuration revisions are independent of input overflow epochs.
@@ -7419,6 +7439,12 @@ impl InputProcessor {
             RawInputEvent::Key(event) => self.process_key(event),
             RawInputEvent::RecoverInput { sequence, explicit } => {
                 self.recover_retained_input(sequence, explicit)
+            }
+            RawInputEvent::ProfileRefresh => {
+                // Like the privacy refresh, never in the way of a fence acknowledgement.
+                if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
+                    self.refresh_input_profiles();
+                }
             }
             RawInputEvent::PrivacyRefresh(foreground) => {
                 // Periodic refresh is not a gate-control dependency. The next
@@ -18503,6 +18529,102 @@ mod tests {
         processor.process(receiver.try_recv().expect("queued again"));
         assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
         assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// The kinds of the refresh events waiting in `receiver`.
+    fn queued_refreshes(receiver: &Receiver<QueuedInputEvent>) -> Vec<&'static str> {
+        receiver
+            .try_iter()
+            .map(|queued| match queued.event {
+                RawInputEvent::ProfileRefresh => "profiles",
+                RawInputEvent::PrivacyRefresh(_) => "privacy",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_timer_tick_refreshes_the_keyboard_profiles_also_over_the_shell() {
+        let (mut state, receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        let now = Instant::now();
+        // The shell gets no field check, but its keyboard profiles age like any other.
+        queue_periodic_refreshes(&mut state, foreground, true, now);
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+        state
+            .metrics
+            .profile_refresh_queued
+            .store(false, Ordering::Release);
+        queue_periodic_refreshes(&mut state, foreground, false, now);
+        assert_eq!(queued_refreshes(&receiver), ["profiles", "privacy"]);
+        // The field check keeps its own interval; the profiles come with every tick.
+        state
+            .metrics
+            .profile_refresh_queued
+            .store(false, Ordering::Release);
+        state
+            .metrics
+            .privacy_refresh_queued
+            .store(false, Ordering::Release);
+        queue_periodic_refreshes(&mut state, foreground, false, now);
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+    }
+
+    #[test]
+    fn a_profile_refresh_waits_once_in_the_queue_and_a_full_queue_only_drops_it() {
+        let (state, receiver) = test_gate_state(1);
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+        // Still marked as queued until the worker takes it: the next tick sends nothing.
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        assert!(receiver.try_recv().is_err());
+        state
+            .metrics
+            .profile_refresh_queued
+            .store(false, Ordering::Release);
+        assert!(state.enqueue(RawInputEvent::Mouse));
+        let epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        assert!(!state.enqueue(RawInputEvent::ProfileRefresh));
+        assert_eq!(state.metrics.input_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(state.metrics.dropped_events.load(Ordering::Acquire), 0);
+        assert!(!state.metrics.profile_refresh_queued.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_profile_refresh_polls_the_keyboard_profiles_unless_a_gate_holds_keys() {
+        let (state, receiver) = test_gate_state(4);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.profile_override = None;
+        let asked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&asked);
+        let snapshot = test_profiles();
+        processor.input_profiles = KeyboardProfileCache::with_resolver(
+            BoundedProbe::spawn("test-profiles", move || {
+                move |()| {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                    Ok(snapshot.clone())
+                }
+            })
+            .unwrap(),
+        );
+        state.metrics.active_gate_token.store(9, Ordering::Release);
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        processor.process(receiver.try_recv().unwrap());
+        assert!(!state.metrics.profile_refresh_queued.load(Ordering::Acquire));
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(asked.load(Ordering::Acquire), 0, "a gate holds keys");
+        state.metrics.active_gate_token.store(0, Ordering::Release);
+        // The provider answers a request on a later refresh.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while processor.input_profiles.generation() == 0 && Instant::now() < deadline {
+            assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+            processor.process(receiver.try_recv().unwrap());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(processor.input_profiles.generation(), 1);
+        assert!(asked.load(Ordering::Acquire) >= 1);
+        assert_eq!(processor.resolved_profiles(), Some(&test_profiles()));
     }
 
     #[test]

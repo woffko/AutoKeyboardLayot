@@ -103,6 +103,16 @@ impl Default for KeyboardProfileCache {
     }
 }
 impl KeyboardProfileCache {
+    /// A cache that asks `resolver` instead of a provider of its own; tests give one that
+    /// answers with a fixed snapshot.
+    pub fn with_resolver(resolver: KeyboardProfileResolver) -> Self {
+        Self {
+            resolver: Some(resolver),
+            cache: ProfileSnapshotCache::default(),
+            next_refresh: Instant::now(),
+        }
+    }
+
     /// Returns true only when bindings or availability changed, not on every
     /// identical periodic refresh. Consumers must invalidate buffered state then.
     pub fn poll(&mut self) -> bool {

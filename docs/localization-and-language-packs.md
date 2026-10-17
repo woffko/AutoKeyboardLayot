@@ -490,9 +490,13 @@ request) keeps the last snapshot until it is too old, and retries are throttled
 to 250 ms; only a disconnected provider clears availability, and it is not
 replaced with new threads. Hooks do not enumerate, activate or resolve layouts.
 No refresh request is started while an input gate is active; freshness checks
-can still reject an expired snapshot.
+can still reject an expired snapshot. The agent asks for a refresh on every
+250 ms timer tick whatever window is in the foreground: the desktop and File
+Explorer get no periodic field check, but their snapshot would age all the same,
+and the first key after a quiet minute there must not find it expired.
 
-An identical fresh snapshot preserves its generation and buffered word. Changed
+An identical fresh snapshot preserves its generation and buffered word, and the
+same bindings coming back after an expiry do not start another generation. Changed
 or expired bindings, and a disconnected provider, invalidate pending conversion
 and undo state; a transient failure alone does not. A
 partially typed word is suppressed until its boundary instead of treating its
