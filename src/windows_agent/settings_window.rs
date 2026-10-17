@@ -1,10 +1,11 @@
 //! Fluent settings UI. It runs as a separate mode of the same executable so
 //! the keyboard-hook process never shares or blocks the UI event loop.
 
-use std::{collections::BTreeSet, fs::OpenOptions, mem::size_of, sync::Arc};
+use std::{collections::BTreeSet, fs::OpenOptions, mem::size_of, path::Path, sync::Arc};
 
+use autokeyboardlayot::configuration::{EditorEntry, load_configuration_directory};
 use autokeyboardlayot::localization::UiLanguagePreference;
-use autokeyboardlayot::{BackendRules, ConfigurationDocument, Hotkey};
+use autokeyboardlayot::{BackendRules, ConfigurationDocument, Hotkey, PackId};
 use i_slint_backend_winit::winit::platform::windows::WindowAttributesExtWindows;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use windows::{
@@ -505,35 +506,91 @@ fn wire_callbacks(
             return;
         }
         let original = save_document.borrow().clone();
-        match document_from_ui(&ui, original.clone()) {
-            Ok(document) => match configuration_directory_or_error().and_then(|directory| {
-                save_configuration_if_unchanged(&directory, &document, &original)
-            }) {
-                Ok(()) => {
-                    let preference = document.ui_language.clone();
-                    *save_document.borrow_mut() = document;
-                    refresh_ui_language(&ui, &preference, &registry.borrow());
-                    ui.set_status_error(false);
-                    ui.set_status_text(if notify_agent() {
-                        tr("settings.saved_notified").into()
-                    } else {
-                        tr("settings.saved_agent_unavailable").into()
-                    });
-                    if close_after_save {
-                        let _ = slint::quit_event_loop();
-                    }
+        let document = match document_from_ui(&ui, original.clone()) {
+            Ok(document) => document,
+            Err(error) => {
+                if let Some(page) = error.page {
+                    ui.set_current_page(page);
                 }
-                Err(error) => {
-                    ui.set_status_error(true);
-                    ui.set_status_text(
-                        tr_format("error.save_config", &[("error", &error.to_string())]).into(),
-                    );
-                }
-            },
+                ui.set_status_error(true);
+                ui.set_status_text(error.message.into());
+                return;
+            }
+        };
+        let saved = configuration_directory_or_error()
+            .and_then(|directory| save_or_merge(&directory, &document, &original));
+        let document = match saved {
+            Ok(Saved::AsDrafted) => document,
+            Ok(Saved::Merged(merged)) => {
+                // The window shows what was saved: the draft with the changes made meanwhile.
+                populate_ui(&ui, &merged, &registry.borrow());
+                merged
+            }
+            Ok(Saved::Conflict {
+                document,
+                current,
+                conflicts,
+            }) => {
+                // The next Apply saves the window's values over the configuration as it is now.
+                *save_document.borrow_mut() = *current;
+                populate_ui(&ui, &document, &registry.borrow());
+                ui.set_status_error(true);
+                ui.set_status_text(
+                    tr_format(
+                        "settings.merge_conflict",
+                        &[("fields", &conflicts.join(", "))],
+                    )
+                    .into(),
+                );
+                return;
+            }
             Err(error) => {
                 ui.set_status_error(true);
-                ui.set_status_text(error.into());
+                ui.set_status_text(
+                    tr_format("error.save_config", &[("error", &error.to_string())]).into(),
+                );
+                return;
             }
+        };
+        let preference = document.ui_language.clone();
+        let unknown = unknown_language_entry(
+            &document,
+            ui.get_user_dictionary_text().as_str(),
+            ui.get_word_exclusions_text().as_str(),
+            |id| {
+                registry
+                    .borrow()
+                    .installed_ids()
+                    .any(|installed| installed == id)
+            },
+        );
+        *save_document.borrow_mut() = document;
+        refresh_ui_language(&ui, &preference, &registry.borrow());
+        let notified = notify_agent();
+        if let Some(unknown) = unknown {
+            ui.set_current_page(unknown.page);
+            ui.set_status_error(true);
+            ui.set_status_text(
+                tr_format(
+                    "settings.saved_unknown_language",
+                    &[
+                        ("page", &tr(unknown.page_name)),
+                        ("line", &unknown.line.to_string()),
+                        ("id", &unknown.id),
+                    ],
+                )
+                .into(),
+            );
+            return;
+        }
+        ui.set_status_error(false);
+        ui.set_status_text(if notified {
+            tr("settings.saved_notified").into()
+        } else {
+            tr("settings.saved_agent_unavailable").into()
+        });
+        if close_after_save {
+            let _ = slint::quit_event_loop();
         }
     });
 
@@ -611,16 +668,195 @@ fn wire_callbacks(
 }
 
 fn settings_edits_are_saved(
-    candidate: Result<ConfigurationDocument, String>,
+    candidate: Result<ConfigurationDocument, DraftError>,
     original: &ConfigurationDocument,
 ) -> bool {
     candidate.is_ok_and(|document| document == *original)
 }
 
+const DICTIONARY_PAGE: i32 = 3;
+const WORD_EXCLUSIONS_PAGE: i32 = 4;
+const PROCESS_EXCLUSIONS_PAGE: i32 = 5;
+const BACKENDS_PAGE: i32 = 6;
+
+/// Why the window's draft cannot be saved, and the page that shows the problem.
+#[derive(Debug, PartialEq, Eq)]
+struct DraftError {
+    message: String,
+    page: Option<i32>,
+}
+
+impl From<String> for DraftError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            page: None,
+        }
+    }
+}
+
+/// A problem on a line of the editor on `page`, named `page_name` in the navigation.
+fn editor_error(page: i32, page_name: &str, line: usize, message: &str) -> DraftError {
+    DraftError {
+        message: tr_format(
+            "error.editor_line",
+            &[
+                ("page", &tr(page_name)),
+                ("line", &line.to_string()),
+                ("error", message),
+            ],
+        ),
+        page: Some(page),
+    }
+}
+
+/// The dictionary, word-exclusion and program-exclusion editors, each read on its own: a bad
+/// entry is named with its page and its line in that editor.
+struct EditorLists {
+    dictionary: Vec<EditorEntry>,
+    word_exclusions: Vec<EditorEntry>,
+    process_exclusions: Vec<EditorEntry>,
+}
+
+fn editor_lists(
+    dictionary: &str,
+    word_exclusions: &str,
+    process_exclusions: &str,
+) -> Result<EditorLists, DraftError> {
+    let in_editor = |page, page_name| {
+        move |error: autokeyboardlayot::ConfigurationError| {
+            editor_error(page, page_name, error.line.unwrap_or(1), &error.message)
+        }
+    };
+    let dictionary = ConfigurationDocument::lexicon_editor_entries(dictionary)
+        .map_err(in_editor(DICTIONARY_PAGE, "nav.dictionary"))?;
+    let word_exclusions = ConfigurationDocument::lexicon_editor_entries(word_exclusions)
+        .map_err(in_editor(WORD_EXCLUSIONS_PAGE, "nav.word_exclusions"))?;
+    if let Some(both) = word_exclusions
+        .iter()
+        .find(|word| dictionary.iter().any(|entry| entry.entry == word.entry))
+    {
+        return Err(editor_error(
+            WORD_EXCLUSIONS_PAGE,
+            "nav.word_exclusions",
+            both.line,
+            "this entry is also in the user dictionary",
+        ));
+    }
+    let process_exclusions = ConfigurationDocument::process_editor_entries(process_exclusions)
+        .map_err(in_editor(PROCESS_EXCLUSIONS_PAGE, "nav.process_exclusions"))?;
+    Ok(EditorLists {
+        dictionary,
+        word_exclusions,
+        process_exclusions,
+    })
+}
+
+/// A dictionary or word-exclusion entry whose language is not installed: saved, but without
+/// effect until the language is installed.
+#[derive(Debug, PartialEq, Eq)]
+struct UnknownLanguage {
+    page: i32,
+    page_name: &'static str,
+    line: usize,
+    id: String,
+}
+
+fn unknown_language_entry(
+    document: &ConfigurationDocument,
+    dictionary: &str,
+    word_exclusions: &str,
+    installed: impl Fn(&PackId) -> bool,
+) -> Option<UnknownLanguage> {
+    let lists = [
+        (
+            DICTIONARY_PAGE,
+            "nav.dictionary",
+            dictionary,
+            &document.user_dictionary,
+        ),
+        (
+            WORD_EXCLUSIONS_PAGE,
+            "nav.word_exclusions",
+            word_exclusions,
+            &document.word_exclusions,
+        ),
+    ];
+    for (page, page_name, editor, saved) in lists {
+        let entries = ConfigurationDocument::lexicon_editor_entries(editor).unwrap_or_default();
+        for entry in entries.iter().filter(|entry| saved.contains(&entry.entry)) {
+            let Some((id, _)) = entry.entry.split_once(':') else {
+                continue;
+            };
+            if PackId::parse(id).is_ok_and(|pack| !installed(&pack)) {
+                return Some(UnknownLanguage {
+                    page,
+                    page_name,
+                    line: entry.line,
+                    id: id.to_owned(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// What came of saving the window's draft.
+#[derive(Debug, PartialEq, Eq)]
+enum Saved {
+    /// Saved as the window holds it.
+    AsDrafted,
+    /// The configuration changed since the window read it; the draft was merged into it and the
+    /// merge, as read back, saved.
+    Merged(ConfigurationDocument),
+    /// The configuration changed meanwhile in values the draft changed too: nothing was saved.
+    /// `document` is the merge with the draft's values, `current` the configuration now.
+    Conflict {
+        document: Box<ConfigurationDocument>,
+        current: Box<ConfigurationDocument>,
+        conflicts: Vec<String>,
+    },
+}
+
+/// Saves the draft (made from `original`) into the configuration in `directory`. When the
+/// configuration changed since the window read it (a word added from the tray, a hand edit),
+/// the draft is merged into it and that is saved; values both changed are a conflict.
+fn save_or_merge(
+    directory: &Path,
+    draft: &ConfigurationDocument,
+    original: &ConfigurationDocument,
+) -> std::io::Result<Saved> {
+    match save_configuration_if_unchanged(directory, draft, original) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        other => return other.map(|()| Saved::AsDrafted),
+    }
+    // Another writer may change it again between the read and the save.
+    for _ in 0..3 {
+        let current = load_configuration_directory(directory)?;
+        let merged = ConfigurationDocument::merge(original, draft, &current);
+        if !merged.conflicts.is_empty() {
+            return Ok(Saved::Conflict {
+                document: Box::new(merged.document),
+                current: Box::new(current),
+                conflicts: merged.conflicts,
+            });
+        }
+        match save_configuration_if_unchanged(directory, &merged.document, &current) {
+            Ok(()) => return load_configuration_directory(directory).map(Saved::Merged),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Configuration keeps changing outside this window; try applying again",
+    ))
+}
+
 fn document_from_ui(
     ui: &SettingsWindow,
     mut document: ConfigurationDocument,
-) -> Result<ConfigurationDocument, String> {
+) -> Result<ConfigurationDocument, DraftError> {
     let selected =
         usize::try_from(ui.get_ui_language_index()).map_err(|_| tr("error.ui_language"))?;
     let preference = ui
@@ -663,11 +899,20 @@ fn document_from_ui(
     settings.force_hotkey_modifiers = hotkey.modifiers;
     document.settings = settings;
 
-    document.user_dictionary = editor_lines(ui.get_user_dictionary_text().as_str());
-    document.word_exclusions = editor_lines(ui.get_word_exclusions_text().as_str());
-    document.process_exclusions = editor_lines(ui.get_process_exclusions_text().as_str());
+    let lists = editor_lists(
+        ui.get_user_dictionary_text().as_str(),
+        ui.get_word_exclusions_text().as_str(),
+        ui.get_process_exclusions_text().as_str(),
+    )?;
+    let entries = |list: Vec<EditorEntry>| list.into_iter().map(|entry| entry.entry).collect();
+    document.user_dictionary = entries(lists.dictionary);
+    document.word_exclusions = entries(lists.word_exclusions);
+    document.process_exclusions = entries(lists.process_exclusions);
     document.backend_rules = BackendRules::from_lines(ui.get_backend_rules_text().lines())
-        .map_err(|error| tr_format("error.backend_rules", &[("error", &error.to_string())]))?;
+        .map_err(|error| DraftError {
+            message: tr_format("error.backend_rules", &[("error", &error.to_string())]),
+            page: Some(BACKENDS_PAGE),
+        })?;
     document
         .canonicalize_and_validate()
         .map_err(|error| tr_format("error.settings", &[("error", &error.to_string())]))?;
@@ -689,14 +934,6 @@ fn lines_to_editor(lines: &[String]) -> SharedString {
     } else {
         format!("{}\n", lines.join("\n")).into()
     }
-}
-
-fn editor_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
 }
 
 fn append_unique_line(existing: &str, entry: &str) -> String {
@@ -872,10 +1109,155 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_editor_line_names_its_page_and_its_line_in_that_editor() {
+        let dictionary = "# my words\nen-US: firefox\n\nen-US: two words\n";
+        let error = editor_lists(dictionary, "", "").err().unwrap();
+        assert_eq!(error.page, Some(DICTIONARY_PAGE));
+        assert!(
+            error.message.starts_with("User dictionary, line 4: "),
+            "{}",
+            error.message
+        );
+        // The same mistake in the word exclusions names that page.
+        let error = editor_lists("", dictionary, "").err().unwrap();
+        assert_eq!(error.page, Some(WORD_EXCLUSIONS_PAGE));
+        assert!(
+            error.message.starts_with("Word exclusions, line 4: "),
+            "{}",
+            error.message
+        );
+        let error = editor_lists("", "", "private.exe\n\n\"#vault.exe\"\n")
+            .err()
+            .unwrap();
+        assert_eq!(error.page, Some(PROCESS_EXCLUSIONS_PAGE));
+        assert!(error.message.contains(", line 3: "), "{}", error.message);
+        // An entry in both lists is named at its line in the exclusions.
+        let error = editor_lists("en-US: firefox\n", "\nru-RU: x\nen-US: Firefox\n", "")
+            .err()
+            .unwrap();
+        assert_eq!(error.page, Some(WORD_EXCLUSIONS_PAGE));
+        assert!(error.message.contains(", line 3: "), "{}", error.message);
+        let lists = editor_lists(
+            "en-US: Firefox\n",
+            "ru-RU: руддщ\n",
+            "C:\\Apps\\Vault.exe\n",
+        )
+        .unwrap();
+        assert_eq!(lists.dictionary[0].entry, "en-US: firefox");
+        assert_eq!(lists.process_exclusions[0].entry, "vault.exe");
+    }
+
+    #[test]
+    fn an_entry_for_a_language_that_is_not_installed_is_reported_after_saving() {
+        let document = ConfigurationDocument {
+            user_dictionary: vec!["de: hallo".to_owned(), "en-US: firefox".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        let english = PackId::parse("en-US").unwrap();
+        let unknown =
+            unknown_language_entry(&document, "en-US: firefox\n\nde: Hallo\n", "", |id| {
+                *id == english
+            });
+        assert_eq!(
+            unknown,
+            Some(UnknownLanguage {
+                page: DICTIONARY_PAGE,
+                page_name: "nav.dictionary",
+                line: 3,
+                id: "de".to_owned(),
+            })
+        );
+        assert_eq!(
+            unknown_language_entry(&document, "de: Hallo\n", "", |_| true),
+            None
+        );
+    }
+
+    /// A configuration folder holding `document`.
+    fn folder_with(document: &ConfigurationDocument) -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("config.ini"),
+            document.to_text().unwrap(),
+        )
+        .unwrap();
+        folder
+    }
+
+    #[test]
+    fn a_draft_merges_with_a_word_added_from_the_tray_while_the_window_was_open() {
+        // The owner's case: the window is open, a word is added from the tray, then a box is
+        // unticked in the window and Apply is selected.
+        let base = ConfigurationDocument::default();
+        let folder = folder_with(&base);
+        let offer = super::super::VolatileLexiconCandidate::new(
+            super::super::LexiconOfferTarget::UserDictionary,
+            autokeyboardlayot::Language::English,
+            "firefox".to_owned(),
+            std::time::Instant::now(),
+        );
+        super::super::persist_lexicon_candidate(folder.path(), &offer).unwrap();
+        let mut draft = base.clone();
+        draft.settings.suppress_after_manual_layout_change =
+            !base.settings.suppress_after_manual_layout_change;
+        let saved = save_or_merge(folder.path(), &draft, &base).unwrap();
+        let on_disk = load_configuration_directory(folder.path()).unwrap();
+        assert_eq!(saved, Saved::Merged(on_disk.clone()));
+        assert_eq!(
+            on_disk.settings.suppress_after_manual_layout_change,
+            !base.settings.suppress_after_manual_layout_change
+        );
+        assert_eq!(on_disk.user_dictionary, ["en-US: firefox"]);
+        // Unchanged since, the next draft is saved as it is.
+        let mut next = on_disk.clone();
+        next.settings.layout_model = !next.settings.layout_model;
+        assert_eq!(
+            save_or_merge(folder.path(), &next, &on_disk).unwrap(),
+            Saved::AsDrafted
+        );
+    }
+
+    #[test]
+    fn a_value_changed_in_the_window_and_outside_it_is_not_saved_over() {
+        let base = ConfigurationDocument::default();
+        let mut outside = base.clone();
+        outside.ui_language = UiLanguagePreference::from_config("et");
+        let folder = folder_with(&outside);
+        let mut draft = base.clone();
+        draft.ui_language = UiLanguagePreference::from_config("ru");
+        let Saved::Conflict {
+            document,
+            current,
+            conflicts,
+        } = save_or_merge(folder.path(), &draft, &base).unwrap()
+        else {
+            panic!("no conflict");
+        };
+        assert_eq!(conflicts, ["ui_language"]);
+        assert_eq!(document.ui_language.as_config(), "ru");
+        assert_eq!(current.ui_language.as_config(), "et");
+        assert_eq!(
+            load_configuration_directory(folder.path())
+                .unwrap()
+                .ui_language
+                .as_config(),
+            "et"
+        );
+        // With the configuration as it is now as the base, the window's values are saved.
+        assert_eq!(
+            save_or_merge(folder.path(), &document, &current).unwrap(),
+            Saved::AsDrafted
+        );
+    }
+
+    #[test]
     fn normal_close_requires_valid_unchanged_settings() {
         let original = ConfigurationDocument::default();
         assert!(settings_edits_are_saved(Ok(original.clone()), &original));
-        assert!(!settings_edits_are_saved(Err("invalid".into()), &original));
+        assert!(!settings_edits_are_saved(
+            Err(DraftError::from("invalid".to_owned())),
+            &original
+        ));
         let mut edited = original.clone();
         edited.settings.automatic_conversion_on_startup =
             !edited.settings.automatic_conversion_on_startup;

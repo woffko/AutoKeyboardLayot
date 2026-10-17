@@ -1,6 +1,9 @@
 //! Versioned, human-readable configuration shared by the Windows agent and GUI.
 
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use crate::localization::UiLanguagePreference;
 use crate::{BackendRuleError, BackendRules, ExclusionPolicy, Hotkey, Settings, UserLexicon};
@@ -462,6 +465,93 @@ impl ConfigurationDocument {
     pub fn process_editor_entries(text: &str) -> Result<Vec<EditorEntry>, ConfigurationError> {
         editor_entries(text, process_entry)
     }
+
+    /// Merges a draft (`ours`, made from `base`) into the configuration as it is now (`theirs`):
+    /// what the draft changed since `base` wins, everything else is taken from `theirs`. Settings,
+    /// profiles and rules are merged one by one and the lists entry by entry, so a word the draft
+    /// added and one added meanwhile both stay. A value both changed differently is a conflict;
+    /// the draft's value is kept for it.
+    pub fn merge(base: &Self, ours: &Self, theirs: &Self) -> MergedConfiguration {
+        let mut conflicts = Vec::new();
+        let package_mode = merge_value(
+            "mode",
+            &base.package_mode,
+            &ours.package_mode,
+            &theirs.package_mode,
+            &mut conflicts,
+        );
+        let ui_language = merge_value(
+            "ui_language",
+            &base.ui_language,
+            &ours.ui_language,
+            &theirs.ui_language,
+            &mut conflicts,
+        );
+        let settings_text: String = merge_map(
+            &settings_values(&base.settings),
+            &settings_values(&ours.settings),
+            &settings_values(&theirs.settings),
+            &mut conflicts,
+        )
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect();
+        let profiles = merge_map(
+            &profile_values(&base.input_profiles),
+            &profile_values(&ours.input_profiles),
+            &profile_values(&theirs.input_profiles),
+            &mut conflicts,
+        );
+        let rules: String = merge_map(
+            &rule_values(&base.backend_rules),
+            &rule_values(&ours.backend_rules),
+            &rule_values(&theirs.backend_rules),
+            &mut conflicts,
+        )
+        .iter()
+        .map(|(pattern, strategy)| format!("{pattern} = {strategy}\n"))
+        .collect();
+        let document = Self {
+            package_mode,
+            // Every value comes from one of three valid documents.
+            settings: Settings::try_from_text(&settings_text)
+                .unwrap_or_else(|_| ours.settings.clone()),
+            input_profiles: crate::input_profile_selection::InputProfileSelections::parse(
+                profiles.iter(),
+            )
+            .unwrap_or_else(|_| ours.input_profiles.clone()),
+            ui_language,
+            user_dictionary: merge_entries(
+                &base.user_dictionary,
+                &ours.user_dictionary,
+                &theirs.user_dictionary,
+            ),
+            word_exclusions: merge_entries(
+                &base.word_exclusions,
+                &ours.word_exclusions,
+                &theirs.word_exclusions,
+            ),
+            process_exclusions: merge_entries(
+                &base.process_exclusions,
+                &ours.process_exclusions,
+                &theirs.process_exclusions,
+            ),
+            backend_rules: BackendRules::from_lines(rules.lines())
+                .unwrap_or_else(|_| ours.backend_rules.clone()),
+        };
+        if document
+            .word_exclusions
+            .iter()
+            .any(|entry| document.user_dictionary.contains(entry))
+        {
+            conflicts.push("user_dictionary, word_exclusions".to_owned());
+        }
+        MergedConfiguration {
+            document,
+            conflicts,
+        }
+    }
+
     /// Fresh installer document only; never use this to replace a user's config.
     /// The caller must initialize/verify the empty managed store before saving it.
     pub fn english_only_managed() -> Self {
@@ -531,6 +621,93 @@ impl ConfigurationDocument {
         }
         Ok(())
     }
+}
+
+/// A three-way merge of one value: the draft's change wins, otherwise the configuration's.
+fn merge_value<T: PartialEq + Clone>(
+    name: &str,
+    base: &T,
+    ours: &T,
+    theirs: &T,
+    conflicts: &mut Vec<String>,
+) -> T {
+    if ours == base {
+        theirs.clone()
+    } else {
+        if theirs != base && theirs != ours {
+            conflicts.push(name.to_owned());
+        }
+        ours.clone()
+    }
+}
+
+/// A three-way merge of named values, one by one; a missing name is a value too (removed).
+fn merge_map(
+    base: &BTreeMap<String, String>,
+    ours: &BTreeMap<String, String>,
+    theirs: &BTreeMap<String, String>,
+    conflicts: &mut Vec<String>,
+) -> BTreeMap<String, String> {
+    let names: BTreeSet<&String> = base
+        .keys()
+        .chain(ours.keys())
+        .chain(theirs.keys())
+        .collect();
+    let mut merged = BTreeMap::new();
+    for name in names {
+        if let Some(value) = merge_value(
+            name,
+            &base.get(name),
+            &ours.get(name),
+            &theirs.get(name),
+            conflicts,
+        ) {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    merged
+}
+
+/// A three-way merge of a list, entry by entry: an entry both keep stays, one either side added
+/// stays, one either side removed goes.
+fn merge_entries(base: &[String], ours: &[String], theirs: &[String]) -> Vec<String> {
+    let kept = |entry: &&String| !base.contains(entry);
+    ours.iter()
+        .filter(|entry| theirs.contains(entry) || kept(entry))
+        .chain(theirs.iter().filter(kept))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn settings_values(settings: &Settings) -> BTreeMap<String, String> {
+    settings
+        .to_text()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect()
+}
+
+fn profile_values(
+    profiles: &crate::input_profile_selection::InputProfileSelections,
+) -> BTreeMap<String, String> {
+    profiles
+        .iter()
+        .map(|(id, profile)| (id.to_string(), profile.to_string()))
+        .collect()
+}
+
+fn rule_values(rules: &BackendRules) -> BTreeMap<String, String> {
+    rules
+        .to_text()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(pattern, strategy)| (pattern.trim().to_owned(), strategy.trim().to_owned()))
+        .collect()
 }
 
 fn canonical_lexicon_entries(
@@ -1103,6 +1280,87 @@ mod tests {
             "vault.exe"
         );
     }
+
+    impl ConfigurationDocument {
+        /// The document as it is stored: lists sorted and normalized.
+        fn canonical(mut self) -> Self {
+            self.canonicalize_and_validate().unwrap();
+            self
+        }
+    }
+
+    #[test]
+    fn a_draft_merges_into_a_configuration_changed_meanwhile() {
+        // The owner's case: a word added from the tray while the window was open, a box
+        // unticked and a word typed in the window.
+        let base = ConfigurationDocument {
+            user_dictionary: vec!["en-US: old".to_owned(), "en-US: gone".to_owned()],
+            process_exclusions: vec!["private.exe".to_owned()],
+            ..ConfigurationDocument::default()
+        }
+        .canonical();
+        let mut theirs = base.clone();
+        theirs.user_dictionary.push("en-US: firefox".to_owned());
+        theirs
+            .user_dictionary
+            .retain(|entry| entry != "en-US: gone");
+        theirs.settings.layout_model = !base.settings.layout_model;
+        let mut ours = base.clone();
+        ours.settings.suppress_after_manual_layout_change =
+            !base.settings.suppress_after_manual_layout_change;
+        ours.user_dictionary.push("ru-RU: привет".to_owned());
+        ours.process_exclusions.clear();
+        let merged = ConfigurationDocument::merge(&base, &ours.canonical(), &theirs.canonical());
+        assert!(merged.conflicts.is_empty(), "{:?}", merged.conflicts);
+        let document = merged.document;
+        assert_eq!(
+            document.settings.suppress_after_manual_layout_change,
+            !base.settings.suppress_after_manual_layout_change
+        );
+        assert_eq!(document.settings.layout_model, !base.settings.layout_model);
+        assert_eq!(
+            document.user_dictionary,
+            ["en-US: firefox", "en-US: old", "ru-RU: привет"]
+        );
+        assert!(document.process_exclusions.is_empty());
+        assert!(document.to_text().is_ok());
+    }
+
+    #[test]
+    fn a_value_both_sides_changed_differently_is_a_conflict_that_keeps_the_draft() {
+        let base = ConfigurationDocument::default();
+        let mut theirs = base.clone();
+        theirs.ui_language = UiLanguagePreference::from_config("et");
+        theirs.settings.layout_model = !base.settings.layout_model;
+        theirs.backend_rules = BackendRules::from_lines(["notepad.exe = observe-only"]).unwrap();
+        let mut ours = base.clone();
+        ours.ui_language = UiLanguagePreference::from_config("ru");
+        ours.settings.layout_model = !base.settings.layout_model;
+        ours.backend_rules = BackendRules::from_lines(["notepad.exe = physical-replay"]).unwrap();
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        // The same new value on both sides agrees; the rule for notepad.exe and the interface
+        // language do not. The catch-all rule, unchanged by the draft, is theirs.
+        assert_eq!(merged.conflicts, ["ui_language", "notepad.exe"]);
+        assert_eq!(merged.document.ui_language.as_config(), "ru");
+        assert_eq!(
+            merged.document.settings.layout_model,
+            !base.settings.layout_model
+        );
+        assert_eq!(
+            merged.document.backend_rules.resolve("notepad.exe"),
+            BackendStrategy::PhysicalReplay
+        );
+        // An entry that ends up in both lists.
+        let mut theirs = base.clone();
+        theirs.word_exclusions.push("en-US: firefox".to_owned());
+        let mut ours = base.clone();
+        ours.user_dictionary.push("en-US: firefox".to_owned());
+        assert_eq!(
+            ConfigurationDocument::merge(&base, &ours, &theirs).conflicts,
+            ["user_dictionary, word_exclusions"]
+        );
+    }
+
     #[test]
     fn rejects_unknown_or_future_schema() {
         assert!(ConfigurationDocument::from_text("[settings]\n").is_err());
