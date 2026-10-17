@@ -12286,34 +12286,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_transaction_does_not_publish_its_target_as_the_current_word() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
-        let detection = Detection {
-            source_language: Language::English,
-            target_language: Language::Russian,
-            original: "z".into(),
-            replacement: "я".into(),
-            source_score: 0.0,
-            target_score: 1.0,
-        };
-        processor.pending_conversion = Some(PendingConversion {
-            transaction: ConversionTransaction::without_delimiter(&detection).unwrap(),
-            foreground,
-            source_layout: foreground.layout,
-            profile_generation: processor.input_profiles.generation(),
-            space_down_sequence: 7,
-            replay_keys: Vec::new(),
-            forced: true,
-            cycle_order: Vec::new(),
-        });
-        // A mismatched boundary is rejected before touching the native target.
-        processor.execute_pending_conversion_inner(99);
-        assert!(processor.pending_conversion.is_none());
-        assert!(processor.transpose_cycle.is_none());
-    }
-
-    #[test]
     fn another_space_revokes_the_previous_word_boundary() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
         let event = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0);
@@ -15399,9 +15371,11 @@ mod tests {
         assert!(!is_owned_gate_fence_marker(DRAINED_EVENT_MARKER));
     }
 
-    // The keys spell "привет" in Russian, whose dictionary only the legacy-bundled data has.
-    #[cfg(feature = "legacy-bundled-input")]
     #[test]
+    #[cfg_attr(
+        not(feature = "legacy-bundled-input"),
+        ignore = "the keys spell \"привет\" in Russian, and the modular base has no Russian dictionary"
+    )]
     fn drained_space_down_defers_candidate_until_fence_ack() {
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(true, Ordering::Release);
@@ -21111,6 +21085,59 @@ mod tests {
             }
         }
     }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_conversion_planned_for_another_space_is_rejected_although_every_later_guard_passes() {
+        // (sequence the edit runs for, converts): the Space down or the key after it qualifies.
+        for (boundary, converts) in [(41, true), (42, true), (99, false)] {
+            let (mut processor, _diagnostics, foreground, steps) = pause_processor(0x0409);
+            processor.refresh_process_policy(foreground.process_id);
+            let detection = Detection {
+                source_language: Language::English,
+                target_language: Language::Russian,
+                original: "ghbdtn".into(),
+                replacement: "привет".into(),
+                source_score: 0.0,
+                target_score: 1.0,
+            };
+            let replay_keys = GHBDTN
+                .map(|scan_code| ReplayKey {
+                    scan_code: scan_code as u16,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                })
+                .to_vec();
+            processor.pending_conversion = Some(PendingConversion {
+                transaction: ConversionTransaction::new(&detection, ' ').unwrap(),
+                foreground,
+                source_layout: foreground.layout,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 41,
+                replay_keys,
+                forced: true,
+                cycle_order: vec![Language::English, Language::Russian, Language::Estonian],
+            });
+            processor
+                .metrics
+                .active_gate_token
+                .store(boundary, Ordering::Release);
+            processor
+                .metrics
+                .forwarded_input_sequence
+                .store(boundary, Ordering::Release);
+            processor.execute_pending_conversion_inner(boundary);
+            assert!(processor.pending_conversion.is_none(), "{boundary}");
+            assert_eq!(processor.transpose_cycle.is_some(), converts, "{boundary}");
+            assert_eq!(
+                steps.lock().unwrap().steps.is_empty(),
+                !converts,
+                "{boundary}"
+            );
+        }
+    }
+
     #[test]
     fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
         let (script, _steps, state) = scripted_paste();
