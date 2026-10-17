@@ -11988,6 +11988,7 @@ mod tests {
     /// What a key prints, by set-1 scan code, in the US (0x0409), Russian (0x0419) and Estonian
     /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
     /// punctuation key prints nothing here.
+    #[cfg(feature = "legacy-bundled-input")]
     pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
         const KEYS: [(u16, [char; 3]); 33] = [
             (0x10, ['q', 'й', 'q']),
@@ -15218,6 +15219,8 @@ mod tests {
         assert!(!is_owned_gate_fence_marker(DRAINED_EVENT_MARKER));
     }
 
+    // The keys spell "привет" in Russian, whose dictionary only the legacy-bundled data has.
+    #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn drained_space_down_defers_candidate_until_fence_ack() {
         let metrics = Arc::new(ObserverMetrics::default());
