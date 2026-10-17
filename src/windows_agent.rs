@@ -1501,13 +1501,13 @@ impl<'a> ProtectedClipboard<'a> {
             return true;
         }
         self.active = false;
-        let was_current = (self.probe)() == (self.temporary_sequence, self.owner);
-        let command = if was_current {
-            ClipboardBrokerCommand::Restore
+        if (self.probe)() == (self.temporary_sequence, self.owner) {
+            self.finish(ClipboardBrokerCommand::Restore)
         } else {
-            ClipboardBrokerCommand::Abandon
-        };
-        was_current && self.finish(command)
+            // Another program replaced the replacement: theirs stays, and the broker ends now.
+            let _ = self.finish(ClipboardBrokerCommand::Abandon);
+            false
+        }
     }
 
     /// The Ctrl+V was sent and not confirmed: the broker leaves the replacement until the paste's
@@ -18855,6 +18855,26 @@ mod tests {
         state.lock().unwrap().readers.push(FAKE_TARGET);
         assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
         assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_restore_that_finds_the_replacement_replaced_ends_its_broker_at_once() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.text = "theirs".to_owned();
+            state.sequence += 1;
+            state.owner = 99;
+        }
+        assert!(!clipboard.restore());
+        // The broker is over before the next paste could start, and theirs stays.
+        assert_eq!(clipboard.shared.end(), BrokerEnd::Kept);
+        drop(clipboard);
+        assert!(brokers.reap().is_empty());
+        assert_eq!(state.lock().unwrap().text, "theirs");
+        assert_eq!(state.lock().unwrap().restores, 0);
     }
 
     #[test]
