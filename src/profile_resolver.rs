@@ -68,6 +68,9 @@ pub const PROFILE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Default)]
 pub struct ProfileSnapshotCache {
     snapshot: Option<ResolvedKeyboardProfiles>,
+    /// The last accepted snapshot, kept when the snapshot expires: the same
+    /// bindings coming back afterwards changed nothing.
+    last_known: Option<ResolvedKeyboardProfiles>,
     confirmed_at: Option<Instant>,
     generation: u64,
 }
@@ -102,15 +105,19 @@ impl ProfileSnapshotCache {
         _max_age: Duration,
     ) -> bool {
         // Only a real binding change invalidates buffered input. Re-accepting an
-        // identical snapshot after the age limit must not churn the generation,
-        // otherwise periodic refreshes keep clearing the current word.
-        let changed = self.snapshot.as_ref() != Some(&snapshot);
+        // identical snapshot after the age limit, or after an expiry made it
+        // unavailable, must not churn the generation, otherwise periodic refreshes
+        // keep clearing the current word. A snapshot available again is still a
+        // change for the consumers, who must take it up.
+        let changed = self.last_known.as_ref() != Some(&snapshot);
         if changed {
             self.generation = self.generation.wrapping_add(1);
         }
+        let available_again = self.snapshot.is_none();
+        self.last_known = Some(snapshot.clone());
         self.snapshot = Some(snapshot);
         self.confirmed_at = Some(now);
-        changed
+        changed || available_again
     }
 }
 
@@ -569,14 +576,20 @@ mod tests {
         assert!(cache.expire(now + Duration::from_secs(3), ttl));
         assert_eq!(cache.generation(), generation + 1);
         assert!(!cache.expire(now + Duration::from_secs(4), ttl));
+        // The same bindings back after the expiry: available again (a change for the
+        // consumers) in the same generation, so words kept under it stay valid.
         assert!(cache.accept(snapshot.clone(), now + Duration::from_secs(4), ttl));
+        assert_eq!(cache.generation(), generation + 1);
+        assert!(cache.current(now + Duration::from_secs(4), ttl).is_some());
         let mut changed = snapshot;
         changed.profiles.remove(&VARIANT);
         assert!(cache.accept(changed.clone(), now + Duration::from_secs(4), ttl));
-        assert_eq!(cache.generation(), generation + 3);
+        assert_eq!(cache.generation(), generation + 2);
         assert!(cache.invalidate());
+        assert_eq!(cache.generation(), generation + 3);
         assert!(cache.current(now + Duration::from_secs(4), ttl).is_none());
         assert!(cache.accept(changed.clone(), now + Duration::from_secs(5), ttl));
+        assert_eq!(cache.generation(), generation + 3);
         let generation = cache.generation();
         // An identical refresh after the age limit must not churn the generation,
         // otherwise periodic refreshes keep clearing the current word.
