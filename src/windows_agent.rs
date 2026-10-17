@@ -8313,15 +8313,9 @@ impl InputProcessor {
                 );
                 let transaction = delimiter
                     .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter));
-                // The following words see this one as the target language only when the
-                // conversion will be attempted; otherwise the text stays as typed.
-                let attempted =
-                    transaction.is_some() && self.metrics.auto_enabled.load(Ordering::Acquire);
-                self.remember_word_language(if attempted {
-                    detection.target_language
-                } else {
-                    detection.source_language
-                });
+                // The following words see this one as typed until its conversion is applied
+                // (finish_applied_conversion).
+                self.remember_word_language(detection.source_language);
                 transaction
             } else {
                 if !replay_keys.is_empty()
@@ -9386,6 +9380,26 @@ impl InputProcessor {
             }
         };
 
+        self.finish_applied_conversion(pending, boundary_sequence, target_layout, edit_strategy);
+    }
+
+    /// The bookkeeping of a conversion whose edit was applied: the target layout is current, the
+    /// word may be resumed, cycled, undone or added to the dictionary, and the following words
+    /// see an automatically converted word as the target language. Its boundary recorded it as
+    /// typed, so a conversion that ends without an edit leaves the model's context as typed.
+    fn finish_applied_conversion(
+        &mut self,
+        pending: PendingConversion,
+        boundary_sequence: u64,
+        target_layout: HKL,
+        edit_strategy: EditStrategy,
+    ) {
+        if !pending.forced
+            && let Some(last) = self.recent_languages.last_mut()
+            && *last == pending.transaction.source_language
+        {
+            *last = pending.transaction.target_language;
+        }
         self.commit_confirmed_layout(target_layout.0 as usize);
         self.session.clear();
         if let Some(delimiter) = pending.transaction.delimiter {
@@ -15894,27 +15908,82 @@ mod tests {
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
-    fn a_finished_word_counts_as_the_target_language_only_when_a_conversion_is_attempted() {
-        // (automatic conversion on, delimiter, language the next words see)
-        let cases = [
-            (true, Some(' '), Language::Russian),
-            (false, Some(' '), Language::English),
-            (true, None, Language::English),
-            (false, None, Language::English),
-        ];
-        for (automatic, delimiter, expected) in cases {
+    fn a_finished_word_counts_as_typed_until_its_conversion_is_applied() {
+        // (automatic conversion on, delimiter)
+        for (automatic, delimiter) in [
+            (true, Some(' ')),
+            (false, Some(' ')),
+            (true, None),
+            (false, None),
+        ] {
             let metrics = Arc::new(ObserverMetrics::default());
             metrics.auto_enabled.store(automatic, Ordering::Release);
             let mut processor = InputProcessor::new(metrics, 0);
             processor.set_privacy_reason(None);
+            processor.settings.conversion_sound = false;
+            processor.settings.offer_dictionary_after_forced_conversion = false;
             type_wrong_layout_word(&mut processor);
             let conversion = processor.handle_boundary(Some(Language::English), delimiter, false);
             assert_eq!(conversion.is_some(), delimiter.is_some());
             assert_eq!(
                 processor.recent_languages,
-                [expected],
+                [Language::English],
                 "automatic={automatic} delimiter={delimiter:?}"
             );
+            // Only an applied automatic conversion makes the word count as Russian.
+            let Some((transaction, replay_keys)) = conversion else {
+                continue;
+            };
+            for (forced, expected) in [(true, Language::English), (false, Language::Russian)] {
+                let pending = PendingConversion {
+                    transaction: transaction.clone(),
+                    foreground: test_foreground(),
+                    source_layout: 0x0409,
+                    profile_generation: processor.input_profiles.generation(),
+                    space_down_sequence: 1,
+                    replay_keys: replay_keys.clone(),
+                    forced,
+                    cycle_order: Vec::new(),
+                };
+                processor.finish_applied_conversion(
+                    pending,
+                    1,
+                    HKL(0x0419 as *mut c_void),
+                    EditStrategy::ProtectedPaste,
+                );
+                assert_eq!(processor.recent_languages, [expected], "forced={forced}");
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_whose_conversion_is_not_applied_counts_as_typed() {
+        // "ghbdtn", "привет" in Russian, ended by a Space with Shift held, with Caps Lock changed
+        // since the word, deferred by the gate, or handled at once by a conversion that cannot
+        // reach the field here.
+        let ghbdtn = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
+        for case in ["shift", "caps", "deferred", "unapplied"] {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            type_keys(&mut processor, foreground, &ghbdtn);
+            let mut space = space_key(foreground, 7, 0);
+            match case {
+                "shift" => {
+                    processor
+                        .modifiers
+                        .update(u32::from(VK_LSHIFT.0), true, false);
+                }
+                "caps" => space.caps_lock = true,
+                "deferred" => space.drain_token = 9,
+                _ => {}
+            }
+            processor.process_key(space);
+            assert_eq!(
+                processor.pending_conversion.is_some(),
+                case == "deferred",
+                "{case}"
+            );
+            assert_eq!(processor.recent_languages, [Language::English], "{case}");
         }
     }
 
