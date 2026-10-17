@@ -52,8 +52,10 @@ impl Rng {
     }
 }
 
-const SNIPPETS: [&str; 14] = [
+const SNIPPETS: [&str; 15] = [
     "é",
+    // Lowercases to two characters.
+    "İ",
     "я",
     "ü",
     "€",
@@ -218,6 +220,17 @@ fn text_seeds() -> BTreeMap<&'static str, Vec<u8>> {
                 .to_vec(),
         ),
         (
+            // Words at the length limit that lowercasing lengthens past it.
+            "dotted_config",
+            format!(
+                "schema_version=4\n[packages]\nmode=legacy\n[user_dictionary]\nen-US: {}\n[word_exclusions]\nru-RU: {}{}\n",
+                "İ".repeat(64),
+                "a".repeat(60),
+                "İ".repeat(4)
+            )
+            .into_bytes(),
+        ),
+        (
             "backend_rules",
             "notepad.exe = protected-paste\nfirefox.exe = physical-replay\n* = capability-probe\nC:\\Apps\\x.exe = observe-only\n"
                 .as_bytes()
@@ -239,6 +252,7 @@ fn targets<'a>(trust: &'a PackageTrust) -> Vec<Target<'a>> {
         text["full_config"].clone(),
         text["default_config"].clone(),
         text["managed_config"].clone(),
+        text["dotted_config"].clone(),
     ];
     let scoring = vec![
         include_bytes!("../data/scoring/en-US.json").to_vec(),

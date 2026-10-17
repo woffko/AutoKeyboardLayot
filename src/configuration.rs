@@ -440,20 +440,22 @@ fn canonical_lexicon_entries(
 ) -> Result<Vec<String>, ConfigurationError> {
     let mut entries = BTreeSet::new();
     for (line_number, line) in lines {
-        let Some((id, word)) = UserLexicon::normalize_pack_entry(&line) else {
-            return Err(ConfigurationError::at(
-                line_number,
-                "expected a valid language and one word, for example en-US: firefox",
-            ));
-        };
-        entries.insert(
-            UserLexicon::format_pack_entry(&id, &word)
-                .expect("normalized word")
-                .trim_end()
-                .to_owned(),
-        );
+        entries.insert(lexicon_entry(line_number, &line)?);
     }
     Ok(entries.into_iter().collect())
+}
+
+/// The stored form of one dictionary or word-exclusion row.
+fn lexicon_entry(line_number: usize, line: &str) -> Result<String, ConfigurationError> {
+    UserLexicon::normalize_pack_entry(line)
+        .and_then(|(id, word)| UserLexicon::format_pack_entry(&id, &word))
+        .map(|entry| entry.trim_end().to_owned())
+        .ok_or_else(|| {
+            ConfigurationError::at(
+                line_number,
+                "expected a language, a colon and one word, for example en-US: firefox",
+            )
+        })
 }
 
 fn canonical_process_entries(
@@ -479,12 +481,8 @@ fn canonical_lexicon_entries_lossy(text: &str) -> Vec<String> {
             !line.is_empty() && !line.starts_with('#')
         })
         .filter_map(UserLexicon::normalize_pack_entry)
-        .map(|(id, word)| {
-            UserLexicon::format_pack_entry(&id, &word)
-                .expect("normalized word")
-                .trim_end()
-                .to_owned()
-        })
+        .filter_map(|(id, word)| UserLexicon::format_pack_entry(&id, &word))
+        .map(|entry| entry.trim_end().to_owned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -800,6 +798,27 @@ mod tests {
         assert!(one_language.to_text().is_ok());
     }
 
+    #[test]
+    fn a_word_that_lowercasing_lengthens_past_the_limit_is_a_line_error_not_a_panic() {
+        let latin = "a".repeat(60);
+        for word in ["İ".repeat(64), format!("{latin}{}", "İ".repeat(4))] {
+            for section in ["user_dictionary", "word_exclusions"] {
+                let text = format!(
+                    "schema_version=4\n[packages]\nmode=legacy\n[{section}]\nen-US: {word}\n"
+                );
+                assert_eq!(
+                    ConfigurationDocument::from_text(&text).unwrap_err().line,
+                    Some(5)
+                );
+            }
+            let row = format!("en-US: {word}\n");
+            assert!(
+                ConfigurationDocument::try_from_legacy(Settings::default(), &row, "", "").is_err()
+            );
+            let lossy = ConfigurationDocument::from_legacy(Settings::default(), &row, &row, "");
+            assert!(lossy.user_dictionary.is_empty() && lossy.word_exclusions.is_empty());
+        }
+    }
     #[test]
     fn rejects_unknown_or_future_schema() {
         assert!(ConfigurationDocument::from_text("[settings]\n").is_err());

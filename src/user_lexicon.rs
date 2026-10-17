@@ -89,18 +89,20 @@ fn parse_entry(line: &str) -> Option<(PackId, &str)> {
     Some((Language::from_id(language)?, word))
 }
 
+/// The stored form of a word: lowercased, at most 64 characters. The limit applies to the
+/// lowercased form, since some letters (`İ`) lowercase to two characters: a stored word then
+/// normalizes to itself.
 fn normalize_word(word: &str) -> Option<String> {
     let word = word.trim();
-    let character_count = word.chars().count();
-    if character_count == 0
-        || character_count > 64
+    if word.is_empty()
         || word
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
         return None;
     }
-    Some(word.to_lowercase())
+    let stored = word.to_lowercase();
+    (stored.chars().count() <= 64).then_some(stored)
 }
 
 #[cfg(test)]
@@ -119,6 +121,28 @@ mod tests {
         assert!(lexicon.contains(Language::Russian, "РУДДЩ"));
         assert!(lexicon.contains(Language::Estonian, "klaviatuur"));
         assert!(lexicon.contains(Language::Japanese, "こんにちは"));
+    }
+
+    #[test]
+    fn a_stored_word_normalizes_to_itself_also_when_lowercasing_lengthens_it() {
+        let dotted = |count: usize| "İ".repeat(count);
+        let latin = "a".repeat(60);
+        for (word, stored) in [
+            (dotted(32), true),
+            (dotted(33), false),
+            (dotted(64), false),
+            (format!("{latin}{}", dotted(2)), true),
+            (format!("{latin}{}", dotted(4)), false),
+            (format!("{latin}{}", dotted(5)), false),
+        ] {
+            let normalized = normalize_word(&word);
+            assert_eq!(normalized.is_some(), stored, "{word}");
+            if let Some(normalized) = normalized {
+                assert_eq!(normalized.chars().count(), 64);
+                assert_eq!(normalize_word(&normalized), Some(normalized.clone()));
+                assert!(UserLexicon::format_entry(Language::English, &normalized).is_some());
+            }
+        }
     }
 
     #[test]

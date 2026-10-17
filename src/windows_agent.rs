@@ -6297,13 +6297,24 @@ struct RuntimeConfigurationLoader {
 }
 impl RuntimeConfigurationLoader {
     fn spawn() -> std::io::Result<Self> {
+        Self::spawn_with(load_runtime_configuration)
+    }
+
+    /// `load` runs on the loader thread for each request. A load that panics answers as a failed
+    /// read, and the loader goes on serving later requests.
+    fn spawn_with(
+        load: impl Fn() -> std::io::Result<RuntimeConfiguration> + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (requests, receive) = sync_channel(1);
         let (reply, replies) = sync_channel(1);
         thread::Builder::new()
             .name("autokey-package-loader".into())
             .spawn(move || {
                 while receive.recv().is_ok() {
-                    if reply.send(load_runtime_configuration()).is_err() {
+                    let result = guarded(&load, || {
+                        Err(std::io::Error::other("configuration_loader_panicked"))
+                    });
+                    if reply.send(result).is_err() {
                         break;
                     }
                 }
@@ -19344,6 +19355,38 @@ mod tests {
         unsafe {
             DestroyWindow(window).expect("destroy gate window");
         }
+    }
+
+    #[test]
+    fn a_configuration_load_that_panics_fails_that_read_and_the_loader_keeps_serving() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&loads);
+        let mut loader = RuntimeConfigurationLoader::spawn_with(move || {
+            assert!(
+                counter.fetch_add(1, Ordering::AcqRel) > 0,
+                "a row the parser did not expect"
+            );
+            Ok(RuntimeConfiguration::default())
+        })
+        .unwrap();
+        let answer = |loader: &mut RuntimeConfigurationLoader| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = loader.poll() {
+                    return result;
+                }
+                assert!(Instant::now() < deadline, "the loader did not answer");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(loader.request());
+        assert_eq!(
+            answer(&mut loader).unwrap_err().to_string(),
+            "configuration_loader_panicked"
+        );
+        assert!(loader.request());
+        assert!(answer(&mut loader).is_ok());
+        assert_eq!(loads.load(Ordering::Acquire), 2);
     }
 
     #[test]
