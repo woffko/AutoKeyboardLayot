@@ -387,6 +387,20 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_tells_the_start_up_default_of_automatic_conversion_as_it_is() {
+        // The README once promised observation only on a new profile, long after the default
+        // changed: what it says is tied to the default here.
+        let readme = include_str!("../README.md");
+        let default_on = Settings::default().automatic_conversion_on_startup;
+        let stated_on = readme
+            .contains("On a new profile, automatic conversion is on from the start.")
+            && readme.contains("Automatic replacement is on at process start by default");
+        let stated_off = readme.contains("observation-only mode")
+            || readme.contains("Automatic replacement is off at process start");
+        assert_eq!((stated_on, stated_off), (default_on, !default_on));
+    }
+
+    #[test]
     fn every_key_this_version_writes_is_a_known_key() {
         for line in Settings::default().to_text().lines() {
             if let Some((key, _)) = line.split_once('=') {
