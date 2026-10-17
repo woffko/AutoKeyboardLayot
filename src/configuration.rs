@@ -807,7 +807,7 @@ fn append_section(output: &mut String, name: &str, entries: &[String]) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn package_mode_roundtrips_and_fresh_managed_base_does_not_enable_conversion() {
+    fn package_mode_roundtrips_and_a_fresh_managed_base_converts_automatically() {
         use super::{ConfigurationDocument, PackageMode};
         let document = ConfigurationDocument::english_only_managed();
         let serialized = document.to_text().unwrap();

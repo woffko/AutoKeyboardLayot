@@ -15,7 +15,7 @@ inspection timeouts can still cause skipped words, and physical input acceptance
 remains incomplete. Use a disposable document for initial testing, not a live
 terminal command or important unsaved text.
 
-On a new profile, the alpha defaults to observation-only mode:
+On a new profile, automatic conversion is on from the start. The alpha provides:
 
 - deterministic offline EN/RU candidate detection backed by embedded FST
   dictionaries rather than a toy word list;
@@ -73,9 +73,9 @@ On a new profile, the alpha defaults to observation-only mode:
   conversion never waits for audio;
 - no typed-text logging.
 
-Automatic replacement is off at process start by default. A user can explicitly
-enable startup conversion in settings. A conversion failure turns it off again
-and exposes a technical failure counter in the tray status.
+Automatic replacement is on at process start by default; it can be turned off in
+settings (`automatic_conversion_on_startup`). A conversion failure turns it off
+for the session and exposes a technical failure counter in the tray status.
 
 ## Validated so far
 
@@ -282,15 +282,28 @@ Settings and explicitly managed lists are stored atomically in the versioned,
 human-readable `%LOCALAPPDATA%\AutoKeyboardLayot\config.ini`. On a profile that
 does not yet have this file, the previous `settings.ini`, `user_dictionary.txt`,
 `word_exclusions.txt`, and `exclusions.txt` files are imported in memory and
-migrated on the first explicit Save/Apply. The legacy files are not deleted.
-GUI and tray writes share a cross-process named Windows mutex. Apply rejects an
-outdated draft if the configuration has changed since the window was opened,
-preserving newly added dictionary entries. The settings application itself is
-excluded from conversion.
+migrated on the first explicit Save/Apply. The legacy files are not deleted, and
+an error in one of them names that file. The pre-migration backup is written to a
+temporary file and appears whole or not at all.
+GUI and tray writes share a cross-process named Windows mutex; a word added from
+the tray is saved on a thread of its own, so the keyboard hook never waits for the
+lock or the disk. When the configuration has changed since the window was opened
+(a word added from the tray, a hand edit), Apply merges the draft into it: what the
+window changed wins, everything else is kept, and list entries added on either
+side stay. A value changed differently in both places is reported; the window then
+shows the current settings with the user's values for those, and Apply saves them.
+The settings application itself is excluded from conversion.
 
-Dictionary and word-exclusion entries accept `en-US: word`, `ru-RU: слово`, or
-`et-EE: tere`. The GUI validates, normalizes, deduplicates, and rejects a word
-present in both lists. Program exclusions are normalized to executable names.
+Dictionary and word-exclusion entries take the form `en-US: word`, `ru-RU: слово`,
+or `et-EE: tere`; the colon is required, as a first word would otherwise be taken
+for a language. The GUI validates, normalizes, deduplicates, and rejects a word
+present in both lists, naming the page and the editor line of an entry it cannot
+read; after saving it says when an entry's language is not installed. Words are
+limited to 64 characters after lowercasing. Program exclusions are normalized to
+executable names; a name that starts with `#` or is in square brackets is refused,
+as it would read back as a comment or a section. Every save checks that the file
+reads back unchanged. A setting given twice is refused with its line, and a byte
+order mark at the start of a file is accepted.
 The whole configuration is bounded to 1 MiB, loaded once into in-memory sets and
 maps, and reloaded through the worker queue. No list is populated from typed
 text without a direct user action.
