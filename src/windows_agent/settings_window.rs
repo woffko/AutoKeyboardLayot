@@ -34,8 +34,8 @@ use windows::{
 };
 
 use super::{
-    SETTINGS_APPLIED_MESSAGE, WINDOW_CLASS, diagnostic_log_path, save_configuration_if_unchanged,
-    try_load_configuration_document,
+    SETTINGS_APPLIED_MESSAGE, WINDOW_CLASS, configuration_directory_or_error, diagnostic_log_path,
+    save_configuration_if_unchanged, try_load_configuration_document,
 };
 
 slint::include_modules!();
@@ -506,7 +506,9 @@ fn wire_callbacks(
         }
         let original = save_document.borrow().clone();
         match document_from_ui(&ui, original.clone()) {
-            Ok(document) => match save_configuration_if_unchanged(&document, &original) {
+            Ok(document) => match configuration_directory_or_error().and_then(|directory| {
+                save_configuration_if_unchanged(&directory, &document, &original)
+            }) {
                 Ok(()) => {
                     let preference = document.ui_language.clone();
                     *save_document.borrow_mut() = document;

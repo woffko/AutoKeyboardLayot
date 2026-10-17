@@ -166,6 +166,8 @@ const LEXICON_OFFER_MESSAGE: u32 = WM_APP + 7;
 const SETTINGS_APPLIED_MESSAGE: u32 = WM_APP + 8;
 const RECOVERY_NOTICE_MESSAGE: u32 = WM_APP + 9;
 const HELD_KEYS_RETURN_MESSAGE: u32 = WM_APP + 10;
+/// A tray "add word" save finished on its own thread; the window reports it.
+const LEXICON_SAVED_MESSAGE: u32 = WM_APP + 11;
 const LAYOUT_TIMER_ID: usize = 1;
 const LAYOUT_TIMER_INTERVAL_MS: u32 = 250;
 const MENU_AUTO_ID: usize = 1002;
@@ -2226,6 +2228,7 @@ struct AppState {
     pending_configuration: Option<ConfigurationReload>,
     configuration_loader: Option<RuntimeConfigurationLoader>,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
+    lexicon_saves: LexiconSaves,
     diagnostic_sender: Option<SyncSender<String>>,
     diagnostic_worker: Option<JoinHandle<()>>,
     /// Key-ups of keys pressed before a gate, delivered after that gate broke.
@@ -3741,11 +3744,95 @@ fn expire_lexicon_candidate() {
     let _ = valid_lexicon_candidate();
 }
 
+/// Tray "add word" saves finished on their own threads, waiting for the window to report them.
+struct LexiconSaves {
+    sender: SyncSender<(VolatileLexiconCandidate, std::io::Result<()>)>,
+    finished: Receiver<(VolatileLexiconCandidate, std::io::Result<()>)>,
+}
+
+impl LexiconSaves {
+    fn new() -> Self {
+        let (sender, finished) = sync_channel(8);
+        Self { sender, finished }
+    }
+}
+
+/// Saves the word a tray offer names. Reading, merging and writing the configuration waits for
+/// its writer lock and for the disk, so it runs on a thread of its own: this thread serves the
+/// keyboard hook. The window reports the outcome (`finish_lexicon_saves`).
 fn add_recent_lexicon_offer(hwnd: HWND) {
     let Some(candidate) = valid_lexicon_candidate() else {
         return;
     };
-    if let Err(error) = persist_lexicon_candidate(&candidate) {
+    let Some(sender) = APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|state| state.lexicon_saves.sender.clone())
+    }) else {
+        return;
+    };
+    let window = hwnd.0 as usize;
+    let started = configuration_directory()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
+        })
+        .and_then(|directory| {
+            save_lexicon_candidate_in_background(
+                directory,
+                candidate.clone(),
+                move |candidate, result| {
+                    let _ = sender.send((candidate, result));
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(window as *mut c_void)),
+                            LEXICON_SAVED_MESSAGE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                },
+            )
+        });
+    if let Err(error) = started {
+        report_lexicon_save(hwnd, &candidate, Err(error));
+    }
+}
+
+/// Saves `candidate` into the configuration in `directory` on a thread of its own; `finished`
+/// gets the outcome there.
+fn save_lexicon_candidate_in_background(
+    directory: PathBuf,
+    candidate: VolatileLexiconCandidate,
+    finished: impl FnOnce(VolatileLexiconCandidate, std::io::Result<()>) + Send + 'static,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("autokey-lexicon-save".into())
+        .spawn(move || {
+            let result = persist_lexicon_candidate(&directory, &candidate);
+            finished(candidate, result);
+        })
+        .map(drop)
+}
+
+/// Reports the tray "add word" saves that finished.
+fn finish_lexicon_saves(hwnd: HWND) {
+    let finished: Vec<_> = APP_STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|state| state.lexicon_saves.finished.try_iter().collect())
+            .unwrap_or_default()
+    });
+    for (candidate, result) in finished {
+        report_lexicon_save(hwnd, &candidate, result);
+    }
+}
+
+fn report_lexicon_save(
+    hwnd: HWND,
+    candidate: &VolatileLexiconCandidate,
+    result: std::io::Result<()>,
+) {
+    if let Err(error) = result {
         let destination = match candidate.target {
             LexiconOfferTarget::UserDictionary => tr("dictionary.destination"),
             LexiconOfferTarget::WordExclusions => tr("word_exclusions.destination"),
@@ -3759,9 +3846,15 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
         );
         return;
     }
+    // A newer offer made while this one was saved stays.
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow().as_ref()
             && let Ok(mut stored) = state.lexicon_candidate.lock()
+            && stored.as_ref().is_some_and(|offer| {
+                offer.target == candidate.target
+                    && offer.language == candidate.language
+                    && offer.word == candidate.word
+            })
         {
             stored.take();
         }
@@ -4183,6 +4276,7 @@ pub fn run() -> Result<()> {
                 pending_configuration: None,
                 configuration_loader: RuntimeConfigurationLoader::spawn().ok(),
                 lexicon_candidate,
+                lexicon_saves: LexiconSaves::new(),
                 diagnostic_sender: Some(diagnostic_sender),
                 diagnostic_worker: Some(diagnostic_worker),
                 pending_key_releases: Vec::new(),
@@ -4386,6 +4480,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 })
             });
             LRESULT(prepared as isize)
+        }
+        LEXICON_SAVED_MESSAGE => {
+            finish_lexicon_saves(hwnd);
+            LRESULT(0)
         }
         LEXICON_OFFER_MESSAGE => {
             if let Some(candidate) = valid_lexicon_candidate() {
@@ -6414,10 +6512,6 @@ fn configuration_directory() -> Option<PathBuf> {
         .map(|path| path.join("AutoKeyboardLayot"))
 }
 
-fn configuration_path() -> Option<PathBuf> {
-    configuration_directory().map(|directory| directory.join("config.ini"))
-}
-
 fn try_load_configuration_document() -> std::io::Result<ConfigurationDocument> {
     load_configuration_snapshot().map(|loaded| loaded.document)
 }
@@ -6482,18 +6576,20 @@ fn write_configuration_file_atomically(path: &Path, contents: &str) -> std::io::
     Ok(())
 }
 
+/// Every writer of the configuration, in any process, holds this lock for its whole
+/// read-modify-write.
+#[cfg(not(test))]
+const CONFIGURATION_WRITE_MUTEX: PCWSTR = w!("Local\\AutoKeyboardLayot.ConfigurationWrite");
+/// Tests take a lock of their own: they never wait for an agent running in the same session.
+#[cfg(test)]
+const CONFIGURATION_WRITE_MUTEX: PCWSTR = w!("Local\\AutoKeyboardLayot.ConfigurationWrite.Tests");
+
 struct ConfigurationWriteGuard(ProcessHandle);
 
 impl ConfigurationWriteGuard {
     fn acquire() -> std::io::Result<Self> {
-        let handle = unsafe {
-            CreateMutexW(
-                None,
-                false,
-                w!("Local\\AutoKeyboardLayot.ConfigurationWrite"),
-            )
-        }
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let handle = unsafe { CreateMutexW(None, false, CONFIGURATION_WRITE_MUTEX) }
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let handle = ProcessHandle(handle);
         match unsafe { WaitForSingleObject(handle.0, 250) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
@@ -6513,30 +6609,40 @@ impl Drop for ConfigurationWriteGuard {
     }
 }
 
+/// The profile folder, or an error when LOCALAPPDATA is unavailable.
+fn configuration_directory_or_error() -> std::io::Result<PathBuf> {
+    configuration_directory().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
+    })
+}
+
+/// Saves `document` into the configuration in `directory`, unless the configuration there is no
+/// longer `original`, the one the draft was made from (`AlreadyExists`).
 fn save_configuration_if_unchanged(
+    directory: &Path,
     document: &ConfigurationDocument,
     original: &ConfigurationDocument,
 ) -> std::io::Result<()> {
     let _guard = ConfigurationWriteGuard::acquire()?;
-    let current = try_load_configuration_document()?;
+    let current = autokeyboardlayot::configuration::load_configuration_directory(directory)?;
     if &current != original {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "Configuration changed outside this window. Reopen settings before saving; your current draft has not been discarded.",
         ));
     }
-    write_configuration_document(document)
+    write_configuration_document(directory, document)
 }
 
 // Caller holds ConfigurationWriteGuard through its entire read/modify/write.
-fn write_configuration_document(document: &ConfigurationDocument) -> std::io::Result<()> {
-    let path = configuration_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
-    })?;
+fn write_configuration_document(
+    directory: &Path,
+    document: &ConfigurationDocument,
+) -> std::io::Result<()> {
     let contents = document
         .to_text()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    write_configuration_file_atomically(&path, &contents)
+    write_configuration_file_atomically(&directory.join("config.ini"), &contents)
 }
 
 fn merge_lexicon_entry(existing: &str, candidate: &VolatileLexiconCandidate) -> Option<String> {
@@ -6553,9 +6659,12 @@ fn merge_lexicon_entry(existing: &str, candidate: &VolatileLexiconCandidate) -> 
     Some(merged)
 }
 
-fn persist_lexicon_candidate(candidate: &VolatileLexiconCandidate) -> std::io::Result<()> {
+fn persist_lexicon_candidate(
+    directory: &Path,
+    candidate: &VolatileLexiconCandidate,
+) -> std::io::Result<()> {
     let _guard = ConfigurationWriteGuard::acquire()?;
-    let mut document = try_load_configuration_document()?;
+    let mut document = autokeyboardlayot::configuration::load_configuration_directory(directory)?;
     let entries = match candidate.target {
         LexiconOfferTarget::UserDictionary => &mut document.user_dictionary,
         LexiconOfferTarget::WordExclusions => &mut document.word_exclusions,
@@ -6565,7 +6674,7 @@ fn persist_lexicon_candidate(candidate: &VolatileLexiconCandidate) -> std::io::R
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid exclusion word")
     })?;
     *entries = merged.lines().map(str::to_owned).collect();
-    write_configuration_document(&document)
+    write_configuration_document(directory, &document)
 }
 
 fn diagnostic_log_path() -> Option<PathBuf> {
@@ -12491,6 +12600,7 @@ mod tests {
             pending_configuration: None,
             configuration_loader: None,
             lexicon_candidate: Arc::new(Mutex::new(None)),
+            lexicon_saves: LexiconSaves::new(),
             diagnostic_sender: None,
             diagnostic_worker: None,
             pending_key_releases: Vec::new(),
@@ -19355,6 +19465,114 @@ mod tests {
         unsafe {
             DestroyWindow(window).expect("destroy gate window");
         }
+    }
+
+    /// A configuration folder holding the default document.
+    fn configuration_folder() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.ini"),
+            ConfigurationDocument::default().to_text().unwrap(),
+        )
+        .unwrap();
+        directory
+    }
+
+    fn dictionary_offer(word: &str) -> VolatileLexiconCandidate {
+        VolatileLexiconCandidate::new(
+            LexiconOfferTarget::UserDictionary,
+            Language::English,
+            word.to_owned(),
+            Instant::now(),
+        )
+    }
+
+    fn saved_document(directory: &Path) -> ConfigurationDocument {
+        autokeyboardlayot::configuration::load_configuration_directory(directory).unwrap()
+    }
+
+    #[test]
+    fn a_draft_older_than_the_configuration_is_refused_and_a_current_one_is_saved() {
+        let folder = configuration_folder();
+        let base = ConfigurationDocument::default();
+        let mut first = base.clone();
+        first.user_dictionary.push("en-US: firefox".to_owned());
+        save_configuration_if_unchanged(folder.path(), &first, &base).unwrap();
+        let mut stale = base.clone();
+        stale.process_exclusions.push("private.exe".to_owned());
+        assert_eq!(
+            save_configuration_if_unchanged(folder.path(), &stale, &base)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let saved = saved_document(folder.path());
+        assert_eq!(saved.user_dictionary, ["en-US: firefox"]);
+        assert!(saved.process_exclusions.is_empty());
+    }
+
+    #[test]
+    fn writers_saving_at_the_same_time_each_keep_their_entry() {
+        let folder = configuration_folder();
+        let words = ["alpha", "beta", "gamma", "delta"];
+        let start = Arc::new(std::sync::Barrier::new(words.len()));
+        let writers: Vec<_> = words
+            .into_iter()
+            .map(|word| {
+                let directory = folder.path().to_owned();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    loop {
+                        match persist_lexicon_candidate(&directory, &dictionary_offer(word)) {
+                            // Another writer holds the lock: a user would try again.
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            outcome => break outcome,
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let saved = saved_document(folder.path()).user_dictionary;
+        for word in words {
+            assert!(
+                saved.contains(&format!("en-US: {word}")),
+                "{word}: {saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tray_word_is_saved_off_the_calling_thread_while_another_writer_holds_the_lock() {
+        let folder = configuration_folder();
+        let held = ConfigurationWriteGuard::acquire().unwrap();
+        let (sender, outcome) = sync_channel(1);
+        let started = Instant::now();
+        save_lexicon_candidate_in_background(
+            folder.path().to_owned(),
+            dictionary_offer("firefox"),
+            move |candidate, result| {
+                let _ = sender.send((candidate.word, result));
+            },
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the caller waited for the lock"
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert!(outcome.try_recv().is_err(), "saved past the held lock");
+        drop(held);
+        let (word, result) = outcome.recv_timeout(Duration::from_secs(5)).unwrap();
+        result.unwrap();
+        assert_eq!(word, "firefox");
+        assert_eq!(
+            saved_document(folder.path()).user_dictionary,
+            ["en-US: firefox"]
+        );
     }
 
     #[test]

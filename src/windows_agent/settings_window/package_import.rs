@@ -628,15 +628,15 @@ pub(super) fn wire(
             let migrated = if let Some((original, next)) = migration_documents {
                 // Saving mode last is the activation point. Failure leaves a
                 // prepared store ignored by the old legacy configuration.
-                let activation = super::super::configuration_directory()
-                    .and_then(|directory| PackageStore::open(&directory.join("packages")).ok())
-                    .is_some_and(|store| {
+                let activation = super::super::configuration_directory().is_some_and(|directory| {
+                    PackageStore::open(&directory.join("packages")).is_ok_and(|store| {
                         store
                             .with_current_snapshot(&snapshot, &trust, || {
-                                save_configuration_if_unchanged(&next, &original)
+                                save_configuration_if_unchanged(&directory, &next, &original)
                             })
                             .is_ok()
-                    });
+                    })
+                });
                 if !activation {
                     return Ok(inspect_uncertain_write(&trust));
                 }
