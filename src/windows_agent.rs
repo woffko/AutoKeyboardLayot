@@ -12158,7 +12158,17 @@ mod tests {
     /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
     /// punctuation key prints nothing here.
     pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
-        const KEYS: [(u16, [char; 3]); 33] = [
+        const KEYS: [(u16, [char; 3]); 43] = [
+            (0x02, ['1', '1', '1']),
+            (0x03, ['2', '2', '2']),
+            (0x04, ['3', '3', '3']),
+            (0x05, ['4', '4', '4']),
+            (0x06, ['5', '5', '5']),
+            (0x07, ['6', '6', '6']),
+            (0x08, ['7', '7', '7']),
+            (0x09, ['8', '8', '8']),
+            (0x0a, ['9', '9', '9']),
+            (0x0b, ['0', '0', '0']),
             (0x10, ['q', 'й', 'q']),
             (0x11, ['w', 'ц', 'w']),
             (0x12, ['e', 'у', 'e']),
@@ -16199,53 +16209,12 @@ mod tests {
         }
     }
 
-    fn type_token_character(processor: &mut InputProcessor, event: InputEvent) {
-        let buffered_before = processor.session.buffered_character_count();
-        let keys = processor.take_manual_token_keys(event, true, buffered_before);
-        let action = processor
-            .session
-            .handle(event, Some(Language::English), &processor.detector);
-        if matches!(action, SessionAction::Reset(_)) {
-            processor.replay_keys.clear();
-        }
-        if matches!(event, InputEvent::Printable(_))
-            && processor.session.buffered_character_count() == buffered_before + 1
-        {
-            processor.replay_keys.push(ReplayKey {
-                scan_code: 0x22,
-                shift: false,
-                caps_lock: false,
-                extended: false,
-            });
-        }
-        if let Some(keys) = keys {
-            processor.extend_manual_token(
-                keys,
-                Some(ReplayKey {
-                    scan_code: 0x07,
-                    shift: false,
-                    caps_lock: false,
-                    extended: false,
-                }),
-            );
-        }
-    }
-
     #[test]
     fn digit_keeps_the_token_for_manual_conversion_only() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.set_privacy_reason(None);
-        // "ШЗм6" typed in the Russian layout for "IPv6"; tested with Latin
-        // letters because only the key sequence matters here.
-        for event in [
-            InputEvent::Printable('i'),
-            InputEvent::Printable('p'),
-            InputEvent::Printable('v'),
-            InputEvent::UnsupportedInput,
-            InputEvent::Printable('x'),
-        ] {
-            type_token_character(&mut processor, event);
-        }
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        // "ШЗм6" typed in the Russian layout for "IPv6"; typed here as Latin letters because only
+        // the key sequence matters.
+        type_keys(&mut processor, foreground, &[0x17, 0x19, 0x2f, 0x07, 0x2d]);
         assert_eq!(processor.replay_keys.len(), 5);
         assert_eq!(processor.session.buffered_character_count(), 0);
         // Automatic conversion stays suppressed for the token.
@@ -16265,8 +16234,7 @@ mod tests {
         assert!(!processor.session.is_suppressed());
 
         // A token may also start with the unsupported character.
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
-        type_token_character(&mut processor, InputEvent::Printable('t'));
+        type_keys(&mut processor, foreground, &[0x07, 0x14]);
         assert_eq!(processor.replay_keys.len(), 2);
         assert!(
             processor
@@ -16425,24 +16393,17 @@ mod tests {
 
     #[test]
     fn text_after_a_shortcut_is_a_manual_token_only() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.set_privacy_reason(None);
+        let (mut processor, foreground) = processor_typing_in(0x0409);
         // Ctrl+C in a terminal: the shortcut suppresses the session and pauses
         // privacy until the next key rechecks it.
-        processor.last_word_reset = "shortcut";
-        processor
-            .session
-            .handle(InputEvent::Shortcut, None, &processor.detector);
-        processor.mark_privacy_dirty(true);
+        press_chord(
+            &mut processor,
+            foreground,
+            &[(VK_LCONTROL, 0x1d), (VIRTUAL_KEY(0x43), 0x2e)],
+            1,
+        );
         assert_eq!(processor.last_word_reset, "shortcut");
-        processor.set_privacy_reason(None);
-        for event in [
-            InputEvent::Printable('g'),
-            InputEvent::Printable('b'),
-            InputEvent::UnsupportedInput,
-        ] {
-            type_token_character(&mut processor, event);
-        }
+        type_keys(&mut processor, foreground, &[0x22, 0x30, 0x07]);
         assert_eq!(processor.replay_keys.len(), 3);
         assert!(processor.session.is_suppressed());
         assert!(!processor.manual_token_start_known);
@@ -16463,33 +16424,32 @@ mod tests {
 
         // Other suppression causes still do not start a token.
         processor.last_word_reset = "external-input";
-        type_token_character(&mut processor, InputEvent::Printable('a'));
+        type_keys(&mut processor, foreground, &[0x1e]);
         assert!(processor.replay_keys.is_empty());
     }
 
     #[test]
     fn manual_token_never_starts_inside_unknown_text_and_is_bounded() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.set_privacy_reason(None);
+        let (mut processor, foreground) = processor_typing_in(0x0409);
         // After navigation the caret position inside the text is unknown.
-        processor
-            .session
-            .handle(InputEvent::Navigation, None, &processor.detector);
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
-        type_token_character(&mut processor, InputEvent::Printable('a'));
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x4b,
+            extended: true,
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LEFT, 1, 0)
+        });
+        type_keys(&mut processor, foreground, &[0x07, 0x1e]);
         assert!(processor.replay_keys.is_empty());
         // A key without a replay form, or an overlong token, discards it.
         processor.session.clear();
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        type_keys(&mut processor, foreground, &[0x07]);
         let keys = processor.take_manual_token_keys(InputEvent::UnsupportedInput, true, 0);
         processor.extend_manual_token(keys.unwrap(), None);
         assert!(processor.replay_keys.is_empty());
         processor.session.clear();
-        for _ in 0..MANUAL_TOKEN_MAX_KEYS {
-            type_token_character(&mut processor, InputEvent::UnsupportedInput);
-        }
+        type_keys(&mut processor, foreground, &[0x07; MANUAL_TOKEN_MAX_KEYS]);
         assert_eq!(processor.replay_keys.len(), MANUAL_TOKEN_MAX_KEYS);
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        type_keys(&mut processor, foreground, &[0x07]);
         assert!(processor.replay_keys.is_empty());
         // Non-printable keys never extend a token.
         assert!(
