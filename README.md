@@ -488,16 +488,17 @@ later tick. The diagnostics log records `event=hooks` with the reason.
 
 ## Language packs
 
-Pack metadata is exposed by `language::language_packs()`. Dictionary sources,
-checksums, and exact redistribution notices live under
-`data/language-packs/`.
+Which packs take part in conversion is decided at run time from the enabled
+packages and the keyboard layouts Windows has loaded; there is no static
+capability table. Dictionary sources, checksums, and exact redistribution
+notices live under `data/language-packs/`.
 
-- `en-US`: direct layout, dictionary embedded, automatic correction;
-- `ru-RU`: direct layout, dictionary embedded, automatic correction;
-- `et-EE`: direct layout, dictionary embedded, and mapped from the buffered
+- `en-US`: direct layout, automatic correction; its dictionary is built in;
+- `ru-RU`: direct layout, automatic correction;
+- `et-EE`: direct layout, automatic correction, mapped from the buffered
   physical scan codes through the installed Windows Estonian HKL;
-- `ja-JP`: `ImeRomaji` pack and tray identity; automatic correction awaits an
-  adapter that can observe and preserve Windows IME composition.
+- `ja-JP`: no automatic correction; it awaits an adapter that can observe and
+  preserve Windows IME composition.
 
 The Windows mapper uses a fresh keyboard-state buffer and
 `TO_UNICODE_DO_NOT_CHANGE_KEYBOARD_STATE`; it never mutates the foreground

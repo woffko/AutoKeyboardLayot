@@ -1,78 +1,17 @@
-//! Language-pack metadata and direct keyboard-layout mappings.
+//! Pack identity and direct keyboard-layout mappings.
 
 /// Compatibility name for stable pack identity. An ID does not imply that an
 /// input profile, dictionary or adapter is installed or ready.
 pub type Language = crate::dictionary_registry::PackId;
 
-/// Input model required by a language pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackKind {
-    DirectKeyboardLayout,
-    ImeRomaji,
-}
-
-/// Current automatic-correction capability of a pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutomaticCorrection {
-    Enabled,
-    NeedsPhysicalKeyMapper,
-    NeedsImeAdapter,
-}
-
-/// Immutable metadata for one embedded language pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LanguagePack {
-    pub language: Language,
-    pub id: &'static str,
-    pub windows_primary_language_id: u16,
-    pub display_code: &'static str,
-    pub tray_code: &'static str,
-    pub kind: PackKind,
-    pub automatic_correction: AutomaticCorrection,
-    pub dictionary_embedded: bool,
-}
-
-const LANGUAGE_PACKS: &[LanguagePack] = &[
-    LanguagePack {
-        language: Language::English,
-        id: "en-US",
-        windows_primary_language_id: 0x09,
-        display_code: "ENG",
-        tray_code: "EN",
-        kind: PackKind::DirectKeyboardLayout,
-        automatic_correction: AutomaticCorrection::Enabled,
-        dictionary_embedded: true,
-    },
-    LanguagePack {
-        language: Language::Russian,
-        id: "ru-RU",
-        windows_primary_language_id: 0x19,
-        display_code: "RUS",
-        tray_code: "RU",
-        kind: PackKind::DirectKeyboardLayout,
-        automatic_correction: AutomaticCorrection::Enabled,
-        dictionary_embedded: true,
-    },
-    LanguagePack {
-        language: Language::Estonian,
-        id: "et-EE",
-        windows_primary_language_id: 0x25,
-        display_code: "EST",
-        tray_code: "ET",
-        kind: PackKind::DirectKeyboardLayout,
-        automatic_correction: AutomaticCorrection::Enabled,
-        dictionary_embedded: true,
-    },
-    LanguagePack {
-        language: Language::Japanese,
-        id: "ja-JP",
-        windows_primary_language_id: 0x11,
-        display_code: "JPN",
-        tray_code: "JA",
-        kind: PackKind::ImeRomaji,
-        automatic_correction: AutomaticCorrection::NeedsImeAdapter,
-        dictionary_embedded: false,
-    },
+/// The canonical spelling of the built-in pack IDs. Which packs take part in
+/// conversion is decided at run time from the installed packages and the
+/// loaded keyboard layouts (`Detector::automatic_targets`).
+const CANONICAL_IDS: [(Language, &str); 4] = [
+    (Language::English, "en-US"),
+    (Language::Russian, "ru-RU"),
+    (Language::Estonian, "et-EE"),
+    (Language::Japanese, "ja-JP"),
 ];
 
 impl Language {
@@ -95,52 +34,13 @@ impl Language {
         }
     }
 
-    pub fn pack(self) -> Option<&'static LanguagePack> {
-        LANGUAGE_PACKS.iter().find(|pack| pack.language == self)
-    }
-
     /// BCP-47 identifier used by settings and diagnostics.
     pub fn id(&self) -> &str {
-        self.pack().map_or(self.as_str(), |pack| pack.id)
+        CANONICAL_IDS
+            .iter()
+            .find(|(language, _)| language == self)
+            .map_or(self.as_str(), |(_, id)| id)
     }
-
-    /// Short label suitable for a tooltip or larger tray icon.
-    pub fn display_code(&self) -> &str {
-        self.pack().map_or(self.as_str(), |pack| pack.display_code)
-    }
-
-    /// Compact label that remains legible in a 16 by 16 tray icon.
-    pub fn tray_code(self) -> &'static str {
-        self.pack().map_or("??", |pack| pack.tray_code)
-    }
-
-    /// Legacy catalog metadata only. Runtime code must use
-    /// `Detector::automatic_targets`, which validates the active snapshot.
-    pub fn automatic_targets(self) -> impl Iterator<Item = Language> {
-        self.pack()
-            .into_iter()
-            .flat_map(|source| automatic_targets_in(source, LANGUAGE_PACKS))
-    }
-}
-
-/// Capability metadata, not dictionary presence, controls adapter eligibility.
-/// Installed/enabled selection is checked separately by the runtime snapshot.
-fn automatic_targets_in<'a>(
-    source: &'a LanguagePack,
-    packs: &'a [LanguagePack],
-) -> impl Iterator<Item = Language> + 'a {
-    let ready = |pack: &LanguagePack| {
-        pack.kind == PackKind::DirectKeyboardLayout
-            && pack.automatic_correction == AutomaticCorrection::Enabled
-    };
-    packs
-        .iter()
-        .filter(move |target| ready(source) && ready(target) && source.language != target.language)
-        .map(|target| target.language)
-}
-
-pub const fn language_packs() -> &'static [LanguagePack] {
-    LANGUAGE_PACKS
 }
 
 // The strings are ordered by physical key position on the common US/Russian
@@ -201,38 +101,10 @@ mod tests {
         let id = Language::from_id("DE-de").unwrap();
         assert_eq!(id, crate::PackId::parse("de-DE").unwrap());
         assert_eq!(id.id(), "de-de");
-        assert!(id.pack().is_none());
-        assert_eq!(id.tray_code(), "??");
-        assert_eq!(id.display_code(), "de-de");
-        assert!(id.automatic_targets().next().is_none());
         assert_eq!(Language::from_id("eng"), Some(Language::English));
         assert_eq!(Language::from_id("EN-us"), Some(Language::English));
         assert!(Language::from_id("../de-DE").is_none());
         assert_eq!(std::mem::size_of::<Language>(), 64);
-    }
-
-    #[test]
-    fn automatic_targets_follow_descriptor_capabilities() {
-        for source in language_packs() {
-            let targets: Vec<_> = source.language.automatic_targets().collect();
-            if source.kind == PackKind::ImeRomaji {
-                assert!(targets.is_empty());
-            } else {
-                assert_eq!(targets.len(), 2);
-                assert!(!targets.contains(&source.language));
-                assert!(!targets.contains(&Language::Japanese));
-            }
-        }
-        let mut packs = language_packs().to_vec();
-        packs[1].automatic_correction = AutomaticCorrection::NeedsPhysicalKeyMapper;
-        packs[2].dictionary_embedded = false;
-        assert_eq!(
-            automatic_targets_in(&packs[0], &packs).collect::<Vec<_>>(),
-            vec![Language::Estonian]
-        );
-        assert!(automatic_targets_in(&packs[1], &packs).next().is_none());
-        packs[2].kind = PackKind::ImeRomaji;
-        assert!(automatic_targets_in(&packs[0], &packs).next().is_none());
     }
 
     #[test]
@@ -276,19 +148,37 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_separate_estonian_and_japanese_packs() {
-        assert_eq!(language_packs().len(), 4);
-        assert_eq!(Language::Estonian.id(), "et-EE");
-        assert_eq!(Language::Estonian.tray_code(), "ET");
-        assert_eq!(
-            Language::Estonian.pack().unwrap().automatic_correction,
-            AutomaticCorrection::Enabled
-        );
-        assert_eq!(Language::Japanese.pack().unwrap().kind, PackKind::ImeRomaji);
-        assert_eq!(
-            Language::Japanese.pack().unwrap().automatic_correction,
-            AutomaticCorrection::NeedsImeAdapter
-        );
+    fn built_in_pack_ids_keep_their_canonical_spelling() {
+        for (language, canonical) in [
+            (Language::English, "en-US"),
+            (Language::Russian, "ru-RU"),
+            (Language::Estonian, "et-EE"),
+            (Language::Japanese, "ja-JP"),
+        ] {
+            assert_eq!(language.id(), canonical);
+            assert_eq!(Language::from_id(canonical), Some(language));
+            assert_eq!(language.as_str(), canonical.to_ascii_lowercase());
+        }
+    }
+
+    /// The README lists the built-in packs by these IDs and no longer
+    /// advertises a static metadata table.
+    #[test]
+    fn the_readme_lists_the_built_in_packs_by_their_canonical_ids() {
+        let readme = include_str!("../README.md");
+        let section = readme
+            .split("\n## Language packs\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README section Language packs");
+        for (language, _) in CANONICAL_IDS {
+            assert!(
+                section.contains(&format!("- `{}`", language.id())),
+                "{}",
+                language.id()
+            );
+        }
+        assert!(!readme.contains("language_packs()"));
     }
 
     #[test]
