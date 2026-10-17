@@ -170,10 +170,11 @@ language in which the word reads best (a dictionary word first), the next ones t
 the remaining languages, and the last one back to the original; without a clear
 reading the configured order is used. Repeats
 and key-up are swallowed so the hotkey cannot leak into the target editor. A
-manual layout switch ends automatic conversion of the word but not Pause: the
-word typed so far, or else the last completed word, can still be converted and is
-read in the layout it was typed in, and text typed right after a manual switch is
-kept for Pause like text typed after a shortcut. Digits typed on the numeric
+manual layout switch (Alt+Shift, Ctrl+Shift or Win+Space) ends automatic
+conversion of the word but not Pause: the word typed so far, or else the last
+completed word, can still be converted; it is read in the layout it was typed in
+and replaced from the layout the field shows now. Text typed right after a manual
+switch is kept for Pause like text typed after a shortcut. Digits typed on the numeric
 keypad can be part of such a word; they are typed back as keypad keys, because a
 keypad scan code sent alone arrives as the navigation key that shares it (keypad
 2 is Down). Keys held after a Space are replayed the same way. When Pause cannot act, the diagnostics log

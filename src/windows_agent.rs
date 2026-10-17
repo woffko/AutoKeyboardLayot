@@ -7069,6 +7069,26 @@ impl InputProcessor {
         foreground_identity_matches(expected)
     }
 
+    /// The input target that has the focus now, with its layout. Tests pin it.
+    fn current_foreground(&self) -> Option<ForegroundContext> {
+        #[cfg(test)]
+        if self.foreground_override.is_some() {
+            return self.foreground_override;
+        }
+        current_foreground_context()
+    }
+
+    /// Whether the text before the caret is the word an edit is about to replace, as its settle
+    /// step reads it. Tests script it.
+    fn settle_text_status(&self, process_id: u32, expected_text: &str) -> TextBarrierStatus {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().settle();
+        }
+        self.privacy_guard
+            .preceding_text_status(process_id, expected_text)
+    }
+
     /// The image path and the integrity level of `process_id`. Tests describe the process.
     fn process_facts(&self, process_id: u32) -> (Option<String>, Option<u32>) {
         #[cfg(test)]
@@ -7225,10 +7245,12 @@ impl InputProcessor {
         Some(HKL(handle as *mut c_void))
     }
 
+    /// The source layout is the field's layout when the edit starts: after a manual switch Pause
+    /// replaces a word typed in another layout, so it need not be the source language's own. Any
+    /// change of the profiles since the edit was planned changes the generation.
     fn pending_profiles_match(&self, pending: &PendingConversion) -> bool {
         pending.profile_generation == self.input_profiles.generation()
-            && self.language_for_layout(pending.source_layout)
-                == Some(pending.transaction.source_language)
+            && self.language_for_layout(pending.source_layout).is_some()
             && self
                 .find_layout(pending.transaction.target_language)
                 .is_some()
@@ -8704,22 +8726,24 @@ impl InputProcessor {
             .clone()
             .filter(|cycle| same_input_target(cycle.foreground, event.foreground))
         {
-            let Some(source_layout) = self.find_layout(cycle.language) else {
+            if self.find_layout(cycle.language).is_none() {
                 self.diagnostic(
                     "hotkey",
                     "result=ignored reason=layout-unavailable".to_owned(),
                 );
                 return;
-            };
+            }
             if !self.forced_privacy_allows(event.foreground) {
                 self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
                 return;
             }
+            // The cycle knows its text; the edit starts from the layout the field has now, which
+            // the user may have switched since the last press.
             self.advance_layout_cycle(
                 cycle.replay_keys,
                 cycle.delimiter,
                 cycle.foreground,
-                source_layout.0 as usize,
+                event.foreground.layout,
                 cycle.language,
                 cycle.text,
                 event.sequence,
@@ -8729,7 +8753,7 @@ impl InputProcessor {
         }
         // The manual hotkey walks the word through every enabled layout, so it
         // works even when the word is not in any dictionary.
-        let Some((replay_keys, delimiter, source_layout)) = self.forced_conversion_source(event)
+        let Some((replay_keys, delimiter, typed_layout)) = self.forced_conversion_source(event)
         else {
             self.diagnostic(
                 "hotkey",
@@ -8740,16 +8764,14 @@ impl InputProcessor {
             );
             return;
         };
-        let Some(source_language) = self.language_for_layout(source_layout) else {
+        let Some(source_language) = self.language_for_layout(typed_layout) else {
             self.diagnostic(
                 "hotkey",
                 "result=ignored reason=unsupported-layout".to_owned(),
             );
             return;
         };
-        let Some(current_text) =
-            map_replay_keys_to_layout(&replay_keys, HKL(source_layout as *mut c_void))
-        else {
+        let Some(current_text) = (self.key_mapper())(&replay_keys, typed_layout) else {
             // A key of the word gives no single character in the layout it was typed in, so
             // the text on screen cannot be read back and replaced safely.
             self.diagnostic(
@@ -8762,11 +8784,13 @@ impl InputProcessor {
             self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
         }
+        // The keys are read in the layout they were typed in; the edit starts from the layout the
+        // field has now, which differs after a manual switch.
         self.advance_layout_cycle(
             replay_keys,
             delimiter,
             event.foreground,
-            source_layout,
+            event.foreground.layout,
             source_language,
             current_text,
             event.sequence,
@@ -9624,13 +9648,15 @@ impl InputProcessor {
             if !self.edit_guard_is_current(foreground, input_sequence) {
                 return ReplayAttempt::Cancelled;
             }
-            if current_foreground_context().is_none_or(|current| current.layout != source_layout) {
+            if self
+                .current_foreground()
+                .is_none_or(|current| current.layout != source_layout)
+            {
                 return ReplayAttempt::Cancelled;
             }
             if self.text_edit_backend.requires_text_barrier()
                 && matches!(
-                    self.privacy_guard
-                        .preceding_text_status(foreground.process_id, expected_text),
+                    self.settle_text_status(foreground.process_id, expected_text),
                     TextBarrierStatus::Match
                 )
             {
@@ -11201,6 +11227,7 @@ const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
 /// keyboard layout, as tests script them.
 #[cfg(test)]
 trait PasteSeam {
+    fn settle(&mut self) -> TextBarrierStatus;
     fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>);
     fn begin<'a>(
         &mut self,
@@ -20099,8 +20126,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_gate_the_worker_arms_or_hands_over_gives_the_edit_the_time_the_gate_has() {
+    /// A window of the calling thread that accepts every gate request, so that it answers the
+    /// worker's messages within the call. It goes with the thread.
+    fn accepting_gate_window() -> HWND {
         let module = unsafe { GetModuleHandleW(None).expect("module") };
         let class = WNDCLASSW {
             lpfnWndProc: Some(accepting_gate_procedure),
@@ -20108,9 +20136,9 @@ mod tests {
             lpszClassName: w!("AutoKeyboardLayotAcceptingGateTest"),
             ..Default::default()
         };
+        // A second registration fails harmlessly: the class is the same.
         unsafe { RegisterClassW(&class) };
-        // Created by this thread, the window answers the worker's messages within the call.
-        let window = unsafe {
+        unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("AutoKeyboardLayotAcceptingGateTest"),
@@ -20126,7 +20154,12 @@ mod tests {
                 None,
             )
             .expect("gate window")
-        };
+        }
+    }
+
+    #[test]
+    fn a_gate_the_worker_arms_or_hands_over_gives_the_edit_the_time_the_gate_has() {
+        let window = accepting_gate_window();
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
         processor.gate_window = window.0 as usize;
         let lets_go_after = |before: Instant, ms: u64, processor: &InputProcessor| {
@@ -20570,6 +20603,7 @@ mod tests {
     /// collapse.
     struct ScriptedPaste {
         steps: Arc<Mutex<PasteSteps>>,
+        settled: TextBarrierStatus,
         selection: (TextBarrierStatus, Option<SelectionCleanup>),
         clipboard: PasteClipboard,
         taken: Option<usize>,
@@ -20585,6 +20619,7 @@ mod tests {
             let steps = Arc::new(Mutex::new(PasteSteps::default()));
             let script = Self {
                 steps: Arc::clone(&steps),
+                settled: TextBarrierStatus::Match,
                 selection: (TextBarrierStatus::Match, None),
                 clipboard,
                 taken: None,
@@ -20612,6 +20647,11 @@ mod tests {
     }
 
     impl PasteSeam for ScriptedPaste {
+        fn settle(&mut self) -> TextBarrierStatus {
+            self.step("settle");
+            self.settled
+        }
+
         fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>) {
             self.step("select");
             self.selection
@@ -20789,8 +20829,120 @@ mod tests {
         }
     }
 
+    /// A processor in an editor's field on the protected-paste backend whose keyboard, settle
+    /// step and paste are scripted, so that Pause runs its whole pipeline in a test: the field
+    /// shows `layout`, and automatic conversion is off.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn pause_processor(
+        layout: usize,
+    ) -> (
+        InputProcessor,
+        Receiver<String>,
+        ForegroundContext,
+        Arc<Mutex<PasteSteps>>,
+    ) {
+        let (mut processor, diagnostics) = processor_in_field(EDITOR, None);
+        let foreground = ForegroundContext {
+            layout,
+            ..test_foreground()
+        };
+        processor.gate_window = accepting_gate_window().0 as usize;
+        processor.foreground_override = Some(foreground);
+        processor.last_foreground = Some(foreground_identity_key(foreground));
+        processor.last_layout = Some(layout);
+        processor.test_keyboard = Some(test_keyboard);
+        processor.backend_rules =
+            BackendRules::from_lines(["editor.exe = protected-paste"]).unwrap();
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        let (script, steps, _clipboard) = scripted_paste();
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        (processor, diagnostics, foreground, steps)
+    }
+
+    /// Types the keys with these scan codes and a Space in the processor's field.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn type_word_and_space(processor: &mut InputProcessor, scan_codes: &[u32]) {
+        let foreground = processor.foreground_override.expect("the field");
+        type_keys(processor, foreground, scan_codes);
+        processor.process_key(space_key(foreground, scan_codes.len() as u64 + 1, 0));
+    }
+
+    /// Presses Pause in the processor's field and returns the diagnostics written meanwhile. A
+    /// press that converts leaves the field in the target layout, as Windows would.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn press_pause(
+        processor: &mut InputProcessor,
+        diagnostics: &Receiver<String>,
+        sequence: u64,
+    ) -> Vec<String> {
+        diagnostics.try_iter().for_each(drop);
+        let foreground = processor.foreground_override.expect("the field");
+        processor
+            .metrics
+            .active_gate_token
+            .store(sequence, Ordering::Release);
+        let event = RawKeyEvent {
+            foreground,
+            hotkey_trigger: true,
+            ..test_raw_key(WM_KEYDOWN, VK_PAUSE, sequence, 0)
+        };
+        let language = processor.language_for_layout(foreground.layout);
+        processor.execute_forced_conversion(event, language);
+        if let Some(cycle) = &processor.transpose_cycle {
+            let layout = processor
+                .find_layout(cycle.language)
+                .expect("the target layout")
+                .0 as usize;
+            processor.foreground_override = Some(ForegroundContext {
+                layout,
+                ..foreground
+            });
+            processor.last_layout = Some(layout);
+        }
+        diagnostics.try_iter().collect()
+    }
 
     const GHBDTN: [u32; 6] = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_the_last_word_after_a_manual_layout_switch() {
+        let (mut processor, diagnostics, foreground, steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GHBDTN);
+        // Alt+Shift: the field now shows the Russian layout; the word was typed in English.
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0419,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("event=source_settle") && line.contains("result=Applied")),
+            "{lines:?}"
+        );
+        let cycle = processor.transpose_cycle.as_ref().expect("converted");
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "привет");
+        assert_eq!(steps.lock().unwrap().steps[0], "settle");
+        // A manual switch between two presses: the next press starts from the layout the field
+        // shows (Estonian), not from the one the last press left.
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0425,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 42);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("event=source_settle") && line.contains("result=Applied")),
+            "{lines:?}"
+        );
+        let cycle = processor.transpose_cycle.as_ref().expect("converted again");
+        assert_ne!(cycle.language, Language::Russian, "{lines:?}");
+        assert_eq!(cycle.text, "ghbdtn");
+    }
     #[test]
     fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
         let (script, _steps, state) = scripted_paste();
