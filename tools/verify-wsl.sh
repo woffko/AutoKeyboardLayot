@@ -54,7 +54,7 @@ Logs and summary.txt are written to target/verify/<UTC timestamp>/. The exit sta
 every selected step passed.
 
 Test-count floors: AKL_MIN_LINUX_LIB_TESTS (default 334) applies to the library tests of step 05,
-AKL_MIN_WINDOWS_TESTS (default 272) to step 09 and AKL_MIN_WINDOWS_ALL_TESTS (default 1232, both
+AKL_MIN_WINDOWS_TESTS (default 272) to step 09 and AKL_MIN_WINDOWS_ALL_TESTS (default 1241, both
 configurations together) to step 15. Raise them when tests are added; never lower them to hide a
 deleted test.
 EOF
@@ -102,7 +102,7 @@ cd "$repo_root" || exit 2
 
 min_linux_lib=${AKL_MIN_LINUX_LIB_TESTS:-334}
 min_windows=${AKL_MIN_WINDOWS_TESTS:-272}
-min_windows_all=${AKL_MIN_WINDOWS_ALL_TESTS:-1232}
+min_windows_all=${AKL_MIN_WINDOWS_ALL_TESTS:-1241}
 
 # Step selection ---------------------------------------------------------------
 
