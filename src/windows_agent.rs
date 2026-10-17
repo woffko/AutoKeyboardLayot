@@ -86,8 +86,8 @@ use windows::{
         },
         UI::{
             Accessibility::{
-                CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement,
-                IUIAutomationTextPattern, TextPatternRangeEndpoint_End,
+                CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationTextPattern,
+                IUIAutomationTextRange, TextPatternRangeEndpoint_End,
                 TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_CONTROLTYPE_ID,
                 UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_TextPatternId,
             },
@@ -158,6 +158,8 @@ const GATE_ARM_MESSAGE: u32 = WM_APP + 2;
 const GATE_RELEASE_MESSAGE: u32 = WM_APP + 3;
 const GATE_DRAIN_ACK_MESSAGE: u32 = WM_APP + 4;
 const GATE_FAIL_OPEN_MESSAGE: u32 = WM_APP + 5;
+/// The LPARAM of a fail-open request whose edit may have left the word selected.
+const GATE_FAIL_OPEN_SELECTION_LEFT: isize = 1;
 const GATE_HANDOFF_BUDGET_MESSAGE: u32 = WM_APP + 6;
 const LEXICON_OFFER_MESSAGE: u32 = WM_APP + 7;
 const SETTINGS_APPLIED_MESSAGE: u32 = WM_APP + 8;
@@ -181,6 +183,10 @@ const UIA_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 50;
 /// correction gate's time budget accounts for.
 const UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 100;
 const UIA_MANUAL_SELECTION_ATTEMPTS: u32 = 2;
+/// How often, and for how long at most, the agent's own selection is collapsed and read back
+/// when an edit does not go ahead.
+const SELECTION_COLLAPSE_ATTEMPTS: u32 = 4;
+const SELECTION_COLLAPSE_BUDGET_MS: u64 = 200;
 /// How long, and for how many windows, the last word stays available to Pause after the agent
 /// stopped tracking it (a window switch, a click, a shortcut). Memory only, never written.
 const REMEMBERED_WORD_TTL: Duration = Duration::from_secs(120);
@@ -534,6 +540,8 @@ enum GateFailureCause {
     DownstreamHook,
     InternalFault,
     HookReinstall,
+    /// The worker's edit may have left the word selected, so the held keys would replace it.
+    SelectionLeft,
 }
 
 #[derive(Debug, Clone)]
@@ -842,6 +850,9 @@ enum TextEditAttempt {
     Unsupported,
     Cancelled,
     Failed,
+    /// The edit did not go ahead and the agent's selection of the word could not be shown gone:
+    /// keys typed now would replace the word.
+    SelectionLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1359,6 +1370,7 @@ enum ConversionFailureReason {
     GateDrain = 6,
     ClipboardEdit = 7,
     InternalFault = 8,
+    SelectionLeft = 9,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1409,11 +1421,22 @@ enum BarrierCharacterClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TextBarrierStage {
+    /// Not reached.
     #[default]
     None,
+    /// The text is empty or longer than the barrier checks.
+    TextLength,
     Resolver,
+    /// The selection could not be read.
     Selection,
+    /// The selection is not exactly one range.
+    SelectionRanges,
+    /// The only selection range could not be read.
     Caret,
+    /// Text is selected instead of an empty caret.
+    CaretNotEmpty,
+    /// The caret range could not be copied.
+    RangeClone,
     RangeMove,
     TextRead,
     TextCompared,
@@ -1457,6 +1480,8 @@ struct TextBarrierReport {
     confirmation: Option<SelectionConfirmation>,
     /// How many selection attempts ran.
     attempts: u32,
+    /// What became of the agent's selection when it was collapsed again.
+    cleanup: Option<SelectionCleanup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3748,7 +3773,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(acknowledge_correction_gate_drain(old_token, new_token) as isize)
         }
         GATE_FAIL_OPEN_MESSAGE => {
-            fail_open_correction_gate(wparam.0 as u64);
+            fail_open_correction_gate(wparam.0 as u64, fail_open_cause(lparam.0));
             LRESULT(0)
         }
         HELD_KEYS_RETURN_MESSAGE => {
@@ -4466,19 +4491,19 @@ fn acknowledge_correction_gate_drain(old_token: u64, new_token: u64) -> bool {
             .is_ok()
         };
         if !posted {
-            fail_open_correction_gate(old_token);
+            fail_open_correction_gate(old_token, GateFailureCause::WorkerAck);
         }
     }
     acknowledged
 }
 
-fn fail_open_correction_gate(token: u64) {
+fn fail_open_correction_gate(token: u64, cause: GateFailureCause) {
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut()
             && state.correction_gate.active
             && state.correction_gate.token == token
         {
-            state.break_correction_gate_fail_open(GateFailureCause::WorkerAck);
+            state.break_correction_gate_fail_open(cause);
         }
     });
 }
@@ -4575,6 +4600,16 @@ fn stalled_worker_may_hand_back(input: &RetainedInput, facts: HandBackFacts) -> 
             .current
             .is_some_and(|current| same_input_target(input.foreground, current))
         && recovery_privacy_allows(facts.privacy)
+}
+
+/// The cause a worker's fail-open request names in its LPARAM: a selection the edit may have
+/// left, or else a drain acknowledgement that was refused.
+const fn fail_open_cause(code: isize) -> GateFailureCause {
+    if code == GATE_FAIL_OPEN_SELECTION_LEFT {
+        GateFailureCause::SelectionLeft
+    } else {
+        GateFailureCause::WorkerAck
+    }
 }
 
 /// Deletes held keys that were neither handed back nor recovered within their lifetime. They were
@@ -4793,311 +4828,72 @@ impl PrivacyGuard {
         expected_process_id: u32,
         expected_text: &str,
     ) -> TextBarrierStatus {
-        self.last_barrier_report.set(TextBarrierReport {
+        let report = &self.last_barrier_report;
+        report.set(TextBarrierReport {
             expected_chars: expected_text.chars().count(),
             ..TextBarrierReport::default()
         });
-        let Ok(character_count) = i32::try_from(expected_text.encode_utf16().count()) else {
+        let Some(units) = barrier_units(expected_text) else {
+            set_barrier_stage(report, TextBarrierStage::TextLength);
             return TextBarrierStatus::Unavailable;
         };
-        if character_count == 0 || character_count > 128 {
-            return TextBarrierStatus::Unavailable;
-        }
-
-        unsafe {
-            let (_element, pattern) = match self.focused_editable_text_pattern(expected_process_id)
-            {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            let Ok(ranges) = pattern.GetSelection() else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Selection,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Unavailable;
-            };
-            if ranges.Length().ok() != Some(1) {
-                return TextBarrierStatus::Mismatch;
-            }
-            let Ok(caret) = ranges.GetElement(0) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Unavailable;
-            };
-            if caret
-                .CompareEndpoints(
-                    TextPatternRangeEndpoint_Start,
-                    &caret,
-                    TextPatternRangeEndpoint_End,
-                )
-                .ok()
-                != Some(0)
-            {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Mismatch;
-            }
-            let Ok(range) = caret.Clone() else {
-                return TextBarrierStatus::Unavailable;
-            };
-            let moved = range
-                .MoveEndpointByUnit(
-                    TextPatternRangeEndpoint_Start,
-                    TextUnit_Character,
-                    -character_count,
-                )
-                .ok();
-            if moved != Some(-character_count) {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::RangeMove,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or(i32::MIN),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Mismatch;
-            }
-            let Ok(actual) = range.GetText(-1) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::TextRead,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or_default(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Unavailable;
-            };
-            let actual = actual.to_string();
-            self.last_barrier_report.set(classify_text_barrier(
-                &actual,
-                expected_text,
-                TextBarrierStage::TextCompared,
-                moved.unwrap_or_default(),
-            ));
-            if text_barrier_matches(&actual, expected_text) {
-                TextBarrierStatus::Match
-            } else {
-                TextBarrierStatus::Mismatch
-            }
+        let field = match self.focused_text_field(expected_process_id) {
+            Ok(field) => field,
+            Err(status) => return status,
+        };
+        match read_preceding_text(&field, units, expected_text, report) {
+            Ok(_) => TextBarrierStatus::Match,
+            Err(status) => status,
         }
     }
 
+    /// Selects the text before the caret, trying again only when the field did not show the
+    /// selection and it was collapsed. Returns the status and what became of the selection when
+    /// it was collapsed again.
     fn select_preceding_text(
         &self,
         expected_process_id: u32,
         expected_text: &str,
         patience: PastePatience,
-    ) -> TextBarrierStatus {
-        let (status, attempts) = retry_unshown_selection(patience.attempts(), || {
-            self.select_preceding_text_once(
-                expected_process_id,
+    ) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+        let (attempt, attempts) = retry_unshown_selection(patience.attempts(), |earlier| {
+            self.last_barrier_report.set(TextBarrierReport {
+                expected_chars: expected_text.chars().count(),
+                ..TextBarrierReport::default()
+            });
+            select_preceding_text_in(
                 expected_text,
                 patience.confirm_timeout(),
+                earlier,
+                &self.last_barrier_report,
+                || self.focused_text_field(expected_process_id),
             )
         });
         let mut report = self.last_barrier_report.get();
         report.attempts = attempts;
         self.last_barrier_report.set(report);
-        status
+        (attempt.status, attempt.cleanup)
     }
 
-    /// One attempt: check the text before the caret, select it and confirm the selection.
-    /// The confirmation is returned when a selection was made.
-    fn select_preceding_text_once(
-        &self,
-        expected_process_id: u32,
-        expected_text: &str,
-        confirm_timeout: Duration,
-    ) -> (TextBarrierStatus, Option<SelectionConfirmation>) {
-        self.last_barrier_report.set(TextBarrierReport {
-            expected_chars: expected_text.chars().count(),
-            ..TextBarrierReport::default()
-        });
-        let Ok(character_count) = i32::try_from(expected_text.encode_utf16().count()) else {
-            return (TextBarrierStatus::Unavailable, None);
+    /// Collapses the agent's confirmed selection when the edit does not go ahead after all, and
+    /// reads it back. The report keeps the step it described and adds only the cleanup.
+    fn collapse_selection_to_end(&self, expected_process_id: u32) -> SelectionCleanup {
+        let report = self.last_barrier_report.get();
+        let cleanup = match self.focused_text_field(expected_process_id) {
+            Ok(field) => collapse_selection(&field),
+            Err(_) => SelectionCleanup::Unverified,
         };
-        if character_count == 0 || character_count > 128 {
-            return (TextBarrierStatus::Unavailable, None);
-        }
-
-        unsafe {
-            let (_element, pattern) = match self.focused_editable_text_pattern(expected_process_id)
-            {
-                Ok(value) => value,
-                Err(status) => return (status, None),
-            };
-            let Ok(ranges) = pattern.GetSelection() else {
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            if ranges.Length().ok() != Some(1) {
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            let Ok(caret) = ranges.GetElement(0) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            if caret
-                .CompareEndpoints(
-                    TextPatternRangeEndpoint_Start,
-                    &caret,
-                    TextPatternRangeEndpoint_End,
-                )
-                .ok()
-                != Some(0)
-            {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            let Ok(range) = caret.Clone() else {
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            let moved = range
-                .MoveEndpointByUnit(
-                    TextPatternRangeEndpoint_Start,
-                    TextUnit_Character,
-                    -character_count,
-                )
-                .ok();
-            if moved != Some(-character_count) {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::RangeMove,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or(i32::MIN),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            let Ok(actual) = range.GetText(-1) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::TextRead,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or_default(),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            let actual = actual.to_string();
-            self.last_barrier_report.set(classify_text_barrier(
-                &actual,
-                expected_text,
-                TextBarrierStage::TextCompared,
-                moved.unwrap_or_default(),
-            ));
-            if !text_barrier_matches(&actual, expected_text) {
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            if range.Select().is_err() {
-                let mut report = self.last_barrier_report.get();
-                report.stage = TextBarrierStage::SelectCall;
-                self.last_barrier_report.set(report);
-                return (TextBarrierStatus::Mismatch, None);
-            }
-
-            let moved_units = moved.unwrap_or_default();
-            let confirmation = confirm_selection(
-                confirm_timeout,
-                || {
-                    let Ok(selected_ranges) = pattern.GetSelection() else {
-                        return SelectionPoll::Unreadable;
-                    };
-                    if selected_ranges.Length().ok() != Some(1) {
-                        return SelectionPoll::NotOneRange;
-                    }
-                    let Ok(selected) = selected_ranges.GetElement(0) else {
-                        return SelectionPoll::Unreadable;
-                    };
-                    if selected
-                        .CompareEndpoints(
-                            TextPatternRangeEndpoint_Start,
-                            &selected,
-                            TextPatternRangeEndpoint_End,
-                        )
-                        .ok()
-                        == Some(0)
-                    {
-                        return SelectionPoll::Empty;
-                    }
-                    match selected.GetText(-1) {
-                        Ok(actual) => {
-                            let actual = actual.to_string();
-                            self.last_barrier_report.set(classify_text_barrier(
-                                &actual,
-                                expected_text,
-                                TextBarrierStage::SelectionConfirm,
-                                moved_units,
-                            ));
-                            SelectionPoll::Text(actual)
-                        }
-                        Err(_) => SelectionPoll::Unreadable,
-                    }
-                },
-                |actual| text_barrier_matches(actual, expected_text),
-                || thread::sleep(Duration::from_millis(1)),
-                || self.collapse_selection_to_end(expected_process_id),
-            );
-            let mut report = if confirmation == SelectionConfirmation::Unreadable {
-                TextBarrierReport {
-                    stage: TextBarrierStage::SelectionConfirm,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units,
-                    ..TextBarrierReport::default()
-                }
-            } else {
-                self.last_barrier_report.get()
-            };
-            report.confirmation = Some(confirmation);
-            self.last_barrier_report.set(report);
-            (confirmation.status(), Some(confirmation))
-        }
+        self.last_barrier_report.set(TextBarrierReport {
+            cleanup: Some(cleanup),
+            ..report
+        });
+        cleanup
     }
 
-    fn collapse_selection_to_end(&self, expected_process_id: u32) {
-        unsafe {
-            let Ok((_element, pattern)) = self.focused_editable_text_pattern(expected_process_id)
-            else {
-                return;
-            };
-            let Ok(ranges) = pattern.GetSelection() else {
-                return;
-            };
-            if ranges.Length().ok() != Some(1) {
-                return;
-            }
-            let Ok(range) = ranges.GetElement(0) else {
-                return;
-            };
-            if range
-                .MoveEndpointByRange(
-                    TextPatternRangeEndpoint_Start,
-                    &range,
-                    TextPatternRangeEndpoint_End,
-                )
-                .is_ok()
-            {
-                let _ = range.Select();
-            }
-        }
-    }
-
-    fn focused_editable_text_pattern(
+    fn focused_text_field(
         &self,
         expected_process_id: u32,
-    ) -> core::result::Result<(IUIAutomationElement, IUIAutomationTextPattern), TextBarrierStatus>
-    {
+    ) -> core::result::Result<UiaTextField, TextBarrierStatus> {
         let Some(automation) = &self.automation else {
             self.set_resolver_failure(EditableResolverReason::AutomationUnavailable, 0);
             return Err(TextBarrierStatus::Unavailable);
@@ -5152,7 +4948,7 @@ impl PrivacyGuard {
                     EditableResolverAction::Continue => {}
                     EditableResolverAction::ReturnCurrent => {
                         return pattern
-                            .map(|pattern| (element, pattern))
+                            .map(|pattern| UiaTextField { pattern })
                             .ok_or(TextBarrierStatus::Unavailable);
                     }
                 }
@@ -5356,18 +5152,21 @@ const fn paste_patience(forced: bool) -> PastePatience {
 }
 
 /// Runs selection attempts until one is not an unshown selection or `attempts` have run. Only a
-/// selection the field did not show is tried again, and every attempt reads and checks the text
-/// before the caret again before it selects. Returns the last status and how many attempts ran.
+/// selection the field did not show, and that was collapsed again, is tried again; every attempt
+/// reads and checks the text before the caret again before it selects, and is told whether an
+/// earlier attempt ran. Returns the last attempt and how many attempts ran.
 fn retry_unshown_selection(
     attempts: u32,
-    mut attempt: impl FnMut() -> (TextBarrierStatus, Option<SelectionConfirmation>),
-) -> (TextBarrierStatus, u32) {
+    mut attempt: impl FnMut(bool) -> SelectionAttempt,
+) -> (SelectionAttempt, u32) {
     let mut ran = 0;
     loop {
+        let result = attempt(ran > 0);
         ran += 1;
-        let (status, confirmation) = attempt();
-        if confirmation != Some(SelectionConfirmation::NotShown) || ran >= attempts {
-            return (status, ran);
+        let unshown = result.confirmation == Some(SelectionConfirmation::NotShown)
+            && result.cleanup == Some(SelectionCleanup::Collapsed);
+        if !unshown || ran >= attempts {
+            return (result, ran);
         }
     }
 }
@@ -5376,13 +5175,14 @@ fn retry_unshown_selection(
 /// `timeout`. Every outcome but `Confirmed` collapses the selection, exactly once: the selection
 /// is ours, made a moment ago, and must not be left behind to be typed over. This runs only
 /// after our own successful `Select()`, so a selection the user made is never collapsed.
+/// Returns the outcome and, when the selection was collapsed, what became of it.
 fn confirm_selection(
     timeout: Duration,
     mut poll: impl FnMut() -> SelectionPoll,
     text_matches: impl Fn(&str) -> bool,
     mut sleep: impl FnMut(),
-    collapse: impl FnOnce(),
-) -> SelectionConfirmation {
+    collapse: impl FnOnce() -> SelectionCleanup,
+) -> (SelectionConfirmation, Option<SelectionCleanup>) {
     let deadline = Instant::now() + timeout;
     let mut saw_other_text = false;
     let mut saw_not_shown = false;
@@ -5408,10 +5208,349 @@ fn confirm_selection(
         }
         sleep();
     };
-    if outcome != SelectionConfirmation::Confirmed {
-        collapse();
+    let cleanup = (outcome != SelectionConfirmation::Confirmed).then(collapse);
+    (outcome, cleanup)
+}
+
+/// What became of the agent's own selection when it was collapsed again because the edit did
+/// not go ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionCleanup {
+    /// Collapsed to its end, and read back empty.
+    Collapsed,
+    /// Not collapsed, or not read back empty in time: the field may still show the word
+    /// selected, and keys typed now would replace it.
+    Unverified,
+}
+
+/// One selection attempt: its status, how the selection was confirmed when one was made, and
+/// what became of the selection when it was collapsed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionAttempt {
+    status: TextBarrierStatus,
+    confirmation: Option<SelectionConfirmation>,
+    cleanup: Option<SelectionCleanup>,
+}
+
+/// The selection of a field as one read found it.
+enum SelectionRead<R> {
+    /// The selection could not be read.
+    Unreadable,
+    /// The selection is not exactly one range.
+    NotOneRange,
+    /// The only range could not be read.
+    RangeUnreadable,
+    One(R),
+}
+
+/// The text pattern calls that the text barrier and the selection make on one field. UI
+/// Automation makes them on the focused control (`UiaTextField`); tests script them.
+trait TextField {
+    type Range;
+    fn selection(&self) -> SelectionRead<Self::Range>;
+    /// Whether the range is empty; `None` when the comparison fails.
+    fn is_empty(&self, range: &Self::Range) -> Option<bool>;
+    fn clone_range(&self, range: &Self::Range) -> Option<Self::Range>;
+    /// Moves the start of the range by `units` characters and returns how far it moved.
+    fn move_start(&self, range: &Self::Range, units: i32) -> Option<i32>;
+    fn text(&self, range: &Self::Range) -> Option<String>;
+    fn select(&self, range: &Self::Range) -> bool;
+    /// Moves the start of the range onto its end.
+    fn collapse_to_end(&self, range: &Self::Range) -> bool;
+}
+
+/// The focused editable control, through its UI Automation text pattern.
+struct UiaTextField {
+    pattern: IUIAutomationTextPattern,
+}
+
+// The calls go to COM interfaces obtained on this thread; a provider that fails or does not
+// answer in time returns an error, which each method turns into its failure value.
+impl TextField for UiaTextField {
+    type Range = IUIAutomationTextRange;
+
+    fn selection(&self) -> SelectionRead<IUIAutomationTextRange> {
+        unsafe {
+            let Ok(ranges) = self.pattern.GetSelection() else {
+                return SelectionRead::Unreadable;
+            };
+            if ranges.Length().ok() != Some(1) {
+                return SelectionRead::NotOneRange;
+            }
+            ranges
+                .GetElement(0)
+                .map_or(SelectionRead::RangeUnreadable, SelectionRead::One)
+        }
     }
-    outcome
+
+    fn is_empty(&self, range: &IUIAutomationTextRange) -> Option<bool> {
+        unsafe {
+            range
+                .CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    range,
+                    TextPatternRangeEndpoint_End,
+                )
+                .ok()
+                .map(|order| order == 0)
+        }
+    }
+
+    fn clone_range(&self, range: &IUIAutomationTextRange) -> Option<IUIAutomationTextRange> {
+        unsafe { range.Clone().ok() }
+    }
+
+    fn move_start(&self, range: &IUIAutomationTextRange, units: i32) -> Option<i32> {
+        unsafe {
+            range
+                .MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, units)
+                .ok()
+        }
+    }
+
+    fn text(&self, range: &IUIAutomationTextRange) -> Option<String> {
+        unsafe { range.GetText(-1).ok().map(|text| text.to_string()) }
+    }
+
+    fn select(&self, range: &IUIAutomationTextRange) -> bool {
+        unsafe { range.Select().is_ok() }
+    }
+
+    fn collapse_to_end(&self, range: &IUIAutomationTextRange) -> bool {
+        unsafe {
+            range
+                .MoveEndpointByRange(
+                    TextPatternRangeEndpoint_Start,
+                    range,
+                    TextPatternRangeEndpoint_End,
+                )
+                .is_ok()
+        }
+    }
+}
+
+/// The length in UTF-16 units of a text the barrier checks: none for an empty text or one longer
+/// than 128 units.
+fn barrier_units(expected_text: &str) -> Option<i32> {
+    i32::try_from(expected_text.encode_utf16().count())
+        .ok()
+        .filter(|units| (1..=128).contains(units))
+}
+
+fn set_barrier_stage(report: &Cell<TextBarrierReport>, stage: TextBarrierStage) {
+    report.set(TextBarrierReport {
+        stage,
+        ..report.get()
+    });
+}
+
+/// Checks that the `units` UTF-16 units before the caret of `field` are `expected_text`. Each
+/// early exit records its own stage in `report`; a comparison records what it found. Returns
+/// the range over that text when it matches.
+fn read_preceding_text<F: TextField>(
+    field: &F,
+    units: i32,
+    expected_text: &str,
+    report: &Cell<TextBarrierReport>,
+) -> core::result::Result<F::Range, TextBarrierStatus> {
+    let stop = |stage, status| {
+        set_barrier_stage(report, stage);
+        status
+    };
+    let caret = match field.selection() {
+        SelectionRead::Unreadable => {
+            return Err(stop(
+                TextBarrierStage::Selection,
+                TextBarrierStatus::Unavailable,
+            ));
+        }
+        SelectionRead::NotOneRange => {
+            return Err(stop(
+                TextBarrierStage::SelectionRanges,
+                TextBarrierStatus::Mismatch,
+            ));
+        }
+        SelectionRead::RangeUnreadable => {
+            return Err(stop(
+                TextBarrierStage::Caret,
+                TextBarrierStatus::Unavailable,
+            ));
+        }
+        SelectionRead::One(caret) => caret,
+    };
+    if field.is_empty(&caret) != Some(true) {
+        return Err(stop(
+            TextBarrierStage::CaretNotEmpty,
+            TextBarrierStatus::Mismatch,
+        ));
+    }
+    let Some(range) = field.clone_range(&caret) else {
+        return Err(stop(
+            TextBarrierStage::RangeClone,
+            TextBarrierStatus::Unavailable,
+        ));
+    };
+    let moved = field.move_start(&range, -units);
+    if moved != Some(-units) {
+        report.set(TextBarrierReport {
+            moved_units: moved.unwrap_or(i32::MIN),
+            ..report.get()
+        });
+        return Err(stop(
+            TextBarrierStage::RangeMove,
+            TextBarrierStatus::Mismatch,
+        ));
+    }
+    let Some(actual) = field.text(&range) else {
+        report.set(TextBarrierReport {
+            moved_units: -units,
+            ..report.get()
+        });
+        return Err(stop(
+            TextBarrierStage::TextRead,
+            TextBarrierStatus::Unavailable,
+        ));
+    };
+    report.set(classify_text_barrier(
+        &actual,
+        expected_text,
+        TextBarrierStage::TextCompared,
+        -units,
+    ));
+    if text_barrier_matches(&actual, expected_text) {
+        Ok(range)
+    } else {
+        Err(TextBarrierStatus::Mismatch)
+    }
+}
+
+/// One attempt to select the text before the caret of the field `resolve` finds: read and check
+/// the text, select it, confirm the selection and collapse it again unless it was confirmed.
+/// After an earlier attempt, text selected at the caret is that attempt's selection shown late,
+/// and is collapsed too; a first attempt leaves a selection it finds alone, as the user made it.
+fn select_preceding_text_in<F: TextField>(
+    expected_text: &str,
+    confirm_timeout: Duration,
+    earlier_attempt: bool,
+    report: &Cell<TextBarrierReport>,
+    resolve: impl FnOnce() -> core::result::Result<F, TextBarrierStatus>,
+) -> SelectionAttempt {
+    let refused = |status| SelectionAttempt {
+        status,
+        confirmation: None,
+        cleanup: None,
+    };
+    let Some(units) = barrier_units(expected_text) else {
+        set_barrier_stage(report, TextBarrierStage::TextLength);
+        return refused(TextBarrierStatus::Unavailable);
+    };
+    let field = match resolve() {
+        Ok(field) => field,
+        Err(status) => return refused(status),
+    };
+    let range = match read_preceding_text(&field, units, expected_text, report) {
+        Ok(range) => range,
+        Err(status) => {
+            let late_selection =
+                earlier_attempt && report.get().stage == TextBarrierStage::CaretNotEmpty;
+            let cleanup = late_selection.then(|| collapse_selection(&field));
+            report.set(TextBarrierReport {
+                cleanup,
+                ..report.get()
+            });
+            return SelectionAttempt {
+                status,
+                confirmation: None,
+                cleanup,
+            };
+        }
+    };
+    if !field.select(&range) {
+        // The call can fail after the field applied it (a provider timeout, say): what is
+        // selected is unknown, so it is collapsed like any selection that was not confirmed.
+        let cleanup = collapse_selection(&field);
+        report.set(TextBarrierReport {
+            stage: TextBarrierStage::SelectCall,
+            cleanup: Some(cleanup),
+            ..report.get()
+        });
+        return SelectionAttempt {
+            status: TextBarrierStatus::Mismatch,
+            confirmation: None,
+            cleanup: Some(cleanup),
+        };
+    }
+    let (confirmation, cleanup) = confirm_selection(
+        confirm_timeout,
+        || match field.selection() {
+            SelectionRead::Unreadable | SelectionRead::RangeUnreadable => SelectionPoll::Unreadable,
+            SelectionRead::NotOneRange => SelectionPoll::NotOneRange,
+            SelectionRead::One(selected) => {
+                if field.is_empty(&selected) == Some(true) {
+                    return SelectionPoll::Empty;
+                }
+                match field.text(&selected) {
+                    Some(actual) => {
+                        report.set(classify_text_barrier(
+                            &actual,
+                            expected_text,
+                            TextBarrierStage::SelectionConfirm,
+                            -units,
+                        ));
+                        SelectionPoll::Text(actual)
+                    }
+                    None => SelectionPoll::Unreadable,
+                }
+            }
+        },
+        |actual| text_barrier_matches(actual, expected_text),
+        || thread::sleep(Duration::from_millis(1)),
+        || collapse_selection(&field),
+    );
+    let mut final_report = if confirmation == SelectionConfirmation::Unreadable {
+        TextBarrierReport {
+            stage: TextBarrierStage::SelectionConfirm,
+            expected_chars: expected_text.chars().count(),
+            moved_units: -units,
+            ..TextBarrierReport::default()
+        }
+    } else {
+        report.get()
+    };
+    final_report.confirmation = Some(confirmation);
+    final_report.cleanup = cleanup;
+    report.set(final_report);
+    SelectionAttempt {
+        status: confirmation.status(),
+        confirmation: Some(confirmation),
+        cleanup,
+    }
+}
+
+/// Collapses the selection of `field` to its end and reads it back. A selection read back empty
+/// is `Collapsed`; one that cannot be read, or is still not empty after
+/// `SELECTION_COLLAPSE_ATTEMPTS` reads or `SELECTION_COLLAPSE_BUDGET_MS`, is `Unverified`.
+fn collapse_selection<F: TextField>(field: &F) -> SelectionCleanup {
+    let deadline = Instant::now() + Duration::from_millis(SELECTION_COLLAPSE_BUDGET_MS);
+    for attempt in 0..SELECTION_COLLAPSE_ATTEMPTS {
+        if attempt > 0 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let SelectionRead::One(range) = field.selection() else {
+            continue;
+        };
+        match field.is_empty(&range) {
+            Some(true) => return SelectionCleanup::Collapsed,
+            Some(false) if field.collapse_to_end(&range) => {
+                let _ = field.select(&range);
+            }
+            _ => {}
+        }
+    }
+    SelectionCleanup::Unverified
 }
 
 /// The result of a protected paste whose text edit and clipboard restoration are known.
@@ -5470,12 +5609,13 @@ fn classify_text_barrier(
         resolver_process_id: 0,
         confirmation: None,
         attempts: 0,
+        cleanup: None,
     }
 }
 
 fn format_text_barrier_report(report: TextBarrierReport) -> String {
     format!(
-        "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_is_word={},drop_last_is_word={},leading={:?},trailing={:?},confirm={:?},attempts={}",
+        "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_matches={},drop_last_matches={},leading={:?},trailing={:?},confirm={:?},attempts={},cleanup={:?}",
         report.stage,
         report.resolver_reason,
         report.resolver_depth,
@@ -5493,6 +5633,7 @@ fn format_text_barrier_report(report: TextBarrierReport) -> String {
         report.trailing,
         report.confirmation,
         report.attempts,
+        report.cleanup,
     )
 }
 
@@ -5987,6 +6128,10 @@ struct InputProcessor {
     gate_window: usize,
     // Token of the most recent gate release request (0 when none yet).
     last_gate_release_token: u64,
+    // Token of the most recent gate ended with its held keys kept for recovery (0 when none).
+    last_gate_retention_token: u64,
+    // The gate whose held keys are kept for recovery when it ends, instead of replayed.
+    held_keys_kept_for: Option<u64>,
     // Policy D1: how often automatic conversion may resume after a recovered gate abort.
     auto_resumes: RateLimit,
     // Replacements of the privacy provider that were already logged.
@@ -6126,6 +6271,8 @@ impl InputProcessor {
             metrics,
             gate_window,
             last_gate_release_token: 0,
+            last_gate_retention_token: 0,
+            held_keys_kept_for: None,
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
             sound_player: None,
@@ -8098,7 +8245,17 @@ impl InputProcessor {
 
     fn execute_pending_conversion(&mut self, boundary_sequence: u64) {
         self.execute_pending_conversion_inner(boundary_sequence);
-        self.request_gate_release(boundary_sequence);
+        self.end_conversion_gate(boundary_sequence);
+    }
+
+    /// Ends the gate of a conversion or an undo. Its held keys are replayed, unless the edit may
+    /// have left the word selected: then they are kept for recovery, as they would type over it.
+    fn end_conversion_gate(&mut self, token: u64) {
+        if self.held_keys_kept_for.take() == Some(token) {
+            self.request_gate_retention(token);
+        } else {
+            self.request_gate_release(token);
+        }
     }
 
     fn execute_pending_conversion_inner(&mut self, boundary_sequence: u64) {
@@ -8263,6 +8420,10 @@ impl InputProcessor {
                                 self.record_conversion_failure(
                                     ConversionFailureReason::ClipboardEdit,
                                 );
+                                return;
+                            }
+                            TextEditAttempt::SelectionLeft => {
+                                let _ = self.apply_paste_attempt_result(attempt, boundary_sequence);
                                 return;
                             }
                         }
@@ -8563,7 +8724,7 @@ impl InputProcessor {
             .forwarded_input_sequence
             .fetch_max(pause_sequence, Ordering::AcqRel);
         self.execute_undo_inner(pause_sequence);
-        self.request_gate_release(pause_sequence);
+        self.end_conversion_gate(pause_sequence);
     }
 
     fn execute_undo_inner(&mut self, pause_sequence: u64) {
@@ -8736,22 +8897,23 @@ impl InputProcessor {
             );
             return TextEditAttempt::Cancelled;
         }
-        let selection = self.privacy_guard.select_preceding_text(
+        let (selection, cleanup) = self.privacy_guard.select_preceding_text(
             foreground.process_id,
             expected_source,
             patience,
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=selection result={selection:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
+        if cleanup == Some(SelectionCleanup::Unverified) {
+            return TextEditAttempt::SelectionLeft;
+        }
         match selection {
             TextBarrierStatus::Match => {}
             TextBarrierStatus::Mismatch => return TextEditAttempt::Cancelled,
             TextBarrierStatus::Unavailable => return TextEditAttempt::Unsupported,
         }
         if !self.edit_guard_is_current(foreground, input_sequence) {
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Cancelled;
+            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         }
 
         let Some(mut clipboard) =
@@ -8764,20 +8926,16 @@ impl InputProcessor {
                     started.elapsed().as_millis()
                 ),
             );
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
             // Nothing was typed and the user's clipboard was not replaced: a busy clipboard is a
             // word left alone, not a failed edit, so automatic conversion stays on.
-            return TextEditAttempt::Cancelled;
+            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         };
         let clipboard_current = clipboard.is_current();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_prepare result=ready current={clipboard_current} elapsed_ms={}", started.elapsed().as_millis()));
         if !clipboard_current || !self.edit_guard_is_current(foreground, input_sequence) {
             let restored = clipboard.restore();
             self.diagnostic("paste", format!("sequence={input_sequence} phase=before_submit result=cancelled restored={restored}"));
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Cancelled;
+            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         }
 
         let paste_inputs = build_paste_inputs();
@@ -8787,9 +8945,7 @@ impl InputProcessor {
             let control_up = [keyboard_input(VK_LCONTROL, 0, KEYEVENTF_KEYUP)];
             let _ = send_input_batch(&control_up);
             let _ = clipboard.restore();
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Failed;
+            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Failed);
         }
 
         let paste_commit =
@@ -8803,8 +8959,7 @@ impl InputProcessor {
             // The paste may not have replaced the selected word: do not leave our selection behind,
             // unless the user has already moved on.
             if self.edit_guard_is_current(foreground, input_sequence) {
-                self.privacy_guard
-                    .collapse_selection_to_end(foreground.process_id);
+                return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Failed);
             }
             return TextEditAttempt::Failed;
         }
@@ -8836,6 +8991,28 @@ impl InputProcessor {
         )
     }
 
+    /// Collapses the agent's selection when a paste does not go ahead after the word was
+    /// selected. The attempt ends as `outcome` when the field shows the selection gone, and as
+    /// `SelectionLeft` when it cannot be shown gone.
+    fn abandon_selection(
+        &self,
+        foreground: ForegroundContext,
+        input_sequence: u64,
+        outcome: TextEditAttempt,
+    ) -> TextEditAttempt {
+        let cleanup = self
+            .privacy_guard
+            .collapse_selection_to_end(foreground.process_id);
+        self.diagnostic(
+            "paste",
+            format!("sequence={input_sequence} phase=cleanup result={cleanup:?}"),
+        );
+        match cleanup {
+            SelectionCleanup::Collapsed => outcome,
+            SelectionCleanup::Unverified => TextEditAttempt::SelectionLeft,
+        }
+    }
+
     /// Decides what a finished paste attempt means for the conversion. `Some` carries the strategy
     /// to record when the text edit was made. A confirmed edit whose clipboard could not be
     /// restored still counts as success (policy D2): it is logged and counted, and automatic
@@ -8864,6 +9041,13 @@ impl InputProcessor {
             }
             TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
                 self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
+                None
+            }
+            TextEditAttempt::SelectionLeft => {
+                // The field may still show the word selected: the keys the gate holds would type
+                // over it, so they are kept for recovery instead of being replayed.
+                self.held_keys_kept_for = Some(sequence);
+                self.record_conversion_failure(ConversionFailureReason::SelectionLeft);
                 None
             }
         }
@@ -9098,6 +9282,28 @@ impl InputProcessor {
                     LPARAM(0),
                 );
             }
+        }
+    }
+
+    /// Asks the UI thread to end the gate `token` keeping its held keys for recovery. It counts
+    /// as the gate's release, so `process` does not release it as well.
+    fn request_gate_retention(&mut self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        // Recorded before the window check so that tests, which run without a window, see it.
+        self.last_gate_release_token = token;
+        self.last_gate_retention_token = token;
+        if self.gate_window == 0 {
+            return;
+        }
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.gate_window as *mut c_void)),
+                GATE_FAIL_OPEN_MESSAGE,
+                WPARAM(token as usize),
+                LPARAM(GATE_FAIL_OPEN_SELECTION_LEFT),
+            );
         }
     }
 
@@ -10266,6 +10472,7 @@ const fn conversion_failure_label(reason: u8) -> &'static str {
         value if value == ConversionFailureReason::GateDrain as u8 => "gate-drain",
         value if value == ConversionFailureReason::ClipboardEdit as u8 => "clipboard-edit",
         value if value == ConversionFailureReason::InternalFault as u8 => "internal-fault",
+        value if value == ConversionFailureReason::SelectionLeft as u8 => "selection-left",
         _ => "unknown",
     }
 }
@@ -11673,15 +11880,24 @@ mod tests {
         ];
         for (path, polls, expected, collapses) in cases {
             let collapsed = Cell::new(0);
-            let status = confirm_selection(
+            let (status, cleanup) = confirm_selection(
                 Duration::from_millis(40),
                 scripted_polls(polls),
                 |actual| actual == "ghbdtn",
                 || thread::sleep(Duration::from_millis(1)),
-                || collapsed.set(collapsed.get() + 1),
+                || {
+                    collapsed.set(collapsed.get() + 1);
+                    SelectionCleanup::Unverified
+                },
             );
             assert_eq!(status, expected, "{path}");
             assert_eq!(collapsed.get(), collapses, "{path}: collapses");
+            // The result of the collapse is passed on as it was found.
+            assert_eq!(
+                cleanup,
+                (collapses == 1).then_some(SelectionCleanup::Unverified),
+                "{path}: cleanup"
+            );
         }
     }
 
@@ -11725,36 +11941,62 @@ mod tests {
     #[test]
     fn only_a_selection_the_field_did_not_show_is_tried_again() {
         use SelectionConfirmation::{Confirmed, NotShown, OtherText, Unreadable};
-        let run =
-            |attempts: u32, script: Vec<(TextBarrierStatus, Option<SelectionConfirmation>)>| {
-                let mut script = std::collections::VecDeque::from(script);
-                retry_unshown_selection(attempts, || {
-                    script.pop_front().expect("no more attempts than scripted")
-                })
-            };
-        let not_shown = (TextBarrierStatus::Mismatch, Some(NotShown));
-        let confirmed = (TextBarrierStatus::Match, Some(Confirmed));
+        let run = |attempts: u32, script: Vec<SelectionAttempt>| {
+            let mut script = std::collections::VecDeque::from(script);
+            let mut earlier = Vec::new();
+            let result = retry_unshown_selection(attempts, |earlier_attempt| {
+                earlier.push(earlier_attempt);
+                script.pop_front().expect("no more attempts than scripted")
+            });
+            // Every attempt after the first is told that an earlier one ran.
+            assert!(
+                earlier
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| *value == (index > 0))
+            );
+            result
+        };
+        let attempt = |status, confirmation, cleanup| SelectionAttempt {
+            status,
+            confirmation,
+            cleanup,
+        };
+        let not_shown = attempt(
+            TextBarrierStatus::Mismatch,
+            Some(NotShown),
+            Some(SelectionCleanup::Collapsed),
+        );
+        let confirmed = attempt(TextBarrierStatus::Match, Some(Confirmed), None);
         // A second selection that the field shows is used.
-        assert_eq!(
-            run(2, vec![not_shown, confirmed]),
-            (TextBarrierStatus::Match, 2)
-        );
+        assert_eq!(run(2, vec![not_shown, confirmed]), (confirmed, 2));
         // Two unshown selections give up as before.
-        assert_eq!(
-            run(2, vec![not_shown, not_shown]),
-            (TextBarrierStatus::Mismatch, 2)
-        );
+        assert_eq!(run(2, vec![not_shown, not_shown]), (not_shown, 2));
         // An automatic conversion looks once.
-        assert_eq!(run(1, vec![not_shown]), (TextBarrierStatus::Mismatch, 1));
-        // Other text, unreadable selections and text that never matched are not retried.
+        assert_eq!(run(1, vec![not_shown]), (not_shown, 1));
+        // Other text, unreadable selections, text that never matched, and an unshown selection
+        // that could not be collapsed are not retried.
         for once in [
-            (TextBarrierStatus::Mismatch, Some(OtherText)),
-            (TextBarrierStatus::Unavailable, Some(Unreadable)),
-            (TextBarrierStatus::Mismatch, None),
-            (TextBarrierStatus::Unavailable, None),
+            attempt(
+                TextBarrierStatus::Mismatch,
+                Some(OtherText),
+                Some(SelectionCleanup::Collapsed),
+            ),
+            attempt(
+                TextBarrierStatus::Unavailable,
+                Some(Unreadable),
+                Some(SelectionCleanup::Collapsed),
+            ),
+            attempt(TextBarrierStatus::Mismatch, None, None),
+            attempt(TextBarrierStatus::Unavailable, None, None),
+            attempt(
+                TextBarrierStatus::Mismatch,
+                Some(NotShown),
+                Some(SelectionCleanup::Unverified),
+            ),
             confirmed,
         ] {
-            assert_eq!(run(2, vec![once]), (once.0, 1), "{once:?}");
+            assert_eq!(run(2, vec![once]), (once, 1), "{once:?}");
         }
     }
 
@@ -11773,7 +12015,7 @@ mod tests {
         );
         assert!(
             format_text_barrier_report(TextBarrierReport::default())
-                .ends_with(",confirm=None,attempts=0")
+                .ends_with(",confirm=None,attempts=0,cleanup=None")
         );
     }
 
@@ -16184,6 +16426,7 @@ mod tests {
             DownstreamHook,
             InternalFault,
             HookReinstall,
+            SelectionLeft,
         ] {
             let (mut state, receiver) = test_gate_state(8);
             state.correction_gate.activate(10);
@@ -16648,6 +16891,478 @@ mod tests {
         processor.process(receiver.try_recv().expect("queued again"));
         assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
         assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// A scripted text field. The caret is at the end of `text`, and `selected` characters
+    /// before it are selected (shared, so a test can look after the field was moved).
+    struct FakeField {
+        text: Vec<char>,
+        selected: std::rc::Rc<Cell<usize>>,
+        selection_fails: bool,
+        not_one_range: bool,
+        range_unreadable: bool,
+        clone_fails: bool,
+        move_short: bool,
+        text_fails: bool,
+        /// Select() reports failure; with `select_applies` the field selects all the same.
+        select_fails: bool,
+        select_applies: bool,
+        /// The field selects one character less than asked.
+        select_short: bool,
+        /// From the first Select() on, the selection cannot be read.
+        unreadable_after_select: bool,
+        /// Moving a range's start onto its end fails.
+        collapse_fails: bool,
+        /// Selecting an empty range is accepted but changes nothing.
+        ignores_collapse: bool,
+        selected_once: Cell<bool>,
+    }
+
+    struct FakeRange {
+        start: Cell<usize>,
+        end: usize,
+    }
+
+    fn fake_field(text: &str) -> FakeField {
+        FakeField {
+            text: text.chars().collect(),
+            selected: std::rc::Rc::new(Cell::new(0)),
+            selection_fails: false,
+            not_one_range: false,
+            range_unreadable: false,
+            clone_fails: false,
+            move_short: false,
+            text_fails: false,
+            select_fails: false,
+            select_applies: false,
+            select_short: false,
+            unreadable_after_select: false,
+            collapse_fails: false,
+            ignores_collapse: false,
+            selected_once: Cell::new(false),
+        }
+    }
+
+    impl TextField for FakeField {
+        type Range = FakeRange;
+
+        fn selection(&self) -> SelectionRead<FakeRange> {
+            if self.selection_fails || (self.unreadable_after_select && self.selected_once.get()) {
+                return SelectionRead::Unreadable;
+            }
+            if self.not_one_range {
+                return SelectionRead::NotOneRange;
+            }
+            if self.range_unreadable {
+                return SelectionRead::RangeUnreadable;
+            }
+            let end = self.text.len();
+            SelectionRead::One(FakeRange {
+                start: Cell::new(end - self.selected.get()),
+                end,
+            })
+        }
+
+        fn is_empty(&self, range: &FakeRange) -> Option<bool> {
+            Some(range.start.get() == range.end)
+        }
+
+        fn clone_range(&self, range: &FakeRange) -> Option<FakeRange> {
+            (!self.clone_fails).then(|| FakeRange {
+                start: Cell::new(range.start.get()),
+                end: range.end,
+            })
+        }
+
+        fn move_start(&self, range: &FakeRange, units: i32) -> Option<i32> {
+            let old = i32::try_from(range.start.get()).unwrap();
+            let new = (old + units).max(0);
+            range.start.set(usize::try_from(new).unwrap());
+            Some(if self.move_short {
+                units + 1
+            } else {
+                new - old
+            })
+        }
+
+        fn text(&self, range: &FakeRange) -> Option<String> {
+            (!self.text_fails).then(|| self.text[range.start.get()..range.end].iter().collect())
+        }
+
+        fn select(&self, range: &FakeRange) -> bool {
+            if self.ignores_collapse && range.start.get() == range.end {
+                return true;
+            }
+            self.selected_once.set(true);
+            if !self.select_fails || self.select_applies {
+                let length = range.end - range.start.get();
+                let short = usize::from(self.select_short && length > 0);
+                self.selected.set(length - short);
+            }
+            !self.select_fails
+        }
+
+        fn collapse_to_end(&self, range: &FakeRange) -> bool {
+            if self.collapse_fails {
+                return false;
+            }
+            range.start.set(range.end);
+            true
+        }
+    }
+
+    /// One selection attempt for "ghbdtn " on `field`; returns it, its report and how many
+    /// characters stay selected.
+    fn select_in(field: FakeField, earlier: bool) -> (SelectionAttempt, TextBarrierReport, usize) {
+        let expected = "ghbdtn ";
+        let selected = std::rc::Rc::clone(&field.selected);
+        let report = Cell::new(TextBarrierReport {
+            expected_chars: expected.chars().count(),
+            ..TextBarrierReport::default()
+        });
+        let attempt = select_preceding_text_in(
+            expected,
+            Duration::from_millis(20),
+            earlier,
+            &report,
+            || Ok(field),
+        );
+        (attempt, report.get(), selected.get())
+    }
+
+    #[test]
+    fn a_selection_the_field_confirms_is_kept() {
+        let (attempt, report, selected) = select_in(fake_field("hello ghbdtn "), false);
+        assert_eq!(attempt.status, TextBarrierStatus::Match);
+        assert_eq!(attempt.confirmation, Some(SelectionConfirmation::Confirmed));
+        assert_eq!(attempt.cleanup, None);
+        assert_eq!(report.cleanup, None);
+        assert_eq!(selected, 7);
+    }
+
+    #[test]
+    fn a_select_call_that_fails_is_still_collapsed_and_read_back() {
+        // The field applied the selection although the call reported failure.
+        let (attempt, report, selected) = select_in(
+            FakeField {
+                select_fails: true,
+                select_applies: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.status, TextBarrierStatus::Mismatch);
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(report.stage, TextBarrierStage::SelectCall);
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(selected, 0);
+        // When it cannot be collapsed, the selection is reported left.
+        let (attempt, report, selected) = select_in(
+            FakeField {
+                select_fails: true,
+                select_applies: true,
+                collapse_fails: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(selected, 7);
+    }
+
+    #[test]
+    fn a_selection_that_cannot_be_read_back_or_collapsed_is_reported_left() {
+        // A busy field: the selection is made, then nothing can be read any more.
+        let (attempt, report, _) = select_in(
+            FakeField {
+                unreadable_after_select: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(
+            attempt.confirmation,
+            Some(SelectionConfirmation::Unreadable)
+        );
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(report.stage, TextBarrierStage::SelectionConfirm);
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Unverified));
+        // The field shows other text and refuses to collapse it.
+        let (attempt, _, selected) = select_in(
+            FakeField {
+                select_short: true,
+                collapse_fails: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.confirmation, Some(SelectionConfirmation::OtherText));
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(selected, 6);
+        // The same field, collapsing: the selection is gone and that is confirmed.
+        let (attempt, report, selected) = select_in(
+            FakeField {
+                select_short: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn a_late_selection_found_by_a_second_attempt_is_collapsed_and_a_users_is_not() {
+        let late = || {
+            let field = fake_field("hello ghbdtn ");
+            field.selected.set(7);
+            field
+        };
+        let (attempt, report, selected) = select_in(late(), true);
+        assert_eq!(attempt.status, TextBarrierStatus::Mismatch);
+        assert_eq!(report.stage, TextBarrierStage::CaretNotEmpty);
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(selected, 0);
+        let (attempt, _, selected) = select_in(late(), false);
+        assert_eq!(attempt.cleanup, None);
+        assert_eq!(
+            selected, 7,
+            "the first attempt leaves a selection it finds alone"
+        );
+    }
+
+    #[test]
+    fn a_collapse_the_field_ignores_gives_up_within_its_budget() {
+        // The collapse call fails, or it is accepted and the selection stays: read back, it is
+        // never shown gone.
+        for field in [
+            FakeField {
+                collapse_fails: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            FakeField {
+                ignores_collapse: true,
+                ..fake_field("hello ghbdtn ")
+            },
+        ] {
+            field.selected.set(7);
+            let started = Instant::now();
+            assert_eq!(collapse_selection(&field), SelectionCleanup::Unverified);
+            assert!(started.elapsed() < Duration::from_millis(SELECTION_COLLAPSE_BUDGET_MS + 100));
+            assert_eq!(field.selected.get(), 7);
+            field.selected.set(0);
+            assert_eq!(collapse_selection(&field), SelectionCleanup::Collapsed);
+        }
+    }
+
+    #[test]
+    fn every_early_exit_of_the_barrier_names_its_own_stage() {
+        type Break = fn(&mut FakeField);
+        let cases: [(Break, TextBarrierStage, TextBarrierStatus); 8] = [
+            (
+                |field| field.selection_fails = true,
+                TextBarrierStage::Selection,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.not_one_range = true,
+                TextBarrierStage::SelectionRanges,
+                TextBarrierStatus::Mismatch,
+            ),
+            (
+                |field| field.range_unreadable = true,
+                TextBarrierStage::Caret,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.selected.set(2),
+                TextBarrierStage::CaretNotEmpty,
+                TextBarrierStatus::Mismatch,
+            ),
+            (
+                |field| field.clone_fails = true,
+                TextBarrierStage::RangeClone,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.move_short = true,
+                TextBarrierStage::RangeMove,
+                TextBarrierStatus::Mismatch,
+            ),
+            (
+                |field| field.text_fails = true,
+                TextBarrierStage::TextRead,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.text = "hello world ".chars().collect(),
+                TextBarrierStage::TextCompared,
+                TextBarrierStatus::Mismatch,
+            ),
+        ];
+        let mut stages = vec![TextBarrierStage::TextLength, TextBarrierStage::SelectCall];
+        for (break_field, stage, status) in cases {
+            let mut field = fake_field("hello ghbdtn ");
+            break_field(&mut field);
+            let report = Cell::new(TextBarrierReport::default());
+            let result = read_preceding_text(&field, 7, "ghbdtn ", &report);
+            assert_eq!(result.err(), Some(status), "{stage:?}");
+            assert_eq!(report.get().stage, stage);
+            stages.push(stage);
+        }
+        // A text the barrier does not check stops before the field is even looked for.
+        for text in [String::new(), "x".repeat(129)] {
+            let report = Cell::new(TextBarrierReport::default());
+            let attempt = select_preceding_text_in(
+                &text,
+                Duration::from_millis(1),
+                false,
+                &report,
+                || -> core::result::Result<FakeField, TextBarrierStatus> { panic!("resolved") },
+            );
+            assert_eq!(attempt.status, TextBarrierStatus::Unavailable);
+            assert_eq!(report.get().stage, TextBarrierStage::TextLength);
+        }
+        let count = stages.len();
+        stages.sort_by_key(|stage| format!("{stage:?}"));
+        stages.dedup();
+        assert_eq!(
+            stages.len(),
+            count,
+            "every early exit has a stage of its own"
+        );
+    }
+
+    #[test]
+    fn a_collapse_adds_its_result_to_the_report_without_overwriting_the_step() {
+        let guard = PrivacyGuard {
+            automation: None,
+            com_initialized: false,
+            last_barrier_report: Cell::new(TextBarrierReport {
+                stage: TextBarrierStage::TextCompared,
+                expected_chars: 7,
+                ..TextBarrierReport::default()
+            }),
+        };
+        // Without UI Automation the field cannot even be found: the collapse is unverified.
+        assert_eq!(
+            guard.collapse_selection_to_end(3),
+            SelectionCleanup::Unverified
+        );
+        let report = guard.last_barrier_report();
+        assert_eq!(report.stage, TextBarrierStage::TextCompared);
+        assert_eq!(report.resolver_reason, EditableResolverReason::None);
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Unverified));
+        assert!(format_text_barrier_report(report).ends_with(",cleanup=Some(Unverified)"));
+    }
+
+    #[test]
+    fn a_paste_that_may_leave_the_word_selected_keeps_the_held_keys_for_recovery() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 42)
+                .is_none()
+        );
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::SelectionLeft as u8
+        );
+        assert_eq!(
+            conversion_failure_label(ConversionFailureReason::SelectionLeft as u8),
+            "selection-left"
+        );
+        processor.end_conversion_gate(42);
+        assert_eq!(processor.last_gate_retention_token, 42);
+        assert_eq!(processor.last_gate_release_token, 42);
+        // The next conversion's gate is released as usual.
+        processor.end_conversion_gate(43);
+        assert_eq!(processor.last_gate_release_token, 43);
+        assert_eq!(processor.last_gate_retention_token, 42);
+        // An undo whose paste may leave the word selected keeps its held keys as well.
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 44)
+                .is_none()
+        );
+        processor.execute_undo(44);
+        assert_eq!(processor.last_gate_retention_token, 44);
+    }
+
+    #[test]
+    fn a_retention_request_posts_a_fail_open_that_names_the_left_selection() {
+        let module = unsafe { GetModuleHandleW(None) }.unwrap();
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("AutoKeyboardLayot gate retention test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(module.into()),
+                None,
+            )
+        }
+        .unwrap();
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), window.0 as usize);
+        processor.request_gate_retention(77);
+        let mut message = MSG::default();
+        let taken = unsafe {
+            PeekMessageW(
+                &mut message,
+                Some(window),
+                GATE_FAIL_OPEN_MESSAGE,
+                GATE_FAIL_OPEN_MESSAGE,
+                PM_REMOVE,
+            )
+            .as_bool()
+        };
+        unsafe { DestroyWindow(window) }.unwrap();
+        assert!(taken);
+        assert_eq!(message.wParam.0, 77);
+        assert_eq!(
+            fail_open_cause(message.lParam.0),
+            GateFailureCause::SelectionLeft
+        );
+        assert_eq!(fail_open_cause(0), GateFailureCause::WorkerAck);
+    }
+
+    #[test]
+    fn a_fail_open_for_a_left_selection_retains_the_keys_without_replaying_them() {
+        let (mut state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        fail_open_correction_gate(10, GateFailureCause::SelectionLeft);
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(state.pending_held_replay.is_empty());
+        let retained = metrics.retained_input.lock().unwrap().clone();
+        let retained = retained.expect("the held key is retained");
+        assert_eq!(retained.events.len(), 1);
+        assert!(!retained.auto_recover);
+        assert!(!receiver.try_iter().any(|queued| matches!(
+            queued.event,
+            RawInputEvent::RecoverInput {
+                explicit: false,
+                ..
+            }
+        )));
     }
 
     fn stalled_record(retained_at: Instant) -> RetainedInput {
