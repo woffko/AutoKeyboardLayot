@@ -18,6 +18,10 @@ const LAYOUT_MODEL_MINIMUM_CHARACTERS: usize = 3;
 /// Three-letter words are more often ambiguous and need more certainty.
 const LAYOUT_MODEL_THRESHOLD: f32 = 0.9;
 const LAYOUT_MODEL_SHORT_THRESHOLD: f32 = 0.97;
+/// A letter core shorter than this is known only as a common short word or a
+/// user word: the base word lists contain every letter and many two-letter
+/// abbreviations.
+const MINIMUM_BASE_LIST_CHARACTERS: usize = 3;
 
 /// Configuration for precision-first automatic detection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -362,6 +366,21 @@ impl Detector {
             })
     }
 
+    /// The word without the leading and trailing characters the language's
+    /// alphabet does not accept, such as punctuation typed after it.
+    fn letter_core<'a>(&self, language: Language, word: &'a str) -> &'a str {
+        word.trim_matches(|character| !self.accepts_character(language, character))
+    }
+
+    /// Whether `language` knows a word's letters without its edge punctuation.
+    fn knows_letter_core(&self, language: Language, core: &str) -> bool {
+        if core.chars().count() < MINIMUM_BASE_LIST_CHARACTERS {
+            self.common_short_contains(language, core)
+                || self.user_dictionary.contains(language, core)
+        } else {
+            self.dictionary_contains(language, core)
+        }
+    }
     fn accepts_character(&self, language: Language, character: char) -> bool {
         self.dictionaries
             .active_language(language)
@@ -414,6 +433,12 @@ impl Detector {
             self.dictionary_contains(current_language, word)
         };
         if source_is_word && source_is_known {
+            return None;
+        }
+        // "key." reads as "луню" in Russian: punctuation typed after a known word
+        // must not turn it into another layout's word.
+        let core = self.letter_core(current_language, word);
+        if core != word && self.knows_letter_core(current_language, core) {
             return None;
         }
 
@@ -2071,6 +2096,47 @@ mod tests {
                 .detect(typed, Language::English)
                 .unwrap_or_else(|| panic!("expected detection for {typed}"));
             assert_eq!(detection.replacement, expected);
+        }
+    }
+
+    #[test]
+    fn punctuation_after_a_known_word_does_not_turn_it_into_a_russian_word() {
+        let detector = crate::test_support::detector();
+        for (typed, russian) in [
+            ("key.", "луню"),
+            ("next.", "тучею"),
+            ("Bye.", "Иную"),
+            ("net.", "туею"),
+            ("belt.", "иудею"),
+            ("cream.", "скуфью"),
+            ("rent;", "кутеж"),
+        ] {
+            assert!(
+                detector.dictionary_contains(Language::Russian, russian),
+                "premise: {russian} is a Russian word"
+            );
+            assert!(
+                detector.detect(typed, Language::English).is_none(),
+                "{typed}"
+            );
+        }
+        // Without the keys that read as Russian letters no known English word
+        // is left, so these still convert. Two letters such as "nj" or "tp"
+        // count only as common short words: the base list holds them as
+        // abbreviations.
+        for (typed, russian) in [
+            ("hf,jnftn", "работает"),
+            ("k.,k.", "люблю"),
+            (",skj", "было"),
+            ("b[", "их"),
+            (",s", "бы"),
+            ("'nj", "это"),
+            (",tp", "без"),
+        ] {
+            let detection = detector
+                .detect(typed, Language::English)
+                .unwrap_or_else(|| panic!("{typed} is converted"));
+            assert_eq!(detection.replacement, russian);
         }
     }
 
