@@ -87,8 +87,10 @@ and exposes a technical failure counter in the tray status.
 - Fluent window launch and responsiveness on the physical Windows host;
 - UI Automation checks of Apply, hotkey modifier persistence, and stale-draft
   rejection in an isolated temporary profile;
-- an explicit native protected-clipboard round-trip probe with format and text
-  restoration;
+- native protected-clipboard checks on the real clipboard, run on the test VM
+  with `--include-ignored`: format and text restoration with the opt-outs, content
+  rendered on request by its owner, and an unconfirmed paste that gives the
+  clipboard back only after its target read the replacement;
 - native Windows 11 MSVC test and release builds;
 - an interactive-session launch without a visible error window;
 - readable `EN` and `RU` tray icons and live foreground-layout updates;
@@ -234,11 +236,31 @@ materialized by a short-lived STA broker into local clipboard-compatible
 `STGMEDIUM` values before replacement. The broker owns its hidden clipboard
 window, pumps OLE messages, and restores those handles only while the temporary
 sequence and owner are unchanged. This preserves delayed, private, GDI, and
-enterprise-protection formats instead of discarding them. Password, excluded,
+enterprise-protection formats instead of discarding them. The clipboard is
+replaced only if it did not change since it was copied (checked with the
+clipboard open, before it is emptied), so content another program put there
+meanwhile is never lost; an emptied clipboard whose replacement could not be
+completed is put back at once, and only then. The restored item carries the
+history, cloud and monitoring opt-outs it lacked, so it does not come back as a
+new copy in clipboard history. Password, excluded,
 elevated, non-materializable clipboard, and ambiguous UIA contexts fail closed.
 A clipboard that cannot be taken in time (it belongs to a window that does not
 answer) leaves the word alone: an automatic conversion waits 0.2 seconds for it,
-Pause 0.5 seconds, and neither counts it as a failed edit.
+Pause 0.5 seconds, and neither counts it as a failed edit; a broker that took too
+long does not put the replacement there any more, no new paste starts while it
+still runs, and how it ended is logged (`phase=broker_end`).
+
+The replacement's text is rendered only when a program asks for it, so the broker
+knows which process read it. The user's clipboard is put back once the field
+shows the replacement. When the Ctrl+V was sent but the field did not show the
+replacement in time (a busy program), the replacement stays on the clipboard
+until the paste's target process has read it, and the user's clipboard comes back
+right after that; a target that has not read it within 5 seconds leaves the
+replacement there. A paste handled late therefore inserts the replacement, never
+the user's previous clipboard (a password, say). Every wait of a paste is fitted
+into the time the correction gate has left: the selection, the clipboard and the
+Ctrl+V are skipped when what follows them would not fit (`phase=budget`), and a
+Pause press may then wait less than 0.5 seconds for the clipboard.
 Third-party local clipboard readers remain outside the confidentiality
 guarantees of the Win32 clipboard.
 
@@ -386,11 +408,20 @@ collapse is read back: when the field does not show the selection gone within
 200 ms (a busy or hung field), the keys typed after the Space are kept for
 recovery instead of being replayed over the word, automatic conversion pauses
 (`selection-left`), and the log records `phase=cleanup result=Unverified` and
-`cleanup=` in the selection report. When the text edit is
+`cleanup=` in the selection report. A paste abandoned after the user acted (new
+input, a click, another field) leaves what is selected alone, as it may be the
+user's own selection now, and keeps the held keys the same way. Keys kept like
+this never come back automatically; only an explicit recovery brings them back.
+When the text edit is
 confirmed but the previous clipboard contents cannot be put back (restoring
 waits up to 60 ms for the clipboard), the conversion still counts as done:
 automatic conversion stays on and the diagnostics log records
-`clipboard_restored=false`.
+`clipboard_restored=false`. A field that could not be inspected or selected is
+no failed edit either. Failures after the paste name their own reason in the
+tray: `text-commit` (the replacement did not show), `layout-switch` (the layout
+did not switch after it) or `clipboard-edit` (the paste chord was not sent
+whole). A physical replay whose keys were all sent but whose guard was lost
+while waiting for the field logs `result=applied-uncertain`.
 
 The privacy check asks Windows UI Automation about the focused field from a
 dedicated provider thread. If that provider stops answering (a call that never
