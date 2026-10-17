@@ -312,17 +312,10 @@ impl Detector {
             })
             .collect();
         let probabilities = model.probabilities(&features, typed, previous)?;
-        let (best, probability) = probabilities
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let best = confident_layout(&probabilities, threshold)?;
         let replacement = texts[best]?;
         let target_language = model.languages()[best];
-        if best == typed
-            || replacement == word
-            || probability < threshold
-            || !self.accepts_word(target_language, replacement)
+        if best == typed || replacement == word || !self.accepts_word(target_language, replacement)
         {
             return None;
         }
@@ -795,6 +788,17 @@ fn ngram_score(
         .sum()
 }
 
+/// The most probable layout, when its probability reaches `threshold`. A NaN
+/// from a broken model reaches no threshold.
+fn confident_layout(probabilities: &[f32], threshold: f32) -> Option<usize> {
+    let (best, probability) = probabilities
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    (probability >= threshold).then_some(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +885,40 @@ mod tests {
             assert_eq!(detection.replacement, expected);
             assert_eq!(detection.target_language, Language::Estonian);
         }
+    }
+
+    #[test]
+    fn only_a_probability_at_or_above_the_threshold_chooses_a_layout() {
+        assert_eq!(confident_layout(&[0.01, 0.95, 0.04], 0.9), Some(1));
+        assert_eq!(confident_layout(&[0.25, 0.75, 0.0], 0.75), Some(1));
+        assert_eq!(confident_layout(&[0.2, 0.7, 0.1], 0.9), None);
+        assert_eq!(confident_layout(&[0.0, f32::NAN, 0.99], 0.9), None);
+        assert_eq!(confident_layout(&[], 0.9), None);
+    }
+
+    #[test]
+    fn a_broken_layout_model_converts_nothing() {
+        let mut model = crate::layout_model::LayoutModel::parse(include_bytes!(
+            "../data/layout-model/en-ru-et.aklm"
+        ))
+        .unwrap();
+        model.overflow_for_tests();
+        let mut detector = crate::test_support::detector();
+        detector.set_layout_model(Some(Arc::new(model)));
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду"),
+            (Language::Estonian, "küsimusele"),
+        ]);
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &[Language::English]
+                )
+                .is_none()
+        );
     }
 
     #[test]

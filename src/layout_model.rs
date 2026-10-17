@@ -242,6 +242,16 @@ impl LayoutModel {
                 .sum::<f32>()
                 + self.output_bias;
         }
+        // A candidate's logit that is not finite (weights of a broken model overflow) leaves no
+        // probabilities: its softmax would divide by zero into NaN, which a threshold comparison
+        // does not reject.
+        if candidates
+            .iter()
+            .zip(&logits)
+            .any(|(candidate, logit)| candidate.is_some() && !logit.is_finite())
+        {
+            return None;
+        }
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut probabilities = vec![0.0f32; count];
         let mut total = 0.0;
@@ -250,6 +260,9 @@ impl LayoutModel {
                 *probability = (logit - max).exp();
                 total += *probability;
             }
+        }
+        if !(total.is_finite() && total > 0.0) {
+            return None;
         }
         for probability in &mut probabilities {
             *probability /= total;
@@ -331,6 +344,14 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
+impl LayoutModel {
+    /// Weights a bad export could leave, all finite: the hidden units and the logits overflow.
+    pub(crate) fn overflow_for_tests(&mut self) {
+        self.hidden_bias.fill(f32::MAX);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -390,6 +411,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_model_whose_weights_overflow_gives_no_probabilities() {
+        let mut model =
+            LayoutModel::parse(include_bytes!("../data/layout-model/en-ru-et.aklm")).unwrap();
+        model.overflow_for_tests();
+        let texts = ["ghbdtn", "привет", "ghbdtn"];
+        let candidates: Vec<Option<Candidate<'_>>> = model
+            .languages()
+            .iter()
+            .zip(texts)
+            .map(|(_, text)| {
+                Some(Candidate {
+                    text,
+                    in_dictionary: false,
+                    in_short_list: false,
+                })
+            })
+            .collect();
+        let typed = model.index_of(Language::English).unwrap();
+        assert_eq!(model.probabilities(&candidates, typed, &[]), None);
     }
 
     #[test]
