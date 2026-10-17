@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn an_entry_without_an_extension_matches_the_program_by_its_stem() {
         let policy = ExclusionPolicy::from_lines(["Signal", "keepass.exe", "my.app"]);
-        assert!(policy.is_excluded(r"C:\Users\u\AppData\Local\Programs\signal-desktop\Signal.exe"));
+        assert!(policy.is_excluded(r"D:\Apps\signal-desktop\Signal.exe"));
         assert!(policy.is_excluded("KeePass.exe"));
         assert!(policy.is_excluded("my.app.exe"));
         assert!(!policy.is_excluded("SignalR.exe"));
