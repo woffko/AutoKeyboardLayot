@@ -61,7 +61,7 @@ use windows::{
             },
             DataExchange::{
                 CloseClipboard, EmptyClipboard, GetClipboardOwner, GetClipboardSequenceNumber,
-                OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+                GetOpenClipboardWindow, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
             },
             LibraryLoader::GetModuleHandleW,
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
@@ -123,8 +123,9 @@ use windows::{
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
                 WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONDOWN,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN,
-                WNDCLASSW, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
+                WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+                WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WNDCLASSW, WTS_CONSOLE_CONNECT,
+                WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
             },
         },
     },
@@ -199,9 +200,13 @@ const CLIPBOARD_OPEN_RETRIES: usize = 10;
 const CLIPBOARD_RESTORE_OPEN_RETRIES: usize = 30;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 2;
 const CLIPBOARD_BROKER_TIMEOUT_MS: u64 = 500;
-/// How long a paste waits for the broker to put the user's clipboard back; the broker opens the
-/// clipboard for up to 60 ms.
+/// How long a paste waits for the broker to put the user's clipboard back. The broker opens the
+/// clipboard for up to 60 ms; a restore that takes longer finishes on its own and is logged when
+/// it is over.
 const CLIPBOARD_RESTORE_WAIT_MS: u64 = 100;
+/// How long the broker of a paste that was sent but not confirmed waits for the paste's target to
+/// read the replacement before it leaves the replacement on the clipboard for good.
+const UNCONFIRMED_PASTE_WAIT_MS: u64 = 5_000;
 /// The least time worth giving the installation of a paste's replacement.
 const PASTE_MIN_INSTALL_MS: u64 = 50;
 /// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
@@ -1074,8 +1079,21 @@ fn stgmedium_has_custom_releaser(medium: &STGMEDIUM) -> bool {
 
 #[derive(Debug, Clone, Copy)]
 enum ClipboardBrokerCommand {
+    /// Put the user's clipboard back, if the clipboard still holds the replacement.
     Restore,
+    /// Leave the replacement there and drop the copy of the user's clipboard.
     Abandon,
+    /// The Ctrl+V was sent but not confirmed: leave the replacement until `process`, the paste's
+    /// target, has read it, then put the user's clipboard back; leave it for good after `wait`.
+    Defer { process: u32, wait: Duration },
+}
+
+/// What a broker found while waiting for the worker.
+#[derive(Debug, Clone, Copy)]
+enum BrokerWait {
+    Command(ClipboardBrokerCommand),
+    Timeout,
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1085,89 +1103,539 @@ enum ClipboardBrokerResponse {
     Failed,
 }
 
-struct ProtectedClipboard {
-    owner: HWND,
+/// How a clipboard broker ended; logged for a broker the worker stopped waiting for.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerEnd {
+    Running = 0,
+    /// The user's clipboard was never changed.
+    Untouched = 1,
+    /// The user's clipboard was put back.
+    Restored = 2,
+    /// The user's clipboard could not be put back, or another program had replaced the
+    /// replacement meanwhile.
+    NotRestored = 3,
+    /// The replacement was left there on purpose: its paste was not confirmed.
+    Kept = 4,
+}
+
+impl BrokerEnd {
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Untouched,
+            2 => Self::Restored,
+            3 => Self::NotRestored,
+            4 => Self::Kept,
+            _ => Self::Running,
+        }
+    }
+}
+
+/// What the worker and its clipboard broker share besides their channels.
+#[derive(Default)]
+struct BrokerShared {
+    /// Set when the worker stopped waiting for the installation: the broker must not put the
+    /// replacement on the clipboard any more.
+    cancelled: AtomicBool,
+    /// How the broker ended (`BrokerEnd`).
+    end: AtomicU8,
+}
+
+impl BrokerShared {
+    fn finish(&self, end: BrokerEnd) {
+        self.end.store(end as u8, Ordering::Release);
+    }
+
+    fn end(&self) -> BrokerEnd {
+        BrokerEnd::from_code(self.end.load(Ordering::Acquire))
+    }
+}
+
+/// Clipboard brokers the worker stopped waiting for: an installation or a restore that took too
+/// long. Only one broker runs at a time, so no paste starts while one of these still runs, and
+/// each one's end is logged once it is over.
+#[derive(Default)]
+struct ClipboardBrokers {
+    lingering: RefCell<Vec<(JoinHandle<()>, Arc<BrokerShared>)>>,
+}
+
+impl ClipboardBrokers {
+    fn busy(&self) -> bool {
+        self.lingering
+            .borrow()
+            .iter()
+            .any(|(worker, _)| !worker.is_finished())
+    }
+
+    fn linger(&self, worker: JoinHandle<()>, shared: Arc<BrokerShared>) {
+        self.lingering.borrow_mut().push((worker, shared));
+    }
+
+    /// Joins the brokers that are over and says how each one ended.
+    fn reap(&self) -> Vec<BrokerEnd> {
+        let mut lingering = self.lingering.borrow_mut();
+        let mut ended = Vec::new();
+        let mut index = 0;
+        while index < lingering.len() {
+            if lingering[index].0.is_finished() {
+                let (worker, shared) = lingering.swap_remove(index);
+                let _ = worker.join();
+                ended.push(shared.end());
+            } else {
+                index += 1;
+            }
+        }
+        ended
+    }
+}
+
+/// What an installation did to the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    /// Nothing changed: the clipboard could not be opened, it changed since the copy was taken,
+    /// the worker stopped waiting, or the data could not be prepared.
+    Untouched,
+    /// The clipboard was emptied, but the replacement could not be put there whole.
+    Emptied {
+        sequence: u32,
+    },
+    Installed {
+        sequence: u32,
+    },
+}
+
+/// The clipboard calls of a broker, made on its own thread. `SystemClipboard` makes them on the
+/// system clipboard; tests script them.
+trait ClipboardSystem {
+    type Snapshot;
+    /// The clipboard's sequence number.
+    fn sequence(&self) -> u32;
+    /// The broker's clipboard owner, as the worker compares it.
+    fn owner(&self) -> usize;
+    /// Whether the broker owns the clipboard.
+    fn owned(&self) -> bool;
+    /// Renders and copies every format of the current clipboard.
+    fn snapshot(&mut self) -> Option<Self::Snapshot>;
+    /// Puts `text` on the clipboard with the history, cloud and monitoring opt-outs, unless the
+    /// clipboard changed since its sequence was `expected` or the worker stopped waiting.
+    fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome;
+    /// Puts `snapshot` back, with `expected` only while the clipboard still holds the broker's
+    /// item of that sequence, and adds the opt-outs the snapshot lacks.
+    fn restore(&mut self, expected: Option<u32>, snapshot: &mut Self::Snapshot) -> bool;
+    /// Waits for the worker's command, or without `commands` only lets time pass, at most
+    /// `timeout` when one is given. Requests to render the replacement are served meanwhile.
+    fn wait(
+        &mut self,
+        commands: Option<&Receiver<ClipboardBrokerCommand>>,
+        timeout: Option<Duration>,
+    ) -> BrokerWait;
+    /// Whether `process` has read the replacement since it was put on the clipboard.
+    fn read_by(&self, process: u32) -> bool;
+}
+
+/// The broker's work: copy the user's clipboard, put the replacement there, report it, and on
+/// the worker's command put the copy back or leave the replacement. The clipboard is changed only
+/// if it did not change since the copy was taken; an installation that emptied the clipboard and
+/// failed is undone at once, and only such a one.
+fn run_clipboard_broker<S: ClipboardSystem>(
+    system: &mut S,
+    text: &str,
+    shared: &BrokerShared,
+    commands: &Receiver<ClipboardBrokerCommand>,
+    responses: &SyncSender<ClipboardBrokerResponse>,
+) {
+    let before = system.sequence();
+    let Some(mut snapshot) = system.snapshot() else {
+        shared.finish(BrokerEnd::Untouched);
+        let _ = responses.send(ClipboardBrokerResponse::Failed);
+        return;
+    };
+    let sequence = match system.install(text, before, &shared.cancelled) {
+        InstallOutcome::Installed { sequence } => sequence,
+        InstallOutcome::Untouched => {
+            shared.finish(BrokerEnd::Untouched);
+            let _ = responses.send(ClipboardBrokerResponse::Failed);
+            return;
+        }
+        InstallOutcome::Emptied { sequence } => {
+            let end = if system.restore(Some(sequence), &mut snapshot) {
+                BrokerEnd::Restored
+            } else {
+                BrokerEnd::NotRestored
+            };
+            shared.finish(end);
+            let _ = responses.send(ClipboardBrokerResponse::Failed);
+            return;
+        }
+    };
+    // A worker that stopped waiting has already sent its command; it is read below.
+    let _ = responses.send(ClipboardBrokerResponse::Installed {
+        sequence,
+        owner: system.owner(),
+    });
+    let mut waited = system.wait(Some(commands), None);
+    let end = loop {
+        waited = match waited {
+            BrokerWait::Command(ClipboardBrokerCommand::Restore) => {
+                break restore_if_current(system, sequence, &mut snapshot);
+            }
+            BrokerWait::Command(ClipboardBrokerCommand::Defer { process, wait }) => {
+                match wait_for_reader(system, commands, sequence, process, wait) {
+                    ReaderWait::Read => break restore_if_current(system, sequence, &mut snapshot),
+                    ReaderWait::Replaced => break BrokerEnd::NotRestored,
+                    ReaderWait::Expired => break BrokerEnd::Kept,
+                    ReaderWait::Command(command) => BrokerWait::Command(command),
+                }
+            }
+            BrokerWait::Command(ClipboardBrokerCommand::Abandon)
+            | BrokerWait::Timeout
+            | BrokerWait::Disconnected => break BrokerEnd::Kept,
+        };
+    };
+    shared.finish(end);
+    let _ = responses.send(ClipboardBrokerResponse::Finished(
+        end == BrokerEnd::Restored,
+    ));
+}
+
+/// Puts the user's clipboard back while the clipboard still holds the broker's replacement.
+fn restore_if_current<S: ClipboardSystem>(
+    system: &mut S,
+    sequence: u32,
+    snapshot: &mut S::Snapshot,
+) -> BrokerEnd {
+    if system.sequence() != sequence || !system.owned() {
+        return BrokerEnd::NotRestored;
+    }
+    if system.restore(Some(sequence), snapshot) {
+        BrokerEnd::Restored
+    } else {
+        BrokerEnd::NotRestored
+    }
+}
+
+/// How the wait for a paste's target to read the replacement ended.
+enum ReaderWait {
+    Read,
+    /// Another program replaced the replacement: theirs stays.
+    Replaced,
+    Expired,
+    /// The worker sent a command meanwhile.
+    Command(ClipboardBrokerCommand),
+}
+
+/// Waits up to `wait` for `process` to read the replacement. Requests to render it are served
+/// meanwhile, also once the worker no longer listens.
+fn wait_for_reader<S: ClipboardSystem>(
+    system: &mut S,
+    commands: &Receiver<ClipboardBrokerCommand>,
+    sequence: u32,
+    process: u32,
+    wait: Duration,
+) -> ReaderWait {
+    let deadline = Instant::now() + wait;
+    let mut commands = Some(commands);
+    loop {
+        if system.sequence() != sequence || !system.owned() {
+            return ReaderWait::Replaced;
+        }
+        if system.read_by(process) {
+            return ReaderWait::Read;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return ReaderWait::Expired;
+        }
+        let slice = (deadline - now).min(Duration::from_millis(10));
+        match system.wait(commands, Some(slice)) {
+            BrokerWait::Timeout => {}
+            BrokerWait::Command(command) => return ReaderWait::Command(command),
+            BrokerWait::Disconnected => commands = None,
+        }
+    }
+}
+
+fn spawn_clipboard_broker<S, F>(
+    text: String,
+    make: F,
+    shared: Arc<BrokerShared>,
+    commands: Receiver<ClipboardBrokerCommand>,
+    responses: SyncSender<ClipboardBrokerResponse>,
+) -> JoinHandle<()>
+where
+    S: ClipboardSystem,
+    F: FnOnce() -> Option<S> + Send + 'static,
+{
+    thread::spawn(move || {
+        let Some(mut system) = make() else {
+            shared.finish(BrokerEnd::Untouched);
+            let _ = responses.send(ClipboardBrokerResponse::Failed);
+            return;
+        };
+        run_clipboard_broker(&mut system, &text, &shared, &commands, &responses);
+    })
+}
+
+/// Why a protected paste could not put its replacement on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardBeginFailure {
+    /// A broker the worker stopped waiting for still runs.
+    Busy,
+    /// The replacement was not on the clipboard in time. The broker does not put it there any
+    /// more, and puts the user's clipboard back if it already had.
+    NotInstalled,
+}
+
+/// The replacement on the clipboard for one paste. The user's clipboard is put back (`restore`)
+/// once the paste is confirmed. Once the Ctrl+V was sent and not confirmed (`defer`), the
+/// replacement stays until the paste's target has read it: a field that handles the paste late
+/// then gets the replacement, never the user's own clipboard, which comes back afterwards.
+/// Dropping it restores before the Ctrl+V was sent and defers after.
+struct ProtectedClipboard<'a> {
+    owner: usize,
     temporary_sequence: u32,
+    /// The process the paste goes to, and how long a paste that was not confirmed waits for it.
+    target_process: u32,
+    deferred_wait: Duration,
     command: SyncSender<ClipboardBrokerCommand>,
     response: Receiver<ClipboardBrokerResponse>,
     worker: Option<JoinHandle<()>>,
+    shared: Arc<BrokerShared>,
+    brokers: &'a ClipboardBrokers,
+    /// Reads the clipboard's sequence number and owner on the worker's side.
+    probe: Box<dyn Fn() -> (u32, usize)>,
     active: bool,
+    submitted: bool,
 }
 
-impl ProtectedClipboard {
-    fn begin(text: &str, install_timeout: Duration) -> Option<Self> {
+impl<'a> ProtectedClipboard<'a> {
+    fn begin(
+        text: &str,
+        install_timeout: Duration,
+        brokers: &'a ClipboardBrokers,
+        target_process: u32,
+    ) -> core::result::Result<Self, ClipboardBeginFailure> {
+        Self::begin_with(
+            text,
+            install_timeout,
+            brokers,
+            (
+                target_process,
+                Duration::from_millis(UNCONFIRMED_PASTE_WAIT_MS),
+            ),
+            SystemClipboard::new,
+            Box::new(system_clipboard_state),
+        )
+    }
+
+    /// `target`: the paste's target process, and how long a paste that was not confirmed waits
+    /// for it to read the replacement.
+    fn begin_with<S, F>(
+        text: &str,
+        install_timeout: Duration,
+        brokers: &'a ClipboardBrokers,
+        target: (u32, Duration),
+        make: F,
+        probe: Box<dyn Fn() -> (u32, usize)>,
+    ) -> core::result::Result<Self, ClipboardBeginFailure>
+    where
+        S: ClipboardSystem,
+        F: FnOnce() -> Option<S> + Send + 'static,
+    {
+        if brokers.busy() {
+            return Err(ClipboardBeginFailure::Busy);
+        }
         let (command_sender, command_receiver) = sync_channel(1);
         let (response_sender, response_receiver) = sync_channel(1);
-        let text = text.to_owned();
-        let worker = thread::spawn(move || {
-            protected_clipboard_broker(text, command_receiver, response_sender);
-        });
-        let installed = response_receiver.recv_timeout(install_timeout).ok();
-        let Some(ClipboardBrokerResponse::Installed {
-            sequence: temporary_sequence,
-            owner,
-        }) = installed
-        else {
-            let _ = command_sender.try_send(ClipboardBrokerCommand::Restore);
-            if worker.is_finished() {
-                let _ = worker.join();
+        let shared = Arc::new(BrokerShared::default());
+        let worker = spawn_clipboard_broker(
+            text.to_owned(),
+            make,
+            Arc::clone(&shared),
+            command_receiver,
+            response_sender,
+        );
+        match response_receiver.recv_timeout(install_timeout) {
+            Ok(ClipboardBrokerResponse::Installed { sequence, owner }) => Ok(Self {
+                owner,
+                temporary_sequence: sequence,
+                target_process: target.0,
+                deferred_wait: target.1,
+                command: command_sender,
+                response: response_receiver,
+                worker: Some(worker),
+                shared,
+                brokers,
+                probe,
+                active: true,
+                submitted: false,
+            }),
+            _ => {
+                shared.cancelled.store(true, Ordering::Release);
+                let _ = command_sender.try_send(ClipboardBrokerCommand::Restore);
+                brokers.linger(worker, shared);
+                Err(ClipboardBeginFailure::NotInstalled)
             }
-            return None;
-        };
-
-        Some(Self {
-            owner: HWND(owner as *mut c_void),
-            temporary_sequence,
-            command: command_sender,
-            response: response_receiver,
-            worker: Some(worker),
-            active: true,
-        })
+        }
     }
 
     fn is_current(&self) -> bool {
-        self.active
-            && unsafe { GetClipboardSequenceNumber() } == self.temporary_sequence
-            && unsafe { GetClipboardOwner().ok() } == Some(self.owner)
+        self.active && (self.probe)() == (self.temporary_sequence, self.owner)
     }
 
+    /// The Ctrl+V is about to be sent: from now on the replacement stays until the paste was
+    /// confirmed (`restore`) or its target read it (`defer`).
+    fn mark_submitted(&mut self) {
+        self.submitted = true;
+    }
+
+    /// Puts the user's clipboard back if the clipboard still holds the replacement. Waits
+    /// `CLIPBOARD_RESTORE_WAIT_MS` for the broker; a restore that takes longer finishes on its
+    /// own and is logged when it is over.
     fn restore(&mut self) -> bool {
         if !self.active {
             return true;
         }
         self.active = false;
-        let was_current = self.is_current_after_deactivation();
+        let was_current = (self.probe)() == (self.temporary_sequence, self.owner);
         let command = if was_current {
             ClipboardBrokerCommand::Restore
         } else {
             ClipboardBrokerCommand::Abandon
         };
-        if self.command.send(command).is_err() {
-            if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-                let _ = self.worker.take().map(JoinHandle::join);
-            }
-            return false;
-        }
-        let response = self
-            .response
-            .recv_timeout(Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS))
-            .ok();
-        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            let _ = self.worker.take().map(JoinHandle::join);
-        }
-        was_current && matches!(response, Some(ClipboardBrokerResponse::Finished(true)))
+        was_current && self.finish(command)
     }
 
-    fn is_current_after_deactivation(&self) -> bool {
-        (unsafe { GetClipboardSequenceNumber() }) == self.temporary_sequence
-            && (unsafe { GetClipboardOwner().ok() }) == Some(self.owner)
+    /// The Ctrl+V was sent and not confirmed: the broker leaves the replacement until the paste's
+    /// target has read it and then puts the user's clipboard back, or leaves it for good after
+    /// the deferred wait. The worker does not wait for that; the broker's end is logged.
+    fn defer(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let _ = self.command.send(ClipboardBrokerCommand::Defer {
+            process: self.target_process,
+            wait: self.deferred_wait,
+        });
+        if let Some(worker) = self.worker.take() {
+            self.brokers.linger(worker, Arc::clone(&self.shared));
+        }
+    }
+
+    /// Sends the last command and waits for the broker's answer; a broker that does not answer in
+    /// time is left to finish and logged later. True when the user's clipboard was put back.
+    fn finish(&mut self, command: ClipboardBrokerCommand) -> bool {
+        let response = if self.command.send(command).is_ok() {
+            self.response
+                .recv_timeout(Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS))
+                .ok()
+        } else {
+            None
+        };
+        if let Some(worker) = self.worker.take() {
+            if response.is_some() {
+                let _ = worker.join();
+            } else {
+                self.brokers.linger(worker, Arc::clone(&self.shared));
+            }
+        }
+        matches!(response, Some(ClipboardBrokerResponse::Finished(true)))
     }
 }
 
-impl Drop for ProtectedClipboard {
+impl Drop for ProtectedClipboard<'_> {
     fn drop(&mut self) {
-        let _ = self.restore();
+        if self.submitted {
+            self.defer();
+        } else {
+            let _ = self.restore();
+        }
     }
+}
+
+/// The clipboard's sequence number and owner, as the worker compares them with the broker's.
+fn system_clipboard_state() -> (u32, usize) {
+    unsafe {
+        (
+            GetClipboardSequenceNumber(),
+            GetClipboardOwner().map_or(0, |owner| owner.0 as usize),
+        )
+    }
+}
+
+thread_local! {
+    /// On a clipboard broker's thread: the replacement it renders on request, and the processes
+    /// that asked for it.
+    static BROKER_RENDER: RefCell<Option<BrokerRender>> = const { RefCell::new(None) };
+}
+
+struct BrokerRender {
+    text: String,
+    readers: Vec<u32>,
+}
+
+const CLIPBOARD_BROKER_CLASS: PCWSTR = w!("AutoKeyboardLayotClipboardBroker");
+
+/// The broker window's procedure. The replacement's text is rendered when a program asks for it,
+/// and the process of the window holding the clipboard open is noted as a reader; a broker window
+/// that goes away renders it first, so a replacement left on the clipboard stays readable.
+unsafe extern "system" fn clipboard_broker_procedure(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    guarded(
+        || match message {
+            WM_RENDERFORMAT => {
+                if wparam.0 == usize::from(CF_UNICODETEXT.0) {
+                    render_replacement(true);
+                }
+                LRESULT(0)
+            }
+            WM_RENDERALLFORMATS => {
+                if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
+                    if unsafe { GetClipboardOwner().ok() } == Some(hwnd) {
+                        render_replacement(false);
+                    }
+                    let _ = unsafe { CloseClipboard() };
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        },
+        || LRESULT(0),
+    )
+}
+
+fn forget_replacement() {
+    BROKER_RENDER.with(|render| *render.borrow_mut() = None);
+}
+
+/// Puts the replacement's text on the clipboard for a delayed-rendering request; when a program
+/// asked for it, the process of the window holding the clipboard open is noted as a reader.
+fn render_replacement(requested: bool) {
+    BROKER_RENDER.with(|render| {
+        let mut render = render.borrow_mut();
+        let Some(render) = render.as_mut() else {
+            return;
+        };
+        if requested {
+            let mut process = 0;
+            if let Ok(reader) = unsafe { GetOpenClipboardWindow() } {
+                unsafe {
+                    GetWindowThreadProcessId(reader, Some(&mut process));
+                }
+            }
+            if process != 0 {
+                render.readers.push(process);
+            }
+        }
+        if let Some(mut data) = global_utf16(&render.text) {
+            let _ = data.transfer(u32::from(CF_UNICODETEXT.0));
+        }
+    });
 }
 
 struct ClipboardBrokerWindow(HWND);
@@ -1175,10 +1643,20 @@ struct ClipboardBrokerWindow(HWND);
 impl ClipboardBrokerWindow {
     fn new() -> Option<Self> {
         let module = unsafe { GetModuleHandleW(None).ok()? };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(clipboard_broker_procedure),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: CLIPBOARD_BROKER_CLASS,
+            ..Default::default()
+        };
+        // Fails harmlessly once the class exists.
+        unsafe {
+            RegisterClassW(&class);
+        }
         let window = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
-                w!("STATIC"),
+                CLIPBOARD_BROKER_CLASS,
                 w!("AutoKeyboardLayot clipboard broker"),
                 WINDOW_STYLE(0),
                 0,
@@ -1204,74 +1682,88 @@ impl Drop for ClipboardBrokerWindow {
     }
 }
 
-fn protected_clipboard_broker(
-    text: String,
-    commands: Receiver<ClipboardBrokerCommand>,
-    responses: SyncSender<ClipboardBrokerResponse>,
-) {
-    if unsafe { OleInitialize(None).is_err() } {
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
-        return;
+/// The system clipboard for a broker thread: OLE is initialized on that thread, and a hidden
+/// window owns the clipboard while the replacement is on it.
+struct SystemClipboard {
+    owner: ClipboardBrokerWindow,
+}
+
+impl SystemClipboard {
+    fn new() -> Option<Self> {
+        if unsafe { OleInitialize(None).is_err() } {
+            return None;
+        }
+        let Some(owner) = ClipboardBrokerWindow::new() else {
+            unsafe {
+                OleUninitialize();
+            }
+            return None;
+        };
+        Some(Self { owner })
     }
-    let Some(owner) = ClipboardBrokerWindow::new() else {
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
+}
+
+impl Drop for SystemClipboard {
+    fn drop(&mut self) {
         unsafe {
             OleUninitialize();
         }
-        return;
-    };
-    let owner_handle = owner.0;
-    let mut snapshot = materialize_current_clipboard();
-    let installed = snapshot.is_some() && install_protected_clipboard(owner_handle, &text);
-    if !installed {
-        if let Some(snapshot) = &mut snapshot {
-            let _ = restore_materialized_clipboard(owner_handle, None, snapshot);
-        }
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
-        unsafe {
-            OleUninitialize();
-        }
-        return;
+    }
+}
+
+impl ClipboardSystem for SystemClipboard {
+    type Snapshot = Vec<MaterializedClipboardEntry>;
+
+    fn sequence(&self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
     }
 
-    let temporary_sequence = unsafe { GetClipboardSequenceNumber() };
-    if responses
-        .send(ClipboardBrokerResponse::Installed {
-            sequence: temporary_sequence,
-            owner: owner_handle.0 as usize,
+    fn owner(&self) -> usize {
+        self.owner.0.0 as usize
+    }
+
+    fn owned(&self) -> bool {
+        (unsafe { GetClipboardOwner().ok() }) == Some(self.owner.0)
+    }
+
+    fn snapshot(&mut self) -> Option<Self::Snapshot> {
+        materialize_current_clipboard()
+    }
+
+    fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome {
+        install_protected_clipboard(self.owner.0, text, expected, cancelled)
+    }
+
+    fn restore(&mut self, expected: Option<u32>, snapshot: &mut Self::Snapshot) -> bool {
+        // From here the replacement is not the broker's to render any more, not even when its
+        // window, the owner of the restored clipboard, goes away.
+        forget_replacement();
+        restore_materialized_clipboard(self.owner.0, expected, snapshot)
+    }
+
+    fn wait(
+        &mut self,
+        commands: Option<&Receiver<ClipboardBrokerCommand>>,
+        timeout: Option<Duration>,
+    ) -> BrokerWait {
+        wait_clipboard_broker_command(commands, timeout)
+    }
+
+    fn read_by(&self, process: u32) -> bool {
+        BROKER_RENDER.with(|render| {
+            render
+                .borrow()
+                .as_ref()
+                .is_some_and(|render| render.readers.contains(&process))
         })
-        .is_err()
-    {
-        if let Some(snapshot) = &mut snapshot {
-            let _ =
-                restore_materialized_clipboard(owner_handle, Some(temporary_sequence), snapshot);
-        }
-        unsafe {
-            OleUninitialize();
-        }
-        return;
-    }
-
-    let restored = match wait_clipboard_broker_command(&commands) {
-        Ok(ClipboardBrokerCommand::Restore)
-            if (unsafe { GetClipboardSequenceNumber() }) == temporary_sequence
-                && (unsafe { GetClipboardOwner().ok() }) == Some(owner_handle) =>
-        {
-            snapshot.as_mut().is_some_and(|snapshot| {
-                restore_materialized_clipboard(owner_handle, Some(temporary_sequence), snapshot)
-            })
-        }
-        Ok(ClipboardBrokerCommand::Restore | ClipboardBrokerCommand::Abandon) | Err(_) => false,
-    };
-    let _ = responses.send(ClipboardBrokerResponse::Finished(restored));
-    unsafe {
-        OleUninitialize();
     }
 }
 
 fn wait_clipboard_broker_command(
-    commands: &Receiver<ClipboardBrokerCommand>,
-) -> core::result::Result<ClipboardBrokerCommand, ()> {
+    commands: Option<&Receiver<ClipboardBrokerCommand>>,
+    timeout: Option<Duration>,
+) -> BrokerWait {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         let mut message = MSG::default();
         unsafe {
@@ -1280,45 +1772,100 @@ fn wait_clipboard_broker_command(
                 DispatchMessageW(&message);
             }
         }
-        match commands.try_recv() {
-            Ok(command) => return Ok(command),
-            Err(TryRecvError::Disconnected) => return Err(()),
-            Err(TryRecvError::Empty) => {}
+        if let Some(commands) = commands {
+            match commands.try_recv() {
+                Ok(command) => return BrokerWait::Command(command),
+                Err(TryRecvError::Disconnected) => return BrokerWait::Disconnected,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return BrokerWait::Timeout;
         }
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn install_protected_clipboard(owner: HWND, text: &str) -> bool {
-    let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES) else {
-        return false;
+/// Announces `format` for delayed rendering. The call returns no handle even when it succeeds.
+fn announce_delayed_clipboard_format(format: u32) -> bool {
+    unsafe { SetClipboardData(format, None) }
+        .map_or_else(|error| error.code() == HRESULT(0), |_| true)
+}
+
+/// The formats that keep an item out of clipboard history, cloud sync and clipboard managers:
+/// `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` and
+/// `CanUploadToCloudClipboard`.
+fn clipboard_opt_out_formats() -> Option<[u32; 3]> {
+    let formats = unsafe {
+        [
+            RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")),
+            RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory")),
+            RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")),
+        ]
     };
-    let exclusion =
-        unsafe { RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")) };
-    let history = unsafe { RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory")) };
-    let cloud = unsafe { RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")) };
-    if exclusion == 0 || history == 0 || cloud == 0 {
-        return false;
+    formats.iter().all(|format| *format != 0).then_some(formats)
+}
+
+/// The opt-out formats a restored item does not carry itself.
+fn missing_opt_out_formats(present: &[u32], opt_outs: [u32; 3]) -> Vec<u32> {
+    opt_outs
+        .into_iter()
+        .filter(|format| !present.contains(format))
+        .collect()
+}
+
+fn install_protected_clipboard(
+    owner: HWND,
+    text: &str,
+    expected: u32,
+    cancelled: &AtomicBool,
+) -> InstallOutcome {
+    let installed = {
+        let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES) else {
+            return InstallOutcome::Untouched;
+        };
+        // Checked with the clipboard open, so that nothing can change it before it is emptied:
+        // what another program put there after the copy was taken is never replaced.
+        if cancelled.load(Ordering::Acquire) || unsafe { GetClipboardSequenceNumber() } != expected
+        {
+            return InstallOutcome::Untouched;
+        }
+        let Some(opt_outs) = clipboard_opt_out_formats() else {
+            return InstallOutcome::Untouched;
+        };
+        let mut opt_out_data = Vec::with_capacity(opt_outs.len());
+        for _ in opt_outs {
+            let Some(data) = global_bytes(&0u32.to_ne_bytes()) else {
+                return InstallOutcome::Untouched;
+            };
+            opt_out_data.push(data);
+        }
+        // The text itself is rendered when a program asks for it (`clipboard_broker_procedure`),
+        // so the broker learns whether the paste's target read it.
+        BROKER_RENDER.with(|render| {
+            *render.borrow_mut() = Some(BrokerRender {
+                text: text.to_owned(),
+                readers: Vec::new(),
+            });
+        });
+        if unsafe { EmptyClipboard().is_err() } {
+            return InstallOutcome::Untouched;
+        }
+        // Emptying waits for the previous owner to let go, which a hung program delays: a worker
+        // that stopped waiting meanwhile gets the user's clipboard back instead of the replacement.
+        !cancelled.load(Ordering::Acquire)
+            && opt_out_data
+                .iter_mut()
+                .zip(opt_outs)
+                .all(|(data, format)| data.transfer(format))
+            && announce_delayed_clipboard_format(u32::from(CF_UNICODETEXT.0))
+    };
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if installed {
+        InstallOutcome::Installed { sequence }
+    } else {
+        InstallOutcome::Emptied { sequence }
     }
-    let Some(mut exclusion_data) = global_bytes(&0u32.to_ne_bytes()) else {
-        return false;
-    };
-    let Some(mut history_data) = global_bytes(&0u32.to_ne_bytes()) else {
-        return false;
-    };
-    let Some(mut cloud_data) = global_bytes(&0u32.to_ne_bytes()) else {
-        return false;
-    };
-    let Some(mut text_data) = global_utf16(text) else {
-        return false;
-    };
-    if unsafe { EmptyClipboard().is_err() } {
-        return false;
-    }
-    exclusion_data.transfer(exclusion)
-        && history_data.transfer(history)
-        && cloud_data.transfer(cloud)
-        && text_data.transfer(u32::from(CF_UNICODETEXT.0))
 }
 
 fn global_bytes(bytes: &[u8]) -> Option<OwnedClipboardHandle> {
@@ -1366,9 +1913,23 @@ fn restore_materialized_clipboard(
     {
         return false;
     }
-    entries
+    let present: Vec<u32> = entries
+        .iter()
+        .map(|entry| u32::from(entry.format.cfFormat))
+        .collect();
+    let restored = entries
         .iter_mut()
-        .all(MaterializedClipboardEntry::transfer_to_open_clipboard)
+        .all(MaterializedClipboardEntry::transfer_to_open_clipboard);
+    // The user's item comes back as it was, not as a new copy for clipboard history, cloud sync
+    // or clipboard managers: the opt-outs it did not carry itself are added.
+    if let Some(opt_outs) = clipboard_opt_out_formats() {
+        for format in missing_opt_out_formats(&present, opt_outs) {
+            if let Some(mut data) = global_bytes(&0u32.to_ne_bytes()) {
+                let _ = data.transfer(format);
+            }
+        }
+    }
+    restored
 }
 
 #[repr(u8)]
@@ -6149,6 +6710,8 @@ struct InputProcessor {
     held_keys_kept_for: Option<u64>,
     // When the gate holding the keys typed after the word being converted lets them go.
     edit_deadline: Cell<Option<Instant>>,
+    // Clipboard brokers the worker stopped waiting for.
+    clipboard_brokers: ClipboardBrokers,
     // Policy D1: how often automatic conversion may resume after a recovered gate abort.
     auto_resumes: RateLimit,
     // Replacements of the privacy provider that were already logged.
@@ -6291,6 +6854,7 @@ impl InputProcessor {
             last_gate_retention_token: 0,
             held_keys_kept_for: None,
             edit_deadline: Cell::new(None),
+            clipboard_brokers: ClipboardBrokers::default(),
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
             sound_player: None,
@@ -6424,6 +6988,7 @@ impl InputProcessor {
     /// conversion, a shortcut modifier) used to leave the held keys waiting for the deadline and
     /// aborting the gate. Releasing is always safe: it only replays held keys unchanged.
     fn process(&mut self, queued: QueuedInputEvent) {
+        self.log_finished_clipboard_brokers();
         let armed = self.armed_gate_token(&queued);
         let reason = if armed == 0 {
             ""
@@ -6442,6 +7007,13 @@ impl InputProcessor {
                 format!("phase=release_forced token={armed} reason={reason}"),
             );
             self.request_gate_release(armed);
+        }
+    }
+
+    /// Logs how each clipboard broker the worker stopped waiting for ended, once it is over.
+    fn log_finished_clipboard_brokers(&self) {
+        for end in self.clipboard_brokers.reap() {
+            self.diagnostic("paste", format!("phase=broker_end result={end:?}"));
         }
     }
 
@@ -8930,17 +9502,30 @@ impl InputProcessor {
             self.note_paste_budget(input_sequence, "install", budget);
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         };
-        let Some(mut clipboard) = ProtectedClipboard::begin(replacement, install_timeout) else {
-            self.diagnostic(
-                "paste",
-                format!(
-                    "sequence={input_sequence} phase=clipboard_prepare result=failed elapsed_ms={}",
-                    started.elapsed().as_millis()
-                ),
-            );
-            // Nothing was typed and the user's clipboard was not replaced: a busy clipboard is a
-            // word left alone, not a failed edit, so automatic conversion stays on.
-            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
+        let mut clipboard = match ProtectedClipboard::begin(
+            replacement,
+            install_timeout,
+            &self.clipboard_brokers,
+            foreground.process_id,
+        ) {
+            Ok(clipboard) => clipboard,
+            Err(failure) => {
+                self.diagnostic(
+                        "paste",
+                        format!(
+                            "sequence={input_sequence} phase=clipboard_prepare result={failure:?} elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                // Nothing was typed and the user's clipboard was not replaced: a busy
+                // clipboard is a word left alone, not a failed edit, so automatic conversion
+                // stays on.
+                return self.abandon_selection(
+                    foreground,
+                    input_sequence,
+                    TextEditAttempt::Cancelled,
+                );
+            }
         };
         let clipboard_current = clipboard.is_current();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_prepare result=ready current={clipboard_current} elapsed_ms={}", started.elapsed().as_millis()));
@@ -8955,13 +9540,20 @@ impl InputProcessor {
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         }
 
+        clipboard.mark_submitted();
         let paste_inputs = build_paste_inputs();
         let submitted = send_input_count(&paste_inputs);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=submit submitted={submitted} requested={} elapsed_ms={}", paste_inputs.len(), started.elapsed().as_millis()));
         if submitted != paste_inputs.len() {
             let control_up = [keyboard_input(VK_LCONTROL, 0, KEYEVENTF_KEYUP)];
             let _ = send_input_batch(&control_up);
-            let _ = clipboard.restore();
+            // Part of the chord reached the field and may still paste: the replacement stays until
+            // the field reads it.
+            clipboard.defer();
+            self.diagnostic(
+                "paste",
+                format!("sequence={input_sequence} phase=clipboard_restore result=deferred reason=partial-submit"),
+            );
             return self.abandon_selection(
                 foreground,
                 input_sequence,
@@ -8973,10 +9565,12 @@ impl InputProcessor {
             self.wait_for_text_commit(foreground, input_sequence, source_layout, replacement);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
-        let owned_before_restore = clipboard.is_current();
-        let clipboard_restored = clipboard.restore();
-        self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
-        if !matches!(paste_commit, ReplayAttempt::Applied) {
+        if clipboard_after_paste(paste_commit) == ClipboardAfterPaste::Defer {
+            clipboard.defer();
+            self.diagnostic(
+                "paste",
+                format!("sequence={input_sequence} phase=clipboard_restore result=deferred reason=paste-unconfirmed"),
+            );
             // The paste may not have replaced the selected word: do not leave our selection
             // behind, unless the user has already moved on.
             if self.edit_guard_is_current(foreground, input_sequence) {
@@ -8988,6 +9582,9 @@ impl InputProcessor {
             }
             return TextEditAttempt::Failed(ConversionFailureReason::TextCommit);
         }
+        let owned_before_restore = clipboard.is_current();
+        let clipboard_restored = clipboard.restore();
+        self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
         let switched = self.switch_layout_and_wait(foreground, target_layout, input_sequence);
         self.diagnostic(
             "paste",
@@ -10187,6 +10784,24 @@ impl PasteBudget {
     fn allows_submit(self, now: Instant) -> bool {
         self.remaining(now)
             .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
+    }
+}
+
+/// What becomes of the user's clipboard once the Ctrl+V was sent: put back at once after the
+/// field showed the replacement, otherwise only after the paste's target read the replacement. A
+/// paste a busy field handles late then gets the replacement, never the user's own clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardAfterPaste {
+    Restore,
+    Defer,
+}
+
+const fn clipboard_after_paste(commit: ReplayAttempt) -> ClipboardAfterPaste {
+    match commit {
+        ReplayAttempt::Applied => ClipboardAfterPaste::Restore,
+        ReplayAttempt::Cancelled | ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
+            ClipboardAfterPaste::Defer
+        }
     }
 }
 
@@ -13391,18 +14006,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn protected_clipboard_round_trip_when_explicitly_enabled() {
-        if std::env::var_os("AUTOKEYBOARDLAYOT_CLIPBOARD_PROBE").is_none() {
-            return;
-        }
-        let _com = PrivacyGuard::new();
+    /// An invisible window owned by this thread, to open the clipboard with.
+    fn clipboard_test_window(title: PCWSTR) -> HWND {
         let module = unsafe { GetModuleHandleW(None).expect("module") };
-        let window = unsafe {
+        unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("STATIC"),
-                w!("AutoKeyboardLayot clipboard probe"),
+                title,
                 WINDOW_STYLE(0),
                 0,
                 0,
@@ -13413,14 +14024,44 @@ mod tests {
                 Some(HINSTANCE(module.0)),
                 None,
             )
-            .expect("probe window")
-        };
-        let original_formats = test_clipboard_formats(window).expect("clipboard formats");
-        let original_text = test_clipboard_unicode(window);
+            .expect("clipboard test window")
+        }
+    }
 
+    /// Puts `text` on the clipboard, owned by `owner`.
+    fn put_test_clipboard_text(owner: HWND, text: &str) {
+        let _open = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES).expect("open");
+        unsafe { EmptyClipboard() }.expect("empty");
+        let mut data = global_utf16(text).expect("text");
+        assert!(data.transfer(u32::from(CF_UNICODETEXT.0)));
+    }
+
+    fn sorted(mut formats: Vec<u32>) -> Vec<u32> {
+        formats.sort_unstable();
+        formats.dedup();
+        formats
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn protected_clipboard_round_trip_on_the_real_clipboard() {
+        let _com = PrivacyGuard::new();
+        // The clipboard's owner must answer when the clipboard is emptied; this thread waits for
+        // the broker meanwhile, so the original comes from a window that is gone by then.
+        let source = clipboard_test_window(w!("AutoKeyboardLayot clipboard source"));
+        put_test_clipboard_text(source, "akl-original");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot clipboard probe"));
+        let original_formats = test_clipboard_formats(window).expect("clipboard formats");
+
+        let brokers = ClipboardBrokers::default();
         let mut transaction = ProtectedClipboard::begin(
             "akl-clipboard-probe",
             Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            unsafe { GetCurrentProcessId() },
         )
         .expect("protected clipboard transaction");
         assert!(transaction.is_current());
@@ -13428,22 +14069,175 @@ mod tests {
             test_clipboard_unicode(window).as_deref(),
             Some("akl-clipboard-probe")
         );
+        let opt_outs = clipboard_opt_out_formats().expect("opt-out formats");
         let temporary_formats = test_clipboard_formats(window).expect("temporary formats");
-        for name in [
-            w!("ExcludeClipboardContentFromMonitorProcessing"),
-            w!("CanIncludeInClipboardHistory"),
-            w!("CanUploadToCloudClipboard"),
-        ] {
-            let format = unsafe { RegisterClipboardFormatW(name) };
-            assert!(format != 0 && temporary_formats.contains(&format));
+        for format in opt_outs {
+            assert!(temporary_formats.contains(&format));
         }
 
         assert!(transaction.restore());
-        assert_eq!(test_clipboard_formats(window), Some(original_formats));
-        assert_eq!(test_clipboard_unicode(window), original_text);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-original")
+        );
+        // The user's item comes back with the opt-outs it lacked, and nothing else.
+        let mut expected = original_formats.clone();
+        expected.extend(opt_outs);
+        assert_eq!(
+            sorted(test_clipboard_formats(window).expect("restored formats")),
+            sorted(expected)
+        );
+        drop(transaction);
+        assert!(brokers.reap().is_empty());
         unsafe {
             DestroyWindow(window).expect("destroy probe window");
         }
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn the_real_clipboard_is_not_replaced_once_it_changed_since_the_copy() {
+        let source = clipboard_test_window(w!("AutoKeyboardLayot changed source"));
+        put_test_clipboard_text(source, "akl-newer");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot changed probe"));
+        let owner = clipboard_test_window(w!("AutoKeyboardLayot changed owner"));
+        // The copy was taken before another program wrote: its sequence is an older one.
+        let stale = unsafe { GetClipboardSequenceNumber() }.wrapping_sub(1);
+        let cancelled = AtomicBool::new(false);
+        assert_eq!(
+            install_protected_clipboard(owner, "akl-replacement", stale, &cancelled),
+            InstallOutcome::Untouched
+        );
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("akl-newer"));
+        // A worker that stopped waiting is not served either, whatever the sequence.
+        cancelled.store(true, Ordering::Release);
+        let current = unsafe { GetClipboardSequenceNumber() };
+        assert_eq!(
+            install_protected_clipboard(owner, "akl-replacement", current, &cancelled),
+            InstallOutcome::Untouched
+        );
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("akl-newer"));
+        unsafe {
+            DestroyWindow(owner).expect("destroy owner window");
+            DestroyWindow(window).expect("destroy probe window");
+        }
+    }
+
+    const DELAYED_TEXT: &str = "akl-delayed-original";
+
+    unsafe extern "system" fn delayed_render_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_RENDERALLFORMATS, WM_RENDERFORMAT};
+        let render = || {
+            if let Some(mut data) = global_utf16(DELAYED_TEXT) {
+                let _ = data.transfer(u32::from(CF_UNICODETEXT.0));
+            }
+        };
+        match message {
+            WM_RENDERFORMAT => {
+                render();
+                LRESULT(0)
+            }
+            WM_RENDERALLFORMATS => {
+                if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
+                    if unsafe { GetClipboardOwner().ok() } == Some(hwnd) {
+                        render();
+                    }
+                    let _ = unsafe { CloseClipboard() };
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn delayed_rendered_clipboard_content_survives_a_protected_paste() {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+        // Programs such as Excel or browsers put formats on the clipboard that they render only
+        // when asked. Rendering them for the copy must not count as a change of the clipboard,
+        // or no paste could ever replace such content.
+        let (ready_sender, ready) = sync_channel::<u32>(1);
+        let owner = thread::spawn(move || {
+            let module = unsafe { GetModuleHandleW(None).expect("module") };
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(delayed_render_procedure),
+                hInstance: HINSTANCE(module.0),
+                lpszClassName: w!("AutoKeyboardLayotDelayedRenderTest"),
+                ..Default::default()
+            };
+            unsafe { RegisterClassW(&class) };
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("AutoKeyboardLayotDelayedRenderTest"),
+                    w!("AutoKeyboardLayot delayed render test"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    Some(HINSTANCE(module.0)),
+                    None,
+                )
+                .expect("owner window")
+            };
+            {
+                let _open = ClipboardOpenGuard::open(window, CLIPBOARD_OPEN_RETRIES).expect("open");
+                unsafe { EmptyClipboard() }.expect("empty");
+                // Without data the call returns no handle even when it succeeds.
+                let _ = unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), None) };
+            }
+            let _ = ready_sender.send(unsafe { GetCurrentThreadId() });
+            let mut message = MSG::default();
+            while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+                unsafe {
+                    DispatchMessageW(&message);
+                }
+            }
+            unsafe {
+                let _ = DestroyWindow(window);
+            }
+        });
+        let owner_thread = ready.recv().expect("owner ready");
+
+        let _com = PrivacyGuard::new();
+        let window = clipboard_test_window(w!("AutoKeyboardLayot delayed render probe"));
+        let brokers = ClipboardBrokers::default();
+        let mut transaction = ProtectedClipboard::begin(
+            "akl-delayed-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            unsafe { GetCurrentProcessId() },
+        )
+        .expect("the replacement goes over delayed-rendered content");
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-delayed-probe")
+        );
+        assert!(transaction.restore());
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some(DELAYED_TEXT)
+        );
+        drop(transaction);
+        unsafe {
+            PostThreadMessageW(owner_thread, WM_QUIT, WPARAM(0), LPARAM(0))
+                .expect("stop the owner");
+            DestroyWindow(window).expect("destroy probe window");
+        }
+        owner.join().expect("owner thread");
     }
 
     #[test]
@@ -17736,6 +18530,422 @@ mod tests {
         let state = take_app_state().unwrap();
         assert!(metrics.retained_input.lock().unwrap().is_none());
         assert_eq!(state.pending_held_replay.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn an_unconfirmed_paste_gives_the_real_clipboard_back_only_after_its_target_read_it() {
+        let _com = PrivacyGuard::new();
+        let source = clipboard_test_window(w!("AutoKeyboardLayot deferred source"));
+        put_test_clipboard_text(source, "akl-user-clipboard");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot deferred probe"));
+        let own_process = unsafe { GetCurrentProcessId() };
+        let wait_for = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while test_clipboard_unicode(window).as_deref() != Some(expected)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            test_clipboard_unicode(window)
+        };
+
+        // This process is the paste's target: reading the replacement is the late paste, and
+        // the user's clipboard comes back right after it.
+        let brokers = ClipboardBrokers::default();
+        let mut transaction = ProtectedClipboard::begin(
+            "akl-deferred-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            own_process,
+        )
+        .expect("protected clipboard transaction");
+        transaction.mark_submitted();
+        transaction.defer();
+        drop(transaction);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-deferred-probe")
+        );
+        assert_eq!(
+            wait_for("akl-user-clipboard").as_deref(),
+            Some("akl-user-clipboard")
+        );
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+
+        // Another process is the target: this one reading the replacement proves nothing, and
+        // the replacement stays once the wait is over.
+        let mut transaction = ProtectedClipboard::begin_with(
+            "akl-deferred-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            (4, Duration::from_millis(300)),
+            SystemClipboard::new,
+            Box::new(system_clipboard_state),
+        )
+        .expect("protected clipboard transaction");
+        transaction.mark_submitted();
+        transaction.defer();
+        drop(transaction);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-deferred-probe")
+        );
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Kept]);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-deferred-probe")
+        );
+        unsafe {
+            DestroyWindow(window).expect("destroy probe window");
+        }
+    }
+
+    /// A scripted clipboard for the broker: its text, sequence and owner, and the failures and
+    /// delays to inject.
+    #[derive(Default)]
+    struct FakeClipboardState {
+        text: String,
+        sequence: u32,
+        owner: usize,
+        empties: u32,
+        restores: u32,
+        snapshot_delay: Duration,
+        restore_delay: Duration,
+        /// Another program puts this on the clipboard while the copy is taken.
+        writer_during_snapshot: Option<String>,
+        open_fails: bool,
+        install_fails_after_empty: bool,
+        /// Processes that read the replacement.
+        readers: Vec<u32>,
+    }
+
+    const FAKE_BROKER_OWNER: usize = 7;
+    const FAKE_TARGET: u32 = 1234;
+
+    struct FakeClipboard(Arc<Mutex<FakeClipboardState>>);
+
+    impl ClipboardSystem for FakeClipboard {
+        type Snapshot = String;
+
+        fn sequence(&self) -> u32 {
+            self.0.lock().unwrap().sequence
+        }
+
+        fn owner(&self) -> usize {
+            FAKE_BROKER_OWNER
+        }
+
+        fn owned(&self) -> bool {
+            self.0.lock().unwrap().owner == FAKE_BROKER_OWNER
+        }
+
+        fn snapshot(&mut self) -> Option<String> {
+            let delay = self.0.lock().unwrap().snapshot_delay;
+            thread::sleep(delay);
+            let mut state = self.0.lock().unwrap();
+            let copy = state.text.clone();
+            if let Some(newer) = state.writer_during_snapshot.take() {
+                state.text = newer;
+                state.sequence += 1;
+                state.owner = 99;
+            }
+            Some(copy)
+        }
+
+        fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome {
+            let mut state = self.0.lock().unwrap();
+            if state.open_fails || cancelled.load(Ordering::Acquire) || state.sequence != expected {
+                return InstallOutcome::Untouched;
+            }
+            state.empties += 1;
+            state.text.clear();
+            state.owner = FAKE_BROKER_OWNER;
+            state.sequence += 1;
+            if state.install_fails_after_empty {
+                return InstallOutcome::Emptied {
+                    sequence: state.sequence,
+                };
+            }
+            state.text = text.to_owned();
+            state.sequence += 1;
+            InstallOutcome::Installed {
+                sequence: state.sequence,
+            }
+        }
+
+        fn restore(&mut self, expected: Option<u32>, snapshot: &mut String) -> bool {
+            let delay = self.0.lock().unwrap().restore_delay;
+            thread::sleep(delay);
+            let mut state = self.0.lock().unwrap();
+            if expected.is_some_and(|sequence| {
+                state.sequence != sequence || state.owner != FAKE_BROKER_OWNER
+            }) {
+                return false;
+            }
+            state.restores += 1;
+            state.text = snapshot.clone();
+            state.sequence += 1;
+            true
+        }
+
+        fn wait(
+            &mut self,
+            commands: Option<&Receiver<ClipboardBrokerCommand>>,
+            timeout: Option<Duration>,
+        ) -> BrokerWait {
+            match (commands, timeout) {
+                (Some(commands), Some(timeout)) => match commands.recv_timeout(timeout) {
+                    Ok(command) => BrokerWait::Command(command),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => BrokerWait::Timeout,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        BrokerWait::Disconnected
+                    }
+                },
+                (Some(commands), None) => commands
+                    .recv()
+                    .map_or(BrokerWait::Disconnected, BrokerWait::Command),
+                (None, timeout) => {
+                    thread::sleep(timeout.unwrap_or(Duration::from_millis(10)));
+                    BrokerWait::Timeout
+                }
+            }
+        }
+
+        fn read_by(&self, process: u32) -> bool {
+            self.0.lock().unwrap().readers.contains(&process)
+        }
+    }
+
+    fn fake_clipboard(text: &str) -> Arc<Mutex<FakeClipboardState>> {
+        Arc::new(Mutex::new(FakeClipboardState {
+            text: text.to_owned(),
+            sequence: 1,
+            owner: 99,
+            ..FakeClipboardState::default()
+        }))
+    }
+
+    /// Begins a protected clipboard on `state` for a paste to `FAKE_TARGET` that, unconfirmed,
+    /// waits `deferred_wait` for its target; the worker's checks read the same state.
+    fn begin_fake_with<'a>(
+        state: &Arc<Mutex<FakeClipboardState>>,
+        brokers: &'a ClipboardBrokers,
+        install_timeout: Duration,
+        deferred_wait: Duration,
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+        let broker_state = Arc::clone(state);
+        let probe_state = Arc::clone(state);
+        ProtectedClipboard::begin_with(
+            "привет",
+            install_timeout,
+            brokers,
+            (FAKE_TARGET, deferred_wait),
+            move || Some(FakeClipboard(broker_state)),
+            Box::new(move || {
+                let state = probe_state.lock().unwrap();
+                (state.sequence, state.owner)
+            }),
+        )
+    }
+
+    fn begin_fake<'a>(
+        state: &Arc<Mutex<FakeClipboardState>>,
+        brokers: &'a ClipboardBrokers,
+        install_timeout: Duration,
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+        begin_fake_with(state, brokers, install_timeout, Duration::from_secs(2))
+    }
+
+    /// Waits until every broker the worker stopped waiting for is over; says how they ended.
+    fn reap_all(brokers: &ClipboardBrokers) -> Vec<BrokerEnd> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while brokers.busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        brokers.reap()
+    }
+
+    #[test]
+    fn a_confirmed_paste_puts_the_users_clipboard_back() {
+        let state = fake_clipboard("user text");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        assert!(clipboard.is_current());
+        assert_eq!(state.lock().unwrap().text, "привет");
+        clipboard.mark_submitted();
+        assert!(clipboard.restore());
+        drop(clipboard);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert_eq!(state.lock().unwrap().restores, 1);
+        assert!(brokers.reap().is_empty(), "the broker was waited for");
+    }
+
+    #[test]
+    fn a_paste_sent_and_not_confirmed_gives_the_clipboard_back_only_after_its_target_read_it() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        clipboard.defer();
+        drop(clipboard);
+        // Another program reading it proves nothing: the replacement stays for the late paste.
+        state.lock().unwrap().readers.push(99);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert!(brokers.busy());
+        // The busy field finally handles its Ctrl+V: now the password comes back.
+        state.lock().unwrap().readers.push(FAKE_TARGET);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_replacement_its_target_never_read_stays_on_the_clipboard() {
+        // Dropped after the Ctrl+V (an early return), the transaction defers all the same.
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake_with(
+            &state,
+            &brokers,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        clipboard.mark_submitted();
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Kept]);
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert_eq!(state.lock().unwrap().restores, 0);
+        // Another program that replaced the replacement keeps its content.
+        let state = fake_clipboard("password");
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        clipboard.defer();
+        drop(clipboard);
+        {
+            let mut state = state.lock().unwrap();
+            state.text = "theirs".to_owned();
+            state.sequence += 1;
+            state.owner = 99;
+        }
+        assert_eq!(reap_all(&brokers), [BrokerEnd::NotRestored]);
+        assert_eq!(state.lock().unwrap().text, "theirs");
+        // Before the Ctrl+V, dropping it puts the user's clipboard back at once.
+        let state = fake_clipboard("user text");
+        drop(begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap());
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert!(brokers.reap().is_empty());
+    }
+
+    #[test]
+    fn the_users_clipboard_comes_back_only_after_the_field_showed_the_paste() {
+        assert_eq!(
+            clipboard_after_paste(ReplayAttempt::Applied),
+            ClipboardAfterPaste::Restore
+        );
+        for unconfirmed in [
+            ReplayAttempt::Cancelled,
+            ReplayAttempt::Failed,
+            ReplayAttempt::LayoutSwitchFailed,
+        ] {
+            assert_eq!(
+                clipboard_after_paste(unconfirmed),
+                ClipboardAfterPaste::Defer,
+                "{unconfirmed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clipboard_changed_while_it_is_copied_is_left_alone() {
+        let state = fake_clipboard("old");
+        state.lock().unwrap().writer_during_snapshot = Some("newer".to_owned());
+        let brokers = ClipboardBrokers::default();
+        assert!(matches!(
+            begin_fake(&state, &brokers, Duration::from_secs(2)),
+            Err(ClipboardBeginFailure::NotInstalled)
+        ));
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        let state = state.lock().unwrap();
+        assert_eq!(state.text, "newer");
+        assert_eq!(state.empties, 0);
+        assert_eq!(state.restores, 0);
+    }
+
+    #[test]
+    fn a_failed_installation_is_undone_only_when_it_emptied_the_clipboard() {
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().install_fails_after_empty = true;
+        let brokers = ClipboardBrokers::default();
+        assert!(begin_fake(&state, &brokers, Duration::from_secs(2)).is_err());
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert_eq!(state.lock().unwrap().restores, 1);
+        // A clipboard that could not even be opened was never changed: nothing is put back.
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().open_fails = true;
+        assert!(begin_fake(&state, &brokers, Duration::from_secs(2)).is_err());
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        assert_eq!(state.lock().unwrap().empties, 0);
+        assert_eq!(state.lock().unwrap().restores, 0);
+    }
+
+    #[test]
+    fn a_broker_the_worker_stopped_waiting_for_never_installs_and_holds_back_the_next_paste() {
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().snapshot_delay = Duration::from_millis(300);
+        let brokers = ClipboardBrokers::default();
+        assert!(matches!(
+            begin_fake(&state, &brokers, Duration::from_millis(20)),
+            Err(ClipboardBeginFailure::NotInstalled)
+        ));
+        // One broker at a time: the next paste does not start while that one still runs.
+        let other = fake_clipboard("other");
+        assert!(matches!(
+            begin_fake(&other, &brokers, Duration::from_secs(2)),
+            Err(ClipboardBeginFailure::Busy)
+        ));
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert_eq!(state.lock().unwrap().empties, 0);
+        assert!(begin_fake(&other, &brokers, Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn a_restore_the_worker_stopped_waiting_for_is_logged_when_it_ends() {
+        let (processor, receiver) = processor_with_diagnostics();
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().restore_delay =
+            Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS + 200);
+        let mut clipboard =
+            begin_fake(&state, &processor.clipboard_brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        assert!(!clipboard.restore(), "not waited for");
+        drop(clipboard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while processor.clipboard_brokers.busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        processor.log_finished_clipboard_brokers();
+        let lines: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.contains("phase=broker_end"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("result=Restored"), "{lines:?}");
+        assert_eq!(state.lock().unwrap().text, "user text");
+    }
+
+    #[test]
+    fn a_restored_item_gets_the_opt_outs_it_lacked_and_keeps_its_own() {
+        let opt_outs = [101, 102, 103];
+        assert_eq!(missing_opt_out_formats(&[13, 1], opt_outs), [101, 102, 103]);
+        assert_eq!(missing_opt_out_formats(&[13, 102], opt_outs), [101, 103]);
+        assert!(missing_opt_out_formats(&[101, 102, 103, 13], opt_outs).is_empty());
     }
 
     #[test]
