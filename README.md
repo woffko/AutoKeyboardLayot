@@ -257,9 +257,14 @@ knows which process read it. The user's clipboard is put back once the field
 shows the replacement. When the Ctrl+V was sent but the field did not show the
 replacement in time (a busy program), the replacement stays on the clipboard
 until the paste's target process has read it, and the user's clipboard comes back
-right after that; a target that has not read it within 5 seconds leaves the
-replacement there. A paste handled late therefore inserts the replacement, never
-the user's previous clipboard (a password, say). Every wait of a paste is fitted
+half a second after that (the read may be the program's own look at the new
+clipboard, with its paste right behind it); a target that has not read it within
+5 seconds leaves the replacement there. Only the first program to read the
+replacement is seen, so when another program reads it first, the replacement
+stays as well. A paste handled late therefore inserts the replacement rather than
+the user's previous clipboard (a password, say), unless the program read the
+clipboard on its own and handles the paste more than half a second later. Every
+wait of a paste is fitted
 into the time the correction gate has left: the selection, the clipboard and the
 Ctrl+V are skipped when what follows them would not fit (`phase=budget`), and a
 Pause press may then wait less than 0.5 seconds for the clipboard.

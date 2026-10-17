@@ -207,6 +207,10 @@ const CLIPBOARD_RESTORE_WAIT_MS: u64 = 100;
 /// How long the broker of a paste that was sent but not confirmed waits for the paste's target to
 /// read the replacement before it leaves the replacement on the clipboard for good.
 const UNCONFIRMED_PASTE_WAIT_MS: u64 = 5_000;
+/// How long the replacement stays after the target of an unconfirmed paste read it. The read may
+/// be the target's own look at the new clipboard (a clipboard listener) rather than its paste, and
+/// a busy program handles its queued Ctrl+V right after: that paste still gets the replacement.
+const TARGET_READ_GRACE_MS: u64 = 500;
 /// The least time worth giving the installation of a paste's replacement.
 const PASTE_MIN_INSTALL_MS: u64 = 50;
 /// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
@@ -1088,7 +1092,8 @@ enum ClipboardBrokerCommand {
     /// Leave the replacement there and drop the copy of the user's clipboard.
     Abandon,
     /// The Ctrl+V was sent but not confirmed: leave the replacement until `process`, the paste's
-    /// target, has read it, then put the user's clipboard back; leave it for good after `wait`.
+    /// target, has read it, then put the user's clipboard back (`TARGET_READ_GRACE_MS` after the
+    /// read); leave it for good after `wait`.
     Defer { process: u32, wait: Duration },
 }
 
@@ -1328,8 +1333,8 @@ enum ReaderWait {
     Command(ClipboardBrokerCommand),
 }
 
-/// Waits up to `wait` for `process` to read the replacement. Requests to render it are served
-/// meanwhile, also once the worker no longer listens.
+/// Waits up to `wait` for `process` to read the replacement, and `TARGET_READ_GRACE_MS` more once
+/// it did. Requests to render it are served meanwhile, also once the worker no longer listens.
 fn wait_for_reader<S: ClipboardSystem>(
     system: &mut S,
     commands: &Receiver<ClipboardBrokerCommand>,
@@ -1337,18 +1342,24 @@ fn wait_for_reader<S: ClipboardSystem>(
     process: u32,
     wait: Duration,
 ) -> ReaderWait {
-    let deadline = Instant::now() + wait;
+    let mut deadline = Instant::now() + wait;
+    let mut read = false;
     let mut commands = Some(commands);
     loop {
         if system.sequence() != sequence || !system.owned() {
             return ReaderWait::Replaced;
         }
-        if system.read_by(process) {
-            return ReaderWait::Read;
-        }
         let now = Instant::now();
+        if !read && system.read_by(process) {
+            read = true;
+            deadline = now + Duration::from_millis(TARGET_READ_GRACE_MS);
+        }
         if now >= deadline {
-            return ReaderWait::Expired;
+            return if read {
+                ReaderWait::Read
+            } else {
+                ReaderWait::Expired
+            };
         }
         let slice = (deadline - now).min(Duration::from_millis(10));
         match system.wait(commands, Some(slice)) {
@@ -18974,8 +18985,13 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         assert_eq!(state.lock().unwrap().text, "привет");
         assert!(brokers.busy());
-        // The busy field finally handles its Ctrl+V: now the password comes back.
+        // The target reads it. That may be its clipboard listener, with the queued Ctrl+V right
+        // after: the replacement stays a moment longer.
         state.lock().unwrap().readers.push(FAKE_TARGET);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert!(brokers.busy());
+        // Then the password comes back.
         assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
         assert_eq!(state.lock().unwrap().text, "password");
     }
@@ -19903,6 +19919,10 @@ mod tests {
             ["select", "begin", "submit:4", "commit", "collapse"]
         );
         assert!(processor.clipboard_brokers.busy());
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
+        // That read may be the field's own look at the clipboard: a paste right after it still
+        // gets the replacement.
+        thread::sleep(Duration::from_millis(100));
         assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
         let deadline = Instant::now() + Duration::from_secs(3);
         while test_clipboard_unicode(window).as_deref() != Some("akl-user-clipboard")
