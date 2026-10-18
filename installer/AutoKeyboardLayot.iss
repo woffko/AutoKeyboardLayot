@@ -254,14 +254,21 @@ begin
   ReleaseLeases;
 end;
 
-function InitializeUninstall: Boolean;
+// Close the program only once the user has confirmed the removal: declining must leave
+// it running. usUninstall follows the confirmation, and Abort ends the uninstall there.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ErrorText: String;
 begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
   ErrorText := StopAndLease(ExpandConstant('{app}\AutoKeyboardLayot.exe'));
-  Result := ErrorText = '';
-  if not Result then
-    MsgBox(ErrorText, mbError, MB_OK);
+  if ErrorText <> '' then begin
+    Log(ErrorText);
+    if not UninstallSilent then
+      MsgBox(ErrorText, mbError, MB_OK);
+    Abort;
+  end;
 end;
 
 procedure DeinitializeUninstall;

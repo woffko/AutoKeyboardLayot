@@ -27,3 +27,4 @@ AkPackageDone=パッケージをインストールしました。
 AkBaseProbeCode=同梱のプログラムが自己診断に失敗しました (コード %1)。インストールは開始されていません。
 AkFenceBusy=AutoKeyboardLayot の別のセットアップまたはアンインストールが実行中か、このユーザーの別のセッションで AutoKeyboardLayot が実行中です。終了するか閉じてから、再試行してください。
 AkFenceInvalid=インストールのロック ファイル %1 を使用できません (コード %2)。空の通常ファイルである必要があります。削除してから再試行してください。
+AkPackageCloses=[次へ] をクリックすると、開いている AutoKeyboardLayot とその設定を閉じ、選択した言語をすぐにインストールします。

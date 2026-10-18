@@ -28,3 +28,4 @@ AkPackageDone=Packages installed.
 AkBaseProbeCode=The bundled program failed its self-check (code %1). Installation was not started.
 AkFenceBusy=Another setup or uninstall of AutoKeyboardLayot is running, or AutoKeyboardLayot is running in another session of this user. Finish or close it, then retry.
 AkFenceInvalid=The installation lock file %1 cannot be used (code %2). It must be an empty ordinary file: delete it, then retry.
+AkPackageCloses=Next closes AutoKeyboardLayot and its settings if they are open, and installs the chosen languages right away.

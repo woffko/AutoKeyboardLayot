@@ -67,6 +67,11 @@ begin
   else Result := Id;
 end;
 
+function PackageIntro: String;
+begin
+  Result := CustomMessage('AkPackageIntro') + ' ' + CustomMessage('AkPackageCloses');
+end;
+
 procedure PackageControls;
 var Available, Seen: Boolean; I: Integer;
 begin
@@ -120,7 +125,7 @@ end;
 
 procedure PackageListClick(Sender: TObject);
 begin
-  PackageStatus.Caption := CustomMessage('AkPackageIntro');
+  PackageStatus.Caption := PackageIntro;
   PackageControls;
 end;
 
@@ -349,7 +354,7 @@ begin
   PackageList.OnClickCheck := @PackageListClick;
   PackageStatus := TNewStaticText.Create(WizardForm); PackageStatus.Parent := PackagePage.Surface;
   PackageStatus.SetBounds(0, PackagePage.SurfaceHeight - ScaleY(67), PackagePage.SurfaceWidth, ScaleY(65));
-  PackageStatus.AutoSize := False; PackageStatus.WordWrap := True; PackageStatus.Caption := CustomMessage('AkPackageIntro');
+  PackageStatus.AutoSize := False; PackageStatus.WordWrap := True; PackageStatus.Caption := PackageIntro;
   PackageCheck.Visible := False; PackageLocal.Visible := False; PackageDownload.Visible := False;
   PackageReviewList := TNewComboBox.Create(WizardForm); PackageReviewList.Parent := PackageReviewPage.Surface;
   PackageReviewList.SetBounds(0, 0, PackageReviewPage.SurfaceWidth, ScaleY(24)); PackageReviewList.Style := csDropDownList;
