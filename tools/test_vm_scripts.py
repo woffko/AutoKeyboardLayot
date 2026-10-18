@@ -7,6 +7,7 @@ directory and expected computer reach the VM. Nothing here contacts a machine.
 import base64
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -22,8 +23,11 @@ sys.path.insert(0, str(TOOLS))
 import vm_config  # noqa: E402
 from vm_config import VmSettings, VmSettingsError, sftp_path  # noqa: E402
 
-DRIVERS = ['run_vm_cross_session.py', 'run_vm_ui_offline_session.py', 'run_vm_upgrade.py']
-SCRIPTS = DRIVERS + ['test-vm-cross-session.ps1', 'test-vm-upgrade.ps1']
+DRIVERS = ['run_vm_cross_session.py', 'run_vm_installer_ui.py', 'run_vm_upgrade.py']
+SCRIPTS = DRIVERS + ['test-vm-cross-session.ps1', 'test-vm-upgrade.ps1', 'test-installer-ui.ps1']
+# The build directory (and scenarios) the drivers that take them get in these tests.
+BUILD = 'target/installer-vm-candidate-20260913-03'
+DRIVER_ARGUMENTS = {'run_vm_cross_session.py': (BUILD,), 'run_vm_installer_ui.py': (BUILD, 'retry', 'missing-exe')}
 # Values that tie a script to one machine or one person. Written in pieces so that a scan for
 # these values does not flag this file.
 MACHINE_LOCAL = ['192' + '.168.', 'C:\\Users\\', '/home/', 'root' + '@', 'DESKTOP-', 'w0' + 'w']
@@ -145,7 +149,7 @@ class FakeVm:
         if "'COMPUTER='" in script:
             return (f'COMPUTER={self.computer}\nLOCALAPPDATA={self.local_app_data}\nAPP_PROC=0\nPROFILE=False\n'
                     'SESSIONS=console 1 Active\n')
-        for marker in ('STAGE_READY', 'VM_UPGRADE_RETURNED', 'VM_CROSS_SESSION_RETURNED', 'VM_UI_OFFLINE_RETURNED'):
+        for marker in ('STAGE_READY', 'VM_UPGRADE_RETURNED', 'VM_CROSS_SESSION_RETURNED', 'VM_INSTALLER_UI_RETURNED'):
             if marker in script:
                 return marker + '\n'
         return ''
@@ -160,8 +164,10 @@ def artifacts(root):
             ' {"file": "target/release/AutoKeyboardLayot.exe", "sha256": "%s"}]}' % ('a' * 64, 'b' * 64))
 
 
-def run_driver(name, environment, fake, arguments=()):
+def run_driver(name, environment, fake, arguments=None):
     """Runs one driver's main() against the fake VM and returns (exit code, output directory)."""
+    if arguments is None:
+        arguments = DRIVER_ARGUMENTS.get(name, ())
     module = types.ModuleType(name)
     module.__file__ = str(TOOLS / name)
     source = (TOOLS / name).read_text(encoding='utf-8')
@@ -209,7 +215,7 @@ class DriverTests(unittest.TestCase):
 
     def test_drivers_use_the_login_host_key_name_and_staging_from_the_environment(self):
         environment = dict(ENVIRONMENT, AKL_VM_HOST_KEY_ALIAS='pinned-name')
-        stages = {'run_vm_cross_session.py': 'akl-cross-session', 'run_vm_ui_offline_session.py': 'akl-ui-offline',
+        stages = {'run_vm_cross_session.py': 'akl-cross-session', 'run_vm_installer_ui.py': 'akl-installer-ui',
                   'run_vm_upgrade.py': 'akl-upgrade'}
         for name in DRIVERS:
             fake = FakeVm()
@@ -250,9 +256,29 @@ class DriverTests(unittest.TestCase):
     def test_the_interactive_task_runs_as_the_configured_user(self):
         environment = dict(ENVIRONMENT, AKL_VM_TEST_USER='console')
         fake = FakeVm()
-        run_driver('run_vm_ui_offline_session.py', environment, fake)
-        task = next(script for _, script in fake.ssh if 'Register-ScheduledTask' in script)
-        self.assertIn("-UserId 'TESTGUEST01\\console'", task)
+        run_driver('run_vm_installer_ui.py', environment, fake)
+        tasks = [script for _, script in fake.ssh if 'Register-ScheduledTask' in script]
+        self.assertEqual(len(tasks), 2)
+        for task in tasks:
+            self.assertIn("-UserId 'TESTGUEST01\\console'", task)
+
+    def test_the_installer_ui_driver_runs_each_named_scenario_of_the_build(self):
+        fake = FakeVm()
+        _, controller = run_driver('run_vm_installer_ui.py', ENVIRONMENT, fake)
+        uploads = ''.join(batch for _, batch in fake.sftp)
+        self.assertIn('installer-vm-candidate-20260913-03/AutoKeyboardLayot-0.1.0-setup-experimental.exe', uploads)
+        self.assertIn('run-retry.cmd', uploads)
+        self.assertIn('run-missing-exe.cmd', uploads)
+        self.assertEqual(set(json.loads(controller)['scenarios']), {'retry', 'missing-exe'})
+
+    def test_an_unknown_scenario_or_a_missing_build_stops_before_anything_runs(self):
+        for arguments in [(BUILD,), (BUILD, 'probe'), (BUILD, 'retry', 'unknown')]:
+            fake = FakeVm()
+            message = io.StringIO()
+            with contextlib.redirect_stderr(message):
+                code, _ = run_driver('run_vm_installer_ui.py', ENVIRONMENT, fake, arguments)
+            self.assertEqual(code, 2, arguments)
+            self.assertEqual(fake.ssh + fake.sftp, [], arguments)
 
 
 if __name__ == '__main__':
