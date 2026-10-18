@@ -46,7 +46,11 @@ files, or terminates a process forcibly. It handles settings before the agent.
 Before sending `WM_CLOSE`, it opens the window's process, checks its canonical
 executable path against `<directory>/AutoKeyboardLayot.exe`, and rechecks the
 window PID. It also requires the versioned `AutoKeyboardLayot.GracefulClose.v1`
-window property advertised by the guarded agent/settings code. Older versions
+window property advertised by the guarded agent/settings code. The settings
+window sets it on one of the first ticks of its event loop, once the native window
+exists, and removes it while the window still exists, before the loop ends; a close
+it refuses (unsaved edits, a package operation in progress) keeps it, so a later
+setup can ask again. Older versions
 without that capability require manual closure; no `WM_CLOSE` is sent to them.
 A portable instance from another directory is not closed. A request
 waits at most 15 seconds per process. A missing window with a live singleton is
@@ -256,8 +260,12 @@ without the startup task), `helper-failure`, `timer-exception`, `no-store`,
 `uninstall-confirmation` (No leaves the running program alone, Yes closes and removes
 it), `missing-exe`, `startup-removal`, `fence-invalid`, `no-selectable-row` for a
 catalog whose packages all need a newer package API (or a test build of the package
-helper that reports every row unavailable), and `probe` for a `/DInstallerUiProbe`
-build. The language list comes from the published catalog, so the VM needs network
+helper that reports every row unavailable), `probe` for a `/DInstallerUiProbe`
+build, and `settings-open` (a silent upgrade while the settings window is open:
+without edits the window closes and the upgrade installs; with an unsaved edit the
+window stays open with the edit, setup reports the program busy with helper code 12
+and replaces nothing; after Apply the upgrade closes the window and installs). The
+language list comes from the published catalog, so the VM needs network
 access. The script refuses to run when the user already has a profile or an
 installation, and removes what it created.
 

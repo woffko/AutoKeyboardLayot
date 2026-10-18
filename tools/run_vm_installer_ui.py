@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STAGE_NAME = 'akl-installer-ui'
 TASK = 'AklInstallerAcceptance'
 SCENARIOS = ('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
-             'startup-removal', 'fence-invalid')
+             'startup-removal', 'fence-invalid', 'settings-open')
 
 
 def artifacts(build_directory):

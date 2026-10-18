@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory=$true)][string]$InstalledAppHash,
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [ValidateSet('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
-                 'startup-removal', 'fence-invalid', 'no-selectable-row', 'probe')]
+                 'startup-removal', 'fence-invalid', 'no-selectable-row', 'probe', 'settings-open')]
     [string]$Scenario = 'retry',
     [string]$Language = 'Deutsch'
 )
@@ -29,6 +29,10 @@ param(
 #   probe                   the installation-disabled UI probe build (/DInstallerUiProbe): every Next with a
 #                           language is refused and can be repeated, the helper never receives a download or
 #                           install command, Cancel ends it, and no profile is created
+#   settings-open           a silent upgrade while the settings window is open: without edits the window closes
+#                           and the upgrade installs; with an unsaved edit the window stays open with the edit,
+#                           setup reports the program busy and replaces nothing; once the edit is saved, the
+#                           upgrade closes the window and installs
 # The language list comes from the published catalog (network). The script refuses to run when the user
 # already has a profile or an installation, and removes what it created.
 $ErrorActionPreference = 'Stop'
@@ -52,6 +56,8 @@ public static class SetupWindows {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetProp(IntPtr h, string name);
   public static string Text(IntPtr h) { var b = new StringBuilder(8192); SendText(h, 0x000D, (IntPtr)b.Capacity, b); return b.ToString(); }
   public static string Class(IntPtr h) { var b = new StringBuilder(256); GetClassName(h, b, 256); return b.ToString(); }
   public static uint Owner(IntPtr h) { uint p; GetWindowThreadProcessId(h, out p); return p; }
@@ -263,6 +269,35 @@ function Installed-Hash {
     if (-not (Test-Path -LiteralPath $installedExe)) { return $false }
     return (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash -eq $InstalledAppHash
 }
+function Settings-Window { return [SetupWindows]::FindWindow('AutoKeyboardLayot.Settings.Window', [NullString]::Value) }
+# The settings window advertises the installer's graceful close once its native window exists.
+function Wait-Settings([Diagnostics.Process]$Process) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    do {
+        $window = Settings-Window
+        if ($window -ne [IntPtr]::Zero -and [SetupWindows]::GetProp($window, 'AutoKeyboardLayot.GracefulClose.v1') -eq [IntPtr]1) {
+            Start-Sleep -Seconds 3
+            return $window
+        }
+        if ($Process.HasExited) { throw "The settings process exited with $($Process.ExitCode)." }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $classes = @([SetupWindows]::Windows() | Where-Object { [SetupWindows]::Owner($_) -eq $Process.Id } | ForEach-Object { [SetupWindows]::Class($_) })
+    throw "The settings window did not open (window $window; windows of the process: $($classes -join ', '))."
+}
+# Settings controls through UI Automation (Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes).
+function Settings-Element([IntPtr]$Window, $Type, [string]$Name) {
+    $condition = New-Object Windows.Automation.AndCondition(
+        (New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, $Type)),
+        (New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::NameProperty, $Name)))
+    return [Windows.Automation.AutomationElement]::FromHandle($Window).FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+}
+function Sound-Box([IntPtr]$Window) {
+    $box = Settings-Element $Window ([Windows.Automation.ControlType]::CheckBox) 'Play a soft, quiet sound when a word is converted'
+    if ($null -eq $box) { throw 'No conversion sound check box.' }
+    return $box.GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+}
+function Sound-On([IntPtr]$Window) { return (Sound-Box $Window).Current.ToggleState -eq [Windows.Automation.ToggleState]::On }
 
 try {
     if (Test-Path -LiteralPath $profilePath) { throw 'The user already has a profile.' }
@@ -430,6 +465,41 @@ try {
                     Check 'removed_after_yes' (-not (Test-Path -LiteralPath $registration) -and -not (Test-Path -LiteralPath $installedExe))
                 }
             }
+        }
+        'settings-open' {
+            Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+            Check 'silent_install_exit' ((Silent-Setup '') -eq 0)
+            $config = Join-Path $profilePath 'config.ini'
+            $settings = Start-Owned $installedExe '--settings'
+            [void](Wait-Settings $settings)
+            Check 'upgrade_without_edits_exit' ((Silent-Setup '') -eq 0)
+            Check 'settings_closed_without_edits' ($settings.WaitForExit(5000) -and $settings.ExitCode -eq 0)
+            Check 'installed_app_hash' (Installed-Hash)
+            $settings = Start-Owned $installedExe '--settings'
+            $window = Wait-Settings $settings
+            Check 'sound_off_before_the_edit' (-not (Sound-On $window))
+            (Sound-Box $window).Toggle()
+            Start-Sleep -Seconds 1
+            Check 'sound_on_after_the_edit' (Sound-On $window)
+            $before = Get-Item -LiteralPath $installedExe
+            $result.busy_setup_exit = Silent-Setup ''
+            Check 'upgrade_refused_with_an_unsaved_edit' ($result.busy_setup_exit -ne 0)
+            $logText = [IO.File]::ReadAllText($script:silentLog)
+            $result.busy_log = @($logText -split "`r?`n" | Where-Object { $_ -like '*Helper code:*' })
+            Check 'busy_reported' ($logText -like '*Close or finish work in AutoKeyboardLayot and its settings, then retry.*Helper code: 12*')
+            $after = Get-Item -LiteralPath $installedExe
+            Check 'nothing_replaced' ($logText -notlike '*-- File entry --*' -and $after.CreationTimeUtc -eq $before.CreationTimeUtc -and $after.LastWriteTimeUtc -eq $before.LastWriteTimeUtc)
+            Check 'settings_still_open' (-not $settings.HasExited -and (Settings-Window) -eq $window)
+            Check 'edit_kept' (Sound-On $window)
+            Check 'unsaved_notice_shown' ($null -ne (Settings-Element $window ([Windows.Automation.ControlType]::Text) 'Settings contain unsaved or invalid changes. Save them before closing, or choose Cancel to explicitly discard them.'))
+            (Settings-Element $window ([Windows.Automation.ControlType]::Button) 'Apply').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while ([IO.File]::ReadAllText($config) -notmatch '(?m)^conversion_sound=true\r?$' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+            Check 'edit_saved' ([IO.File]::ReadAllText($config) -match '(?m)^conversion_sound=true\r?$')
+            Check 'upgrade_after_saving_exit' ((Silent-Setup '') -eq 0)
+            Check 'settings_closed_after_saving' ($settings.WaitForExit(5000) -and $settings.ExitCode -eq 0)
+            Check 'installed_app_hash_after_saving' (Installed-Hash)
+            Check 'saved_edit_kept' ([IO.File]::ReadAllText($config) -match '(?m)^conversion_sound=true\r?$')
         }
         'missing-exe' {
             Check 'silent_install_exit' ((Silent-Setup '') -eq 0)
