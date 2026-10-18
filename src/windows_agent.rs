@@ -15791,10 +15791,30 @@ mod tests {
 
     #[test]
     fn auto_mode_has_one_shared_atomic_source_of_truth() {
-        let metrics = Arc::new(ObserverMetrics::default());
-        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
-        metrics.auto_enabled.store(true, Ordering::Release);
-        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        // The tray menu's toggle writes the one value that the worker and the window's gate
+        // requests read: nothing keeps a copy of its own.
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        metrics.auto_enabled.store(false, Ordering::Release);
+        let processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let space = |epoch| QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(test_raw_key(WM_KEYDOWN, VK_SPACE, 1, 0)),
+            configuration: None,
+        };
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        for enabled in [true, false] {
+            toggle_auto_enabled();
+            // The toggle makes queued events stale; a new one is judged by the mode alone.
+            let current = space(metrics.input_epoch.load(Ordering::Acquire));
+            assert_eq!(
+                processor.gate_bypass_reason(&current) == "automatic-off",
+                !enabled
+            );
+            assert_eq!(gate_request_enabled(&metrics, 0), enabled);
+        }
+        drop(take_app_state());
     }
 
     #[test]
