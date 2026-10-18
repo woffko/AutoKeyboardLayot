@@ -26,8 +26,8 @@ use windows::{
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                FindWindowW, GA_ROOTOWNER, GetAncestor, PostMessageW, SW_RESTORE, SW_SHOWNORMAL,
-                SetForegroundWindow, ShowWindow,
+                FindWindowW, GA_ROOTOWNER, GetAncestor, IsIconic, PostMessageW, SHOW_WINDOW_CMD,
+                SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
             },
         },
     },
@@ -1065,9 +1065,17 @@ fn focus_existing_window() {
         // A native popup may share the backend class; focus its owning window.
         let owner = GetAncestor(window, GA_ROOTOWNER);
         let window = if owner.0.is_null() { window } else { owner };
-        let _ = ShowWindow(window, SW_RESTORE);
+        if let Some(command) = show_command_for_focus(IsIconic(window).as_bool()) {
+            let _ = ShowWindow(window, command);
+        }
         let _ = SetForegroundWindow(window);
     }
+}
+
+/// How a second start shows the open window: a minimized one is restored, any other keeps its
+/// placement, so a maximized window stays maximized.
+fn show_command_for_focus(minimized: bool) -> Option<SHOW_WINDOW_CMD> {
+    minimized.then_some(SW_RESTORE)
 }
 
 #[cfg(test)]
@@ -1327,6 +1335,12 @@ mod tests {
             DestroyWindow(window).unwrap();
             UnregisterClassW(class, Some(instance)).unwrap();
         }
+    }
+
+    #[test]
+    fn a_second_start_restores_only_a_minimized_window() {
+        assert_eq!(show_command_for_focus(true), Some(SW_RESTORE));
+        assert_eq!(show_command_for_focus(false), None);
     }
 
     #[test]
