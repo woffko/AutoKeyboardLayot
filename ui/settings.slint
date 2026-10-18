@@ -87,6 +87,63 @@ component DirectionalCheckBox inherits Rectangle {
     }
 }
 
+// One choice of a group whose selection the model holds. It only shows that selection and asks
+// to be chosen, so a click can never leave a stale mark next to another choice.
+component ChoiceRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback chosen;
+    forward-focus: choice-focus;
+    min-height: max(24px, label.preferred-height);
+    preferred-height: self.min-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    border-radius: 4px;
+    border-width: choice-focus.has-focus ? 1px : 0px;
+    border-color: Palette.accent-background;
+    accessible-role: radio-button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-action-default => { root.chosen(); }
+
+    Rectangle {
+        x: Localization.rtl ? parent.width - 22px : 2px;
+        y: (parent.height - self.height) / 2;
+        width: 20px;
+        height: 20px;
+        border-radius: 10px;
+        border-width: root.selected ? 6px : 1px;
+        border-color: root.selected ? Palette.accent-background : Palette.border;
+        background: Palette.background;
+    }
+    label := UiText {
+        x: Localization.rtl ? 0px : 32px;
+        width: max(0px, parent.width - 32px);
+        height: parent.height;
+        text: root.text;
+        color: Palette.foreground;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    TouchArea {
+        clicked => {
+            choice-focus.focus();
+            root.chosen();
+        }
+    }
+    choice-focus := FocusScope {
+        width: 0px;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.chosen();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
 // Application-owned menu labels, composed entirely from public Slint primitives.
 // TextInput remains responsible for IME, selection, undo and clipboard operations.
 // The menu is an ancestor of the editor, so Menu/Shift+F10 reaches it as well.
@@ -529,10 +586,10 @@ export component SettingsWindow inherits Window {
                                     text: Localization.text("ui_language.label", Localization.revision);
                                     color: Palette.foreground;
                                 }
-                                for name[index] in root.ui-language-names : DirectionalCheckBox {
+                                for name[index] in root.ui-language-names : ChoiceRow {
                                     text: name;
-                                    checked: root.ui-language-index == index;
-                                    toggled => { if (self.checked) { root.ui-language-index = index; } }
+                                    selected: root.ui-language-index == index;
+                                    chosen => { root.ui-language-index = index; }
                                 }
                                 UiText { text: root.ui-language-status; color: Palette.foreground; font-size: 12px; wrap: word-wrap; }
                                 UiText { text: Localization.text("ui_language.fallback", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
