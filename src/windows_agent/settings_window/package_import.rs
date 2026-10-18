@@ -959,6 +959,11 @@ pub(super) fn wire(
             }
         },
     );
+    // The removal and rollback tools list the installed packages; read them once at opening
+    // instead of waiting for a refresh elsewhere.
+    if ui.get_package_import_allowed() {
+        ui.invoke_refresh_packages();
+    }
     timer
 }
 
