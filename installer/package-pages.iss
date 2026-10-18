@@ -19,6 +19,8 @@ var
     PackageInstalling, PackageInTimer, PackageCancelRequested, PackageFault: Boolean;
   // PackageFault: the helper failed or its replies cannot be trusted, so this session
   // installs no languages; setup continues with English only (Back and Next retry).
+  // PackageEnglishOnly: the profile keeps no package store, so there is nothing to install.
+  PackageAnySelectable, PackageEnglishOnly: Boolean;
 
 function PackageSetTimer(Wnd: HWND; Event: UINT_PTR; Elapse: UINT; Callback: LongWord): UINT_PTR;
   external 'SetTimer@user32.dll stdcall';
@@ -77,7 +79,7 @@ end;
 procedure PackageControls;
 var Available, Seen: Boolean; I: Integer;
 begin
-  Available := not PackageFault and not PackageBusy and (PackageAwaiting < 0);
+  Available := not PackageFault and not PackageEnglishOnly and not PackageBusy and (PackageAwaiting < 0);
   PackageCheck.Enabled := Available;
   PackageLocal.Enabled := Available;
   PackageList.Enabled := Available and (PackagePhase = 'selecting');
@@ -90,10 +92,11 @@ begin
   if WizardForm.CurPageID <> PackagePage.ID then Exit;
   if PackageBusy or (PackageAwaiting >= 0) then
     WizardForm.NextButton.Enabled := False
-  else if PackageFault or (PackagePhase = 'idle') or PackageComplete then
+  else if PackageFault or PackageEnglishOnly or (PackagePhase = 'idle') or PackageComplete then
     WizardForm.NextButton.Enabled := True
   else if PackagePhase = 'selecting' then
-    WizardForm.NextButton.Enabled := PackageCount > 0
+    // A language must be chosen, unless the catalog offers none that this setup can install.
+    WizardForm.NextButton.Enabled := (PackageCount > 0) or not PackageAnySelectable
   else
     WizardForm.NextButton.Enabled := False;
 end;
@@ -169,7 +172,13 @@ begin
   PackageReason := GetIniString('helper', 'reason', '', FileName);
   if (GetIniString('helper', 'operation', '', FileName) <> 'ok') or
      (ResultText = 'failed') or (ResultText = 'commit_uncertain') then begin
-    PackageFailed;
+    if PackageReason = 'store_missing' then begin
+      // An English-only profile from an earlier version keeps no package store.
+      PackageEnglishOnly := True;
+      PackageAfterSelect := False;
+      PackageStatus.Caption := CustomMessage('AkPackageNoStore');
+    end else
+      PackageFailed;
     PackageControls;
     Exit;
   end;
@@ -179,6 +188,7 @@ begin
     PackageList.Items.Clear;
     SetArrayLength(PackageIds, Count);
     SetArrayLength(PackageBytes, Count);
+    PackageAnySelectable := False;
     for I := 0 to Count - 1 do begin
       Section := 'package' + IntToStr(I);
       Id := GetIniString(Section, 'id', '', FileName);
@@ -190,6 +200,7 @@ begin
       if GetIniString(Section, 'input', '0', FileName) = '1' then Caption := Caption + ' ' + CustomMessage('AkPackageInput');
       Enabled := GetIniString(Section, 'compatible', '0', FileName) = '1';
       if not Enabled then Caption := Caption + ' ' + CustomMessage('AkPackageUnavailable');
+      PackageAnySelectable := PackageAnySelectable or Enabled;
       // The helper's selection survives a rebuild, for example after a refused Next.
       PackageList.AddCheckBox(Caption, '', 0, Enabled and (GetIniString(Section, 'selected', '0', FileName) = '1'),
         Enabled, False, False, nil);
@@ -297,6 +308,7 @@ var Code: Integer; StoreRoot: String;
 begin
   PackageComplete := False;
   PackageFault := False;
+  PackageEnglishOnly := False;
   PackageReason := '';
   SetArrayLength(PackageReviewFiles, 0); SetArrayLength(PackageSeen, 0);
   if PackageReady then begin PackageSend(Command, 'check'); Exit; end;
@@ -397,7 +409,7 @@ begin
   if CurPageID = PackagePage.ID then begin
     if not Result then Exit;
     // Installed, or nothing can be installed in this session: continue (English only).
-    if PackageComplete or PackageFault then Exit;
+    if PackageComplete or PackageFault or PackageEnglishOnly then Exit;
     if PackagePhase = 'checking' then begin Result := False; Exit; end;
     if (PackageCount > 0) and (PackagePhase = 'selecting') then begin
       // One action: install the selected languages and continue.
@@ -406,7 +418,7 @@ begin
       Exit;
     end;
     if (PackagePhase = 'downloading') or (PackagePhase = 'installing') then begin Result := False; Exit; end;
-    if PackagePhase = 'selecting' then begin Result := False; Exit; end;
+    if PackagePhase = 'selecting' then begin Result := not PackageAnySelectable; Exit; end;
     Exit;
   end;
   if not Result then MsgBox(CustomMessage('AkPackagePending'), mbInformation, MB_OK);

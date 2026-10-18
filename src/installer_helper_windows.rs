@@ -153,10 +153,16 @@ fn session_continues(parent: WAIT_EVENT) -> bool {
     parent == WAIT_TIMEOUT
 }
 
+/// Rejection of a download into a profile without a package store: an English-only profile
+/// from an earlier version. The page then continues with English only.
+const STORE_MISSING: &str = "store_missing";
+
 /// Coarse, path-free failure code for a rejected synchronous command.
 fn reject_reason(text: &str) -> &'static str {
     let text = text.to_ascii_lowercase();
-    if text.starts_with("check:") || text.contains("catalog") {
+    if text == STORE_MISSING {
+        STORE_MISSING
+    } else if text.starts_with("check:") || text.contains("catalog") {
         "catalog"
     } else if text.contains("selection") {
         "selection"
@@ -324,6 +330,9 @@ pub fn run() -> Result<()> {
                             return Err("stale or busy".into());
                         }
                         let _leases = leases()?;
+                        if !store_root.try_exists()? {
+                            return Err(STORE_MISSING.into());
+                        }
                         let store = PackageStore::open(store_root)?;
                         real_seen = true;
                         if let Some((ticket, selected)) = session
@@ -450,6 +459,14 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::WAIT_FAILED;
+
+    #[test]
+    fn a_missing_store_has_its_own_reason_and_the_others_keep_theirs() {
+        assert_eq!(reject_reason(STORE_MISSING), "store_missing");
+        assert_eq!(reject_reason("selection: Missing"), "selection");
+        assert_eq!(reject_reason("stale or busy"), "state");
+        assert_eq!(reject_reason("store missing elsewhere"), "rejected");
+    }
 
     #[test]
     fn the_session_ends_with_setup_and_never_for_idle_time() {

@@ -28,4 +28,5 @@ AkBaseProbeCode=Program bawaan gagal dalam pemeriksaan mandiri (kode %1). Instal
 AkFenceBusy=Instalasi atau penghapusan AutoKeyboardLayot lain sedang berjalan, atau AutoKeyboardLayot sedang berjalan di sesi lain milik pengguna ini. Selesaikan atau tutup, lalu coba lagi.
 AkFenceInvalid=Berkas kunci instalasi %1 tidak dapat digunakan (kode %2). Berkas itu harus berupa berkas biasa yang kosong: hapus berkas itu, lalu coba lagi.
 AkPackageCloses=Maju akan menutup AutoKeyboardLayot dan pengaturannya jika sedang terbuka, lalu langsung memasang bahasa yang dipilih.
+AkPackageNoStore=Profil ini tidak menyimpan paket bahasa. Instalasi berlanjut hanya dengan bahasa Inggris.
 AkPackageEnglishNext=Klik Maju untuk melanjutkan hanya dengan bahasa Inggris.

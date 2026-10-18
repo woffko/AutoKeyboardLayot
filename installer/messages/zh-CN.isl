@@ -28,4 +28,5 @@ AkBaseProbeCode=随附的程序未通过自检（代码 %1）。安装未开始�
 AkFenceBusy=另一个 AutoKeyboardLayot 安装或卸载正在运行，或者 AutoKeyboardLayot 正在此用户的另一个会话中运行。请完成或关闭它，然后重试。
 AkFenceInvalid=无法使用安装锁文件 %1（代码 %2）。它必须是一个空的普通文件：请删除它，然后重试。
 AkPackageCloses=点击“下一步”会关闭已打开的 AutoKeyboardLayot 及其设置，并立即安装所选语言。
+AkPackageNoStore=此配置文件不保存语言包。安装程序将仅使用英语继续。
 AkPackageEnglishNext=点击“下一步”仅使用英语继续。

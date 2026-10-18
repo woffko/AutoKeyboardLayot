@@ -28,4 +28,5 @@ AkBaseProbeCode=Le programme fourni a échoué à son autotest (code %1). L’in
 AkFenceBusy=Une autre installation ou désinstallation d’AutoKeyboardLayot est en cours, ou AutoKeyboardLayot s’exécute dans une autre session de cet utilisateur. Attendez la fin de l’autre opération ou fermez AutoKeyboardLayot, puis réessayez.
 AkFenceInvalid=Le fichier de verrouillage de l’installation %1 est inutilisable (code %2). Il doit s’agir d’un fichier ordinaire vide : supprimez-le, puis réessayez.
 AkPackageCloses=« Suivant » ferme AutoKeyboardLayot et ses paramètres s’ils sont ouverts, puis installe immédiatement les langues choisies.
+AkPackageNoStore=Ce profil ne conserve aucun paquet de langue. L’installation continue avec l’anglais uniquement.
 AkPackageEnglishNext=Cliquez sur « Suivant » pour continuer avec l’anglais uniquement.
