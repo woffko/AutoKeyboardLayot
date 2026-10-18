@@ -481,7 +481,8 @@ under which the shell shows the standard tooltip only when every call asks for i
 builds did not ask, so hovering over the icon showed nothing.
 
 The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
-the tray icon is added again, and if Explorer is not ready yet the addition is
+the tray icon is added again, showing what the old icon showed, so a conversion failure
+it already announced is not announced again; if Explorer is not ready yet the addition is
 retried with a growing delay. Unlocking the session, reconnecting and resuming
 from sleep reinstall both hooks (held keys are handed back first, as after a gate
 timeout). A

@@ -3252,18 +3252,19 @@ fn retry_missing_hooks(hwnd: HWND) {
     }
 }
 
-/// Adds the tray icon; on failure a retry is scheduled, because Explorer may still be starting.
-fn add_tray(hwnd: HWND, indicator: LayoutIndicator) -> bool {
+/// Adds the tray icon showing `status`; on failure a retry is scheduled, because Explorer may
+/// still be starting.
+fn add_tray(hwnd: HWND, status: TrayStatus) -> bool {
     let now = Instant::now();
-    match TrayIcon::add(hwnd, indicator) {
+    match TrayIcon::add(hwnd, status) {
         Ok(tray) => {
             let duplicate = APP_STATE.with(|slot| {
                 let mut borrowed = slot.borrow_mut();
                 let state = borrowed.as_mut()?;
                 if state.tray.is_none() {
                     state.tray = Some(tray);
-                    // The new icon shows the initial status; the next refresh brings it up to date.
-                    state.last_tray_status = TrayStatus::initial(indicator);
+                    // The next refresh compares with what the new icon shows.
+                    state.last_tray_status = status;
                     None
                 } else {
                     Some(tray)
@@ -3287,19 +3288,21 @@ fn add_tray(hwnd: HWND, indicator: LayoutIndicator) -> bool {
     }
 }
 
-/// Explorer restarted (`TaskbarCreated`) and every notification icon is gone: build a new one.
+/// Explorer restarted (`TaskbarCreated`) and every notification icon is gone: build a new one
+/// that shows what the old one showed. Starting from the initial status instead would announce
+/// an old conversion failure again at the next refresh.
 fn recreate_tray(hwnd: HWND) {
     let taken = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
-            .map(|state| (state.tray.take(), state.last_tray_status.indicator))
+            .map(|state| (state.tray.take(), state.last_tray_status))
     });
-    let Some((old, indicator)) = taken else {
+    let Some((old, status)) = taken else {
         return;
     };
     // Dropping the old icon calls the shell, so no borrow is held here.
     drop(old);
-    add_tray(hwnd, indicator);
+    add_tray(hwnd, status);
 }
 
 /// Repeats a failed tray registration with backoff while the icon is missing.
@@ -3315,15 +3318,15 @@ fn retry_tray(hwnd: HWND) {
     if !due {
         return;
     }
-    let indicator = APP_STATE.with(|slot| {
+    let status = APP_STATE.with(|slot| {
         slot.borrow()
             .as_ref()
             .filter(|state| state.tray.is_none())
-            .map(|state| state.last_tray_status.indicator)
+            .map(|state| state.last_tray_status)
     });
-    match indicator {
-        Some(indicator) => {
-            add_tray(hwnd, indicator);
+    match status {
+        Some(status) => {
+            add_tray(hwnd, status);
         }
         None => UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None),
     }
@@ -3995,6 +3998,12 @@ fn refresh_tray_state() {
     } else {
         LayoutIndicator::from_layout(context.layout)
     };
+    update_tray(indicator, now);
+}
+
+/// Shows the agent's current status with `indicator` in the tray icon when it changed, and
+/// announces a new conversion failure.
+fn update_tray(indicator: LayoutIndicator, now: Instant) {
     let Some((mut tray, status, notify_failure)) = APP_STATE.with(|slot| {
         let mut borrowed = slot.borrow_mut();
         let state = borrowed.as_mut()?;
@@ -4067,13 +4076,14 @@ struct TrayIcon {
 }
 
 impl TrayIcon {
-    fn add(hwnd: HWND, indicator: LayoutIndicator) -> Result<Self> {
-        let icon = create_indicator_icon(TrayVisual::Disabled, indicator)?;
+    fn add(hwnd: HWND, status: TrayStatus) -> Result<Self> {
+        let visual = tray_visual_state(status);
+        let icon = create_indicator_icon(visual, status.indicator)?;
         let mut data = notify_icon_data(hwnd, icon);
         // With NOTIFYICON_VERSION_4 the shell shows the tooltip only when every call asks for it.
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
-        let tooltip = tray_tooltip(TrayStatus::initial(indicator));
+        let tooltip = tray_tooltip(status);
         set_tooltip(&mut data, &tooltip);
         if !shell_notify_icon(NIM_ADD, &data) {
             return Err(last_error_then(|| unsafe {
@@ -4097,8 +4107,8 @@ impl TrayIcon {
         Ok(Self {
             hwnd,
             icon,
-            visual: TrayVisual::Disabled,
-            indicator,
+            visual,
+            indicator: status.indicator,
         })
     }
 
@@ -4256,7 +4266,7 @@ pub fn run() -> Result<()> {
             .map(|context| LayoutIndicator::from_layout(context.layout))
             .unwrap_or(LayoutIndicator::Unavailable);
         installer_lifecycle::advertise_safe_close(hwnd);
-        let tray = TrayIcon::add(hwnd, initial_indicator)?;
+        let tray = TrayIcon::add(hwnd, TrayStatus::initial(initial_indicator))?;
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(
             initial_configuration
@@ -14583,11 +14593,12 @@ mod tests {
         assert_ne!(rasters[1], rasters[2]);
     }
 
-    /// One call to the scripted notification area: the message and its flags.
+    /// One call to the scripted notification area: the message, its flags and the tooltip.
     #[derive(Debug, Clone)]
     struct ShellCall {
         message: NOTIFY_ICON_MESSAGE,
         flags: windows::Win32::UI::Shell::NOTIFY_ICON_DATA_FLAGS,
+        tip: String,
     }
 
     /// A notification area for the tray code of the calling thread. It records every call, keeps
@@ -14606,6 +14617,14 @@ mod tests {
         static SCRIPTED_SHELL: RefCell<Option<ScriptedShell>> = const { RefCell::new(None) };
     }
 
+    fn wide_text(buffer: &[u16]) -> String {
+        let length = buffer
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..length])
+    }
+
     /// The scripted notification area's answer, or `None` when the thread uses the real one.
     pub(super) fn scripted_shell_call(
         message: NOTIFY_ICON_MESSAGE,
@@ -14617,6 +14636,7 @@ mod tests {
             shell.calls.push(ShellCall {
                 message,
                 flags: data.uFlags,
+                tip: wide_text(&data.szTip),
             });
             let during = shell
                 .during
@@ -14676,7 +14696,11 @@ mod tests {
             ..ScriptedShell::default()
         };
         let (added, shell) = with_scripted_shell(shell, || {
-            TrayIcon::add(HWND::default(), LayoutIndicator::English).map(|tray| tray.icon)
+            TrayIcon::add(
+                HWND::default(),
+                TrayStatus::initial(LayoutIndicator::English),
+            )
+            .map(|tray| tray.icon)
         });
         assert_eq!(
             added.err().map(|error| error.code()),
@@ -14690,7 +14714,11 @@ mod tests {
     #[test]
     fn every_icon_call_asks_the_shell_for_the_standard_tooltip() {
         let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
-            let mut tray = TrayIcon::add(HWND::default(), LayoutIndicator::English).expect("add");
+            let mut tray = TrayIcon::add(
+                HWND::default(),
+                TrayStatus::initial(LayoutIndicator::English),
+            )
+            .expect("add");
             let status = TrayStatus {
                 auto_enabled: true,
                 ..TrayStatus::initial(LayoutIndicator::Russian)
@@ -14713,6 +14741,48 @@ mod tests {
             calls,
             [(NIM_ADD, true), (NIM_MODIFY, true), (NIM_MODIFY, true)]
         );
+    }
+
+    #[test]
+    fn a_re_added_icon_shows_the_last_status_and_announces_no_old_failure() {
+        // A conversion failed and paused automatic conversion, which the tray announced once.
+        // Explorer restarts: the new icon shows the failure in its tooltip, and the next refresh
+        // has nothing to announce.
+        let (state, _receiver) = test_gate_state(1);
+        state.metrics.auto_enabled.store(false, Ordering::Release);
+        state
+            .metrics
+            .conversion_failures
+            .store(1, Ordering::Release);
+        state
+            .metrics
+            .last_failure_reason
+            .store(ConversionFailureReason::TextCommit as u8, Ordering::Release);
+        let indicator = LayoutIndicator::English;
+        let start = Instant::now();
+        let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            update_tray(indicator, start);
+            recreate_tray(HWND::default());
+            update_tray(indicator, start + Duration::from_secs(1));
+            drop(take_app_state());
+        });
+        let balloons = shell
+            .calls
+            .iter()
+            .filter(|call| call.flags.contains(NIF_INFO))
+            .count();
+        assert_eq!(balloons, 1, "{:?}", shell.calls);
+        let added: Vec<_> = shell
+            .calls
+            .iter()
+            .filter(|call| call.message == NIM_ADD)
+            .map(|call| call.tip.as_str())
+            .collect();
+        assert_eq!(added.len(), 2);
+        assert!(!added[0].contains("conversion failures"), "{}", added[0]);
+        assert!(added[1].contains("conversion failures: 1"), "{}", added[1]);
     }
 
     #[test]
