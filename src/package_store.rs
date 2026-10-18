@@ -338,7 +338,7 @@ impl PackageStore {
             packages.push(Arc::new(VerifiedLanguagePackage::verify(&bytes, trust)?));
         }
         Ok(StoreSnapshot {
-            inventory: PackageInventory::restore(&state, &packages)?,
+            inventory: PackageInventory::restore(&state, &packages, trust)?,
             state_hash: hash,
         })
     }
@@ -463,7 +463,7 @@ impl PackageStore {
             }
             verified.push(Arc::new(VerifiedLanguagePackage::verify(bytes, trust)?));
         }
-        let inventory = PackageInventory::restore(&state, &verified)?;
+        let inventory = PackageInventory::restore(&state, &verified, trust)?;
         let state_hash = digest(&state);
         if state_hash == current.state_hash {
             return Ok(current);
@@ -1344,7 +1344,8 @@ mod tests {
             serde_json::from_slice(&PackageInventory::default().state_bytes().unwrap()).unwrap();
         unrelated["generation"] = json!(2);
         let unrelated =
-            PackageInventory::restore(&serde_json::to_vec(&unrelated).unwrap(), &[]).unwrap();
+            PackageInventory::restore(&serde_json::to_vec(&unrelated).unwrap(), &[], &trust())
+                .unwrap();
         assert!(matches!(
             store.commit(&first, &unrelated, &[], &trust()),
             Err(StoreError::Inventory(InventoryError::Rollback))

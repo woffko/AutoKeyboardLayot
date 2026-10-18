@@ -68,19 +68,27 @@ impl From<PackageError> for ReleaseError {
 
 /// A receipt from previously authenticated metadata. Persistence and writer
 /// locking belong to the manager; supplying None does not provide rollback defense.
+/// It records the fingerprint of the key that signed the catalog, so that a store
+/// can forget a checkpoint whose key is no longer trusted (`PackageInventory::restore`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogCheckpoint {
     revision: u64,
     document_sha256: [u8; 32],
+    signer_sha256: [u8; 32],
 }
 impl CatalogCheckpoint {
-    pub fn from_persisted(revision: u64, document_sha256: [u8; 32]) -> Result<Self, ReleaseError> {
+    pub fn from_persisted(
+        revision: u64,
+        document_sha256: [u8; 32],
+        signer_sha256: [u8; 32],
+    ) -> Result<Self, ReleaseError> {
         if revision == 0 {
             return Err(ReleaseError::InvalidData);
         }
         Ok(Self {
             revision,
             document_sha256,
+            signer_sha256,
         })
     }
     pub const fn revision(self) -> u64 {
@@ -88,6 +96,10 @@ impl CatalogCheckpoint {
     }
     pub const fn document_sha256(self) -> [u8; 32] {
         self.document_sha256
+    }
+    /// SHA-256 of the public key that signed the catalog.
+    pub const fn signer_sha256(self) -> [u8; 32] {
+        self.signer_sha256
     }
 }
 
@@ -287,6 +299,9 @@ impl VerifiedReleaseCatalog {
             &envelope.signature,
             MAX_DOCUMENT_BYTES,
         )?;
+        let signer_sha256 = trust
+            .key_fingerprint(&envelope.signer)
+            .ok_or(PackageError::UntrustedSigner)?;
         let document: Document =
             serde_json::from_str(&envelope.catalog).map_err(|_| ReleaseError::InvalidData)?;
         if document.format != 1 || document.revision == 0 {
@@ -306,6 +321,7 @@ impl VerifiedReleaseCatalog {
         let checkpoint = CatalogCheckpoint {
             revision: document.revision,
             document_sha256: Sha256::digest(envelope.catalog.as_bytes()).into(),
+            signer_sha256,
         };
         if let Some(previous) = previous {
             if checkpoint.revision < previous.revision {
@@ -559,9 +575,16 @@ mod tests {
         let first = verify(&old, None, 100).unwrap();
         let checkpoint = first.checkpoint();
         assert!(verify(&old, Some(checkpoint), 100).is_ok());
-        let persisted =
-            CatalogCheckpoint::from_persisted(checkpoint.revision(), checkpoint.document_sha256())
-                .unwrap();
+        assert_eq!(
+            checkpoint.signer_sha256(),
+            <[u8; 32]>::from(Sha256::digest(key().verifying_key().as_bytes()))
+        );
+        let persisted = CatalogCheckpoint::from_persisted(
+            checkpoint.revision(),
+            checkpoint.document_sha256(),
+            checkpoint.signer_sha256(),
+        )
+        .unwrap();
         assert_eq!(persisted, checkpoint);
         let mut changed = old.clone();
         changed["expires_at"] = json!(201);
@@ -575,7 +598,7 @@ mod tests {
             verify(&old, Some(next.checkpoint()), 100).unwrap_err(),
             ReleaseError::Rollback
         );
-        assert!(CatalogCheckpoint::from_persisted(0, [0; 32]).is_err());
+        assert!(CatalogCheckpoint::from_persisted(0, [0; 32], [0; 32]).is_err());
     }
     #[test]
     fn freshness_is_checked_at_inspection_and_selection_boundaries() {

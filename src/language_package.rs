@@ -211,6 +211,21 @@ impl PackageTrust {
         })
     }
 
+    /// SHA-256 of the public key trusted under this signer name: the fingerprint that
+    /// data/package-signing/public-key.json lists for the key.
+    pub(crate) fn key_fingerprint(&self, signer: &str) -> Option<[u8; 32]> {
+        self.0
+            .get(signer)
+            .map(|key| Sha256::digest(key.as_bytes()).into())
+    }
+
+    /// Whether the key with this fingerprint is still trusted, under any signer name.
+    pub(crate) fn trusts_key(&self, fingerprint: &[u8; 32]) -> bool {
+        self.0
+            .values()
+            .any(|key| <[u8; 32]>::from(Sha256::digest(key.as_bytes())) == *fingerprint)
+    }
+
     pub(crate) fn verify_document(
         &self,
         domain: &[u8],
