@@ -730,6 +730,9 @@ export component SettingsWindow inherits Window {
                                         text: Localization.text("languages.add_button", Localization.revision);
                                         enabled: root.package-import-allowed && !root.package-import-busy;
                                         clicked => {
+                                            // The dialog shows the messages of what happens in it.
+                                            root.status-text = "";
+                                            root.status-error = false;
                                             root.add-language-visible = true;
                                             if (!root.download-catalog-ready && !root.package-import-ready) { root.check-download-catalog(); }
                                         }
@@ -1007,6 +1010,13 @@ export component SettingsWindow inherits Window {
                         }
                     }
 
+                    // Progress, results and failures of the dialog's operations, in the dialog: the
+                    // window's own message row is behind the dimmed layer.
+                    if root.status-text != "": UiText {
+                        text: root.status-text;
+                        color: root.status-error ? #c42b1c : Palette.foreground;
+                        wrap: word-wrap;
+                    }
                     HorizontalLayout {
                         Rectangle { horizontal-stretch: 1; }
                         Button { text: Localization.text("add_language.close", Localization.revision); enabled: !root.package-import-busy; clicked => { root.add-language-visible = false; } }
