@@ -122,9 +122,9 @@ use windows::{
                 TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
                 WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONDOWN,
-                WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-                WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WNDCLASSW, WTS_CONSOLE_CONNECT,
+                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_QUIT,
+                WM_RBUTTONDOWN, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+                WM_TIMER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WNDCLASSW, WTS_CONSOLE_CONNECT,
                 WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
             },
         },
@@ -4403,7 +4403,7 @@ pub fn run() -> Result<()> {
                 Ok(hook) => hook,
                 Err(error) => {
                     drop(take_app_state());
-                    let _ = DestroyWindow(hwnd);
+                    abandon_startup(hwnd);
                     return Err(error);
                 }
             };
@@ -4413,7 +4413,7 @@ pub fn run() -> Result<()> {
                 Err(error) => {
                     let _ = UnhookWindowsHookEx(keyboard_hook);
                     drop(take_app_state());
-                    let _ = DestroyWindow(hwnd);
+                    abandon_startup(hwnd);
                     return Err(error);
                 }
             };
@@ -4427,7 +4427,7 @@ pub fn run() -> Result<()> {
 
         if SetTimer(Some(hwnd), LAYOUT_TIMER_ID, LAYOUT_TIMER_INTERVAL_MS, None) == 0 {
             let error = Error::from_thread();
-            let _ = DestroyWindow(hwnd);
+            abandon_startup(hwnd);
             return Err(error);
         }
 
@@ -4446,6 +4446,17 @@ pub fn run() -> Result<()> {
 
         drop(take_app_state());
         Ok(())
+    }
+}
+
+/// Destroys the agent's window after a start-up failure. Its WM_DESTROY posts WM_QUIT for a
+/// message loop that never ran; left in the queue, that message would close the error dialog that
+/// `main` shows next before anyone could read it.
+fn abandon_startup(hwnd: HWND) {
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+        let mut message = MSG::default();
+        while PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
     }
 }
 
@@ -14976,6 +14987,54 @@ mod tests {
         });
         let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
         assert_eq!(messages, [NIM_ADD, NIM_ADD, NIM_SETVERSION, NIM_DELETE]);
+    }
+
+    /// A window of the calling thread with the agent's window procedure. It goes with the thread.
+    fn agent_procedure_window() -> HWND {
+        let module = unsafe { GetModuleHandleW(None).expect("module") };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: w!("AutoKeyboardLayotProcedureTest"),
+            ..Default::default()
+        };
+        // A second registration fails harmlessly: the class is the same.
+        unsafe { RegisterClassW(&class) };
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("AutoKeyboardLayotProcedureTest"),
+                w!("AutoKeyboardLayot procedure test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+            .expect("window")
+        }
+    }
+
+    /// Takes a WM_QUIT waiting in this thread's queue; true when there was one.
+    fn take_quit_message() -> bool {
+        let mut message = MSG::default();
+        unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) }.as_bool()
+    }
+
+    #[test]
+    fn a_failed_start_leaves_no_quit_message_for_the_error_dialog() {
+        // Destroying the agent's window posts WM_QUIT for its message loop.
+        let window = agent_procedure_window();
+        unsafe { DestroyWindow(window).expect("destroy window") };
+        assert!(take_quit_message());
+        // A failed start never ran that loop: it takes the message back, so the dialog that main
+        // shows next is not closed by it.
+        abandon_startup(agent_procedure_window());
+        assert!(!take_quit_message());
     }
 
     #[test]
