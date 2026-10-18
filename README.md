@@ -161,7 +161,11 @@ written anywhere unless the user selects that action.
 A successful forced conversion can similarly offer its result for the user
 dictionary. Suggestions expire after two minutes and are only persisted after
 an explicit tray action. Selecting a hotkey with modifiers does not inject
-corrections until those modifiers have been released. Selected-text conversion
+corrections until those modifiers have been released. Recording a shortcut in the
+settings refuses chords that are typing, which the agent would otherwise swallow
+everywhere: Shift with a letter or digit (a capital or a symbol) and Ctrl+Alt with a
+letter or digit (AltGr on many layouts, without Win). It warns before Alt+F4 and
+Ctrl+C, V, X, Z, A and S, which Windows and programs use. Selected-text conversion
 is planned separately and is not implemented.
 
 Enter and Tab end the current word without converting it, then re-check privacy

@@ -2,8 +2,9 @@
 //! Starts only with every keyboard key released; consumed modifier downs and
 //! ups stay paired. No synthetic input, text log or global persistent recorder.
 use super::super::ui_localization::{tr, tr_format};
-use super::super::{current_foreground_context, hotkey_modifier_bit};
+use super::super::{acceptance_typing, current_foreground_context, hotkey_modifier_bit};
 use super::{Hotkey, SettingsWindow, set_ui_hotkey};
+use autokeyboardlayot::{HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN};
 use slint::ComponentHandle;
 use std::{
     cell::{Cell, RefCell},
@@ -55,7 +56,53 @@ enum Update {
     Chosen(Hotkey, bool),
     Finished(Hotkey),
     Invalid,
+    Refused(Refusal),
     Cancel,
+}
+
+/// Why the capture refuses a shortcut that the hotkey rules allow: once applied, the agent would
+/// swallow typing with it everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Shift alone with a letter or digit types a capital letter or a symbol.
+    ShiftOnly,
+    /// Ctrl+Alt is AltGr on many layouts: with a letter or digit it types a character (€, @).
+    AltGr,
+}
+
+/// What the capture makes of a shortcut the hotkey rules allow: refused when it is typing, else
+/// accepted, and true when Windows and many programs use it themselves.
+fn verdict(hotkey: Hotkey) -> Result<bool, Refusal> {
+    let letter_or_digit = matches!(hotkey.virtual_key, 0x30..=0x39 | 0x41..=0x5a);
+    let ctrl_alt = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT;
+    if letter_or_digit && hotkey.modifiers == HOTKEY_MOD_SHIFT {
+        return Err(Refusal::ShiftOnly);
+    }
+    if letter_or_digit
+        && hotkey.modifiers & HOTKEY_MOD_WIN == 0
+        && hotkey.modifiers & ctrl_alt == ctrl_alt
+    {
+        return Err(Refusal::AltGr);
+    }
+    Ok(is_common_shortcut(hotkey))
+}
+
+/// Alt+F4 closes the window; Ctrl+C, V, X, Z, A and S copy, paste, cut, undo, select all and save.
+fn is_common_shortcut(hotkey: Hotkey) -> bool {
+    const VK_F4: u16 = 0x73;
+    (hotkey.modifiers == HOTKEY_MOD_ALT && hotkey.virtual_key == VK_F4)
+        || (hotkey.modifiers == HOTKEY_MOD_CONTROL
+            && matches!(hotkey.virtual_key, 0x41 | 0x43 | 0x53 | 0x56 | 0x58 | 0x5a))
+}
+
+/// The hint once `hotkey` is chosen, warning about a shortcut that Windows and programs use.
+fn chosen_hint(hotkey: Hotkey) -> String {
+    let key = if verdict(hotkey) == Ok(true) {
+        "hotkey.selected_common"
+    } else {
+        "hotkey.selected"
+    };
+    tr_format(key, &[("hotkey", &hotkey.display_name())])
 }
 
 /// This hook-side state contains no GUI object or callback. The UI timer
@@ -112,11 +159,12 @@ impl CaptureKeys {
             .iter()
             .filter_map(|key| hotkey_modifier_bit(*key))
             .fold(0, |all, bit| all | bit);
-        match Hotkey::new(key, modifiers) {
-            Ok(hotkey) => {
+        match Hotkey::new(key, modifiers).map(|hotkey| (hotkey, verdict(hotkey))) {
+            Ok((hotkey, Ok(_))) => {
                 self.chosen = Some(hotkey);
                 Update::Chosen(hotkey, self.pressed.is_empty())
             }
+            Ok((_, Err(refusal))) => Update::Refused(refusal),
             Err(_) => Update::Invalid,
         }
     }
@@ -230,20 +278,26 @@ fn process_pending_update() {
     }
     match update {
         Some(Update::Chosen(hotkey, finished)) => {
-            ui.set_hotkey_capture_hint(
-                tr_format("hotkey.selected", &[("hotkey", &hotkey.display_name())]).into(),
-            );
+            ui.set_hotkey_capture_hint(chosen_hint(hotkey).into());
             if finished {
                 set_ui_hotkey(&ui, hotkey);
                 stop();
             }
         }
+        // The choice may arrive with its release, between two ticks of this timer.
         Some(Update::Finished(hotkey)) => {
+            ui.set_hotkey_capture_hint(chosen_hint(hotkey).into());
             set_ui_hotkey(&ui, hotkey);
             stop();
         }
         Some(Update::Cancel) => cancel(tr("hotkey.cancelled")),
         Some(Update::Invalid) => ui.set_hotkey_capture_hint(tr("hotkey.modifier_required").into()),
+        Some(Update::Refused(Refusal::ShiftOnly)) => {
+            ui.set_hotkey_capture_hint(tr("hotkey.shift_only").into());
+        }
+        Some(Update::Refused(Refusal::AltGr)) => {
+            ui.set_hotkey_capture_hint(tr("hotkey.altgr").into());
+        }
         Some(Update::Pending) | None => {}
     }
 }
@@ -253,7 +307,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    if event.flags.contains(LLKHF_INJECTED) {
+    // Test builds take the desktop acceptance's marked typing as the user's.
+    if event.flags.contains(LLKHF_INJECTED) && !acceptance_typing(event.dwExtraInfo) {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     if ABORT_CAPTURE.with(Cell::get) || !owns_foreground() {
@@ -321,6 +376,61 @@ mod tests {
         assert_eq!(keys.event(0x41, true), Update::Invalid);
         assert_eq!(keys.event(0x41, false), Update::Pending);
         assert_eq!(keys.event(0x1b, true), Update::Cancel);
+    }
+
+    #[test]
+    fn a_shortcut_that_types_is_refused_and_a_common_one_is_flagged() {
+        use autokeyboardlayot::{HOTKEY_MOD_ALT, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN};
+        let hotkey = |key: u8, modifiers| Hotkey::new(u16::from(key), modifiers).unwrap();
+        let ctrl_alt = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT;
+        for (shortcut, expected) in [
+            // Shift types capitals and symbols; Ctrl+Alt is AltGr (€ on E, @ on 2), with Shift too.
+            (hotkey(b'Q', HOTKEY_MOD_SHIFT), Err(Refusal::ShiftOnly)),
+            (hotkey(b'7', HOTKEY_MOD_SHIFT), Err(Refusal::ShiftOnly)),
+            (hotkey(b'E', ctrl_alt), Err(Refusal::AltGr)),
+            (
+                hotkey(b'2', ctrl_alt | HOTKEY_MOD_SHIFT),
+                Err(Refusal::AltGr),
+            ),
+            // With Win it is no AltGr; Ctrl, Alt or Win make a letter a shortcut, Shift may join.
+            (hotkey(b'E', ctrl_alt | HOTKEY_MOD_WIN), Ok(false)),
+            (
+                hotkey(b'Q', HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
+                Ok(false),
+            ),
+            (hotkey(b'Q', HOTKEY_MOD_ALT), Ok(false)),
+            (hotkey(0x74, HOTKEY_MOD_SHIFT), Ok(false)),
+            (Hotkey::default(), Ok(false)),
+            // Shortcuts Windows and programs use: accepted with a warning.
+            (hotkey(0x73, HOTKEY_MOD_ALT), Ok(true)),
+            (hotkey(b'C', HOTKEY_MOD_CONTROL), Ok(true)),
+            (hotkey(b'S', HOTKEY_MOD_CONTROL), Ok(true)),
+            (hotkey(b'Z', HOTKEY_MOD_CONTROL), Ok(true)),
+            (
+                hotkey(b'C', HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
+                Ok(false),
+            ),
+        ] {
+            assert_eq!(verdict(shortcut), expected, "{}", shortcut.display_name());
+        }
+        // A refused chord leaves the capture open for another one.
+        let mut keys = CaptureKeys::default();
+        assert_eq!(keys.event(0xa0, true), Update::Pending);
+        assert_eq!(keys.event(0x51, true), Update::Refused(Refusal::ShiftOnly));
+        assert_eq!(keys.event(0x51, false), Update::Pending);
+        assert_eq!(keys.event(0xa0, false), Update::Pending);
+        assert_eq!(keys.event(0xa2, true), Update::Pending);
+        assert_eq!(
+            keys.event(0x51, true),
+            Update::Chosen(hotkey(b'Q', HOTKEY_MOD_CONTROL), false)
+        );
+        // The hint names the shortcut and warns about a common one.
+        let common = chosen_hint(hotkey(b'C', HOTKEY_MOD_CONTROL));
+        assert!(
+            common.contains("Ctrl+C") && common.contains("programs"),
+            "{common}"
+        );
+        assert!(!chosen_hint(hotkey(b'Q', HOTKEY_MOD_CONTROL)).contains("programs"));
     }
 
     #[test]
