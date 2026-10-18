@@ -393,6 +393,14 @@ impl VerifiedLanguagePackage {
                     .map_err(|_| PackageError::InvalidComponents)?;
                 let descriptor = InputPackDescriptor::from_json(input.as_bytes())
                     .map_err(|_| PackageError::InvalidComponents)?;
+                // The short tier holds words of one to three characters, as build.rs requires of
+                // the embedded lists: the layout model's short-list feature was trained on those.
+                if short
+                    .lines()
+                    .any(|word| word.to_lowercase().chars().count() > 3)
+                {
+                    return Err(PackageError::InvalidComponents);
+                }
                 let pack = DictionaryPack::from_words(input_id, words.lines(), short.lines())
                     .map_err(|_| PackageError::InvalidComponents)?
                     .with_scoring_model(model)
@@ -770,6 +778,30 @@ mod tests {
             verify(&envelope(&changed_manifest, &components)).unwrap_err(),
             PackageError::TooLarge
         );
+    }
+    #[test]
+    fn short_words_hold_words_of_one_to_three_characters() {
+        let (mut manifest, mut components) = fixtures();
+        for (short, accepted) in [
+            ("a\nhi\nтри\nÕUE\n", true),
+            ("hi\nfour\n", false),
+            ("hi\nкошка\n", false),
+        ] {
+            components["short_words"] = json!(short);
+            manifest["components"]["short_words"] =
+                json!({"bytes":short.len(),"sha256":hex(&Sha256::digest(short.as_bytes()))});
+            let result = verify(&envelope(&manifest, &components));
+            if accepted {
+                let input = result.unwrap().input().unwrap().clone();
+                assert!(input.common_short_contains("три") && input.common_short_contains("õue"));
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    PackageError::InvalidComponents,
+                    "{short}"
+                );
+            }
+        }
     }
     #[test]
     fn signed_metadata_cannot_invent_compatibility_or_mix_partial_components() {
