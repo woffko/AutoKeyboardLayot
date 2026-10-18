@@ -990,6 +990,13 @@ export component SettingsWindow inherits Window {
                             if root.package-import-ready && root.package-online: VerticalLayout {
                                 spacing: 6px;
                                 UiText { text: root.online-summary; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                // Each package's license and notice, one package at a time.
+                                ComboBox {
+                                    model: root.review-package-names;
+                                    current-index <=> root.review-package-index;
+                                    enabled: !root.package-import-busy;
+                                    selected(value) => { root.preview-review-package(self.current-index); }
+                                }
                                 LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 150px; accessible-name: Localization.text("download.confirm", Localization.revision); }
                                 HorizontalLayout {
                                     spacing: 10px;
