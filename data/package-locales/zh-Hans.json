@@ -179,6 +179,7 @@
     "menu.settings": "设置…",
     "menu.exit": "退出",
     "error.read_config": "无法读取配置：{error}",
+    "error.apply_config": "无法应用新配置：{error}",
     "error.read_config_hint": "文件夹：{folder}\n\n您的设置保存在此文件夹中的 config.ini 里。若要使用默认设置启动，请将该文件移到其他位置，然后重新启动程序。如果旁边有名为 config.schema-1.bak 之类的副本，将其重命名为 config.ini 即可恢复之前的设置。 如果该文件夹中还有旧版本的 settings.ini、user_dictionary.txt、word_exclusions.txt 或 exclusions.txt，也请一并移走：没有 config.ini 时，程序会改为读取它们。",
     "error.save_config": "无法保存：{error}",
     "error.invalid_hotkey": "快捷键无效：{error}",

@@ -774,6 +774,26 @@ struct ConfigurationReload {
     snapshot: RuntimeConfiguration,
 }
 
+/// What became of a configuration offered to the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigurationHandoff {
+    Queued,
+    /// Not now: a correction gate or retained keys, two revisions the worker has not acknowledged
+    /// yet, or a full queue. These pass by themselves, so the same snapshot can be offered again.
+    Busy,
+    /// Never: the agent is stopping, the worker is gone, or the snapshot would take back a
+    /// configuration source or a package generation.
+    Refused,
+}
+
+/// Why an event did not reach the worker's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueRefusal {
+    Full,
+    /// No queue or no worker behind it.
+    Closed,
+}
+
 #[derive(Debug, Clone)]
 struct PendingConversion {
     transaction: ConversionTransaction,
@@ -2236,6 +2256,8 @@ struct AppState {
     configuration_sources: autokeyboardlayot::configuration::ConfigurationSources,
     package_source: PackageSource,
     pending_configuration: Option<ConfigurationReload>,
+    /// A loaded configuration that the worker could not take yet; offered again on timer ticks.
+    deferred_configuration: Option<RuntimeConfiguration>,
     configuration_loader: Option<RuntimeConfigurationLoader>,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
     lexicon_saves: LexiconSaves,
@@ -2341,16 +2363,16 @@ impl AppState {
     }
 
     fn enqueue(&self, event: RawInputEvent) -> bool {
-        self.enqueue_with_configuration(event, None)
+        self.enqueue_with_configuration(event, None).is_ok()
     }
 
     fn enqueue_with_configuration(
         &self,
         event: RawInputEvent,
         configuration: Option<Box<ConfigurationReload>>,
-    ) -> bool {
+    ) -> core::result::Result<(), QueueRefusal> {
         let Some(sender) = &self.input_sender else {
-            return false;
+            return Err(QueueRefusal::Closed);
         };
         // At most one refresh of each kind waits in the queue, and a full queue only drops it.
         let refresh_queued = match event {
@@ -2359,7 +2381,7 @@ impl AppState {
             _ => None,
         };
         if refresh_queued.is_some_and(|queued| queued.swap(true, Ordering::AcqRel)) {
-            return true;
+            return Ok(());
         }
         if let RawInputEvent::Key(key) = event {
             self.metrics
@@ -2373,28 +2395,29 @@ impl AppState {
             configuration,
         };
         match sender.try_send(queued) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(TrySendError::Disconnected(_)) => {
                 if let Some(queued) = refresh_queued {
                     queued.store(false, Ordering::Release);
                 }
-                false
+                Err(QueueRefusal::Closed)
             }
             Err(TrySendError::Full(_)) => {
                 if let Some(queued) = refresh_queued {
                     queued.store(false, Ordering::Release);
-                    return false;
+                    return Err(QueueRefusal::Full);
                 }
                 self.metrics.dropped_events.fetch_add(1, Ordering::Relaxed);
                 self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
-                false
+                Err(QueueRefusal::Full)
             }
         }
     }
 
-    fn enqueue_configuration(&mut self, snapshot: RuntimeConfiguration) -> bool {
-        if self.shutdown.load(Ordering::Acquire) {
-            return false;
+    fn enqueue_configuration(&mut self, snapshot: RuntimeConfiguration) -> ConfigurationHandoff {
+        if self.shutdown.load(Ordering::Acquire) || self.metrics.worker_dead.load(Ordering::Acquire)
+        {
+            return ConfigurationHandoff::Refused;
         }
         let previous_sources = self
             .pending_configuration
@@ -2403,7 +2426,7 @@ impl AppState {
                 pending.snapshot.sources
             });
         if !previous_sources.accepts_reload(snapshot.sources) {
-            return false;
+            return ConfigurationHandoff::Refused;
         }
         let previous_packages = self
             .pending_configuration
@@ -2412,7 +2435,7 @@ impl AppState {
                 pending.snapshot.package_source
             });
         if !previous_packages.accepts_reload(snapshot.package_source) {
-            return false;
+            return ConfigurationHandoff::Refused;
         }
         if self.correction_gate.active
             || has_retained_input(&self.metrics)
@@ -2421,17 +2444,17 @@ impl AppState {
                 .saturating_sub(self.metrics.configuration_ack.load(Ordering::Acquire))
                 >= 2
         {
-            return false;
+            return ConfigurationHandoff::Busy;
         }
         let Some(revision) = self.next_configuration_revision.checked_add(1) else {
-            return false;
+            return ConfigurationHandoff::Refused;
         };
         let reload = ConfigurationReload { revision, snapshot };
         self.metrics
             .configuration_pending
             .store(true, Ordering::Release);
         self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
-        if !self.enqueue_with_configuration(
+        if let Err(refusal) = self.enqueue_with_configuration(
             RawInputEvent::ReloadConfiguration,
             Some(Box::new(reload.clone())),
         ) {
@@ -2439,11 +2462,47 @@ impl AppState {
             self.metrics
                 .configuration_pending
                 .store(self.pending_configuration.is_some(), Ordering::Release);
-            return false;
+            return match refusal {
+                QueueRefusal::Full => ConfigurationHandoff::Busy,
+                QueueRefusal::Closed => ConfigurationHandoff::Refused,
+            };
         }
         self.next_configuration_revision = revision;
         self.pending_configuration = Some(reload);
-        true
+        ConfigurationHandoff::Queued
+    }
+
+    /// Hands a freshly loaded configuration, or else the one deferred earlier, to the worker. A
+    /// snapshot that the worker cannot take yet is kept and offered again on the next timer tick,
+    /// unless a newer load replaces it. Returns the message for the user, if any: a load that
+    /// failed is a read error, a snapshot the worker can never take an apply error.
+    fn hand_off_configuration(
+        &mut self,
+        loaded: Option<std::io::Result<RuntimeConfiguration>>,
+    ) -> Option<String> {
+        let snapshot = match loaded {
+            Some(Ok(snapshot)) => snapshot,
+            Some(Err(error)) => {
+                // The files changed again and cannot be read: what was deferred is out of date.
+                self.deferred_configuration = None;
+                return Some(tr_format(
+                    "error.read_config",
+                    &[("error", &error.to_string())],
+                ));
+            }
+            None => self.deferred_configuration.take()?,
+        };
+        match self.enqueue_configuration(snapshot.clone()) {
+            ConfigurationHandoff::Queued => None,
+            ConfigurationHandoff::Busy => {
+                self.deferred_configuration = Some(snapshot);
+                None
+            }
+            ConfigurationHandoff::Refused => Some(tr_format(
+                "error.apply_config",
+                &[("error", "configuration_handoff_unavailable")],
+            )),
+        }
     }
 
     /// Drops the pending configuration when the worker rejected it after a contained panic; the
@@ -3674,14 +3733,6 @@ fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: &Settings) {
         .store(false, Ordering::Release);
 }
 
-fn enqueue_configuration_reload(configuration: RuntimeConfiguration) -> bool {
-    APP_STATE.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .is_some_and(|state| state.enqueue_configuration(configuration))
-    })
-}
-
 fn finish_configuration_reload(hwnd: HWND) {
     let rejected = APP_STATE.with(|slot| {
         slot.borrow_mut()
@@ -3692,7 +3743,7 @@ fn finish_configuration_reload(hwnd: HWND) {
         show_configuration_error(
             hwnd,
             &tr_format(
-                "error.read_config",
+                "error.apply_config",
                 &[("error", "configuration_apply_failed")],
             ),
         );
@@ -3732,34 +3783,19 @@ fn reload_configuration_from_disk(hwnd: HWND) {
     }
 }
 
+/// Hands a configuration the loader finished, or one deferred on an earlier tick, to the worker.
 fn finish_configuration_load(hwnd: HWND) {
-    let result = APP_STATE.with(|slot| {
-        slot.borrow_mut()
+    let message = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        let loaded = state
+            .configuration_loader
             .as_mut()
-            .and_then(|state| state.configuration_loader.as_mut())
-            .and_then(RuntimeConfigurationLoader::poll)
+            .and_then(RuntimeConfigurationLoader::poll);
+        state.hand_off_configuration(loaded)
     });
-    let Some(result) = result else {
-        return;
-    };
-    let configuration = match result {
-        Ok(configuration) => configuration,
-        Err(error) => {
-            show_configuration_error(
-                hwnd,
-                &tr_format("error.read_config", &[("error", &error.to_string())]),
-            );
-            return;
-        }
-    };
-    if !enqueue_configuration_reload(configuration) {
-        show_configuration_error(
-            hwnd,
-            &tr_format(
-                "error.read_config",
-                &[("error", "configuration_handoff_unavailable")],
-            ),
-        );
+    if let Some(message) = message {
+        show_configuration_error(hwnd, &message);
     }
 }
 
@@ -4383,6 +4419,7 @@ pub fn run() -> Result<()> {
                 configuration_sources: initial_configuration.sources,
                 package_source: initial_configuration.package_source,
                 pending_configuration: None,
+                deferred_configuration: None,
                 configuration_loader: RuntimeConfigurationLoader::spawn().ok(),
                 lexicon_candidate,
                 lexicon_saves: LexiconSaves::new(),
@@ -12610,20 +12647,32 @@ mod tests {
         };
         let mut snapshot = test_reload_snapshot("private.exe");
         snapshot.package_source = source;
-        assert!(state.enqueue_configuration(snapshot));
-        assert!(!state.enqueue_configuration(test_reload_snapshot("lost-store.exe")));
+        assert_eq!(
+            state.enqueue_configuration(snapshot),
+            ConfigurationHandoff::Queued
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("lost-store.exe")),
+            ConfigurationHandoff::Refused
+        );
         let mut fork = test_reload_snapshot("fork.exe");
         fork.package_source = PackageSource::Managed {
             generation: 2,
             state_sha256: [2; 32],
         };
-        assert!(!state.enqueue_configuration(fork));
+        assert_eq!(
+            state.enqueue_configuration(fork),
+            ConfigurationHandoff::Refused
+        );
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
         processor.process(receiver.try_recv().unwrap());
         let published = state.publish_acknowledged_configuration().unwrap();
         assert_eq!(published.package_source, source);
         assert_eq!(state.package_source, source);
-        assert!(!state.enqueue_configuration(test_reload_snapshot("lost-store.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("lost-store.exe")),
+            ConfigurationHandoff::Refused
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -12825,12 +12874,18 @@ mod tests {
             if pending {
                 let mut snapshot = test_reload_snapshot("private.exe");
                 snapshot.sources = ConfigurationSources::UNIFIED;
-                assert!(state.enqueue_configuration(snapshot));
+                assert_eq!(
+                    state.enqueue_configuration(snapshot),
+                    ConfigurationHandoff::Queued
+                );
             } else {
                 state.configuration_sources = ConfigurationSources::UNIFIED;
             }
             let previous_revision = state.next_configuration_revision;
-            assert!(!state.enqueue_configuration(RuntimeConfiguration::default()));
+            assert_eq!(
+                state.enqueue_configuration(RuntimeConfiguration::default()),
+                ConfigurationHandoff::Refused
+            );
             assert_eq!(state.next_configuration_revision, previous_revision);
             assert_eq!(
                 state.metrics.configuration_pending.load(Ordering::Acquire),
@@ -12851,7 +12906,10 @@ mod tests {
     fn input_overflow_does_not_cancel_a_queued_configuration() {
         let (mut state, receiver) = test_gate_state(1);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Queued
+        );
         let queued_epoch = state.metrics.input_epoch.load(Ordering::Acquire);
         assert!(!state.enqueue(RawInputEvent::Mouse));
         assert!(state.metrics.input_epoch.load(Ordering::Acquire) > queued_epoch);
@@ -12874,8 +12932,14 @@ mod tests {
     fn a_failed_newer_reload_keeps_the_previous_pending_snapshot() {
         let (mut state, receiver) = test_gate_state(1);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("first.exe")));
-        assert!(!state.enqueue_configuration(test_reload_snapshot("second.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("first.exe")),
+            ConfigurationHandoff::Queued
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy
+        );
         assert!(state.metrics.configuration_pending.load(Ordering::Acquire));
         processor.process(receiver.try_recv().unwrap());
         let acknowledged = state.take_acknowledged_configuration().unwrap();
@@ -12888,7 +12952,10 @@ mod tests {
         let (mut state, receiver) = test_gate_state(1);
         drop(receiver);
         let original = state.settings.clone();
-        assert!(!state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Refused
+        );
         assert_eq!(state.settings, original);
         assert!(state.pending_configuration.is_none());
         assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
@@ -12898,9 +12965,18 @@ mod tests {
     fn rapid_reloads_require_latest_ack_and_bound_outstanding_snapshots() {
         let (mut state, receiver) = test_gate_state(4);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("first.exe")));
-        assert!(state.enqueue_configuration(test_reload_snapshot("second.exe")));
-        assert!(!state.enqueue_configuration(test_reload_snapshot("third.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("first.exe")),
+            ConfigurationHandoff::Queued
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Queued
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("third.exe")),
+            ConfigurationHandoff::Busy
+        );
         let first = receiver.try_recv().unwrap();
         processor.process(first.clone());
         assert!(state.take_acknowledged_configuration().is_none());
@@ -12922,7 +12998,10 @@ mod tests {
     fn pending_configuration_passes_hotkeys_and_suppresses_worker_buffering() {
         let (mut state, receiver) = test_gate_state(2);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Queued
+        );
         assert_eq!(
             contextual_hotkey_action(&state.metrics, WM_KEYDOWN, VK_PAUSE.0, 0),
             UndoHotkeyAction::PassThrough
@@ -12952,11 +13031,73 @@ mod tests {
     fn an_active_gate_prevents_configuration_handoff_without_losing_held_state() {
         let (mut state, receiver) = test_gate_state(2);
         state.correction_gate.activate(9);
-        assert!(!state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Busy
+        );
         assert!(state.correction_gate.active);
         assert_eq!(state.correction_gate.token, 9);
         assert!(receiver.try_recv().is_err());
         assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_configuration_the_worker_cannot_take_yet_is_handed_over_on_a_later_tick() {
+        // Apply in the settings while a correction gate holds keys: nothing to report, and the
+        // newest snapshot reaches the worker once the gate is over.
+        let (mut state, receiver) = test_gate_state(2);
+        state.correction_gate.activate(9);
+        let loaded = |name: &str| Some(Ok(test_reload_snapshot(name)));
+        assert_eq!(state.hand_off_configuration(loaded("first.exe")), None);
+        assert_eq!(state.hand_off_configuration(None), None);
+        // A newer load replaces the deferred snapshot.
+        assert_eq!(state.hand_off_configuration(loaded("second.exe")), None);
+        assert!(receiver.try_recv().is_err());
+        state.correction_gate.active = false;
+        assert_eq!(state.hand_off_configuration(None), None);
+        assert!(state.deferred_configuration.is_none());
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.process(receiver.try_recv().expect("the deferred reload"));
+        let published = state
+            .publish_acknowledged_configuration()
+            .expect("published");
+        assert!(published.process_exclusions.is_excluded("second.exe"));
+        assert!(!published.process_exclusions.is_excluded("first.exe"));
+        assert!(receiver.try_recv().is_err());
+        // Nothing deferred, nothing loaded: nothing happens.
+        assert_eq!(state.hand_off_configuration(None), None);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_a_failed_read_is_a_read_error_and_a_refused_snapshot_an_apply_error() {
+        let (mut state, receiver) = test_gate_state(2);
+        state.correction_gate.activate(9);
+        assert_eq!(
+            state.hand_off_configuration(Some(Ok(test_reload_snapshot("first.exe")))),
+            None
+        );
+        // The files changed again and cannot be read: the deferred snapshot is out of date.
+        let failed = std::io::Error::other("unreadable");
+        assert_eq!(
+            state.hand_off_configuration(Some(Err(failed))),
+            Some(tr_format("error.read_config", &[("error", "unreadable")]))
+        );
+        assert!(state.deferred_configuration.is_none());
+        state.correction_gate.active = false;
+        assert_eq!(state.hand_off_configuration(None), None);
+        assert!(receiver.try_recv().is_err());
+        // A worker that stopped for good can never take a configuration.
+        state.metrics.worker_dead.store(true, Ordering::Release);
+        assert_eq!(
+            state.hand_off_configuration(Some(Ok(test_reload_snapshot("second.exe")))),
+            Some(tr_format(
+                "error.apply_config",
+                &[("error", "configuration_handoff_unavailable")]
+            ))
+        );
+        assert!(state.deferred_configuration.is_none());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -13073,6 +13214,7 @@ mod tests {
             ),
             package_source: PackageSource::LegacyBootstrap,
             pending_configuration: None,
+            deferred_configuration: None,
             configuration_loader: None,
             lexicon_candidate: Arc::new(Mutex::new(None)),
             lexicon_saves: LexiconSaves::new(),

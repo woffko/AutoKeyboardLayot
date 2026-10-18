@@ -172,6 +172,7 @@
     "menu.settings": "Настройки…",
     "menu.exit": "Выход",
     "error.read_config": "Не удалось прочитать конфигурацию: {error}",
+    "error.apply_config": "Не удалось применить новую конфигурацию: {error}",
     "error.read_config_hint": "Папка: {folder}\n\nВаши настройки хранятся в файле config.ini в этой папке. Чтобы запустить программу с настройками по умолчанию, переместите этот файл в другое место и запустите программу снова. Если рядом есть копия с именем вида config.schema-1.bak, переименуйте её в config.ini, чтобы вернуть прежние настройки. Если в папке есть и файлы settings.ini, user_dictionary.txt, word_exclusions.txt или exclusions.txt от прежней версии, переместите и их: без config.ini программа читает их.",
     "error.save_config": "Не удалось сохранить: {error}",
     "error.invalid_hotkey": "Недопустимая горячая клавиша: {error}",

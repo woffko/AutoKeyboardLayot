@@ -175,6 +175,7 @@
     "menu.settings": "सेटिंग्स…",
     "menu.exit": "बाहर निकलें",
     "error.read_config": "कॉन्फ़िगरेशन नहीं पढ़ा जा सका: {error}",
+    "error.apply_config": "नया कॉन्फ़िगरेशन लागू नहीं किया जा सका: {error}",
     "error.read_config_hint": "फ़ोल्डर: {folder}\n\nआपकी सेटिंग इस फ़ोल्डर की config.ini फ़ाइल में सहेजी जाती हैं। डिफ़ॉल्ट सेटिंग के साथ शुरू करने के लिए उस फ़ाइल को कहीं और ले जाएँ और प्रोग्राम को फिर से शुरू करें। यदि उसके पास config.schema-1.bak जैसे नाम की कोई प्रति मौजूद है, तो उसका नाम बदलकर config.ini करने पर पिछली सेटिंग वापस आ जाती हैं। अगर फ़ोल्डर में पुराने संस्करण की settings.ini, user_dictionary.txt, word_exclusions.txt या exclusions.txt फ़ाइलें भी हैं, तो उन्हें भी दूसरी जगह ले जाएँ: config.ini के बिना उन्हीं को पढ़ा जाता है।",
     "error.save_config": "सहेजा नहीं जा सका: {error}",
     "error.invalid_hotkey": "अमान्य कीबोर्ड शॉर्टकट: {error}",

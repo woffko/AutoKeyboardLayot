@@ -175,6 +175,7 @@
     "menu.settings": "সেটিংস…",
     "menu.exit": "প্রস্থান",
     "error.read_config": "কনফিগারেশন পড়া যায়নি: {error}",
+    "error.apply_config": "নতুন কনফিগারেশন প্রয়োগ করা যায়নি: {error}",
     "error.read_config_hint": "ফোল্ডার: {folder}\n\nআপনার সেটিংস এই ফোল্ডারের config.ini ফাইলে সংরক্ষিত থাকে। ডিফল্ট সেটিংস নিয়ে শুরু করতে ফাইলটি অন্য কোথাও সরিয়ে প্রোগ্রামটি আবার চালু করুন। পাশে config.schema-1.bak-এর মতো নামের কোনো কপি থাকলে সেটির নাম config.ini করে দিলে আগের সেটিংস ফিরে আসবে। ফোল্ডারে যদি পুরোনো সংস্করণের settings.ini, user_dictionary.txt, word_exclusions.txt বা exclusions.txt ফাইলও থাকে, সেগুলোও অন্য জায়গায় সরিয়ে দিন: config.ini না থাকলে সেগুলোই পড়া হয়।",
     "error.save_config": "সংরক্ষণ করা যায়নি: {error}",
     "error.invalid_hotkey": "অবৈধ কীবোর্ড শর্টকাট: {error}",

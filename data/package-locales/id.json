@@ -175,6 +175,7 @@
     "menu.settings": "Pengaturan…",
     "menu.exit": "Keluar",
     "error.read_config": "Tidak dapat membaca konfigurasi: {error}",
+    "error.apply_config": "Tidak dapat menerapkan konfigurasi baru: {error}",
     "error.read_config_hint": "Folder: {folder}\n\nPengaturan Anda disimpan di config.ini dalam folder ini. Untuk memulai dengan pengaturan default, pindahkan file itu ke tempat lain lalu jalankan program lagi. Jika ada salinan bernama seperti config.schema-1.bak di sebelahnya, mengganti namanya menjadi config.ini akan memulihkan pengaturan sebelumnya. Jika di folder itu juga ada settings.ini, user_dictionary.txt, word_exclusions.txt, atau exclusions.txt dari versi lama, pindahkan juga: tanpa config.ini, file-file itulah yang dibaca.",
     "error.save_config": "Tidak dapat menyimpan: {error}",
     "error.invalid_hotkey": "Pintasan keyboard tidak valid: {error}",

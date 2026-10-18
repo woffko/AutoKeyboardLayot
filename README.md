@@ -406,7 +406,13 @@ worker is contained. Typing is not affected: the event is passed on untouched,
 keys held by the correction gate are released unchanged (or kept for recovery when
 the input field changed meanwhile), automatic conversion is paused and a tray notice
 points to `crash.log`. A configuration reload whose application panicked is
-rejected with a notice, and the previous settings stay in force. If the worker
+rejected with a notice, and the previous settings stay in force. A reload that the
+worker cannot take at that moment (a correction gate or retained keys, two reloads it
+has not acknowledged yet, a full queue) is kept and handed over on a later timer tick,
+and a newer save replaces it; earlier builds reported it as an unreadable configuration
+and dropped it. Only a configuration that cannot be read is reported as a read error;
+one the agent can never apply (its worker stopped, or it would take back a
+configuration file or a package generation) is reported as such. If the worker
 panics three times within a minute it stops, which is reported once and turned into
 a prompt when Exit is chosen; retained input can then only be deleted, not
 recovered. A tray Exit that is declined (an active correction gate,
