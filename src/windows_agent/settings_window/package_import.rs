@@ -28,6 +28,17 @@ enum ImportFailure {
     Prepare,
     /// The chosen file is not a valid package.
     File,
+    /// The chosen file cannot be read.
+    Unreadable,
+    /// A newer revision of the package is or was installed.
+    Older,
+    /// The inventory holds the revision with other content, or the same components in another
+    /// package.
+    Conflict,
+    /// No more optional packages fit.
+    Capacity,
+    /// The English base is built in.
+    ProtectedBase,
     /// The settings changed outside this window; migration was aborted.
     Migration,
     /// The catalog state is gone or the selection is invalid.
@@ -47,6 +58,11 @@ impl ImportFailure {
             Self::Snapshot => "import.failure.snapshot",
             Self::Prepare => "import.failure.prepare",
             Self::File => "import.failure.file",
+            Self::Unreadable => "import.failure.unreadable",
+            Self::Older => "import.failure.older",
+            Self::Conflict => "import.failure.conflict",
+            Self::Capacity => "import.failure.capacity",
+            Self::ProtectedBase => "import.failure.protected",
             Self::Migration => "import.failure.migration",
             Self::Catalog => "import.failure.catalog",
             Self::OutcomeUnknown => "package.uncertain",
@@ -81,6 +97,35 @@ impl OnlineFailure {
             Self::Code(code) => tr_format("download.failed", &[("code", code)]),
         }
     }
+}
+
+/// Why a chosen package file cannot be installed: a file that fails verification is no valid
+/// package, and a refusal of the inventory says what it refuses.
+fn import_failure(error: &StoreError) -> ImportFailure {
+    use autokeyboardlayot::package_inventory::InventoryError;
+    match error {
+        StoreError::Io(_) => ImportFailure::Unreadable,
+        StoreError::Busy | StoreError::StaleSnapshot => ImportFailure::Snapshot,
+        StoreError::Inventory(InventoryError::Rollback) => ImportFailure::Older,
+        StoreError::Inventory(
+            InventoryError::RevisionConflict
+            | InventoryError::OwnershipConflict
+            | InventoryError::DuplicatePackage,
+        ) => ImportFailure::Conflict,
+        StoreError::Inventory(InventoryError::TooLarge) => ImportFailure::Capacity,
+        StoreError::Inventory(InventoryError::ProtectedBase) => ImportFailure::ProtectedBase,
+        StoreError::Inventory(_) => ImportFailure::Prepare,
+        _ => ImportFailure::File,
+    }
+}
+
+/// Prepares the installation of the package file at `path` into `store`.
+fn prepare_import(store: &PackageStore, path: &Path) -> Result<Completed, ImportFailure> {
+    let trust = PackageTrust::release().map_err(|_| ImportFailure::Prepare)?;
+    let snapshot = store.load(&trust).map_err(|_| ImportFailure::Snapshot)?;
+    PreparedImport::from_file(path, &snapshot, &trust)
+        .map(|prepared| Completed::Prepared(Box::new(prepared)))
+        .map_err(|error| import_failure(&error))
 }
 
 /// What the store's answer to a confirmation means for the window.
@@ -514,14 +559,7 @@ pub(super) fn wire(
         state.pending = None;
         ui.set_package_import_ready(false);
         ui.set_package_import_preview(SharedString::default());
-        start(&ui, &mut state, move || {
-            let store = store()?;
-            let trust = PackageTrust::release().map_err(|_| ImportFailure::Prepare)?;
-            let snapshot = store.load(&trust).map_err(|_| ImportFailure::Snapshot)?;
-            PreparedImport::from_file(&path, &snapshot, &trust)
-                .map(|prepared| Completed::Prepared(Box::new(prepared)))
-                .map_err(|_| ImportFailure::File)
-        });
+        start(&ui, &mut state, move || prepare_import(&store()?, &path));
     });
 
     let weak = ui.as_weak();
@@ -1015,6 +1053,77 @@ mod tests {
         assert!(!expired.contains('{'), "{expired}");
         let generic = OnlineFailure::Code("package_install_Cancelled".into()).status_text();
         assert!(generic.contains("package_install_Cancelled"), "{generic}");
+    }
+
+    #[test]
+    fn a_package_the_inventory_refuses_says_why_and_is_no_invalid_file() {
+        use autokeyboardlayot::{
+            language_package::PackageError, package_inventory::InventoryError,
+        };
+        for (error, failure) in [
+            (
+                StoreError::Package(PackageError::InvalidSignature),
+                ImportFailure::File,
+            ),
+            (StoreError::InvalidFile, ImportFailure::File),
+            (
+                StoreError::Io(std::io::Error::other("locked")),
+                ImportFailure::Unreadable,
+            ),
+            (
+                StoreError::Inventory(InventoryError::Rollback),
+                ImportFailure::Older,
+            ),
+            (
+                StoreError::Inventory(InventoryError::RevisionConflict),
+                ImportFailure::Conflict,
+            ),
+            (
+                StoreError::Inventory(InventoryError::OwnershipConflict),
+                ImportFailure::Conflict,
+            ),
+            (
+                StoreError::Inventory(InventoryError::TooLarge),
+                ImportFailure::Capacity,
+            ),
+            (
+                StoreError::Inventory(InventoryError::ProtectedBase),
+                ImportFailure::ProtectedBase,
+            ),
+            (StoreError::Busy, ImportFailure::Snapshot),
+        ] {
+            let case = error.to_string();
+            assert_eq!(import_failure(&error), failure, "{case}");
+        }
+        // Each reason has a message of its own.
+        let messages: BTreeSet<_> = [
+            ImportFailure::File,
+            ImportFailure::Unreadable,
+            ImportFailure::Older,
+            ImportFailure::Conflict,
+            ImportFailure::Capacity,
+            ImportFailure::ProtectedBase,
+        ]
+        .into_iter()
+        .map(|failure| tr(failure.key()))
+        .collect();
+        assert_eq!(messages.len(), 6);
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("import.failure"))
+        );
+        // Preparing an import: a file that cannot be read, and one that is no package.
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+        let failure = |path: &Path| prepare_import(&store, path).err();
+        assert_eq!(
+            failure(&directory.path().join("missing.aklp")),
+            Some(ImportFailure::Unreadable)
+        );
+        let garbage = directory.path().join("garbage.aklp");
+        std::fs::write(&garbage, b"not a package").unwrap();
+        assert_eq!(failure(&garbage), Some(ImportFailure::File));
     }
 
     #[test]
