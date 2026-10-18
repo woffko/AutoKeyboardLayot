@@ -102,8 +102,8 @@ use windows::{
                 VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
             },
             Shell::{
-                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-                NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFY_ICON_MESSAGE,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD,
+                NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFY_ICON_MESSAGE,
                 NOTIFYICON_VERSION_4, NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
                 SHQueryUserNotificationState, Shell_NotifyIconW,
             },
@@ -4070,7 +4070,8 @@ impl TrayIcon {
     fn add(hwnd: HWND, indicator: LayoutIndicator) -> Result<Self> {
         let icon = create_indicator_icon(TrayVisual::Disabled, indicator)?;
         let mut data = notify_icon_data(hwnd, icon);
-        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        // With NOTIFYICON_VERSION_4 the shell shows the tooltip only when every call asks for it.
+        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
         let tooltip = tray_tooltip(TrayStatus::initial(indicator));
         set_tooltip(&mut data, &tooltip);
@@ -4112,6 +4113,7 @@ impl TrayIcon {
         let icon = new_icon.unwrap_or(self.icon);
         let mut data = notify_icon_data(self.hwnd, icon);
         data.uFlags = NIF_TIP
+            | NIF_SHOWTIP
             | if visual_changed {
                 NIF_ICON
             } else {
@@ -11780,7 +11782,7 @@ fn show_tray_information(hwnd: HWND, title: impl AsRef<str>, message: impl AsRef
         return;
     };
     let mut data = notify_icon_data(hwnd, icon);
-    data.uFlags = NIF_INFO;
+    data.uFlags = NIF_INFO | NIF_SHOWTIP;
     data.dwInfoFlags = NIIF_INFO;
     set_wide_text(&mut data.szInfoTitle, title.as_ref());
     set_wide_text(&mut data.szInfo, message.as_ref());
@@ -14581,10 +14583,11 @@ mod tests {
         assert_ne!(rasters[1], rasters[2]);
     }
 
-    /// One call to the scripted notification area.
+    /// One call to the scripted notification area: the message and its flags.
     #[derive(Debug, Clone)]
     struct ShellCall {
         message: NOTIFY_ICON_MESSAGE,
+        flags: windows::Win32::UI::Shell::NOTIFY_ICON_DATA_FLAGS,
     }
 
     /// A notification area for the tray code of the calling thread. It records every call, keeps
@@ -14611,7 +14614,10 @@ mod tests {
         let (answer, failure, during) = SCRIPTED_SHELL.with(|slot| {
             let mut slot = slot.borrow_mut();
             let shell = slot.as_mut()?;
-            shell.calls.push(ShellCall { message });
+            shell.calls.push(ShellCall {
+                message,
+                flags: data.uFlags,
+            });
             let during = shell
                 .during
                 .take_if(|(expected, _)| *expected == message)
@@ -14679,6 +14685,34 @@ mod tests {
         assert!(shell.icons.is_empty());
         let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
         assert_eq!(messages, [NIM_ADD, NIM_SETVERSION, NIM_DELETE]);
+    }
+
+    #[test]
+    fn every_icon_call_asks_the_shell_for_the_standard_tooltip() {
+        let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            let mut tray = TrayIcon::add(HWND::default(), LayoutIndicator::English).expect("add");
+            let status = TrayStatus {
+                auto_enabled: true,
+                ..TrayStatus::initial(LayoutIndicator::Russian)
+            };
+            tray.update(status).expect("update");
+            // A balloon is a modify call too.
+            let (mut state, _receiver) = test_gate_state(1);
+            state.tray = Some(tray);
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            show_tray_information(HWND::default(), "AutoKeyboardLayot", "notice");
+            drop(take_app_state());
+        });
+        let calls: Vec<_> = shell
+            .calls
+            .iter()
+            .filter(|call| [NIM_ADD, NIM_MODIFY].contains(&call.message))
+            .map(|call| (call.message, call.flags.contains(NIF_SHOWTIP)))
+            .collect();
+        assert_eq!(
+            calls,
+            [(NIM_ADD, true), (NIM_MODIFY, true), (NIM_MODIFY, true)]
+        );
     }
 
     #[test]

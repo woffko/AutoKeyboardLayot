@@ -475,6 +475,11 @@ the same, nothing was typed or clicked since and no modifier key is held, no
 password field or excluded or elevated program was found, and the worker is not
 inside an edit that may have selected or typed text (`phase=recovery_handed_back`).
 
+The tray icon's tooltip shows the mode (or the safety pause and its reason), the
+layout code and the counters. The icon uses version 4 of the notification-area protocol,
+under which the shell shows the standard tooltip only when every call asks for it; earlier
+builds did not ask, so hovering over the icon showed nothing.
+
 The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
 the tray icon is added again, and if Explorer is not ready yet the addition is
 retried with a growing delay. Unlocking the session, reconnecting and resuming
