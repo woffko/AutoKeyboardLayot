@@ -141,13 +141,17 @@ that nobody has reviewed.
    | | |
    |---|---|
    | `THIRD-PARTY-NOTICES.txt` | `4c62f14d32631cc6f16051201ec7bf83cb8a9fbe6e2403cf307e9c35f1568ae1` |
-   | `notices-report.json` | `83d23861b676235c3d5026c7ddf0278d55ce0071c693f07c12c3177ff28552b4` |
+   | `notices-report.json` | `876e883cf54bd0cdc644c13a1c039f7d723f4eb1b1b141c40072f34715454291` |
    | build receipt | `1d3799ef53a07499f7c7eeddda65fa1b6cc6eba29e3144c2234cdcb4fee2aa2f` |
    | `Cargo.toml` | `a401b5b767fbf0c984f0f119243ff04b3ce00cb012860c937206d98673322bb1` |
    | `Cargo.lock` | `2c251fec8048fadbfe737220fad2f01de0eac9713fce82b8d1f5fe2b3aa0a3b6` |
 
-   Files: `target/base-notices-complete-20261003-01/` and
-   `target/base-build-receipt-20261003-01.json` (not tracked; `target/` is local). The 339
+   Files: `target/base-notices-complete-20261018-01/` and
+   `target/base-build-receipt-20261003-01.json` (not tracked; `target/` is local). The notices were
+   regenerated on 2026-10-18 because the report now also records the SHA-256 of the bundled data
+   notices, which the installer build compares with the checkout; `THIRD-PARTY-NOTICES.txt` came out
+   byte for byte the reviewed file, and the earlier report (`target/base-notices-complete-20261003-01/`,
+   SHA-256 `83d23861…`) lacks that record, so the build refuses it. The 339
    third-party packages all have license text, and `missing` is empty.
 
    What changed since the notices of the previous installer (SHA-256
@@ -164,7 +168,7 @@ that nobody has reviewed.
 
    ```sh
    python3 tools/build_experimental_installer.py --output target/installer-0.1.1 \
-     --notice-directory target/base-notices-complete-20261003-01 \
+     --notice-directory target/base-notices-complete-20261018-01 \
      --build-receipt target/base-build-receipt-20261003-01.json \
      --notice-sha256 REVIEWED_NOTICE_SHA256 \
      --iscc PATH_TO_ISCC.exe

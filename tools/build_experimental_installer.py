@@ -9,6 +9,7 @@ import tomllib
 import os
 
 import authenticode_hook
+import collect_dependency_notices
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -38,6 +39,7 @@ if (not report['complete_text_collection'] or report['missing']
         or report['cargo_lock_sha256'] != digest(root / 'Cargo.lock')
         or report['build_receipt_sha256'] != hashlib.sha256(base_raw).hexdigest()
         or base['cargo_toml_sha256'] != digest(root / 'Cargo.toml')
+        or not collect_dependency_notices.bundled_data_notices_current(root, report)
         or len(args.notice_sha256) != 64
         or any(c not in '0123456789abcdef' for c in args.notice_sha256)
         or digest(notices) != args.notice_sha256):
