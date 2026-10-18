@@ -2,7 +2,7 @@
 //! Starts only with every keyboard key released; consumed modifier downs and
 //! ups stay paired. No synthetic input, text log or global persistent recorder.
 use super::super::ui_localization::{tr, tr_format};
-use super::super::{acceptance_typing, current_foreground_context, hotkey_modifier_bit};
+use super::super::{current_foreground_context, hotkey_modifier_bit};
 use super::{Hotkey, SettingsWindow, set_ui_hotkey};
 use autokeyboardlayot::{HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN};
 use slint::ComponentHandle;
@@ -364,8 +364,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    // Test builds take the desktop acceptance's marked typing as the user's.
-    if event.flags.contains(LLKHF_INJECTED) && !acceptance_typing(event.dwExtraInfo) {
+    if event.flags.contains(LLKHF_INJECTED) {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     if ABORT_CAPTURE.with(Cell::get) || !owns_foreground() {
