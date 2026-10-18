@@ -13822,14 +13822,19 @@ mod tests {
     }
 
     #[test]
-    fn a_later_implicit_close_keeps_the_explicit_exit_mark() {
+    fn an_implicit_close_never_sets_the_explicit_exit_mark_and_never_clears_it() {
         EXPLICIT_SHUTDOWN.store(false, Ordering::Release);
-        for explicit in [true, false] {
+        // Accepted every time: an installer's close first, then the tray menu Exit, then another
+        // close. Only the tray menu sets the mark, and nothing clears it.
+        for (explicit, marked) in [(false, false), (true, true), (false, true)] {
             let (state, _receiver) = test_gate_state(4);
             APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
             request_shutdown(HWND::default(), explicit);
-            // Accepted both times; only the tray menu sets the mark and nothing clears it.
-            assert!(EXPLICIT_SHUTDOWN.load(Ordering::Acquire));
+            assert_eq!(
+                EXPLICIT_SHUTDOWN.load(Ordering::Acquire),
+                marked,
+                "explicit={explicit}"
+            );
             drop(take_app_state());
         }
         EXPLICIT_SHUTDOWN.store(false, Ordering::Release);
