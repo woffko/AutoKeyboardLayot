@@ -128,16 +128,51 @@ pub(super) fn run() -> Result<(), String> {
     populate_ui(&ui, &document, &packages.dictionaries);
     let _import_timer = wire_callbacks(&ui, document, packages.dictionaries);
     ui.show().map_err(|error| error.to_string())?;
-    let native_window = own_settings_window();
-    if let Some(window) = native_window {
-        super::installer_lifecycle::advertise_safe_close(window);
-    }
+    // winit creates the native window only once the event loop runs: the installer's graceful
+    // close is advertised on one of its first ticks.
+    let advertiser = std::rc::Rc::new(slint::Timer::default());
+    let done = std::rc::Rc::downgrade(&advertiser);
+    advertiser.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(20),
+        move || {
+            if advertise_graceful_close()
+                && let Some(timer) = done.upgrade()
+            {
+                timer.stop();
+            }
+        },
+    );
     let result = ui.run().map_err(|error| error.to_string());
-    if let Some(window) = native_window {
-        super::installer_lifecycle::remove_safe_close(window);
-    }
+    retract_graceful_close();
     hotkey_capture::stop();
     result
+}
+
+thread_local! {
+    /// The settings window while it advertises the installer's graceful close.
+    static GRACEFUL_CLOSE: std::cell::Cell<Option<HWND>> = const { std::cell::Cell::new(None) };
+}
+
+/// Advertises the installer's graceful close on this process's settings window once its native
+/// window exists; true when it is advertised.
+fn advertise_graceful_close() -> bool {
+    if GRACEFUL_CLOSE.get().is_some() {
+        return true;
+    }
+    let Some(window) = own_settings_window() else {
+        return false;
+    };
+    super::installer_lifecycle::advertise_safe_close(window);
+    GRACEFUL_CLOSE.set(Some(window));
+    true
+}
+
+/// Takes the graceful close back while the window still exists, before the event loop ends.
+fn retract_graceful_close() {
+    if let Some(window) = GRACEFUL_CLOSE.take() {
+        super::installer_lifecycle::remove_safe_close(window);
+    }
 }
 
 /// This process's settings window, once its native window exists.
@@ -397,6 +432,7 @@ fn wire_callbacks(
             return slint::CloseRequestResponse::KeepWindowShown;
         }
         hotkey_capture::stop();
+        retract_graceful_close();
         slint::CloseRequestResponse::HideWindow
     });
     let registry = std::rc::Rc::new(std::cell::RefCell::new(registry));
@@ -597,6 +633,7 @@ fn wire_callbacks(
             tr("settings.saved_agent_unavailable").into()
         });
         if close_after_save {
+            retract_graceful_close();
             let _ = slint::quit_event_loop();
         }
     });
@@ -610,6 +647,7 @@ fn wire_callbacks(
             return;
         }
         hotkey_capture::stop();
+        retract_graceful_close();
         let _ = slint::quit_event_loop();
     });
 
