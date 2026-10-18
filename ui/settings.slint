@@ -15,6 +15,8 @@ component DirectionalButtonPair inherits DirectionalRow {
     in property <string> first-text;
     in property <string> second-text;
     in property <bool> enabled: true;
+    in property <bool> first-enabled: root.enabled;
+    in property <bool> second-enabled: root.enabled;
     callback first-clicked;
     callback second-clicked;
     private property <bool> stacked: first.preferred-width + second.preferred-width + root.spacing > root.width;
@@ -22,7 +24,7 @@ component DirectionalButtonPair inherits DirectionalRow {
 
     first := Button {
         text: root.first-text;
-        enabled: root.enabled;
+        enabled: root.first-enabled;
         width: min(self.preferred-width, parent.width);
         height: self.preferred-height;
         x: Localization.rtl ? parent.width - self.width : 0px;
@@ -30,7 +32,7 @@ component DirectionalButtonPair inherits DirectionalRow {
     }
     second := Button {
         text: root.second-text;
-        enabled: root.enabled;
+        enabled: root.second-enabled;
         width: min(self.preferred-width, parent.width);
         height: self.preferred-height;
         x: root.stacked ? (Localization.rtl ? parent.width - self.width : 0px)
@@ -308,6 +310,27 @@ export global Localization {
     pure callback text(string, int) -> string;
 }
 
+// The mark of a language row: filled and ticked while the language takes part.
+component LanguageMark inherits Rectangle {
+    in property <bool> checked;
+    width: 20px;
+    height: 20px;
+    border-width: 1px;
+    border-color: root.checked ? Palette.accent-background : Palette.border;
+    border-radius: 4px;
+    background: root.checked ? Palette.accent-background : Palette.background;
+    UiText {
+        width: parent.width;
+        height: parent.height;
+        text: root.checked ? "✓" : "";
+        color: Palette.accent-foreground;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+}
+
 component LanguageRow inherits Rectangle {
     in property <string> name;
     in property <string> status;
@@ -329,28 +352,13 @@ component LanguageRow inherits Rectangle {
     accessible-checked: root.checked;
     accessible-action-default => { root.toggled(!root.checked); }
 
-    HorizontalLayout {
+    // A right-to-left interface mirrors the row: the mark at the right edge, the profile picker
+    // at the left one, where it would otherwise cover the mark.
+    if !Localization.rtl: HorizontalLayout {
         padding-left: 12px;
         padding-right: root.has-profile ? root.picker-width + 24px : 12px;
         spacing: 10px;
-        Rectangle {
-            width: 20px;
-            height: 20px;
-            border-width: 1px;
-            border-color: root.checked ? Palette.accent-background : Palette.border;
-            border-radius: 4px;
-            background: root.checked ? Palette.accent-background : Palette.background;
-            UiText {
-                width: parent.width;
-                height: parent.height;
-                text: root.checked ? "✓" : "";
-                color: Palette.accent-foreground;
-                font-size: 13px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                accessible-role: none;
-            }
-        }
+        LanguageMark { checked: root.checked; }
         UiText {
             text: root.name;
             color: Palette.foreground;
@@ -364,6 +372,25 @@ component LanguageRow inherits Rectangle {
             font-size: 12px;
             vertical-alignment: center;
         }
+    }
+    if Localization.rtl: HorizontalLayout {
+        padding-left: root.has-profile ? root.picker-width + 24px : 12px;
+        padding-right: 12px;
+        spacing: 10px;
+        UiText {
+            text: root.status;
+            color: Palette.foreground;
+            opacity: 0.6;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        UiText {
+            text: root.name;
+            color: Palette.foreground;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+        }
+        LanguageMark { checked: root.checked; }
     }
     TouchArea {
         // Keep the profile picker area clickable; the row toggle covers the rest.
@@ -724,24 +751,20 @@ export component SettingsWindow inherits Window {
                                 spacing: 8px;
                                 UiText { text: Localization.text("languages.add_title", Localization.revision); color: Palette.foreground; font-size: 16px; font-weight: 600; }
                                 UiText { text: Localization.text("languages.add_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
-                                HorizontalLayout {
+                                DirectionalButtonPair {
                                     spacing: 10px;
-                                    Button {
-                                        text: Localization.text("languages.add_button", Localization.revision);
-                                        enabled: root.package-import-allowed && !root.package-import-busy;
-                                        clicked => {
-                                            // The dialog shows the messages of what happens in it.
-                                            root.status-text = "";
-                                            root.status-error = false;
-                                            root.add-language-visible = true;
-                                            if (!root.download-catalog-ready && !root.package-import-ready) { root.check-download-catalog(); }
-                                        }
+                                    first-text: Localization.text("languages.add_button", Localization.revision);
+                                    first-enabled: root.package-import-allowed && !root.package-import-busy;
+                                    second-text: Localization.text("remove.refresh", Localization.revision);
+                                    second-enabled: !root.package-import-busy;
+                                    first-clicked => {
+                                        // The dialog shows the messages of what happens in it.
+                                        root.status-text = "";
+                                        root.status-error = false;
+                                        root.add-language-visible = true;
+                                        if (!root.download-catalog-ready && !root.package-import-ready) { root.check-download-catalog(); }
                                     }
-                                    Button {
-                                        text: Localization.text("remove.refresh", Localization.revision);
-                                        enabled: !root.package-import-busy;
-                                        clicked => { root.refresh-packages(); }
-                                    }
+                                    second-clicked => { root.refresh-packages(); }
                                 }
                             }
                         }
@@ -789,9 +812,13 @@ export component SettingsWindow inherits Window {
                                             }
                                         }
                                         LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 180px; accessible-name: Localization.text(root.package-migration ? "migration.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); }
-                                        HorizontalLayout {
-                                            Button { text: Localization.text(root.package-migration ? "migration.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision); enabled: !root.package-import-busy; clicked => { root.confirm-package(); } }
-                                            Button { text: Localization.text("button.cancel", Localization.revision); enabled: !root.package-import-busy; clicked => { root.cancel-package(); } }
+                                        DirectionalButtonPair {
+                                            spacing: 10px;
+                                            enabled: !root.package-import-busy;
+                                            first-text: Localization.text(root.package-migration ? "migration.confirm" : root.package-removal ? "remove.confirm" : root.package-rollback ? "rollback.confirm" : "import.confirm", Localization.revision);
+                                            second-text: Localization.text("button.cancel", Localization.revision);
+                                            first-clicked => { root.confirm-package(); }
+                                            second-clicked => { root.cancel-package(); }
                                         }
                                     }
                                 }
@@ -958,12 +985,22 @@ export component SettingsWindow inherits Window {
                                 read-only: root.package-import-busy || root.download-catalog-ready || root.package-import-ready;
                                 accessible-name: Localization.text("download.repository", Localization.revision);
                             }
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Button { text: Localization.text("download.check", Localization.revision); enabled: root.package-import-allowed && !root.package-import-busy && !root.package-import-ready; clicked => { root.check-download-catalog(); } }
+                            DirectionalRow {
+                                height: check-button.preferred-height;
+                                check-button := Button {
+                                    text: Localization.text("download.check", Localization.revision);
+                                    enabled: root.package-import-allowed && !root.package-import-busy && !root.package-import-ready;
+                                    width: min(self.preferred-width, parent.width);
+                                    height: parent.height;
+                                    x: Localization.rtl ? parent.width - self.width : 0px;
+                                    clicked => { root.check-download-catalog(); }
+                                }
                                 if root.download-active: Button {
                                     text: Localization.text(root.download-cancelling ? "download.cancelling" : "download.cancel", Localization.revision);
                                     enabled: !root.download-cancelling;
+                                    width: self.preferred-width;
+                                    height: parent.height;
+                                    x: Localization.rtl ? check-button.x - parent.spacing - self.width : check-button.width + parent.spacing;
                                     clicked => { root.cancel-download(); }
                                 }
                             }
@@ -983,10 +1020,14 @@ export component SettingsWindow inherits Window {
                                     if !row.has-input: UiText { text: Localization.text("download.ui_only", Localization.revision); wrap: word-wrap; color: Palette.foreground; opacity: 0.75; font-size: 12px; }
                                     if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
                                 }
-                                HorizontalLayout {
+                                DirectionalButtonPair {
                                     spacing: 10px;
-                                    Button { text: Localization.text("download.start", Localization.revision); enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready; clicked => { root.start-selected-download(); } }
-                                    Button { text: Localization.text("download.discard", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready; clicked => { root.discard-download-catalog(); } }
+                                    first-text: Localization.text("download.start", Localization.revision);
+                                    first-enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready;
+                                    second-text: Localization.text("download.discard", Localization.revision);
+                                    second-enabled: !root.package-import-busy && !root.package-import-ready;
+                                    first-clicked => { root.start-selected-download(); }
+                                    second-clicked => { root.discard-download-catalog(); }
                                 }
                             }
 
@@ -1001,10 +1042,13 @@ export component SettingsWindow inherits Window {
                                     selected(value) => { root.preview-review-package(self.current-index); }
                                 }
                                 LocalizedTextEdit { text: root.package-import-preview; read-only: true; height: 150px; accessible-name: Localization.text("download.confirm", Localization.revision); }
-                                HorizontalLayout {
+                                DirectionalButtonPair {
                                     spacing: 10px;
-                                    Button { text: Localization.text("download.confirm", Localization.revision); enabled: !root.package-import-busy; clicked => { root.confirm-package(); } }
-                                    Button { text: Localization.text("button.cancel", Localization.revision); enabled: !root.package-import-busy; clicked => { root.cancel-package(); } }
+                                    enabled: !root.package-import-busy;
+                                    first-text: Localization.text("download.confirm", Localization.revision);
+                                    second-text: Localization.text("button.cancel", Localization.revision);
+                                    first-clicked => { root.confirm-package(); }
+                                    second-clicked => { root.cancel-package(); }
                                 }
                             }
                         }
@@ -1017,9 +1061,16 @@ export component SettingsWindow inherits Window {
                         color: root.status-error ? #c42b1c : Palette.foreground;
                         wrap: word-wrap;
                     }
-                    HorizontalLayout {
-                        Rectangle { horizontal-stretch: 1; }
-                        Button { text: Localization.text("add_language.close", Localization.revision); enabled: !root.package-import-busy; clicked => { root.add-language-visible = false; } }
+                    DirectionalRow {
+                        height: close-button.preferred-height;
+                        close-button := Button {
+                            text: Localization.text("add_language.close", Localization.revision);
+                            enabled: !root.package-import-busy;
+                            width: self.preferred-width;
+                            height: parent.height;
+                            x: Localization.rtl ? 0px : parent.width - self.width;
+                            clicked => { root.add-language-visible = false; }
+                        }
                     }
                 }
             }
