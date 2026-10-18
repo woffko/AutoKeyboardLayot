@@ -14853,14 +14853,15 @@ mod tests {
         assert_ne!(rasters[1], rasters[2]);
     }
 
-    /// One call to the scripted notification area: the message, its flags, the icon image and
-    /// the tooltip.
+    /// One call to the scripted notification area: the message, its flags, the icon image, the
+    /// tooltip and the answer.
     #[derive(Debug, Clone)]
     struct ShellCall {
         message: NOTIFY_ICON_MESSAGE,
         flags: windows::Win32::UI::Shell::NOTIFY_ICON_DATA_FLAGS,
         icon: usize,
         tip: String,
+        answer: bool,
     }
 
     /// A notification area for the tray code of the calling thread. It records every call, keeps
@@ -14873,6 +14874,8 @@ mod tests {
         failures: VecDeque<(NOTIFY_ICON_MESSAGE, windows::Win32::Foundation::WIN32_ERROR)>,
         /// Runs inside the next call of the message, like a message that the call dispatches.
         during: Option<(NOTIFY_ICON_MESSAGE, Box<dyn FnOnce()>)>,
+        /// Passes every call on to the real notification area and records its answer.
+        real: bool,
     }
 
     thread_local! {
@@ -14892,15 +14895,9 @@ mod tests {
         message: NOTIFY_ICON_MESSAGE,
         data: &NOTIFYICONDATAW,
     ) -> Option<bool> {
-        let (answer, failure, during) = SCRIPTED_SHELL.with(|slot| {
+        let (real, failure, during) = SCRIPTED_SHELL.with(|slot| {
             let mut slot = slot.borrow_mut();
             let shell = slot.as_mut()?;
-            shell.calls.push(ShellCall {
-                message,
-                flags: data.uFlags,
-                icon: data.hIcon.0 as usize,
-                tip: wide_text(&data.szTip),
-            });
             let during = shell
                 .during
                 .take_if(|(expected, _)| *expected == message)
@@ -14911,14 +14908,28 @@ mod tests {
                 .position(|(failing, _)| *failing == message)
                 .and_then(|index| shell.failures.remove(index))
                 .map(|(_, error)| error);
-            let answer = failure.is_none()
-                && match message {
+            Some((shell.real, failure, during))
+        })?;
+        // The real shell may dispatch messages that call it again: no borrow is held meanwhile.
+        let answer = failure.is_none()
+            && if real {
+                unsafe { Shell_NotifyIconW(message, data) }.as_bool()
+            } else {
+                scripted_shell(|shell| match message {
                     NIM_ADD => shell.icons.insert(data.uID),
                     NIM_DELETE => shell.icons.remove(&data.uID),
                     _ => shell.icons.contains(&data.uID),
-                };
-            Some((answer, failure, during))
-        })?;
+                })
+            };
+        scripted_shell(|shell| {
+            shell.calls.push(ShellCall {
+                message,
+                flags: data.uFlags,
+                icon: data.hIcon.0 as usize,
+                tip: wide_text(&data.szTip),
+                answer,
+            });
+        });
         // A message dispatched during the call runs with the shell released: it may call it.
         if let Some(during) = during {
             during();
@@ -22778,5 +22789,632 @@ public class AklBusyField : Form {
                 "busy_ms={busy_ms}"
             );
         }
+    }
+
+    // Tray acceptance on the desktop of the test VM: the real notification area and Explorer.
+
+    /// The rectangle of `window`'s tray icon on the screen, while the shell shows it.
+    fn tray_icon_rect(window: HWND) -> Option<windows::Win32::Foundation::RECT> {
+        use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
+        let identifier = NOTIFYICONIDENTIFIER {
+            cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: window,
+            uID: TRAY_ID,
+            ..Default::default()
+        };
+        unsafe { Shell_NotifyIconGetRect(&identifier) }.ok()
+    }
+
+    /// Every visible top-level window: its handle, class name and text.
+    fn visible_windows() -> Vec<(usize, String, String)> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetClassNameW, GetWindowTextW, IsWindowVisible,
+        };
+        unsafe extern "system" fn collect(window: HWND, list: LPARAM) -> windows::core::BOOL {
+            let list = unsafe { &mut *(list.0 as *mut Vec<(usize, String, String)>) };
+            if unsafe { IsWindowVisible(window) }.as_bool() {
+                let mut class = [0u16; 128];
+                let mut text = [0u16; 512];
+                let class_length = unsafe { GetClassNameW(window, &mut class) }.max(0) as usize;
+                let text_length = unsafe { GetWindowTextW(window, &mut text) }.max(0) as usize;
+                list.push((
+                    window.0 as usize,
+                    String::from_utf16_lossy(&class[..class_length]),
+                    String::from_utf16_lossy(&text[..text_length]),
+                ));
+            }
+            true.into()
+        }
+        let mut list: Vec<(usize, String, String)> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(Some(collect), LPARAM(&mut list as *mut _ as isize));
+        }
+        list
+    }
+
+    /// The names that UI Automation shows under `window`, down to eight levels, as
+    /// "control type: name".
+    fn automation_texts(window: usize) -> Vec<String> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let Ok(automation) =
+                CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+            else {
+                return Vec::new();
+            };
+            let (Ok(walker), Ok(top)) = (
+                automation.RawViewWalker(),
+                automation.ElementFromHandle(HWND(window as *mut c_void)),
+            ) else {
+                return Vec::new();
+            };
+            let mut texts = Vec::new();
+            let mut stack = vec![(top, 0)];
+            while let Some((element, depth)) = stack.pop() {
+                if texts.len() > 500 {
+                    break;
+                }
+                let kind = element.CurrentControlType().map_or(0, |kind| kind.0);
+                let name = element
+                    .CurrentName()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    texts.push(format!("{kind}: {name}"));
+                }
+                if depth < 8 {
+                    let mut child = walker.GetFirstChildElement(&element).ok();
+                    while let Some(current) = child {
+                        child = walker.GetNextSiblingElement(&current).ok();
+                        stack.push((current, depth + 1));
+                    }
+                }
+            }
+            texts
+        }
+    }
+
+    /// Saves the whole screen as a 32-bit bitmap file.
+    fn save_screenshot(path: &Path) {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPFILEHEADER, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+            CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, GetDC, GetDIBits, ReleaseDC, SRCCOPY,
+            SelectObject,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+        unsafe {
+            let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let screen = GetDC(None);
+            let memory = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
+            let _ = BitBlt(memory, 0, 0, width, height, Some(screen), 0, 0, SRCCOPY);
+            SelectObject(memory, previous);
+            let mut header = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            GetDIBits(
+                memory,
+                bitmap,
+                0,
+                height as u32,
+                Some(pixels.as_mut_ptr().cast()),
+                &mut header,
+                DIB_RGB_COLORS,
+            );
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(memory);
+            ReleaseDC(None, screen);
+            let offset = (size_of::<BITMAPFILEHEADER>() + size_of::<BITMAPINFOHEADER>()) as u32;
+            let file = BITMAPFILEHEADER {
+                bfType: 0x4D42,
+                bfSize: offset + pixels.len() as u32,
+                bfOffBits: offset,
+                ..Default::default()
+            };
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const file).cast::<u8>(),
+                size_of::<BITMAPFILEHEADER>(),
+            ));
+            bytes.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const header.bmiHeader).cast::<u8>(),
+                size_of::<BITMAPINFOHEADER>(),
+            ));
+            bytes.extend_from_slice(&pixels);
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    /// The names of the tooltips that UI Automation finds among the desktop's windows, their
+    /// children and grandchildren.
+    fn automation_tooltips() -> Vec<String> {
+        use windows::Win32::UI::Accessibility::UIA_ToolTipControlTypeId;
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let Ok(automation) =
+                CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+            else {
+                return Vec::new();
+            };
+            let (Ok(walker), Ok(root)) = (automation.RawViewWalker(), automation.GetRootElement())
+            else {
+                return Vec::new();
+            };
+            let mut names = Vec::new();
+            let mut stack = vec![(root, 0)];
+            let mut visited = 0;
+            while let Some((element, depth)) = stack.pop() {
+                visited += 1;
+                if visited > 3_000 {
+                    break;
+                }
+                if element
+                    .CurrentControlType()
+                    .is_ok_and(|kind| kind == UIA_ToolTipControlTypeId)
+                    && let Ok(name) = element.CurrentName()
+                {
+                    names.push(name.to_string());
+                }
+                if depth < 3 {
+                    let mut child = walker.GetFirstChildElement(&element).ok();
+                    while let Some(current) = child {
+                        child = walker.GetNextSiblingElement(&current).ok();
+                        stack.push((current, depth + 1));
+                    }
+                }
+            }
+            names
+        }
+    }
+
+    /// Moves the pointer to `point` with real input, so that the window under it sees the move.
+    fn move_pointer(point: POINT) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+            MOUSEINPUT,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        let (left, top, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        let scale =
+            |value: i32, origin: i32, size: i32| (value - origin) * 65_535 / (size - 1).max(1);
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: scale(point.x, left, width),
+                    dy: scale(point.y, top, height),
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(send_input_batch(&[input]), "move the pointer");
+    }
+
+    /// The first value `probe` gives within `timeout`, asked every 100 ms.
+    fn within<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = probe() {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Lets the calling thread's windows handle what is queued for them.
+    fn pump_messages() {
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    /// Moves this executable's tray icon out of the overflow area, as the taskbar settings do.
+    /// Windows 11 keeps a new icon there, and an icon there cannot be hovered over.
+    fn promote_this_executables_tray_icon() -> bool {
+        let executable = std::env::current_exe().expect("executable");
+        let name = executable
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_lowercase();
+        let key = within(Duration::from_secs(10), || {
+            let output = std::process::Command::new("reg")
+                .args(["query", r"HKCU\Control Panel\NotifyIconSettings", "/s"])
+                .output()
+                .ok()?;
+            let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+            let mut current = None;
+            for line in listing.lines() {
+                if line.starts_with("HKEY_CURRENT_USER") {
+                    current = Some(line.trim().to_owned());
+                } else if line.contains("ExecutablePath") && line.to_lowercase().ends_with(&name) {
+                    return current.clone();
+                }
+            }
+            None
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        std::process::Command::new("reg")
+            .args([
+                "add",
+                &key,
+                "/v",
+                "IsPromoted",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Whether Explorer's taskbar exists.
+    fn taskbar_exists() -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+        unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.is_ok()
+    }
+
+    /// The agent's state on this thread, owning a window with the agent's procedure, so that the
+    /// tray code runs as in the agent. Explorer's TaskbarCreated reaches that window.
+    fn desktop_tray_state() -> (HWND, Receiver<QueuedInputEvent>) {
+        TASKBAR_CREATED.store(
+            unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            Ordering::Release,
+        );
+        let window = agent_procedure_window();
+        let (mut state, receiver) = test_gate_state(4);
+        state.window = window;
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        (window, receiver)
+    }
+
+    thread_local! {
+        /// The notifications that the icon of `notification_window` received (lParam's low word).
+        static ICON_NOTIFICATIONS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn notification_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == TRAY_CALLBACK_MESSAGE {
+            ICON_NOTIFICATIONS.with(|list| list.borrow_mut().push((lparam.0 as u32) & 0xffff));
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    /// A top-level window of the calling thread that records its icon's notifications.
+    fn notification_window() -> HWND {
+        let module = unsafe { GetModuleHandleW(None).expect("module") };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(notification_procedure),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: w!("AutoKeyboardLayotNotificationTest"),
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&class) };
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("AutoKeyboardLayotNotificationTest"),
+                w!("AutoKeyboardLayot notification test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+            .expect("window")
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the notification area: run it alone in an interactive session on the test VM"]
+    fn the_tray_icon_on_the_desktop_shows_its_status_in_a_tooltip() {
+        let (_agent_window, _receiver) = desktop_tray_state();
+        // The icon belongs to a window that records what the shell tells it.
+        let window = notification_window();
+        let status = TrayStatus {
+            auto_enabled: true,
+            ..TrayStatus::initial(LayoutIndicator::English)
+        };
+        assert!(add_tray(window, status), "the icon was not added");
+        let expected = tray_tooltip(status);
+        let mode = expected.split(';').next().expect("mode").to_owned();
+        eprintln!("rect before promotion: {:?}", tray_icon_rect(window));
+        let promoted = promote_this_executables_tray_icon();
+        let rect = within(Duration::from_secs(10), || tray_icon_rect(window));
+        eprintln!("promoted={promoted} rect={rect:?} expected={mode:?}");
+        let mut shown = None;
+        if let Some(rect) = rect {
+            let center = POINT {
+                x: (rect.left + rect.right) / 2,
+                y: (rect.top + rect.bottom) / 2,
+            };
+            // Hover: from above the icon onto it, a little more after a moment.
+            move_pointer(POINT {
+                x: center.x,
+                y: center.y - 80,
+            });
+            thread::sleep(Duration::from_millis(300));
+            move_pointer(center);
+            thread::sleep(Duration::from_millis(100));
+            move_pointer(POINT {
+                x: center.x + 1,
+                y: center.y,
+            });
+            let mut captured = false;
+            let hovered = Instant::now();
+            shown = within(Duration::from_secs(6), || {
+                pump_messages();
+                if !captured && hovered.elapsed() > Duration::from_millis(2_500) {
+                    captured = true;
+                    save_screenshot(Path::new("tray-tooltip.bmp"));
+                }
+                // A classic tooltip carries its text; one of the XAML taskbar's popups shows it
+                // to UI Automation.
+                visible_windows()
+                    .into_iter()
+                    .flat_map(|(window, class, text)| {
+                        let mut seen = vec![format!("window {class}: {text}")];
+                        if class.contains("Popup") || class.to_lowercase().contains("tooltip") {
+                            seen.extend(
+                                automation_texts(window)
+                                    .into_iter()
+                                    .map(|text| format!("{class} automation {text}")),
+                            );
+                        }
+                        seen
+                    })
+                    .chain(
+                        automation_tooltips()
+                            .into_iter()
+                            .map(|name| format!("automation tooltip: {name}")),
+                    )
+                    .find(|seen| seen.contains(&mode))
+            });
+            if !captured {
+                save_screenshot(Path::new("tray-tooltip.bmp"));
+            }
+        }
+        pump_messages();
+        let notifications = ICON_NOTIFICATIONS.with(|list| list.borrow().clone());
+        eprintln!("notifications: {notifications:x?}");
+        eprintln!("tooltip: {shown:?}");
+        for (window, class, text) in visible_windows() {
+            eprintln!("  visible {window:#x} {class}: {text}");
+            if class.contains("Popup") || class.to_lowercase().contains("tooltip") {
+                for text in automation_texts(window) {
+                    eprintln!("    {text}");
+                }
+            }
+        }
+        for name in automation_tooltips() {
+            eprintln!("  automation tooltip: {name}");
+        }
+        drop(take_app_state());
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+        assert!(rect.is_some(), "the shell does not show the icon");
+        assert!(shown.is_some(), "no tooltip with the status appeared");
+        // Without NIF_SHOWTIP the shell leaves the hover to the program (NIN_POPUPOPEN), and a
+        // shell that honours that shows no tooltip at all.
+        assert!(
+            !notifications.contains(&windows::Win32::UI::Shell::NIN_POPUPOPEN),
+            "the shell asked for a popup of the program's own instead of showing the tooltip"
+        );
+    }
+
+    #[test]
+    #[ignore = "restarts Explorer: run it alone in an interactive session on the test VM"]
+    fn the_tray_icon_on_the_desktop_returns_after_explorer_restarts_without_a_false_pause_notice() {
+        let (window, _receiver) = desktop_tray_state();
+        // A conversion failed and paused automatic conversion, and the tray announced it.
+        APP_STATE.with(|slot| {
+            let borrowed = slot.borrow();
+            let metrics = &borrowed.as_ref().expect("state").metrics;
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.conversion_failures.store(1, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(ConversionFailureReason::TextCommit as u8, Ordering::Release);
+        });
+        let indicator = LayoutIndicator::English;
+        assert!(add_tray(window, TrayStatus::initial(indicator)));
+        update_tray(indicator, Instant::now());
+        // From here on the calls to the notification area are recorded on their way to it.
+        SCRIPTED_SHELL.with(|slot| {
+            *slot.borrow_mut() = Some(ScriptedShell {
+                real: true,
+                ..ScriptedShell::default()
+            });
+        });
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "explorer.exe"])
+            .output();
+        let gone = within(Duration::from_secs(10), || {
+            (!taskbar_exists()).then_some(())
+        });
+        // Windows starts the shell again by itself; this does it when it does not.
+        thread::sleep(Duration::from_secs(3));
+        let restarted_by_windows = taskbar_exists();
+        if !restarted_by_windows {
+            let _ = std::process::Command::new("explorer.exe").spawn();
+        }
+        // The agent's timer ticks: TaskbarCreated reaches the window between them.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut back_since = None;
+        while Instant::now() < deadline {
+            pump_messages();
+            retry_tray(window);
+            update_tray(indicator, Instant::now());
+            let added = scripted_shell(|shell| {
+                shell
+                    .calls
+                    .iter()
+                    .any(|call| call.message == NIM_ADD && call.answer)
+            });
+            if added && back_since.is_none() {
+                back_since = Some(Instant::now());
+            }
+            if back_since.is_some_and(|since| since.elapsed() > Duration::from_secs(5)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let rect = tray_icon_rect(window);
+        let shell = SCRIPTED_SHELL
+            .with(|slot| slot.borrow_mut().take())
+            .expect("recording shell");
+        for call in &shell.calls {
+            eprintln!(
+                "  {:?} flags={:?} answer={} tip={:?}",
+                call.message, call.flags, call.answer, call.tip
+            );
+        }
+        let balloons = shell
+            .calls
+            .iter()
+            .filter(|call| call.flags.contains(NIF_INFO))
+            .count();
+        eprintln!(
+            "gone={:?} restarted_by_windows={restarted_by_windows} back={:?} rect={rect:?} \
+             balloons={balloons}",
+            gone.is_some(),
+            back_since.is_some()
+        );
+        drop(take_app_state());
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+        assert!(gone.is_some(), "Explorer did not stop");
+        assert!(back_since.is_some(), "the icon did not come back");
+        assert_eq!(balloons, 0, "an old failure was announced again");
+    }
+
+    #[test]
+    #[ignore = "runs the agent without Explorer: run it alone in an interactive session on the test VM \
+                with AutoRestartShell off"]
+    fn the_agent_on_the_desktop_starts_without_a_taskbar_and_adds_its_icon_once_there_is_one() {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_CLOSE};
+        let profile =
+            std::env::temp_dir().join(format!("akl-tray-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "explorer.exe"])
+            .output();
+        let gone = within(Duration::from_secs(10), || {
+            (!taskbar_exists()).then_some(())
+        });
+        // With AutoRestartShell off nothing brings the taskbar back on its own.
+        thread::sleep(Duration::from_secs(3));
+        let still_gone = !taskbar_exists();
+        let agent = thread::spawn(run);
+        let agent_window = within(Duration::from_secs(10), || {
+            unsafe { FindWindowW(WINDOW_CLASS, None) }.ok()
+        });
+        // The agent sends panics to its crash log; the test wants them on screen.
+        drop(std::panic::take_hook());
+        thread::sleep(Duration::from_secs(5));
+        let running_without_taskbar = !agent.is_finished();
+        let _ = std::process::Command::new("explorer.exe").spawn();
+        let taskbar = within(Duration::from_secs(60), || taskbar_exists().then_some(()));
+        let log = || fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+        let added = within(Duration::from_secs(60), || {
+            log()
+                .lines()
+                .any(|line| line.contains("event=tray") && line.contains("result=added"))
+                .then_some(())
+        });
+        let rect = agent_window.and_then(tray_icon_rect);
+        for line in log().lines().filter(|line| line.contains("event=tray")) {
+            eprintln!("  {line}");
+        }
+        eprintln!(
+            "gone={} still_gone={still_gone} window={} running={running_without_taskbar} \
+             taskbar={} added={} rect={rect:?}",
+            gone.is_some(),
+            agent_window.is_some(),
+            taskbar.is_some(),
+            added.is_some()
+        );
+        // A graceful close is declined while keys are retained; none are here, but ask again.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !agent.is_finished() && Instant::now() < deadline {
+            if let Some(window) = agent_window {
+                unsafe {
+                    let _ = PostMessageW(Some(window), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+        let stopped = agent.is_finished().then(|| agent.join());
+        let _ = fs::remove_dir_all(&profile);
+        assert!(gone.is_some() && still_gone, "Explorer was not stopped");
+        assert!(agent_window.is_some(), "the agent created no window");
+        assert!(
+            running_without_taskbar,
+            "the agent stopped without a taskbar"
+        );
+        assert!(taskbar.is_some(), "Explorer did not start again");
+        assert!(added.is_some(), "the agent did not add its icon");
+        assert!(
+            matches!(stopped, Some(Ok(Ok(())))),
+            "the agent did not stop cleanly"
+        );
     }
 }

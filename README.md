@@ -100,6 +100,14 @@ for the session and exposes a technical failure counter in the tray status.
   user's clipboard comes back. The test's typing is injected with a marker that
   only test builds take as the user's. These tests need that desktop, so they run
   alone by name there; other runs pass `--skip on_the_desktop`;
+- on the same desktop, the tray icon in the real notification area: hovering over it
+  shows the standard tooltip with the status, and the shell does not ask the program
+  for a popup of its own (`NIN_POPUPOPEN`) as it does without `NIF_SHOWTIP` (the XAML
+  taskbar of Windows 11 26H2 then still shows the tooltip, a classic notification area
+  shows none); Explorer restarted while an old conversion failure is on record gives the
+  icon back without announcing it again; and the agent started while Explorer is
+  stopped (with `AutoRestartShell` set to 0 for the test) keeps running and adds its
+  icon once the taskbar is there;
 - native Windows 11 MSVC test and release builds;
 - an interactive-session launch without a visible error window;
 - readable `EN` and `RU` tray icons and live foreground-layout updates;
