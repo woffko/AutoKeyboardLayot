@@ -10,6 +10,7 @@ import os
 
 import authenticode_hook
 import collect_dependency_notices
+import release_rustflags
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -49,9 +50,14 @@ common = ['--locked', '--offline', '--release', '--no-default-features',
           '--features', 'installer-tools', '--bins', '--target', 'x86_64-pc-windows-msvc',
           '--target-dir', 'target/xwin-hotkeys', '--jobs', '2']
 cargo = ['cargo'] if os.name == 'nt' else ['cargo', 'xwin']
-subprocess.run([*cargo, 'clippy', *common, '--', '-D', 'warnings'], cwd=root, timeout=1800, check=True)
+# No build-machine path may stay in the executables (see release_rustflags.py).
+cargo_home, sysroot = release_rustflags.machine_paths(root)
+cargo_env = dict(os.environ, CARGO_ENCODED_RUSTFLAGS=release_rustflags.encoded(
+    release_rustflags.release_rustflags(root, cargo_home, sysroot)))
+subprocess.run([*cargo, 'clippy', *common, '--', '-D', 'warnings'], cwd=root, timeout=1800, check=True,
+               env=cargo_env)
 build = subprocess.run([*cargo, 'build', *common, '--message-format=json'], cwd=root,
-                       stdout=subprocess.PIPE, timeout=1800, check=True)
+                       stdout=subprocess.PIPE, timeout=1800, check=True, env=cargo_env)
 compiled = {item['package_id'] for line in build.stdout.splitlines()
             if (item := json.loads(line)).get('reason') == 'compiler-artifact'}
 if not compiled or not compiled.issubset(set(base['compiled_package_ids'])):
@@ -63,6 +69,8 @@ def windows(path):
 
 release = root / 'target/xwin-hotkeys/x86_64-pc-windows-msvc/release'
 app, helper = release / 'AutoKeyboardLayot.exe', release / 'installer-package-helper.exe'
+if any(release_rustflags.leaked_paths(path.read_bytes(), [cargo_home, sysroot, root]) for path in [app, helper]):
+    raise SystemExit('The executables still contain build-machine paths.')
 if signing:
     # Sign copies, never the files in the build directory, then package the signed copies.
     signed_inputs = output / 'signed-inputs'

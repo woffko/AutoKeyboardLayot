@@ -11,10 +11,16 @@ for development installs from a checkout; the installer remains the way to insta
 From WSL, cross-build the modular base, which matches what the installer ships:
 
 ```sh
-cargo xwin build --release --target x86_64-pc-windows-msvc --no-default-features \
+CARGO_ENCODED_RUSTFLAGS="$(python3 tools/release_rustflags.py)" \
+  cargo xwin build --release --target x86_64-pc-windows-msvc --no-default-features \
   --bin AutoKeyboardLayot --target-dir target/xwin-hotkeys
 sha256sum target/xwin-hotkeys/x86_64-pc-windows-msvc/release/AutoKeyboardLayot.exe
 ```
+
+`tools/release_rustflags.py` adds path remapping to the flags in `.cargo/config.toml` (the static C
+runtime), so the executable records no path of the build machine: no account name, checkout or
+Cargo cache. The installer build (`tools/build_experimental_installer.py`) uses the same flags and
+refuses executables that still contain such a path.
 
 Commit first: the version shown in Settings contains the commit id, and a build from uncommitted
 changes shows `-dirty` after it.

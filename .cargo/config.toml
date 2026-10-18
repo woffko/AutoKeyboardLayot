@@ -7,6 +7,6 @@
 # the linker's warning about each of them.
 #
 # RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS in the environment replaces this list instead of adding to
-# it: a build that sets either must repeat these flags.
+# it: tools/release_rustflags.py repeats it for the release builds.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/ignore:4099"]
