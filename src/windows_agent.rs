@@ -103,8 +103,8 @@ use windows::{
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-                NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFYICON_VERSION_4,
-                NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+                NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFY_ICON_MESSAGE,
+                NOTIFYICON_VERSION_4, NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
                 SHQueryUserNotificationState, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
@@ -4074,21 +4074,21 @@ impl TrayIcon {
         data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
         let tooltip = tray_tooltip(TrayStatus::initial(indicator));
         set_tooltip(&mut data, &tooltip);
-        if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-            unsafe {
+        if !shell_notify_icon(NIM_ADD, &data) {
+            return Err(last_error_then(|| unsafe {
                 let _ = DestroyIcon(icon);
-            }
-            return Err(Error::from_thread());
+            }));
         }
 
         let mut version_data = notify_icon_data(hwnd, icon);
         version_data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &version_data) }.as_bool() {
-            unsafe {
-                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-                let _ = DestroyIcon(icon);
-            }
-            return Err(Error::from_thread());
+        if !shell_notify_icon(NIM_SETVERSION, &version_data) {
+            return Err(last_error_then(|| {
+                let _ = shell_notify_icon(NIM_DELETE, &data);
+                unsafe {
+                    let _ = DestroyIcon(icon);
+                }
+            }));
         }
         unsafe {
             let _ = SetWindowTextW(hwnd, &HSTRING::from(&tooltip));
@@ -4119,13 +4119,14 @@ impl TrayIcon {
             };
         let tooltip = tray_tooltip(status);
         set_tooltip(&mut data, &tooltip);
-        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
-            if let Some(new_icon) = new_icon {
-                unsafe {
-                    let _ = DestroyIcon(new_icon);
+        if !shell_notify_icon(NIM_MODIFY, &data) {
+            return Err(last_error_then(|| {
+                if let Some(new_icon) = new_icon {
+                    unsafe {
+                        let _ = DestroyIcon(new_icon);
+                    }
                 }
-            }
-            return Err(Error::from_thread());
+            }));
         }
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(&tooltip));
@@ -4146,11 +4147,29 @@ impl TrayIcon {
 impl Drop for TrayIcon {
     fn drop(&mut self) {
         let data = notify_icon_data(self.hwnd, self.icon);
+        let _ = shell_notify_icon(NIM_DELETE, &data);
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
             let _ = DestroyIcon(self.icon);
         }
     }
+}
+
+/// `Shell_NotifyIconW`. Tests put a scripted notification area in its place, which records the
+/// calls and answers them.
+fn shell_notify_icon(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
+    #[cfg(test)]
+    if let Some(answer) = tests::scripted_shell_call(message, data) {
+        return answer;
+    }
+    unsafe { Shell_NotifyIconW(message, data) }.as_bool()
+}
+
+/// The error of the call that just failed, read before `cleanup` runs: the cleanup's own calls
+/// may leave another last error behind.
+fn last_error_then(cleanup: impl FnOnce()) -> Error {
+    let error = Error::from_thread();
+    cleanup();
+    error
 }
 
 /// Panics of this process are written to crash.log in the profile folder (never their message).
@@ -11765,10 +11784,8 @@ fn show_tray_information(hwnd: HWND, title: impl AsRef<str>, message: impl AsRef
     data.dwInfoFlags = NIIF_INFO;
     set_wide_text(&mut data.szInfoTitle, title.as_ref());
     set_wide_text(&mut data.szInfo, message.as_ref());
-    unsafe {
-        data.Anonymous.uTimeout = 5_000;
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
-    }
+    data.Anonymous.uTimeout = 5_000;
+    let _ = shell_notify_icon(NIM_MODIFY, &data);
 }
 
 const fn privacy_reason_code(reason: Option<PrivacyBlockReason>) -> u8 {
@@ -11945,10 +11962,9 @@ fn create_indicator_icon(visual: TrayVisual, indicator: LayoutIndicator) -> Resu
         )
     };
     if mask_bitmap.0.is_null() {
-        unsafe {
+        return Err(last_error_then(|| unsafe {
             let _ = DeleteObject(HGDIOBJ(color_bitmap.0));
-        }
-        return Err(Error::from_thread());
+        }));
     }
 
     let icon_info = ICONINFO {
@@ -14563,6 +14579,106 @@ mod tests {
         // The mode and the layout show in the pixels.
         assert_ne!(rasters[0], rasters[1]);
         assert_ne!(rasters[1], rasters[2]);
+    }
+
+    /// One call to the scripted notification area.
+    #[derive(Debug, Clone)]
+    struct ShellCall {
+        message: NOTIFY_ICON_MESSAGE,
+    }
+
+    /// A notification area for the tray code of the calling thread. It records every call, keeps
+    /// the ids it shows, fails calls on request, and can run a message in the middle of a call.
+    #[derive(Default)]
+    struct ScriptedShell {
+        calls: Vec<ShellCall>,
+        icons: std::collections::BTreeSet<u32>,
+        /// The next calls of these messages fail, in order, with these errors.
+        failures: VecDeque<(NOTIFY_ICON_MESSAGE, windows::Win32::Foundation::WIN32_ERROR)>,
+        /// Runs inside the next call of the message, like a message that the call dispatches.
+        during: Option<(NOTIFY_ICON_MESSAGE, Box<dyn FnOnce()>)>,
+    }
+
+    thread_local! {
+        static SCRIPTED_SHELL: RefCell<Option<ScriptedShell>> = const { RefCell::new(None) };
+    }
+
+    /// The scripted notification area's answer, or `None` when the thread uses the real one.
+    pub(super) fn scripted_shell_call(
+        message: NOTIFY_ICON_MESSAGE,
+        data: &NOTIFYICONDATAW,
+    ) -> Option<bool> {
+        let (answer, failure, during) = SCRIPTED_SHELL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let shell = slot.as_mut()?;
+            shell.calls.push(ShellCall { message });
+            let during = shell
+                .during
+                .take_if(|(expected, _)| *expected == message)
+                .map(|(_, run)| run);
+            let failure = shell
+                .failures
+                .iter()
+                .position(|(failing, _)| *failing == message)
+                .and_then(|index| shell.failures.remove(index))
+                .map(|(_, error)| error);
+            let answer = failure.is_none()
+                && match message {
+                    NIM_ADD => shell.icons.insert(data.uID),
+                    NIM_DELETE => shell.icons.remove(&data.uID),
+                    _ => shell.icons.contains(&data.uID),
+                };
+            Some((answer, failure, during))
+        })?;
+        // A message dispatched during the call runs with the shell released: it may call it.
+        if let Some(during) = during {
+            during();
+        }
+        if let Some(error) = failure {
+            unsafe { windows::Win32::Foundation::SetLastError(error) };
+        }
+        Some(answer)
+    }
+
+    /// Runs `body` with `shell` as this thread's notification area, and gives the shell back.
+    fn with_scripted_shell<T>(
+        shell: ScriptedShell,
+        body: impl FnOnce() -> T,
+    ) -> (T, ScriptedShell) {
+        SCRIPTED_SHELL.with(|slot| *slot.borrow_mut() = Some(shell));
+        let result = body();
+        let shell = SCRIPTED_SHELL
+            .with(|slot| slot.borrow_mut().take())
+            .expect("scripted shell");
+        (result, shell)
+    }
+
+    #[test]
+    fn a_failed_call_reports_its_own_error_and_not_the_cleanup_s() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, SetLastError};
+        unsafe { SetLastError(ERROR_TIMEOUT) };
+        let error = last_error_then(|| unsafe { SetLastError(ERROR_ACCESS_DENIED) });
+        assert_eq!(error.code(), ERROR_TIMEOUT.to_hresult());
+        // The shell refuses the icon's version, and deleting the half-added icon leaves another
+        // error behind: the registration reports the refusal, and no icon is left.
+        let shell = ScriptedShell {
+            failures: VecDeque::from([(NIM_SETVERSION, ERROR_TIMEOUT)]),
+            during: Some((
+                NIM_DELETE,
+                Box::new(|| unsafe { SetLastError(ERROR_ACCESS_DENIED) }),
+            )),
+            ..ScriptedShell::default()
+        };
+        let (added, shell) = with_scripted_shell(shell, || {
+            TrayIcon::add(HWND::default(), LayoutIndicator::English).map(|tray| tray.icon)
+        });
+        assert_eq!(
+            added.err().map(|error| error.code()),
+            Some(ERROR_TIMEOUT.to_hresult())
+        );
+        assert!(shell.icons.is_empty());
+        let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
+        assert_eq!(messages, [NIM_ADD, NIM_SETVERSION, NIM_DELETE]);
     }
 
     #[test]
