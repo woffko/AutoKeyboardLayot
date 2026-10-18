@@ -14434,7 +14434,7 @@ mod tests {
     }
 
     #[test]
-    fn tray_glyph_renderer_changes_pixels() {
+    fn the_tray_status_selects_the_icon_visual() {
         let initial = TrayStatus::initial(LayoutIndicator::English);
         assert_eq!(tray_visual_state(initial), TrayVisual::Disabled);
         let active = TrayStatus {
@@ -14489,6 +14489,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The color pixels (top-down, 0xAARRGGBB) and the mask bytes of a 32×32 icon.
+    fn icon_rasters(icon: HICON) -> (Vec<u32>, Vec<u8>) {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetBitmapBits, GetDC, GetDIBits,
+            ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
+        let mut info = ICONINFO::default();
+        unsafe { GetIconInfo(icon, &mut info) }.expect("icon info");
+        let mut color = vec![0u32; 32 * 32];
+        let mut header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: 32,
+                biHeight: -32,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut mask = vec![0u8; 32 * 32 / 8];
+        unsafe {
+            let screen = GetDC(None);
+            let rows = GetDIBits(
+                screen,
+                info.hbmColor,
+                0,
+                32,
+                Some(color.as_mut_ptr().cast()),
+                &mut header,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(None, screen);
+            assert_eq!(rows, 32, "color rows");
+            // A monochrome bitmap's rows are padded to 16 bits; 32 pixels are four bytes.
+            let read = GetBitmapBits(info.hbmMask, mask.len() as i32, mask.as_mut_ptr().cast());
+            assert_eq!(read, mask.len() as i32, "mask bytes");
+            let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+            let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+        }
+        (color, mask)
+    }
+
+    #[test]
+    fn the_tray_icon_carries_the_rendered_pixels_and_a_mask_that_matches_them() {
+        let mut rasters = Vec::new();
+        for (visual, indicator) in [
+            (TrayVisual::Active, LayoutIndicator::English),
+            (TrayVisual::Disabled, LayoutIndicator::English),
+            (TrayVisual::SafetyPaused, LayoutIndicator::Russian),
+        ] {
+            let expected = tray_visual::pixels(visual, indicator.icon_text());
+            let icon = create_indicator_icon(visual, indicator).expect("icon");
+            let (color, mask) = icon_rasters(icon);
+            unsafe {
+                DestroyIcon(icon).expect("destroy icon");
+            }
+            let case = format!("{visual:?} {indicator:?}");
+            assert_eq!(color, expected, "{case}");
+            // A set mask bit is a transparent pixel: exactly those whose alpha is zero. The badge
+            // is opaque, so a set bit would punch a hole into it.
+            for (index, pixel) in expected.iter().enumerate() {
+                let transparent = mask[index / 8] & (0x80 >> (index % 8)) != 0;
+                assert_eq!(transparent, pixel >> 24 == 0, "{case} pixel {index}");
+            }
+            rasters.push(color);
+        }
+        // The mode and the layout show in the pixels.
+        assert_ne!(rasters[0], rasters[1]);
+        assert_ne!(rasters[1], rasters[2]);
     }
 
     #[test]
