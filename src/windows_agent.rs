@@ -23,8 +23,8 @@ use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
 use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
 use autokeyboardlayot::ui_guard::{
-    ForegroundPrivilege, HookWatchdog, TrayThrottle, WatchdogAction, WatchdogFacts,
-    captures_keyboard, hooks_look_silent, retry_delay,
+    ForegroundPrivilege, HookSilence, HookWatchdog, PointerMotion, SilentHook, TrayThrottle,
+    WatchdogAction, WatchdogFacts, captures_keyboard, retry_delay, silent_hook,
 };
 use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
 use ui_localization::{tr, tr_format};
@@ -110,16 +110,16 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CallNextHookEx, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
                 DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetShellWindow,
-                GetWindowThreadProcessId, HHOOK, HICON, HMENU, ICONINFO, IDYES, KBDLLHOOKSTRUCT,
-                LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MB_ICONERROR, MB_ICONINFORMATION,
-                MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-                MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
-                PBT_APMRESUMESUSPEND, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
-                RegisterClassW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-                SMTO_ERRORONEXIT, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
-                SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu,
-                TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+                GUITHREADINFO, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetMessageW,
+                GetShellWindow, GetWindowThreadProcessId, HHOOK, HICON, HMENU, ICONINFO, IDYES,
+                KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MB_ICONERROR,
+                MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED,
+                MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW,
+                PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PM_REMOVE, PeekMessageW,
+                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+                SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW,
+                SetForegroundWindow, SetTimer, SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON,
+                TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
                 WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_QUIT,
@@ -331,9 +331,10 @@ thread_local! {
     static UI_GUARDS: RefCell<UiGuards> = RefCell::new(UiGuards::new());
 }
 
-/// Milliseconds (`GetTickCount64`) of the last hook callback or hook installation. The watchdog
-/// compares it with the time of the last user input.
-static HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds (`GetTickCount64`) of the last callback or installation of the keyboard hook and
+/// of the mouse hook. The watchdog compares each with the input that hook must have seen.
+static KEYBOARD_HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 /// The window message registered as "TaskbarCreated"; 0 until it is registered.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -360,6 +361,7 @@ impl Retry {
 /// UI-thread state of the rules that keep the thread responsive for the hooks (see `ui_guard`).
 struct UiGuards {
     watchdog: HookWatchdog,
+    pointer: PointerMotion,
     tray: TrayThrottle,
     hook_retry: Option<Retry>,
     tray_retry: Option<Retry>,
@@ -369,6 +371,7 @@ impl UiGuards {
     fn new() -> Self {
         Self {
             watchdog: HookWatchdog::new(),
+            pointer: PointerMotion::new(),
             tray: TrayThrottle::new(),
             hook_retry: None,
             tray_retry: None,
@@ -3037,14 +3040,29 @@ fn finish_shutdown(hwnd: HWND) -> bool {
     requested
 }
 
-fn touch_hook_activity() {
-    HOOK_ACTIVITY_MS.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+/// Marks a callback or an installation of the hook whose mark `activity` is.
+fn touch_hook_activity(activity: &AtomicU64) {
+    activity.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
 }
 
-/// Time since the last hook callback or installation.
-fn hook_silence() -> Duration {
+/// Each hook's time since its last callback or installation.
+fn hook_silence() -> HookSilence {
     let now = unsafe { GetTickCount64() };
-    Duration::from_millis(now.saturating_sub(HOOK_ACTIVITY_MS.load(Ordering::Relaxed)))
+    let since = |activity: &AtomicU64| {
+        Duration::from_millis(now.saturating_sub(activity.load(Ordering::Relaxed)))
+    };
+    HookSilence {
+        keyboard: since(&KEYBOARD_HOOK_ACTIVITY_MS),
+        mouse: since(&MOUSE_HOOK_ACTIVITY_MS),
+    }
+}
+
+/// The pointer's position on the screen, when the input desktop lets it be read.
+fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }
+        .is_ok()
+        .then_some((point.x, point.y))
 }
 
 /// Time since the last user input of the session, from `GetLastInputInfo`.
@@ -3141,16 +3159,20 @@ fn hook_watchdog_tick(hwnd: HWND) {
     if !running {
         return;
     }
+    // Followed on every tick: the pointer counts as moving only over consecutive ticks.
+    let pointer_moving =
+        UI_GUARDS.with(|guards| guards.borrow_mut().pointer.observe(cursor_position()));
     let Some(input_idle) = input_idle() else {
         return;
     };
-    let hook_silent = hook_silence();
-    if !hooks_look_silent(input_idle, hook_silent) {
+    let silence = hook_silence();
+    let Some(hook) = silent_hook(input_idle, silence, pointer_moving) else {
         return;
-    }
+    };
     let facts = WatchdogFacts {
         input_idle,
-        hook_silent,
+        silence,
+        pointer_moving,
         foreground: foreground_privilege(),
         input_desktop_is_default: input_desktop_is_default(),
         foreground_captures_input: foreground_captures_input(),
@@ -3160,7 +3182,10 @@ fn hook_watchdog_tick(hwnd: HWND) {
     match action {
         WatchdogAction::Nothing => {}
         WatchdogAction::Reinstall => {
-            reinstall_hooks("silent");
+            reinstall_hooks(match hook {
+                SilentHook::Keyboard => "silent-keyboard",
+                SilentHook::Mouse => "silent-mouse",
+            });
         }
         WatchdogAction::WarnUnstable => notify_hooks_unstable(hwnd, "watchdog-limit"),
     }
@@ -3202,7 +3227,12 @@ fn install_missing_hooks() -> bool {
         })
         .flatten();
     // A fresh hook has had no chance to be called yet.
-    touch_hook_activity();
+    if keyboard.is_some() {
+        touch_hook_activity(&KEYBOARD_HOOK_ACTIVITY_MS);
+    }
+    if mouse.is_some() {
+        touch_hook_activity(&MOUSE_HOOK_ACTIVITY_MS);
+    }
     let stored = APP_STATE.with(|slot| {
         let mut borrowed = slot.borrow_mut();
         let state = borrowed.as_mut()?;
@@ -4460,7 +4490,8 @@ pub fn run() -> Result<()> {
                 state.mouse_hook = Some(mouse_hook);
             }
         });
-        touch_hook_activity();
+        touch_hook_activity(&KEYBOARD_HOOK_ACTIVITY_MS);
+        touch_hook_activity(&MOUSE_HOOK_ACTIVITY_MS);
 
         if SetTimer(Some(hwnd), LAYOUT_TIMER_ID, LAYOUT_TIMER_INTERVAL_MS, None) == 0 {
             let error = Error::from_thread();
@@ -4761,7 +4792,7 @@ fn tray_interaction(notification: u32, anchor: WPARAM) -> TrayInteraction {
 /// Hook callbacks must not unwind (that aborts the process). A contained panic passes the event
 /// on untouched and raises `ENGINE_FAULT`.
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    touch_hook_activity();
+    touch_hook_activity(&KEYBOARD_HOOK_ACTIVITY_MS);
     let started = Instant::now();
     let result = guarded(
         || unsafe { keyboard_hook_body(code, wparam, lparam) },
@@ -5088,7 +5119,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    touch_hook_activity();
+    touch_hook_activity(&MOUSE_HOOK_ACTIVITY_MS);
     let started = Instant::now();
     let result = guarded(
         || unsafe { mouse_hook_body(code, wparam, lparam) },
@@ -13900,17 +13931,27 @@ mod tests {
     }
 
     #[test]
-    fn hook_silence_is_measured_from_the_last_callback_or_installation() {
-        touch_hook_activity();
-        assert!(hook_silence() < Duration::from_secs(2));
-        let tick = unsafe { GetTickCount64() };
-        HOOK_ACTIVITY_MS.store(tick.saturating_sub(10_000), Ordering::Relaxed);
+    fn each_hook_s_silence_is_measured_from_its_own_callbacks() {
+        let ten_seconds_ago = || unsafe { GetTickCount64() }.saturating_sub(10_000);
+        let about_ten_seconds = |silence: Duration| {
+            silence >= Duration::from_secs(10) && silence < Duration::from_secs(12)
+        };
+        // A keyboard callback (code < 0: passed on untouched) refreshes the keyboard hook's mark
+        // only.
+        KEYBOARD_HOOK_ACTIVITY_MS.store(ten_seconds_ago(), Ordering::Relaxed);
+        MOUSE_HOOK_ACTIVITY_MS.store(ten_seconds_ago(), Ordering::Relaxed);
+        unsafe { keyboard_hook_proc(-1, WPARAM(0), LPARAM(0)) };
         let silence = hook_silence();
-        assert!(
-            silence >= Duration::from_secs(10) && silence < Duration::from_secs(12),
-            "{silence:?}"
-        );
-        touch_hook_activity();
+        assert!(silence.keyboard < Duration::from_secs(2), "{silence:?}");
+        assert!(about_ten_seconds(silence.mouse), "{silence:?}");
+        // And a mouse callback the mouse hook's.
+        KEYBOARD_HOOK_ACTIVITY_MS.store(ten_seconds_ago(), Ordering::Relaxed);
+        unsafe { mouse_hook_proc(-1, WPARAM(0), LPARAM(0)) };
+        let silence = hook_silence();
+        assert!(about_ten_seconds(silence.keyboard), "{silence:?}");
+        assert!(silence.mouse < Duration::from_secs(2), "{silence:?}");
+        // The pointer's position can be read on the test's desktop or not at all.
+        let _ = cursor_position();
     }
 
     #[test]

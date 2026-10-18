@@ -495,8 +495,13 @@ there (`event=tray` in the diagnostics log), where earlier builds stopped with a
 error. Unlocking the session, reconnecting and resuming
 from sleep reinstall both hooks (held keys are handed back first, as after a gate
 timeout). A
-watchdog on the 250 ms timer also reinstalls them when the user types (input
-within the last 400 ms) but no hook callback ran for more than 3 seconds. It does
+watchdog on the 250 ms timer also reinstalls them when a hook misses input it must see
+for more than 3 seconds while the user gives input (within the last 400 ms): the mouse
+hook while the pointer keeps moving (on two ticks in a row, so a program placing the
+pointer does not count), the keyboard hook when input comes while the pointer stands
+still and the mouse hook saw none of it either (a click or a scroll it saw is no
+typing). Each hook has its own record of callbacks, so typing no longer hides a mouse
+hook that Windows removed. It does
 not act on the lock screen or the UAC desktop, when the foreground window has no
 known or a higher integrity level (its input may legitimately never reach the
 hooks), or when nothing is in the foreground; it acts at most once per 15 seconds
@@ -510,7 +515,8 @@ A failed installation is retried with backoff (1 s up to 30 s) and reported afte
 the third failure. Tray updates are limited to two per second and wait while the
 correction gate holds keys, because the shell call can block on an unresponsive
 Explorer while the hooks need the UI thread; a skipped update is tried again on a
-later tick. The diagnostics log records `event=hooks` with the reason.
+later tick. The diagnostics log records `event=hooks` with the reason
+(`silent-keyboard` or `silent-mouse` for the watchdog).
 
 ## Language packs
 
