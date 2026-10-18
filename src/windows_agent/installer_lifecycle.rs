@@ -4,19 +4,20 @@ use std::path::{Path, PathBuf};
 use windows::{
     Win32::{
         Foundation::{
-            ERROR_ALREADY_EXISTS, ERROR_NO_MORE_FILES, GetLastError, HANDLE, HWND, LPARAM,
+            ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, HWND, LPARAM,
             WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
         },
+        Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
         System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                TH32CS_SNAPPROCESS,
+            RemoteDesktop::{
+                ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW,
+                WTSEnumerateProcessesW, WTSFreeMemory,
             },
-            RemoteDesktop::ProcessIdToSessionId,
             Threading::{
-                CreateMutexW, MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess, PROCESS_NAME_WIN32,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
-                ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+                CreateMutexW, GetCurrentProcess, MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess,
+                OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ReleaseMutex,
+                SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
             },
         },
         UI::WindowsAndMessaging::{
@@ -123,82 +124,155 @@ pub fn prepare_upgrade(directory: &Path) -> i32 {
 }
 
 /// Window lookup and Local mutexes cannot see another session. This read-only
-/// process snapshot refuses an already-running same-path instance elsewhere.
+/// process list refuses this user's already-running same-path instance elsewhere.
 /// It is not an atomic cross-session startup lease; do not claim that it is.
 fn require_no_foreign_session_target(executable: &Path) -> Result<(), i32> {
+    let Some(expected) = installed_target(executable)? else {
+        return Ok(());
+    };
     let own_pid = std::process::id();
     let mut own_session = 0;
     unsafe { ProcessIdToSessionId(own_pid, &mut own_session) }.map_err(|_| 11)?;
-    let snapshot =
-        ProcessHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|_| 11)?);
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    unsafe { Process32FirstW(snapshot.0, &mut entry) }.map_err(|_| 11)?;
-    loop {
-        let length = entry
-            .szExeFile
-            .iter()
-            .position(|c| *c == 0)
-            .unwrap_or(entry.szExeFile.len());
-        let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
-        if entry.th32ProcessID != own_pid && name.eq_ignore_ascii_case("AutoKeyboardLayot.exe") {
-            let process = ProcessHandle(
-                unsafe {
-                    OpenProcess(
-                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                        false,
-                        entry.th32ProcessID,
-                    )
-                }
-                .map_err(|_| 11)?,
-            );
-            let state = unsafe { WaitForSingleObject(process.0, 0) };
-            if state != WAIT_OBJECT_0 {
-                if state != WAIT_TIMEOUT {
-                    return Err(11);
-                }
-                let mut session = 0;
-                unsafe { ProcessIdToSessionId(entry.th32ProcessID, &mut session) }
-                    .map_err(|_| 11)?;
-                if session != own_session {
-                    let mut buffer = vec![0u16; 32768];
-                    let mut length = buffer.len() as u32;
-                    unsafe {
-                        QueryFullProcessImageNameW(
-                            process.0,
-                            PROCESS_NAME_WIN32,
-                            PWSTR(buffer.as_mut_ptr()),
-                            &mut length,
-                        )
-                    }
-                    .map_err(|_| 11)?;
-                    let image = String::from_utf16(&buffer[..length as usize]).map_err(|_| 11)?;
-                    let actual = PathBuf::from(image).canonicalize().map_err(|_| 11)?;
-                    let expected = executable.canonicalize().map_err(|_| 11)?;
-                    if foreign_session_target(own_session, session, &expected, &actual) {
-                        return Err(12);
-                    }
-                }
-            }
+    let own_user = current_token_user()?;
+    let own_sid = unsafe { (*own_user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let processes = SessionProcesses::enumerate()?;
+    for row in processes.rows() {
+        if row.pProcessName.is_null() {
+            continue;
         }
-        match unsafe { Process32NextW(snapshot.0, &mut entry) } {
-            Ok(()) => {}
-            Err(error) if error.code().0 as u32 == (0x80070000 | ERROR_NO_MORE_FILES.0) => break,
+        let name = unsafe { row.pProcessName.to_string() }.map_err(|_| 11)?;
+        let process = RunningProcess {
+            id: row.ProcessId,
+            session: row.SessionId,
+            name: &name,
+            // The list carries the SID only of processes this user may query, never another
+            // user's (unless setup runs elevated, when EqualSid tells them apart).
+            same_user: !row.pUserSid.0.is_null()
+                && unsafe { EqualSid(own_sid, row.pUserSid) }.is_ok(),
+        };
+        if !needs_inspection(own_pid, own_session, &process) {
+            continue;
+        }
+        let handle = match unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                row.ProcessId,
+            )
+        } {
+            Ok(handle) => ProcessHandle(handle),
+            // The process ended after the list was taken.
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
             Err(_) => return Err(11),
+        };
+        match unsafe { WaitForSingleObject(handle.0, 0) } {
+            WAIT_OBJECT_0 => continue,
+            WAIT_TIMEOUT => {}
+            _ => return Err(11),
+        }
+        if same_image_path(&expected, &canonical_image(&handle)?) {
+            return Err(12);
         }
     }
     Ok(())
 }
 
-fn foreign_session_target(
-    own_session: u32,
-    other_session: u32,
-    expected: &Path,
-    actual: &Path,
-) -> bool {
-    own_session != other_session && same_image_path(expected, actual)
+/// The canonical install target, or None while nothing is installed there: no process
+/// runs an executable that does not exist, so a first installation compares nothing.
+fn installed_target(executable: &Path) -> Result<Option<PathBuf>, i32> {
+    match executable.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(11),
+    }
+}
+
+struct RunningProcess<'a> {
+    id: u32,
+    session: u32,
+    name: &'a str,
+    same_user: bool,
+}
+
+/// Only this user's instances in other sessions can hold the install directory unseen
+/// by the window and mutex checks. Another user's processes cannot be opened by this
+/// user and run that user's own copy, so they never block this user's setup.
+fn needs_inspection(own_pid: u32, own_session: u32, process: &RunningProcess) -> bool {
+    process.id != own_pid
+        && process.session != own_session
+        && process.same_user
+        && process.name.eq_ignore_ascii_case("AutoKeyboardLayot.exe")
+}
+
+/// WTSEnumerateProcessesW rows, freed on drop.
+struct SessionProcesses {
+    rows: *mut WTS_PROCESS_INFOW,
+    count: u32,
+}
+impl SessionProcesses {
+    fn enumerate() -> Result<Self, i32> {
+        let mut rows = std::ptr::null_mut();
+        let mut count = 0;
+        unsafe {
+            WTSEnumerateProcessesW(Some(WTS_CURRENT_SERVER_HANDLE), 0, 1, &mut rows, &mut count)
+        }
+        .map_err(|_| 11)?;
+        Ok(Self { rows, count })
+    }
+    fn rows(&self) -> &[WTS_PROCESS_INFOW] {
+        if self.rows.is_null() {
+            return &[];
+        }
+        // WTSEnumerateProcessesW returned `count` rows that live until WTSFreeMemory.
+        unsafe { std::slice::from_raw_parts(self.rows, self.count as usize) }
+    }
+}
+impl Drop for SessionProcesses {
+    fn drop(&mut self) {
+        if !self.rows.is_null() {
+            unsafe { WTSFreeMemory(self.rows.cast()) };
+        }
+    }
+}
+
+/// TOKEN_USER of this process, in a pointer-aligned buffer; its SID points into it.
+fn current_token_user() -> Result<Vec<usize>, i32> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|_| 11)?;
+        let token = ProcessHandle(token);
+        let mut required = 0u32;
+        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut required);
+        if (required as usize) < std::mem::size_of::<TOKEN_USER>() {
+            return Err(11);
+        }
+        let mut buffer = vec![0usize; (required as usize).div_ceil(std::mem::size_of::<usize>())];
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+        .map_err(|_| 11)?;
+        Ok(buffer)
+    }
+}
+
+fn canonical_image(process: &ProcessHandle) -> Result<PathBuf, i32> {
+    let mut buffer = vec![0u16; 32768];
+    let mut length = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    }
+    .map_err(|_| 11)?;
+    let image = String::from_utf16(&buffer[..length as usize]).map_err(|_| 11)?;
+    PathBuf::from(image).canonicalize().map_err(|_| 11)
 }
 
 fn close_instance(class: PCWSTR, mutex: PCWSTR, executable: &Path) -> Result<(), i32> {
@@ -218,20 +292,8 @@ fn close_instance(class: PCWSTR, mutex: PCWSTR, executable: &Path) -> Result<(),
         )
         .map_err(|_| 11)?
     });
-    let mut buffer = vec![0u16; 32768];
-    let mut length = buffer.len() as u32;
-    unsafe {
-        QueryFullProcessImageNameW(
-            process.0,
-            PROCESS_NAME_WIN32,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut length,
-        )
-        .map_err(|_| 11)?;
-    }
-    let image = String::from_utf16(&buffer[..length as usize]).map_err(|_| 11)?;
+    let actual = canonical_image(&process)?;
     let expected = executable.canonicalize().map_err(|_| 11)?;
-    let actual = PathBuf::from(image).canonicalize().map_err(|_| 11)?;
     if !same_image_path(&expected, &actual) {
         // A portable/debug copy or unproven window is outside the install scope.
         return Err(11);
@@ -276,17 +338,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_target_in_another_session_is_never_authorized_by_local_guards() {
-        let target = Path::new(r"C:\Users\Test\Programs\AutoKeyboardLayot\AutoKeyboardLayot.exe");
-        assert!(foreign_session_target(0, 1, target, target));
-        assert!(foreign_session_target(2, 1, target, target));
-        assert!(!foreign_session_target(1, 1, target, target));
-        assert!(!foreign_session_target(
-            0,
-            1,
-            target,
-            Path::new(r"C:\Other\AutoKeyboardLayot.exe")
-        ));
+    fn only_this_users_instances_in_other_sessions_are_inspected() {
+        let process = |id, session, name, same_user| RunningProcess {
+            id,
+            session,
+            name,
+            same_user,
+        };
+        // Own session 1, own process 40.
+        for (row, inspected) in [
+            (process(7, 0, "AutoKeyboardLayot.exe", true), true),
+            (process(8, 2, "autokeyboardlayot.EXE", true), true),
+            // Another signed-in user's agent: no SID, no handle, never a reason to refuse.
+            (process(9, 2, "AutoKeyboardLayot.exe", false), false),
+            (process(10, 1, "AutoKeyboardLayot.exe", true), false),
+            (process(40, 0, "AutoKeyboardLayot.exe", true), false),
+            (process(11, 0, "AutoKeyboardLayot-old.exe", true), false),
+        ] {
+            assert_eq!(needs_inspection(40, 1, &row), inspected, "{}", row.id);
+        }
+    }
+
+    #[test]
+    fn a_first_installation_has_no_target_to_compare() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("AutoKeyboardLayot.exe");
+        assert_eq!(installed_target(&executable), Ok(None));
+        assert_eq!(require_no_foreign_session_target(&executable), Ok(()));
+        std::fs::write(&executable, b"").unwrap();
+        assert_eq!(
+            installed_target(&executable),
+            Ok(Some(executable.canonicalize().unwrap()))
+        );
+        // The real process list (this user's agent may run in this session) holds no
+        // instance of a fresh temporary copy.
+        assert_eq!(require_no_foreign_session_target(&executable), Ok(()));
     }
 
     #[test]
