@@ -56,6 +56,15 @@ Exit codes: `0` means the observed processes exited and both singleton probes
 were clear; `10` means invalid arguments/relative target; `11` means identity
 could not be established; `12` means busy/refused/timeout or a failed request.
 
+Window lookup and `Local\` mutexes cannot see another session, so the helper also
+lists the running processes (`WTSEnumerateProcessesW`). It inspects only this
+user's `AutoKeyboardLayot.exe` processes in other sessions and refuses with `12`
+when one runs the install target. Another signed-in user's processes are never
+inspected: the list carries no SID for them, this user cannot open them, and they
+run that user's own copy, so they cannot block this user's setup or uninstall.
+`11` remains for this user's own process whose path cannot be read. A first
+installation, with no executable at the target yet, has nothing to compare.
+
 After exit code 0, the installer must atomically create and hold both exact
 singleton names (`Local\AutoKeyboardLayot.Agent` and
 `Local\AutoKeyboardLayot.Settings.Singleton`), checking `ERROR_ALREADY_EXISTS`
@@ -68,17 +77,55 @@ The initial source in `installer/AutoKeyboardLayot.iss` uses this discipline for
 setup and uninstall. Inno Setup 6.7.3 accepted it with output disabled (`/O-`);
 this validates compilation, not installation, rollback or uninstall behavior.
 
+After the leases, setup opens the installation fence
+(`%LOCALAPPDATA%\AutoKeyboardLayot.installation.lock`) without sharing. A sharing
+violation means another setup, uninstall, agent or settings of this user holds it,
+possibly in another session (`AkFenceBusy`); any other failure, or a lock file that
+is not an empty ordinary file, is reported with the file name and the Windows error
+code (`AkFenceInvalid`), because retrying cannot help until the file is removed.
+Setup releases both leases and the fence as soon as the files are in place
+(`CurStepChanged(ssPostInstall)`), so the new shortcuts start the program while
+the Finished page is still open.
+
+The uninstaller closes the program only after the user has confirmed the removal
+(`CurUninstallStepChanged(usUninstall)`, where `Abort` ends the uninstall), so
+answering No leaves it running. When `{app}\AutoKeyboardLayot.exe` is missing (an
+antivirus quarantine, a deleted file, an interrupted upgrade) nothing can run from
+it: the close helper is skipped, and the leases and the fence are still taken.
+
 `--initialize-installation` requires both mutexes to be owned by another thread
 (the waiting installer), then acquires the configuration writer mutex. It only
 initializes a profile when all known unified/legacy source files are absent.
 The empty managed store is published first, then the English-only config with
-autoconversion off. Existing profiles remain byte-for-byte unchanged; malformed
+automatic conversion on. Existing profiles remain byte-for-byte unchanged; malformed
 configuration and partial/unrelated stores fail without reset. Exit `20` means
 missing lease/path/writer lock; `21` means profile initialization failed.
 
 Initialization precedes binary installation in the current prototype. If a
 later installer step fails or is cancelled, the new valid English-only profile
 may remain; it is not recursively removed or claimed to be a completed install.
+
+## Language page and startup task
+
+The language page checks the published catalog when it opens and lists its
+languages unchecked; English is always installed. Next with checked languages
+selects them in the package helper, runs `PrepareToInstall` (closing the program
+and its settings and taking the leases and the fence) and installs the languages
+before the wizard moves on; the page says so before the first Next. A refusal
+there (open settings with unsaved changes, a busy program, a held fence) is shown
+on the page and keeps the selection: the user removes the cause and presses Next
+again. The package helper lives as long as setup does, however long the user
+stays on the page.
+
+Setup continues with English only, without a selection, when the helper cannot
+start or fails (its replies stop or cannot be trusted; Back and Next start a new
+one), when the catalog offers no language this setup can install, and when an
+existing profile from an earlier version keeps no package store (the helper
+answers `reason=store_missing`). While a reply is pending, Cancel asks the helper
+to cancel first; a failed reply never leaves the page waiting for one.
+
+The startup task writes `HKCU\...\Run\AutoKeyboardLayot`; leaving it unchecked
+on a reinstall or upgrade deletes that value, and uninstall removes it.
 
 ## Remaining work
 
@@ -127,7 +174,12 @@ The current helper also supports `--verify-modular-base`: exit `0` requires the
 base feature set, while `23` identifies a legacy-bundled build. The setup source
 checks this before closure or profile initialization. This is a build-variant
 check on the reviewed payload, not a signature, source-provenance certificate,
-or substitute for validating the installer bundle itself.
+or substitute for validating the installer bundle itself. Only `23` is reported
+as a non-modular build; any other non-zero exit, such as `0xC0000135`
+(-1073741515) for a missing DLL, is reported with its code (`AkBaseProbeCode`).
+The executables link the C runtime statically (`.cargo/config.toml`), so neither
+the program nor the helpers need the Visual C++ redistributable, which setup
+neither ships nor checks.
 
 ## Dependency notice collection
 
@@ -194,6 +246,27 @@ All 10 passed on Windows. The receipt is
 This is neither a full Windows regression run nor physical typing acceptance.
 The installer output, language-selection page and upgrade VM gates remain open.
 
+## Installer acceptance on a VM
+
+`tools/test-installer-ui.ps1` drives the real setup in the tested user's interactive
+session, one scenario per run: `retry` (a held fence refuses Next on the language
+page, the selection stays, Next after the fence is free installs the language; the
+fence is free and the program starts while the Finished page is open; no Run value
+without the startup task), `helper-failure`, `timer-exception`, `no-store`,
+`uninstall-confirmation` (No leaves the running program alone, Yes closes and removes
+it), `missing-exe`, `startup-removal`, `fence-invalid`, and `probe` for a
+`/DInstallerUiProbe` build. The language list comes from the published catalog, so
+the VM needs network access. The script refuses to run when the user already has a
+profile or an installation, and removes what it created.
+
+`tools/run_vm_installer_ui.py OUTPUT BUILD_DIRECTORY SCENARIO...` stages a build of
+`tools/build_experimental_installer.py` and runs the scenarios through a scheduled
+task in the interactive session; `tools/run_vm_cross_session.py OUTPUT BUILD_DIRECTORY`
+runs `tools/test-vm-cross-session.ps1`, where a reader in session 0 holds the fence
+and the silent setup in session 1 must be refused with the fence message. Both read
+the machine from the `AKL_VM_*` variables of `tools/vm_config.py` and the ssh identity
+path from standard input.
+
 ## Setup message catalogs
 
 Application-owned setup labels and errors live in `installer/messages/*.isl`,
@@ -201,8 +274,8 @@ not Pascal string literals. Each language loads its stock Inno messages, then
 the English application fallback, then its own overrides. This ordering avoids
 global English entries overwriting translations, following Inno's
 [message-file ordering](https://jrsoftware.org/ishelp/topic_languagessection.htm).
-Current EN/RU/DE/ES/FR/PT-BR/JA/AR/ZH-CN/ID/UR/ET/HI/BN catalogs contain the same 11 keys and preserve `%1`
-arguments; source-coverage/placeholder tests and Inno 6.7.3 `/O-` compilation pass.
+Current EN/RU/DE/ES/FR/PT-BR/JA/AR/ZH-CN/ID/UR/ET/HI/BN catalogs contain the same 31 keys and preserve `%1`
+and `%2` arguments; source-coverage/placeholder tests and Inno 6.7.3 `/O-` compilation pass.
 `LanguageDetectionMethod=uilanguage` configures OS display-language selection.
 `UsePreviousLanguage=no` prevents the previous installer language from silently
 overriding that default; this does not change any application preference.

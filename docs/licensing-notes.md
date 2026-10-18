@@ -15,6 +15,8 @@ legal advice and draws no legal conclusions.
 | Layout model | `data/layout-model/NOTICE.md` | CC BY-SA 4.0 (training data from wordfreq and from FrequencyWords, which derives from OpenSubtitles) |
 | Slint (settings UI) | crate metadata of `slint`, `slint-build`, `i-slint-core`, `i-slint-backend-winit` | `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0` |
 | Application icon | `assets/` | authorship and license are not recorded (`assets/README.md` only describes how the files are generated) |
+| Setup message translations for Chinese (Simplified), Indonesian, Urdu, Estonian, Hindi and Bengali | `installer/vendor/inno/`, from `jrsoftware/issrc` at the revision in `SOURCES.json` | the Inno Setup License of that repository (`license.txt`, its SHA-256 in `SOURCES.json`); the files name their translators and state no license of their own; the Urdu, Estonian, Hindi and Bengali files are modified and say so in their first line |
+| Inno Setup runtime and its stock message files | the Inno Setup 6.7.3 compiler on the build machine | Inno Setup License (the compiler's `license.txt`, the same text) |
 | Other Rust dependencies | `Cargo.lock` | per crate; their license texts are collected into the installer's `THIRD-PARTY-NOTICES.txt` |
 
 Where each material ships:
@@ -24,6 +26,9 @@ Where each material ships:
   (sections "Bundled English dictionary" and "Bundled layout model").
 - The Russian and Estonian dictionaries ship only inside signed language packages
   (`.aklp`), each with its own license and notice files.
+- The setup program contains the Inno Setup runtime and the compiled setup messages, including
+  the vendored translations. `THIRD-PARTY-NOTICES.txt` covers the Rust dependencies and the bundled
+  data only; it has no Inno Setup section.
 
 ## Open questions
 
@@ -43,6 +48,11 @@ Where each material ships:
 4. **Application icon.** Who created `assets/icon-source.png` and under which license may it be
    distributed? Until the owner supplies a statement, the icon stays an open item and the README makes no
    claim about it.
+5. **Inno Setup in the setup program.** Its license asks binary redistributions to keep the copyright
+   notice and web addresses that are in place (the setup's About box keeps them) and modified versions
+   to be plainly marked; an acknowledgment in the product documentation is appreciated but not required.
+   Should the release notes or `THIRD-PARTY-NOTICES.txt` carry an Inno Setup acknowledgment, and do the
+   translators of the vendored message files need to be credited anywhere besides the files themselves?
 
 ## Decisions to record here
 
