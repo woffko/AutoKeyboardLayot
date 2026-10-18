@@ -26,6 +26,33 @@ use windows::Win32::{
 thread_local! {
     static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
     static ABORT_CAPTURE: Cell<bool> = const { Cell::new(false) };
+    /// Polls for the release of the key that selected Record from the keyboard.
+    static WAITING: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+}
+
+/// How long a capture selected from the keyboard waits for the Space or Enter that selected it.
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// What starting a capture does now: begin with every key up, wait while a key is still down (the
+/// Space or Enter that selected the button fires on its key-down), give up after `RELEASE_WAIT`
+/// or when another program is in the foreground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartStep {
+    Begin,
+    Wait,
+    GiveUp,
+}
+
+fn start_step(owns_foreground: bool, released: bool, waited: Duration) -> StartStep {
+    if !owns_foreground {
+        StartStep::GiveUp
+    } else if released {
+        StartStep::Begin
+    } else if waited < RELEASE_WAIT {
+        StartStep::Wait
+    } else {
+        StartStep::GiveUp
+    }
 }
 
 struct Capture {
@@ -182,10 +209,39 @@ fn keyboard_released() -> bool {
 pub(super) fn start(ui: &SettingsWindow) {
     stop();
     ABORT_CAPTURE.with(|flag| flag.set(false));
-    if !owns_foreground() || !keyboard_released() {
-        ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into());
-        return;
+    match start_step(owns_foreground(), keyboard_released(), Duration::ZERO) {
+        StartStep::Begin => begin(ui),
+        StartStep::GiveUp => ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into()),
+        StartStep::Wait => {
+            let began = Instant::now();
+            let weak = ui.as_weak();
+            let timer = slint::Timer::default();
+            timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(25),
+                move || {
+                    let step = start_step(owns_foreground(), keyboard_released(), began.elapsed());
+                    if step == StartStep::Wait {
+                        return;
+                    }
+                    WAITING.with(|slot| slot.borrow_mut().take());
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    if step == StartStep::Begin {
+                        begin(&ui);
+                    } else {
+                        ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into());
+                    }
+                },
+            );
+            WAITING.with(|slot| *slot.borrow_mut() = Some(timer));
+        }
     }
+}
+
+/// Installs the capture hook; every key is up.
+fn begin(ui: &SettingsWindow) {
     let hook = unsafe {
         GetModuleHandleW(None).and_then(|module| {
             SetWindowsHookExW(
@@ -228,6 +284,7 @@ pub(super) fn start(ui: &SettingsWindow) {
 }
 
 pub(super) fn stop() {
+    WAITING.with(|slot| slot.borrow_mut().take());
     let capture = CAPTURE.with(|slot| slot.borrow_mut().take());
     if let Some(capture) = capture {
         if let Some(ui) = capture.ui.upgrade() {
@@ -431,6 +488,21 @@ mod tests {
             "{common}"
         );
         assert!(!chosen_hint(hotkey(b'Q', HOTKEY_MOD_CONTROL)).contains("programs"));
+    }
+
+    #[test]
+    fn recording_selected_from_the_keyboard_waits_for_that_key_to_be_released() {
+        use StartStep::{Begin, GiveUp, Wait};
+        let moment = Duration::from_millis(100);
+        assert_eq!(start_step(true, true, Duration::ZERO), Begin);
+        // Space or Enter selected the button and is still down: wait for its release.
+        assert_eq!(start_step(true, false, Duration::ZERO), Wait);
+        assert_eq!(start_step(true, false, RELEASE_WAIT - moment), Wait);
+        assert_eq!(start_step(true, true, RELEASE_WAIT - moment), Begin);
+        // A key held longer, or another program in the foreground, ends it.
+        assert_eq!(start_step(true, false, RELEASE_WAIT), GiveUp);
+        assert_eq!(start_step(false, true, Duration::ZERO), GiveUp);
+        assert_eq!(start_step(false, false, moment), GiveUp);
     }
 
     #[test]
