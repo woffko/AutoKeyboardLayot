@@ -3034,13 +3034,24 @@ fn input_desktop_is_default() -> bool {
 }
 
 fn foreground_privilege() -> ForegroundPrivilege {
-    let Some(context) = current_foreground_context() else {
+    foreground_privilege_of(
+        current_foreground_context().map(|context| context.process_id),
+        unsafe { GetCurrentProcessId() },
+        process_integrity_level,
+    )
+}
+
+/// The privilege of the `foreground` process (`None`: nothing is in the foreground) compared with
+/// the `agent` process, from the integrity level `integrity_level` reads for a process id.
+fn foreground_privilege_of(
+    foreground: Option<u32>,
+    agent: u32,
+    integrity_level: impl Fn(u32) -> Option<u32>,
+) -> ForegroundPrivilege {
+    let Some(foreground) = foreground else {
         return ForegroundPrivilege::None;
     };
-    ForegroundPrivilege::compare(
-        process_integrity_level(context.process_id),
-        process_integrity_level(unsafe { GetCurrentProcessId() }),
-    )
+    ForegroundPrivilege::compare(integrity_level(foreground), integrity_level(agent))
 }
 
 /// Why the hooks are reinstalled for a session change notification, if they are.
@@ -13656,6 +13667,42 @@ mod tests {
         }
         let _ = input_desktop_is_default();
         let _ = foreground_privilege();
+    }
+
+    #[test]
+    fn the_foreground_privilege_compares_the_foreground_process_with_the_agent() {
+        use ForegroundPrivilege::{Higher, NotHigher, Unknown};
+        const LOW: u32 = 0x1000;
+        const MEDIUM: u32 = 0x2000;
+        const HIGH: u32 = 0x3000;
+        // Process 10 is the agent at medium integrity, 20 an elevated program, 30 a process whose
+        // token cannot be read, and every other one runs at low integrity.
+        let level = |process: u32| match process {
+            10 => Some(MEDIUM),
+            20 => Some(HIGH),
+            30 => None,
+            _ => Some(LOW),
+        };
+        assert_eq!(
+            foreground_privilege_of(None, 10, level),
+            ForegroundPrivilege::None
+        );
+        assert_eq!(foreground_privilege_of(Some(20), 10, level), Higher);
+        assert_eq!(foreground_privilege_of(Some(10), 10, level), NotHigher);
+        assert_eq!(foreground_privilege_of(Some(40), 10, level), NotHigher);
+        assert_eq!(foreground_privilege_of(Some(30), 10, level), Unknown);
+        // An agent that cannot read its own level knows nothing either.
+        assert_eq!(foreground_privilege_of(Some(40), 30, level), Unknown);
+        // The real lookup: the agent is never above itself, and the idle process cannot be opened.
+        let agent = unsafe { GetCurrentProcessId() };
+        assert_eq!(
+            foreground_privilege_of(Some(agent), agent, process_integrity_level),
+            NotHigher
+        );
+        assert_eq!(
+            foreground_privilege_of(Some(0), agent, process_integrity_level),
+            Unknown
+        );
     }
 
     #[test]
