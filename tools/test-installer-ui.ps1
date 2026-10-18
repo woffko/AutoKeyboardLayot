@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory=$true)][string]$InstalledAppHash,
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [ValidateSet('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
-                 'startup-removal', 'fence-invalid', 'probe')]
+                 'startup-removal', 'fence-invalid', 'no-selectable-row', 'probe')]
     [string]$Scenario = 'retry',
     [string]$Language = 'Deutsch'
 )
@@ -23,6 +23,9 @@ param(
 #   missing-exe             a silent uninstall succeeds when the installed program is missing
 #   startup-removal         a reinstall with the startup task unchecked removes the Run value
 #   fence-invalid           a lock file that is not empty is reported by name and setup installs nothing
+#   no-selectable-row       every row of the catalog is unavailable (all its packages need a newer package API):
+#                           Next continues with English only. Needs a setup whose catalog, or a test build of its
+#                           package helper, offers no compatible row
 #   probe                   the installation-disabled UI probe build (/DInstallerUiProbe): every Next with a
 #                           language is refused and can be repeated, the helper never receives a download or
 #                           install command, Cancel ends it, and no profile is created
@@ -342,6 +345,19 @@ try {
             $logText = [IO.File]::ReadAllText($script:silentLog)
             Check 'invalid_fence_reported' ($logText -like "*The installation lock file $fencePath cannot be used (code 0)*")
             Check 'nothing_installed' (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $registration))
+        }
+        'no-selectable-row' {
+            $setup = Start-Owned $Executable ('/SP- /LANG=english /DIR="' + $installTarget + '" /LOG="' + (Join-Path $OutputDirectory 'setup.log') + '"')
+            $list = Reach-LanguageList
+            $rows = [SetupWindows]::Message($list, 0x18B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+            $texts = @(for ($index = 0; $index -lt $rows; $index++) { [SetupWindows]::Row($list, $index) })
+            Check 'every_row_unavailable' (@($texts | Where-Object { $_ -notlike '*Unavailable*' }).Count -eq 0)
+            Check 'next_enabled_without_a_language' ([SetupWindows]::IsWindowEnabled((Next-Button)))
+            Click (Next-Button)
+            Finish-Wizard $null
+            [void](Wait-Exit $setup 60)
+            Check 'installed_app_hash' (Installed-Hash)
+            Check 'no_language_installed' (@(Store-Packages).Count -eq 0)
         }
         'probe' {
             $log = Join-Path $OutputDirectory 'setup.log'

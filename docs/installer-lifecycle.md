@@ -254,10 +254,12 @@ page, the selection stays, Next after the fence is free installs the language; t
 fence is free and the program starts while the Finished page is open; no Run value
 without the startup task), `helper-failure`, `timer-exception`, `no-store`,
 `uninstall-confirmation` (No leaves the running program alone, Yes closes and removes
-it), `missing-exe`, `startup-removal`, `fence-invalid`, and `probe` for a
-`/DInstallerUiProbe` build. The language list comes from the published catalog, so
-the VM needs network access. The script refuses to run when the user already has a
-profile or an installation, and removes what it created.
+it), `missing-exe`, `startup-removal`, `fence-invalid`, `no-selectable-row` for a
+catalog whose packages all need a newer package API (or a test build of the package
+helper that reports every row unavailable), and `probe` for a `/DInstallerUiProbe`
+build. The language list comes from the published catalog, so the VM needs network
+access. The script refuses to run when the user already has a profile or an
+installation, and removes what it created.
 
 `tools/run_vm_installer_ui.py OUTPUT BUILD_DIRECTORY SCENARIO...` stages a build of
 `tools/build_experimental_installer.py` and runs the scenarios through a scheduled
