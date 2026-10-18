@@ -359,6 +359,19 @@ fn process_pending_update() {
     }
 }
 
+/// Hands key events to a running capture as the hook hands on keys that are not injected. The
+/// hook ignores injected input, so the desktop acceptance shows its chords this way.
+#[cfg(test)]
+pub(super) fn deliver(keys: &[(u16, bool)]) {
+    CAPTURE.with(|slot| {
+        if let Some(capture) = slot.borrow_mut().as_mut() {
+            for &(key, down) in keys {
+                capture.dispatch.accept(key, down);
+            }
+        }
+    });
+}
+
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };

@@ -1184,6 +1184,101 @@ fn the_settings_window_on_the_desktop_starts_recording_with_space() {
 
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_refuses_shortcuts_that_type() {
+    let window = Window::open(Profile::legacy());
+    let ui = Automation::new();
+    let record = scroll_to(
+        &ui,
+        &window,
+        UIA_ButtonControlTypeId,
+        &tr("hotkey.record_button"),
+    );
+    record.focus();
+    thread::sleep(Duration::from_millis(500));
+    keys(&[(VK_SPACE, true)]);
+    thread::sleep(Duration::from_millis(300));
+    keys(&[(VK_SPACE, false)]);
+    let pressing = tr("hotkey.press");
+    let recording = ui.wait(
+        window.handle,
+        UIA_TextControlTypeId,
+        &pressing,
+        Duration::from_secs(5),
+    );
+    // The capture ignores injected keys, as it must: each chord reaches it the way its hook hands on
+    // keys that are not injected.
+    let chord = |keys: Vec<(u16, bool)>| {
+        slint::invoke_from_event_loop(move || super::hotkey_capture::deliver(&keys))
+            .expect("event loop");
+    };
+    // Left Shift and Q.
+    chord(vec![
+        (0xa0, true),
+        (0x51, true),
+        (0x51, false),
+        (0xa0, false),
+    ]);
+    let shift_refused = ui.wait(
+        window.handle,
+        UIA_TextControlTypeId,
+        &tr("hotkey.shift_only"),
+        Duration::from_secs(5),
+    );
+    let _ = screenshot("settings-shift-refused.bmp");
+    let recording_after_shift = ui
+        .find(window.handle, UIA_TextControlTypeId, &pressing)
+        .is_some();
+    // Left Ctrl, left Alt and E: AltGr+E.
+    chord(vec![
+        (0xa2, true),
+        (0xa4, true),
+        (0x45, true),
+        (0x45, false),
+        (0xa4, false),
+        (0xa2, false),
+    ]);
+    let altgr_refused = ui.wait(
+        window.handle,
+        UIA_TextControlTypeId,
+        &tr("hotkey.altgr"),
+        Duration::from_secs(5),
+    );
+    let recording_after_altgr = ui
+        .find(window.handle, UIA_TextControlTypeId, &pressing)
+        .is_some();
+    eprintln!(
+        "recording={} shift_refused={} after_shift={recording_after_shift} altgr_refused={} \
+         after_altgr={recording_after_altgr}",
+        recording.is_some(),
+        shift_refused.is_some(),
+        altgr_refused.is_some()
+    );
+    // Escape ends the recording without a choice.
+    chord(vec![(0x1b, true), (0x1b, false)]);
+    window.request_close();
+    let closed = window.closed_within(Duration::from_secs(30));
+    assert!(recording.is_some(), "Space did not start the recording");
+    assert!(
+        shift_refused.is_some(),
+        "Shift and a letter was not refused"
+    );
+    assert!(
+        recording_after_shift,
+        "the recording ended at Shift and a letter"
+    );
+    assert!(
+        altgr_refused.is_some(),
+        "Ctrl+Alt and a letter was not refused"
+    );
+    assert!(
+        recording_after_altgr,
+        "the recording ended at Ctrl+Alt and a letter"
+    );
+    assert!(closed, "the window did not close without changes");
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_shows_the_migration_review_without_opening_the_tools() {
     // Migration needs a package for every input language this build carries.
     let required: Vec<PackId> = autokeyboardlayot::DictionaryRegistry::embedded()

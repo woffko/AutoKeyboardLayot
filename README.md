@@ -121,8 +121,11 @@ for the session and exposes a technical failure counter in the tray status.
   rows are mirrored with their marks visible; Space starts a shortcut recording; the
   migration review shows in a legacy profile without opening the tools; the installed
   packages are listed at opening; file dialogs belong to the settings window and
-  disable it; a maximized window stays maximized when Settings is opened again. The
-  shortcut capture ignores injected input, so its rules are tested without the desktop;
+  disable it; a maximized window stays maximized when Settings is opened again; while
+  a recording runs, Shift with a letter and Ctrl+Alt with a letter are refused with
+  their reasons and the recording goes on. The shortcut capture ignores injected input,
+  so that test hands the chords to it the way its hook hands on keys that are not
+  injected;
 - native Windows 11 MSVC test and release builds;
 - an interactive-session launch without a visible error window;
 - readable `EN` and `RU` tray icons and live foreground-layout updates;
