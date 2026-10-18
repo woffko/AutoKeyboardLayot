@@ -110,16 +110,16 @@ use windows::{
             WindowsAndMessaging::{
                 AppendMenuW, CallNextHookEx, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
                 DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-                GUITHREADINFO, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetMessageW,
-                GetShellWindow, GetWindowThreadProcessId, HHOOK, HICON, HMENU, ICONINFO, IDYES,
-                KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MB_ICONERROR,
-                MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED,
-                MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW,
-                PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PM_REMOVE, PeekMessageW,
-                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-                SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW,
-                SetForegroundWindow, SetTimer, SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON,
-                TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+                GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetShellWindow,
+                GetWindowThreadProcessId, HHOOK, HICON, HMENU, ICONINFO, IDYES, KBDLLHOOKSTRUCT,
+                LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MB_ICONERROR, MB_ICONINFORMATION,
+                MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+                MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, MessageBoxW, PBT_APMRESUMEAUTOMATIC,
+                PBT_APMRESUMESUSPEND, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
+                RegisterClassW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+                SMTO_ERRORONEXIT, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
+                SetWindowTextW, SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu,
+                TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
                 WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_QUIT,
@@ -4645,10 +4645,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         TRAY_CALLBACK_MESSAGE => {
             let notification = (lparam.0 as u32) & 0xffff;
-            match tray_interaction(notification) {
+            match tray_interaction(notification, wparam) {
                 TrayInteraction::Settings => settings_window::show(hwnd),
-                TrayInteraction::QuickMenu => {
-                    let _ = show_tray_menu(hwnd, None);
+                TrayInteraction::QuickMenu(anchor) => {
+                    let _ = show_tray_menu(hwnd, anchor);
                 }
                 TrayInteraction::Ignore => {}
             }
@@ -4702,17 +4702,21 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum TrayInteraction {
     Settings,
-    QuickMenu,
+    /// The menu, opened at this screen point.
+    QuickMenu(POINT),
     Ignore,
 }
 
-fn tray_interaction(notification: u32) -> TrayInteraction {
+/// What a notification of the icon asks for. With NOTIFYICON_VERSION_4, `anchor` (wParam) holds
+/// where a menu belongs: the pointer after a right click, the icon after the menu key or
+/// Shift+F10.
+fn tray_interaction(notification: u32, anchor: WPARAM) -> TrayInteraction {
     match notification {
         WM_LBUTTONDBLCLK | NIN_KEYSELECT | NIN_SELECT => TrayInteraction::Settings,
-        WM_CONTEXTMENU => TrayInteraction::QuickMenu,
+        WM_CONTEXTMENU => TrayInteraction::QuickMenu(point_from_packed_word(anchor)),
         _ => TrayInteraction::Ignore,
     }
 }
@@ -12058,7 +12062,6 @@ fn create_indicator_icon(visual: TrayVisual, indicator: LayoutIndicator) -> Resu
     icon
 }
 
-#[cfg(test)]
 fn point_from_packed_word(value: WPARAM) -> POINT {
     let packed = value.0 as u32;
     POINT {
@@ -12067,7 +12070,7 @@ fn point_from_packed_word(value: WPARAM) -> POINT {
     }
 }
 
-fn show_tray_menu(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
+fn show_tray_menu(hwnd: HWND, anchor: POINT) -> Result<()> {
     let entered = APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         match state.as_mut() {
@@ -12081,7 +12084,7 @@ fn show_tray_menu(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
     if !entered {
         return Ok(());
     }
-    let result = show_tray_menu_inner(hwnd, interaction_point);
+    let result = show_tray_menu_inner(hwnd, anchor);
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.menu_open = false;
@@ -12091,9 +12094,27 @@ fn show_tray_menu(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
     result
 }
 
-fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
+/// A popup menu, destroyed when it goes out of scope: on every return path.
+struct PopupMenu(HMENU);
+
+impl PopupMenu {
+    fn new() -> Result<Self> {
+        Ok(Self(unsafe { CreatePopupMenu() }?))
+    }
+}
+
+impl Drop for PopupMenu {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyMenu(self.0);
+        }
+    }
+}
+
+fn show_tray_menu_inner(hwnd: HWND, anchor: POINT) -> Result<()> {
     unsafe {
-        let menu: HMENU = CreatePopupMenu()?;
+        let popup = PopupMenu::new()?;
+        let menu = popup.0;
         let snapshot = APP_STATE.with(|slot| {
             let state = slot.borrow();
             let state = state.as_ref()?;
@@ -12113,7 +12134,6 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             })
         });
         let Some(status) = snapshot else {
-            DestroyMenu(menu)?;
             return Ok(());
         };
         let auto_flags = MF_STRING
@@ -12202,25 +12222,17 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             &HSTRING::from(tr("menu.exit")),
         )?;
 
-        let point = if let Some(point) = interaction_point {
-            point
-        } else {
-            let mut point = POINT::default();
-            GetCursorPos(&mut point)?;
-            point
-        };
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(
             menu,
             ui_localization::popup_menu_style(TPM_RIGHTBUTTON),
-            point.x,
-            point.y,
+            anchor.x,
+            anchor.y,
             Some(0),
             hwnd,
             None,
         );
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        DestroyMenu(menu)?;
         Ok(())
     }
 }
@@ -15039,10 +15051,40 @@ mod tests {
 
     #[test]
     fn right_click_opens_menu_and_left_click_opens_settings() {
-        assert_eq!(tray_interaction(WM_CONTEXTMENU), TrayInteraction::QuickMenu);
-        assert_eq!(tray_interaction(NIN_KEYSELECT), TrayInteraction::Settings);
-        assert_eq!(tray_interaction(NIN_SELECT), TrayInteraction::Settings);
-        assert_eq!(tray_interaction(WM_TIMER), TrayInteraction::Ignore);
+        // The menu opens where the shell says: the icon's place on a monitor left of the primary
+        // one, as for the menu key, never wherever the pointer happens to be.
+        let anchor = WPARAM((usize::from(860u16) << 16) | usize::from((-120i16) as u16));
+        assert_eq!(
+            tray_interaction(WM_CONTEXTMENU, anchor),
+            TrayInteraction::QuickMenu(POINT { x: -120, y: 860 })
+        );
+        assert_eq!(
+            tray_interaction(NIN_KEYSELECT, anchor),
+            TrayInteraction::Settings
+        );
+        assert_eq!(
+            tray_interaction(NIN_SELECT, anchor),
+            TrayInteraction::Settings
+        );
+        assert_eq!(tray_interaction(WM_TIMER, anchor), TrayInteraction::Ignore);
+    }
+
+    #[test]
+    fn the_tray_menu_is_destroyed_on_every_return() {
+        use windows::Win32::System::Threading::{
+            GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::IsMenu;
+        let menu = PopupMenu::new().expect("menu");
+        let handle = menu.0;
+        assert!(unsafe { IsMenu(handle) }.as_bool());
+        drop(menu);
+        assert!(!unsafe { IsMenu(handle) }.as_bool());
+        // Without the agent's state (it is stopping) the menu returns early, leaving nothing.
+        let objects = || unsafe { GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) };
+        let before = objects();
+        show_tray_menu_inner(HWND::default(), POINT::default()).expect("early return");
+        assert_eq!(objects(), before);
     }
 
     #[test]
