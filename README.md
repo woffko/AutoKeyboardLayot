@@ -32,7 +32,10 @@ On a new profile, automatic conversion is on from the start. The alpha provides:
 - a singleton Slint Fluent settings window in the same EXE's `--settings`
   process, with pages for
   general behavior, switching rules, languages, user words, word/process
-  exclusions, backend routing, diagnostics, and About;
+  exclusions, backend routing, diagnostics, and About. It renders with OpenGL 2.0
+  or later: where the display adapter offers only Windows' built-in OpenGL 1.1 (a
+  virtual machine with the basic display adapter, for example) it does not open
+  until the Microsoft OpenGL Compatibility Pack is installed;
 - executable browsing and selection from running processes for exclusions;
 - atomic apply-and-hot-reload without opening managed lists in an external text
   editor or blocking the keyboard-hook thread;
@@ -108,6 +111,17 @@ for the session and exposes a technical failure counter in the tray status.
   icon back without announcing it again; and the agent started while Explorer is
   stopped (with `AutoRestartShell` set to 0 for the test) keeps running and adds its
   icon once the taskbar is there;
+- on the same desktop, the settings window, driven through UI Automation and input:
+  the installer's graceful-close property appears once the window exists and the
+  window closes on the installer's request; a long message is shown in full; one
+  interface language stays marked after several clicks; the online review shows each
+  chosen package's license through its package picker, which stays clear of the
+  preview; the Add language dialog shows its failures inside; in Arabic the language
+  rows are mirrored with their marks visible; Space starts a shortcut recording; the
+  migration review shows in a legacy profile without opening the tools; the installed
+  packages are listed at opening; file dialogs belong to the settings window and
+  disable it; a maximized window stays maximized when Settings is opened again. The
+  shortcut capture ignores injected input, so its rules are tested without the desktop;
 - native Windows 11 MSVC test and release builds;
 - an interactive-session launch without a visible error window;
 - readable `EN` and `RU` tray icons and live foreground-layout updates;

@@ -42,6 +42,8 @@ use super::{
 
 slint::include_modules!();
 use super::ui_localization::{tr, tr_format};
+#[cfg(test)]
+mod desktop_acceptance;
 mod hotkey_capture;
 mod package_import;
 
