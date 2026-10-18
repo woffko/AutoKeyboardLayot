@@ -483,7 +483,10 @@ builds did not ask, so hovering over the icon showed nothing.
 The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
 the tray icon is added again, showing what the old icon showed, so a conversion failure
 it already announced is not announced again; if Explorer is not ready yet the addition is
-retried with a growing delay. Unlocking the session, reconnecting and resuming
+retried with a growing delay. The same holds at start-up: an agent that starts with the
+session before the taskbar exists works without the icon and adds it once the taskbar is
+there (`event=tray` in the diagnostics log), where earlier builds stopped with a start-up
+error. Unlocking the session, reconnecting and resuming
 from sleep reinstall both hooks (held keys are handed back first, as after a gate
 timeout). A
 watchdog on the 250 ms timer also reinstalls them when the user types (input

@@ -3274,15 +3274,44 @@ fn add_tray(hwnd: HWND, status: TrayStatus) -> bool {
             if let Some(duplicate) = duplicate {
                 duplicate.discard_replaced();
             }
-            UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None);
+            let failures = UI_GUARDS.with(|guards| {
+                guards
+                    .borrow_mut()
+                    .tray_retry
+                    .take()
+                    .map_or(0, |retry| retry.failures)
+            });
+            if failures > 0 {
+                APP_STATE.with(|slot| {
+                    if let Ok(borrowed) = slot.try_borrow()
+                        && let Some(state) = borrowed.as_ref()
+                    {
+                        state.event_diagnostic("tray", format!("result=added failures={failures}"));
+                    }
+                });
+            }
             true
         }
-        Err(_) => {
-            UI_GUARDS.with(|guards| {
+        Err(error) => {
+            let failures = UI_GUARDS.with(|guards| {
                 let mut guards = guards.borrow_mut();
                 match guards.tray_retry.as_mut() {
                     Some(retry) => retry.failed_again(now),
                     None => guards.tray_retry = Some(Retry::first(now)),
+                }
+                guards.tray_retry.as_ref().map_or(0, |retry| retry.failures)
+            });
+            APP_STATE.with(|slot| {
+                if let Ok(borrowed) = slot.try_borrow()
+                    && let Some(state) = borrowed.as_ref()
+                {
+                    state.event_diagnostic(
+                        "tray",
+                        format!(
+                            "result=unavailable failures={failures} error={:#010x}",
+                            error.code().0
+                        ),
+                    );
                 }
             });
             false
@@ -4288,7 +4317,6 @@ pub fn run() -> Result<()> {
             .map(|context| LayoutIndicator::from_layout(context.layout))
             .unwrap_or(LayoutIndicator::Unavailable);
         installer_lifecycle::advertise_safe_close(hwnd);
-        let tray = TrayIcon::add(hwnd, TrayStatus::initial(initial_indicator))?;
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(
             initial_configuration
@@ -4339,7 +4367,7 @@ pub fn run() -> Result<()> {
         APP_STATE.with(|slot| {
             *slot.borrow_mut() = Some(AppState {
                 window: hwnd,
-                tray: Some(tray),
+                tray: None,
                 keyboard_hook: None,
                 mouse_hook: None,
                 input_sender: Some(input_sender),
@@ -4365,6 +4393,10 @@ pub fn run() -> Result<()> {
                 typed_input: 0,
             });
         });
+        // The agent starts with the session, possibly before the taskbar exists. It works without
+        // the icon meanwhile: a refused icon is retried with backoff, and TaskbarCreated adds it as
+        // soon as Explorer is ready.
+        add_tray(hwnd, TrayStatus::initial(initial_indicator));
 
         let keyboard_hook =
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(instance), 0) {
@@ -14906,6 +14938,44 @@ mod tests {
             .filter(|call| call.message == NIM_DELETE)
             .count();
         assert_eq!(deletes, 1, "only the final teardown deletes");
+    }
+
+    #[test]
+    fn an_icon_the_shell_refuses_is_added_by_a_later_retry() {
+        use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        // The agent starts before the taskbar exists: the shell refuses the icon, and the agent
+        // goes on without it until a later timer tick adds it.
+        let (state, _receiver) = test_gate_state(1);
+        let shell = ScriptedShell {
+            failures: VecDeque::from([(NIM_ADD, ERROR_FILE_NOT_FOUND)]),
+            ..ScriptedShell::default()
+        };
+        let stored = || APP_STATE.with(|slot| slot.borrow().as_ref().unwrap().tray.is_some());
+        let ((), shell) = with_scripted_shell(shell, || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(!add_tray(
+                HWND::default(),
+                TrayStatus::initial(LayoutIndicator::English)
+            ));
+            assert!(!stored());
+            // Not due yet: nothing is tried.
+            retry_tray(HWND::default());
+            assert_eq!(scripted_shell(|shell| shell.calls.len()), 1);
+            UI_GUARDS.with(|guards| {
+                guards
+                    .borrow_mut()
+                    .tray_retry
+                    .as_mut()
+                    .expect("retry")
+                    .next_attempt = Instant::now();
+            });
+            retry_tray(HWND::default());
+            assert!(stored());
+            assert!(UI_GUARDS.with(|guards| guards.borrow().tray_retry.is_none()));
+            drop(take_app_state());
+        });
+        let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
+        assert_eq!(messages, [NIM_ADD, NIM_ADD, NIM_SETVERSION, NIM_DELETE]);
     }
 
     #[test]
