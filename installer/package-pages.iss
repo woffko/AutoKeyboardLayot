@@ -294,9 +294,14 @@ begin
       PackageSend('{"action":"cancel"}', 'cancel');
     end else if PackageBusy and (PackageAwaiting < 0) then PackageSend('{"action":"poll"}', 'poll');
   except
-    PackageFault := True;
-    PackageFailed;
-    PackageControls;
+    // Stop waiting for replies that can no longer be trusted, so that Cancel and Next work.
+    // A ready helper is still asked to close when setup ends (StopPackageHelper).
+    PackageAwaiting := -1;
+    PackageBusy := False;
+    PackageCancelRequested := False;
+    // Before the helper is ready its first reply would only fail again on every tick.
+    if not PackageReady then PackageStarted := False;
+    PackageHelperFailed;
    end;
   finally
     PackageInTimer := False;
