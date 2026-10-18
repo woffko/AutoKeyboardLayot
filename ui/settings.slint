@@ -827,16 +827,16 @@ export component SettingsWindow inherits Window {
             }
 
             Rectangle { height: 1px; background: Palette.border; }
+            // Messages name their remedy at the end: the whole text is shown, wrapped across the
+            // window's width, in full contrast.
+            if root.status-text != "": UiText {
+                text: root.status-text;
+                color: root.status-error ? #c42b1c : Palette.foreground;
+                wrap: word-wrap;
+            }
             DirectionalRow {
                 height: 40px;
                 spacing: 10px;
-                UiText {
-                    text: root.status-text; color: root.status-error ? #c42b1c : Palette.foreground;
-                    opacity: root.status-text == "" ? 0 : 0.75; vertical-alignment: center;
-                    x: Localization.rtl ? cancel-button.x + cancel-button.width + parent.spacing : 0px;
-                    width: max(0px, parent.width - cancel-button.width - apply-button.width - ok-button.width - 3 * parent.spacing);
-                    height: parent.height; wrap: no-wrap; overflow: elide;
-                }
                 cancel-button := Button {
                     enabled: !root.package-import-busy;
                     text: Localization.text("button.cancel", Localization.revision);
