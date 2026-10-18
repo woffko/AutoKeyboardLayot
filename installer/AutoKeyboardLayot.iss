@@ -76,6 +76,8 @@ Name: "{userprograms}\AutoKeyboardLayot\{cm:AkSettingsShortcut}"; Filename: "{ap
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "AutoKeyboardLayot"; ValueData: """{app}\AutoKeyboardLayot.exe"""; Tasks: startup; Flags: uninsdeletevalue
+; Unchecking the task on a reinstall or upgrade removes the value an earlier run wrote.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "AutoKeyboardLayot"; Tasks: not startup; Flags: deletevalue
 
 ; No [Run], [InstallDelete], or [UninstallDelete]: setup never starts conversion
 ; and never enrolls the separate user-data directory for recursive deletion.
