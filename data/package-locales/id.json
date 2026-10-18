@@ -10,6 +10,7 @@
     "rollback.unavailable": "Pengembalian versi tidak dapat disiapkan. Paket sebelumnya mungkin hilang, rusak, tidak tepercaya, atau tidak kompatibel, atau inventaris telah berubah. Tidak ada yang dipasang. Segarkan daftar sebelum mencoba lagi.",
     "rollback.done": "Versi paket sebelumnya telah dipulihkan. Preferensi, data pengguna, dan riwayat versi dipertahankan. Permintaan muat ulang dikirim ke agen jika sedang berjalan.",
     "package.uncertain": "Status paket dibaca ulang setelah penulisan yang hasilnya tidak pasti. Perubahan mungkin sudah terlihat, tetapi penyimpanan permanen belum dikonfirmasi. Jangan mengulang tanpa pemeriksaan; periksa penyimpanan.",
+    "package.not_installed": "Tidak ada yang dipasang: status paket berubah atau digunakan operasi lain sebelum perubahan dapat disimpan. Siapkan perubahan lagi.",
     "download.repository": "Repositori GitHub (pemilik/nama; kosongkan untuk sumber yang diterima). Jangan masukkan kredensial.",
     "download.check": "Periksa katalog paket",
     "download.selection": "Dipilih: {count} paket, {bytes} byte. Pengunduhan menerima katalog ini dan menyimpan riwayat perlindungan dari penurunan versi meskipun dibatalkan. Instalasi memerlukan konfirmasi terpisah.",

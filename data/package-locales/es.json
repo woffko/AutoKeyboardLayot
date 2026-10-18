@@ -10,6 +10,7 @@
     "rollback.unavailable": "No se pudo preparar la reversión. El paquete anterior puede faltar, estar dañado, no ser de confianza o ser incompatible, o el inventario puede haber cambiado. No se instaló nada. Actualice la lista antes de volver a intentarlo.",
     "rollback.done": "Se restauró la versión anterior del paquete. Se conservaron las preferencias, los datos del usuario y el historial de versiones. Se envió una solicitud de recarga al agente si está en ejecución.",
     "package.uncertain": "Se volvió a leer el estado de los paquetes tras una escritura incierta. El cambio puede ser visible, pero no se confirmó su guardado duradero. No reintente a ciegas; compruebe el almacenamiento.",
+    "package.not_installed": "No se ha instalado nada: el estado de los paquetes cambió u otra operación lo usó antes de que se pudiera guardar el cambio. Prepare el cambio de nuevo.",
     "download.repository": "Repositorio de GitHub (propietario/nombre; déjelo vacío para usar la fuente aceptada). No introduzca credenciales.",
     "download.check": "Comprobar catálogo de paquetes",
     "download.selection": "Seleccionados: {count} paquetes, {bytes} bytes. La descarga acepta este catálogo y conserva su protección contra retrocesos incluso si se cancela. La instalación requiere otra confirmación.",

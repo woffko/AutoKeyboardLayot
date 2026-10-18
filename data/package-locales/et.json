@@ -10,6 +10,7 @@
     "rollback.unavailable": "Tagasipööramist ei saa ette valmistada. Eelmine pakett võib puududa, olla kahjustatud, ebausaldusväärne või ühildumatu või pakettide loend võib olla muutunud. Midagi ei paigaldatud. Enne uut katset värskenda loendit.",
     "rollback.done": "Paketi eelmine versioon taastati. Eelistused, kasutajaandmed ja versiooniajalugu säilitati. Kui agent töötab, saadeti sellele taaslaadimise taotlus.",
     "package.uncertain": "Pakettide olek loeti pärast ebaselge tulemusega kirjutamist uuesti. Muudatus võib juba nähtav olla, kuid püsivat salvestamist ei kinnitatud. Ära korda toimingut pimesi; kontrolli salvestusruumi.",
+    "package.not_installed": "Midagi ei paigaldatud: pakettide olek muutus või kasutas seda mõni teine toiming enne, kui muudatuse sai salvestada. Valmista muudatus uuesti ette.",
     "download.repository": "GitHubi hoidla (omanik/nimi; jäta tühjaks kinnitatud allika kasutamiseks). Ära sisesta pääsuandmeid.",
     "download.check": "Kontrolli paketikataloogi",
     "download.selection": "Valitud: {count} paketti, {bytes} baiti. Allalaadimine kinnitab kataloogi; tagasipööramise vastane ajalugu säilib ka tühistamisel. Paigaldamine vajab eraldi kinnitust.",

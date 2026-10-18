@@ -10,6 +10,7 @@
     "rollback.unavailable": "Das Zurücksetzen konnte nicht vorbereitet werden. Das vorherige Paket fehlt möglicherweise, ist beschädigt, nicht vertrauenswürdig oder inkompatibel, oder der Paketbestand hat sich geändert. Es wurde nichts installiert. Aktualisieren Sie die Liste vor einem erneuten Versuch.",
     "rollback.done": "Die vorherige Paketversion wurde wiederhergestellt. Einstellungen, Benutzerdaten und Versionsverlauf blieben erhalten. Dem Agenten wurde eine Neuladeanforderung gesendet, sofern er läuft.",
     "package.uncertain": "Der Paketstatus wurde nach einem unklaren Schreibergebnis neu gelesen. Die Änderung kann bereits sichtbar sein, dauerhaftes Speichern wurde jedoch nicht bestätigt. Wiederholen Sie den Vorgang nicht blind; prüfen Sie den Speicher.",
+    "package.not_installed": "Es wurde nichts installiert: Der Paketzustand hat sich geändert oder ein anderer Vorgang hat ihn verwendet, bevor die Änderung gespeichert werden konnte. Bereiten Sie die Änderung erneut vor.",
     "download.repository": "GitHub-Repository (Inhaber/Name; leer lassen für die bestätigte Quelle). Keine Zugangsdaten eingeben.",
     "download.check": "Paketkatalog prüfen",
     "download.selection": "Ausgewählt: {count} Pakete, {bytes} Bytes. Der Download bestätigt diesen Katalog; der Rückstufungsschutz bleibt auch bei Abbruch erhalten. Die Installation erfordert eine separate Bestätigung.",

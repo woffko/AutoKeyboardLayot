@@ -10,6 +10,7 @@
     "rollback.unavailable": "Cannot prepare rollback. The previous package may be missing, damaged, untrusted or incompatible, or the inventory may have changed. Nothing was installed. Refresh the list before trying again.",
     "rollback.done": "The previous package version was restored. Preferences, user data and version history were kept. A reload request was sent to the agent if it is running.",
     "package.uncertain": "Package state was reread after an uncertain write. The change may already be visible, but durable saving was not confirmed. Do not retry blindly; check the storage.",
+    "package.not_installed": "Nothing was installed: the package state changed or another operation used it before the change could be saved. Prepare the change again.",
     "download.repository": "GitHub repository (owner/name, or leave blank to use the accepted source). Do not enter credentials.",
     "download.check": "Check package catalog",
     "download.selection": "Selected: {count} packages, {bytes} bytes. Downloading accepts this catalog and keeps its anti-rollback history even if cancelled. Installation requires a separate confirmation.",

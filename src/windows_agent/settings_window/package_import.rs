@@ -8,7 +8,8 @@ use autokeyboardlayot::{
     package_install::{InstallError, PreparedCatalog, PreparedOnlineInstall},
     package_inventory::PackageInventory,
     package_store::{
-        PackageStore, PreparedImport, PreparedRollback, PreparedStoreInitialization, StoreSnapshot,
+        PackageStore, PreparedImport, PreparedRollback, PreparedStoreInitialization, StoreError,
+        StoreSnapshot,
     },
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,8 @@ enum ImportFailure {
     Catalog,
     /// A write may have happened; never advertise a safe automatic retry.
     OutcomeUnknown,
+    /// The store refused before the new state could become visible: nothing was installed.
+    NotInstalled,
     /// The worker could not be started (no work was submitted).
     Thread,
 }
@@ -47,6 +50,7 @@ impl ImportFailure {
             Self::Migration => "import.failure.migration",
             Self::Catalog => "import.failure.catalog",
             Self::OutcomeUnknown => "package.uncertain",
+            Self::NotInstalled => "package.not_installed",
             Self::Thread => "import.failure.thread",
         }
     }
@@ -76,6 +80,27 @@ impl OnlineFailure {
             Self::CatalogExpired => tr("download.catalog_expired"),
             Self::Code(code) => tr_format("download.failed", &[("code", code)]),
         }
+    }
+}
+
+/// What the store's answer to a confirmation means for the window.
+enum Confirmation {
+    /// The change is in the store.
+    Done(Box<StoreSnapshot>),
+    /// The change may already be visible: reread the store, never confirm again.
+    Uncertain,
+    /// The store refused before the new state could become visible: nothing was installed, and
+    /// the change can be prepared again.
+    NotInstalled,
+}
+
+/// Only `CommitUncertain` comes after the store may have published the new state; every other
+/// error of a confirmation came before it.
+fn confirmation(result: Result<StoreSnapshot, StoreError>) -> Confirmation {
+    match result {
+        Ok(snapshot) => Confirmation::Done(Box::new(snapshot)),
+        Err(StoreError::CommitUncertain) => Confirmation::Uncertain,
+        Err(_) => Confirmation::NotInstalled,
     }
 }
 
@@ -596,11 +621,10 @@ pub(super) fn wire(
                     snapshot
                 }
             };
-            let (snapshot, uncertain) = match snapshot {
-                Ok(snapshot) => (snapshot, false),
-                Err(autokeyboardlayot::package_store::StoreError::CommitUncertain)
-                    if migration_documents.is_none() =>
-                {
+            let (snapshot, uncertain) = match confirmation(snapshot) {
+                Confirmation::Done(snapshot) => (*snapshot, false),
+                Confirmation::NotInstalled => return Err(ImportFailure::NotInstalled),
+                Confirmation::Uncertain if migration_documents.is_none() => {
                     // Refresh, never repeat a possibly committed operation.
                     // A migration must not activate config after this error.
                     notify_agent();
@@ -615,7 +639,7 @@ pub(super) fn wire(
                         true,
                     )
                 }
-                Err(_) => return Ok(inspect_uncertain_write(&trust)),
+                Confirmation::Uncertain => return Ok(inspect_uncertain_write(&trust)),
             };
             // Even if settings closes after confirmation, notify the agent of
             // the committed store; a missing receiver must not skip this step.
@@ -991,6 +1015,36 @@ mod tests {
         assert!(!expired.contains('{'), "{expired}");
         let generic = OnlineFailure::Code("package_install_Cancelled".into()).status_text();
         assert!(generic.contains("package_install_Cancelled"), "{generic}");
+    }
+
+    #[test]
+    fn only_an_uncertain_commit_is_reread_and_other_refusals_installed_nothing() {
+        use autokeyboardlayot::package_inventory::InventoryError;
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+        let snapshot = store.load(&PackageTrust::release().unwrap()).unwrap();
+        assert!(matches!(confirmation(Ok(snapshot)), Confirmation::Done(_)));
+        assert!(matches!(
+            confirmation(Err(StoreError::CommitUncertain)),
+            Confirmation::Uncertain
+        ));
+        // Another writer, a held lock, damaged artifacts, an inventory refusal: before the pointer.
+        for error in [
+            StoreError::StaleSnapshot,
+            StoreError::Busy,
+            StoreError::Integrity,
+            StoreError::Inventory(InventoryError::Rollback),
+            StoreError::Io(std::io::Error::other("disk")),
+        ] {
+            let case = error.to_string();
+            assert!(
+                matches!(confirmation(Err(error)), Confirmation::NotInstalled),
+                "{case}"
+            );
+        }
+        let message = tr(ImportFailure::NotInstalled.key());
+        assert!(message.starts_with("Nothing was installed"), "{message}");
+        assert!(!message.contains("retry blindly"), "{message}");
     }
 
     #[test]
