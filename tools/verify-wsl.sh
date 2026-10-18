@@ -40,9 +40,10 @@ Runs the complete local verification gate from WSL, one logged step at a time:
   14 windows-signing-tests
                        cross-build the signing utility's Windows unit tests (DPAPI fixtures only, never a real key)
                        and run them on the Windows host like step 09
-  15 windows-all-tests cross-build every test executable (library, agent and integration tests) with the default
-                       features and with --no-default-features (the modular base the installer ships) and run each
-                       on the Windows host, except tests that read the source tree at run time
+  15 windows-all-tests cross-build every test executable (library, agent, installer helper and integration tests)
+                       with the default features and with --no-default-features --features installer-tools (the
+                       modular base and package helper the installer ships) and run each on the Windows host,
+                       except tests that read the source tree at run time
 
 Options:
   --keep-going   run every step even after a failure (default: stop at the first failure)
@@ -334,7 +335,7 @@ windows_all_tests_step() {
 step_windows_all_tests() {
     local failed=0
     windows_all_tests_step 'default features' || failed=1
-    windows_all_tests_step 'modular base' --no-default-features || failed=1
+    windows_all_tests_step 'modular base' --no-default-features --features installer-tools || failed=1
     return "$failed"
 }
 

@@ -19,7 +19,9 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{
+            CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
         System::Threading::{
             MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, ReleaseMutex,
             SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
@@ -143,6 +145,14 @@ fn leases() -> std::result::Result<Vec<Handle>, InstallError> {
     Ok(handles)
 }
 
+/// The session lasts exactly as long as setup: `parent` is the state of a zero-timeout wait on
+/// the setup process. Idle time never ends it, because the page sends no request while the user
+/// reads or chooses, and a helper that left on its own would fail every later action of a page
+/// that is still open.
+fn session_continues(parent: WAIT_EVENT) -> bool {
+    parent == WAIT_TIMEOUT
+}
+
 /// Coarse, path-free failure code for a rejected synchronous command.
 fn reject_reason(text: &str) -> &'static str {
     let text = text.to_ascii_lowercase();
@@ -212,7 +222,6 @@ pub fn run() -> Result<()> {
             .as_bytes(),
         )?;
         let mut sequence = 1u64;
-        let mut last_activity = Instant::now();
         let mut outcome = "none";
         let mut reason = "none";
         loop {
@@ -234,9 +243,7 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
-            if unsafe { WaitForSingleObject(parent.0, 0) } != WAIT_TIMEOUT
-                || last_activity.elapsed() > Duration::from_secs(300)
-            {
+            if !session_continues(unsafe { WaitForSingleObject(parent.0, 0) }) {
                 break;
             }
             let request = directory.join(format!("request-{sequence}.json"));
@@ -256,7 +263,6 @@ pub fn run() -> Result<()> {
             } else {
                 None
             };
-            last_activity = Instant::now();
             if matches!(command, Command::Close {}) {
                 break;
             }
@@ -438,4 +444,18 @@ pub fn run() -> Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::WAIT_FAILED;
+
+    #[test]
+    fn the_session_ends_with_setup_and_never_for_idle_time() {
+        assert!(session_continues(WAIT_TIMEOUT));
+        assert!(!session_continues(WAIT_OBJECT_0));
+        assert!(!session_continues(WAIT_FAILED));
+        assert!(!session_continues(WAIT_ABANDONED));
+    }
 }
