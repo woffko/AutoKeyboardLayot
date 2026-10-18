@@ -10751,9 +10751,17 @@ fn physical_modifiers_released() -> bool {
 }
 
 fn shortcut_modifiers_released() -> bool {
+    shortcut_modifiers_released_by(|key| unsafe {
+        GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0
+    })
+}
+
+/// No Ctrl, Alt or Windows key is down, as `held` reports each one. With one of them a Space is a
+/// shortcut (Win+Space switches the layout), not the end of a word.
+fn shortcut_modifiers_released_by(held: impl Fn(VIRTUAL_KEY) -> bool) -> bool {
     [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
         .into_iter()
-        .all(|key| unsafe { GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 == 0 })
+        .all(|key| !held(key))
 }
 
 /// The modifier keys of `RawKeyEvent::held_modifiers`, one bit each from bit 0: left and right
@@ -15849,15 +15857,31 @@ mod tests {
 
     #[test]
     fn win_space_never_arms_or_holds_the_decision_gate() {
-        assert!(!should_arm_space_decision_gate(
-            false,
-            true,
-            VK_SPACE.0,
-            true,
-            PRIVACY_ALLOWED,
-            false,
-            false,
-        ));
+        // The hook asks for the generic Ctrl and Alt keys, and for each Windows key: there is no
+        // generic one. Shift is part of typing.
+        for (held_key, arms) in [
+            (None, true),
+            (Some(VK_SHIFT), true),
+            (Some(VK_LWIN), false),
+            (Some(VK_RWIN), false),
+            (Some(VK_CONTROL), false),
+            (Some(VK_MENU), false),
+        ] {
+            let released = shortcut_modifiers_released_by(|key| Some(key) == held_key);
+            assert_eq!(
+                should_arm_space_decision_gate(
+                    false,
+                    true,
+                    VK_SPACE.0,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    released,
+                ),
+                arms,
+                "{held_key:?}"
+            );
+        }
     }
 
     #[test]
