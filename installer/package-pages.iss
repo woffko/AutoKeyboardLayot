@@ -384,8 +384,9 @@ begin
   if not Result then MsgBox(CustomMessage('AkPackagePending'), mbInformation, MB_OK);
 end;
 
+// A silent setup offers no choice of languages: it installs English only and starts no helper.
 function ShouldSkipPage(PageID: Integer): Boolean;
-begin Result := PageID = PackageReviewPage.ID; end;
+begin Result := (PageID = PackageReviewPage.ID) or (WizardSilent and (PageID = PackagePage.ID)); end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
