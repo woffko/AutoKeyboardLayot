@@ -17,6 +17,8 @@ var
   PackageProcess: THandle;
   PackageStarted, PackageReady, PackageBusy, PackageComplete, PackageAfterSelect,
     PackageInstalling, PackageInTimer, PackageCancelRequested, PackageFault: Boolean;
+  // PackageFault: the helper failed or its replies cannot be trusted, so this session
+  // installs no languages; setup continues with English only (Back and Next retry).
 
 function PackageSetTimer(Wnd: HWND; Event: UINT_PTR; Elapse: UINT; Callback: LongWord): UINT_PTR;
   external 'SetTimer@user32.dll stdcall';
@@ -84,10 +86,14 @@ begin
   Seen := Length(PackageSeen) > 0;
   for I := 0 to GetArrayLength(PackageSeen) - 1 do Seen := Seen and PackageSeen[I];
   PackageInstall.Enabled := Available and (PackagePhase = 'reviewing') and Seen;
-  if PackagePhase = 'selecting' then
-    WizardForm.NextButton.Enabled := PackageCount > 0
+  // Timer replies may arrive after the user left the page; never touch another page's Next.
+  if WizardForm.CurPageID <> PackagePage.ID then Exit;
+  if PackageBusy or (PackageAwaiting >= 0) then
+    WizardForm.NextButton.Enabled := False
   else if PackageFault or (PackagePhase = 'idle') or PackageComplete then
     WizardForm.NextButton.Enabled := True
+  else if PackagePhase = 'selecting' then
+    WizardForm.NextButton.Enabled := PackageCount > 0
   else
     WizardForm.NextButton.Enabled := False;
 end;
@@ -121,6 +127,15 @@ begin
   PackageAfterSelect := False;
   PackageInstalling := False;
   PackageComplete := False;
+end;
+
+// The helper failed or cannot be trusted: no language is installed in this session.
+procedure PackageHelperFailed;
+begin
+  PackageFault := True;
+  PackageFailed;
+  PackageStatus.Caption := PackageStatus.Caption + ' ' + CustomMessage('AkPackageEnglishNext');
+  PackageControls;
 end;
 
 procedure PackageListClick(Sender: TObject);
@@ -175,7 +190,9 @@ begin
       if GetIniString(Section, 'input', '0', FileName) = '1' then Caption := Caption + ' ' + CustomMessage('AkPackageInput');
       Enabled := GetIniString(Section, 'compatible', '0', FileName) = '1';
       if not Enabled then Caption := Caption + ' ' + CustomMessage('AkPackageUnavailable');
-      PackageList.AddCheckBox(Caption, '', 0, False, Enabled, False, False, nil);
+      // The helper's selection survives a rebuild, for example after a refused Next.
+      PackageList.AddCheckBox(Caption, '', 0, Enabled and (GetIniString(Section, 'selected', '0', FileName) = '1'),
+        Enabled, False, False, nil);
     end;
     PackageListClick(PackageList);
   end;
@@ -203,7 +220,8 @@ begin
     Restart := False;
     ErrorText := PrepareToInstall(Restart);
     if ErrorText <> '' then begin
-      PackageFault := True;
+      // A refusal (open Settings, a busy program, a held fence) is retried with Next once
+      // its cause is gone; the list keeps the selection.
       PackageStatus.Caption := ErrorText;
       PackageControls;
     end
@@ -237,14 +255,14 @@ begin
     if (PackageProcess <> 0) and (PackageWait(PackageProcess, 0) <> 258) then begin
       NativeCloseHandle(PackageProcess); PackageProcess := 0;
       PackageBusy := False; PackageAwaiting := -1; PackageStarted := False; PackageReady := False;
-      PackageFailed; PackageControls; Exit;
+      PackageHelperFailed; Exit;
     end;
     if not PackageReady then begin
       FileName := PackageDir + '\reply-0.ini';
       if not FileExists(FileName) then begin
         if PackageTicks - PackageStartTick > 15000 then begin
-          PackageFault := True; PackageStarted := False; PackageAwaiting := -1;
-          PackageFailed; PackageControls;
+          PackageStarted := False; PackageAwaiting := -1;
+          PackageHelperFailed;
         end;
         Exit;
       end;
@@ -253,7 +271,7 @@ begin
       PackageProcess := PackageOpenProcess($100000, 0, Pid);
       if PackageProcess = 0 then RaiseException('Helper process unavailable');
       PackageReady := True; PackageAwaiting := -1;
-      if not PackageSend(PackageQueued, 'check') then PackageFailed;
+      if not PackageSend(PackageQueued, 'check') then PackageHelperFailed;
       Exit;
     end;
     if PackageAwaiting >= 0 then begin
@@ -278,6 +296,7 @@ procedure PackageStart(Command: String);
 var Code: Integer; StoreRoot: String;
 begin
   PackageComplete := False;
+  PackageFault := False;
   PackageReason := '';
   SetArrayLength(PackageReviewFiles, 0); SetArrayLength(PackageSeen, 0);
   if PackageReady then begin PackageSend(Command, 'check'); Exit; end;
@@ -291,7 +310,9 @@ begin
   StoreRoot := ExpandConstant('{localappdata}\AutoKeyboardLayot\packages');
 #endif
   ExtractTemporaryFile('installer-package-helper.exe');
-  if not Exec(ExpandConstant('{tmp}\installer-package-helper.exe'), IntToStr(PackageCurrentPid) + ' "' + PackageDir + '" "' + StoreRoot + '" ' + PackageIdentity, '', SW_HIDE, ewNoWait, Code) then begin PackageAwaiting := -1; PackageFailed; Exit; end;
+  if not Exec(ExpandConstant('{tmp}\installer-package-helper.exe'), IntToStr(PackageCurrentPid) + ' "' + PackageDir + '" "' + StoreRoot + '" ' + PackageIdentity, '', SW_HIDE, ewNoWait, Code) then begin
+    PackageAwaiting := -1; PackageHelperFailed; Exit;
+  end;
   PackageStarted := True;
   PackageStartTick := PackageTicks;
   PackageControls;
@@ -371,9 +392,12 @@ end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
-  Result := not PackageFault and not PackageBusy and (PackageAwaiting < 0);
+  // A package operation in flight must finish or be cancelled first.
+  Result := not PackageBusy and (PackageAwaiting < 0);
   if CurPageID = PackagePage.ID then begin
-    if PackageComplete then begin Result := True; Exit; end;
+    if not Result then Exit;
+    // Installed, or nothing can be installed in this session: continue (English only).
+    if PackageComplete or PackageFault then Exit;
     if PackagePhase = 'checking' then begin Result := False; Exit; end;
     if (PackageCount > 0) and (PackagePhase = 'selecting') then begin
       // One action: install the selected languages and continue.
@@ -383,7 +407,6 @@ begin
     end;
     if (PackagePhase = 'downloading') or (PackagePhase = 'installing') then begin Result := False; Exit; end;
     if PackagePhase = 'selecting' then begin Result := False; Exit; end;
-    Result := True;
     Exit;
   end;
   if not Result then MsgBox(CustomMessage('AkPackagePending'), mbInformation, MB_OK);
@@ -395,7 +418,10 @@ begin Result := (PageID = PackageReviewPage.ID) or (WizardSilent and (PageID = P
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (CurPageID = PackagePage.ID) and not PackageStarted then
+  if CurPageID <> PackagePage.ID then Exit;
+  if PackageStarted then
+    PackageControls
+  else
     PackageStart('{"action":"check_catalog"}');
 end;
 

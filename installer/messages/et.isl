@@ -28,3 +28,4 @@ AkBaseProbeCode=Kaasasolev programm ei läbinud enesekontrolli (kood %1). Paigal
 AkFenceBusy=AutoKeyboardLayoti teine paigaldus või eemaldamine on käimas või AutoKeyboardLayot töötab selle kasutaja teises seansis. Lõpetage see või sulgege see ja proovige uuesti.
 AkFenceInvalid=Paigalduse lukufaili %1 ei saa kasutada (kood %2). See peab olema tühi tavaline fail: kustutage see ja proovige uuesti.
 AkPackageCloses=Nupp „Edasi“ sulgeb avatud AutoKeyboardLayoti ja selle seaded ning paigaldab valitud keeled kohe.
+AkPackageEnglishNext=Ainult inglise keelega jätkamiseks klõpsake „Edasi“.
