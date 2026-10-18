@@ -26,8 +26,9 @@ use windows::{
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                FindWindowW, GA_ROOTOWNER, GetAncestor, IsIconic, PostMessageW, SHOW_WINDOW_CMD,
-                SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
+                FindWindowExW, FindWindowW, GA_ROOTOWNER, GetAncestor, GetWindowThreadProcessId,
+                IsIconic, PostMessageW, SHOW_WINDOW_CMD, SW_RESTORE, SW_SHOWNORMAL,
+                SetForegroundWindow, ShowWindow,
             },
         },
     },
@@ -127,17 +128,7 @@ pub(super) fn run() -> Result<(), String> {
     populate_ui(&ui, &document, &packages.dictionaries);
     let _import_timer = wire_callbacks(&ui, document, packages.dictionaries);
     ui.show().map_err(|error| error.to_string())?;
-    let class = HSTRING::from(SETTINGS_WINDOW_CLASS);
-    let native_window = unsafe { FindWindowW(&class, None) }.ok().filter(|window| {
-        let mut process_id = 0;
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                *window,
-                Some(&mut process_id),
-            );
-        }
-        process_id == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() }
-    });
+    let native_window = own_settings_window();
     if let Some(window) = native_window {
         super::installer_lifecycle::advertise_safe_close(window);
     }
@@ -147,6 +138,22 @@ pub(super) fn run() -> Result<(), String> {
     }
     hotkey_capture::stop();
     result
+}
+
+/// This process's settings window, once its native window exists.
+fn own_settings_window() -> Option<HWND> {
+    let class = HSTRING::from(SETTINGS_WINDOW_CLASS);
+    let own = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+    let mut previous = None;
+    while let Ok(window) = unsafe { FindWindowExW(None, previous, &class, None) } {
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+        if process_id == own {
+            return Some(window);
+        }
+        previous = Some(window);
+    }
+    None
 }
 
 fn set_ui_hotkey(ui: &SettingsWindow, hotkey: Hotkey) {
@@ -616,7 +623,7 @@ fn wire_callbacks(
             return;
         }
         ui.set_package_import_busy(true);
-        let selected = browse_for_executable();
+        let selected = browse_for_executable(own_settings_window());
         ui.set_package_import_busy(false);
         if let Some(path) = selected {
             ui.set_process_exclusions_text(
@@ -954,7 +961,28 @@ fn append_unique_line(existing: &str, entry: &str) -> String {
     }
 }
 
-fn browse_for_executable() -> Option<String> {
+/// The open-file dialog's parameters. With the settings window as `owner` the dialog is modal: the
+/// window takes no input while it is open, so nothing queued replays after it closes.
+fn file_dialog(
+    owner: Option<HWND>,
+    filter: &[u16],
+    title: &[u16],
+    file: &mut [u16],
+    flags: windows::Win32::UI::Controls::Dialogs::OPEN_FILENAME_FLAGS,
+) -> Option<OPENFILENAMEW> {
+    Some(OPENFILENAMEW {
+        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).ok()?,
+        hwndOwner: owner.unwrap_or_default(),
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file.as_mut_ptr()),
+        nMaxFile: u32::try_from(file.len()).ok()?,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: flags,
+        ..Default::default()
+    })
+}
+
+fn browse_for_executable(owner: Option<HWND>) -> Option<String> {
     let filter: Vec<u16> = format!(
         "{}\0*.exe\0{}\0*.*\0\0",
         tr("dialog.executables"),
@@ -967,15 +995,13 @@ fn browse_for_executable() -> Option<String> {
         .chain([0])
         .collect();
     let mut file = vec![0u16; 32_768];
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).ok()?,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(file.as_mut_ptr()),
-        nMaxFile: u32::try_from(file.len()).ok()?,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
-        ..Default::default()
-    };
+    let mut dialog = file_dialog(
+        owner,
+        &filter,
+        &title,
+        &mut file,
+        OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+    )?;
     if !unsafe { GetOpenFileNameW(&raw mut dialog) }.as_bool() {
         return None;
     }
@@ -1335,6 +1361,18 @@ mod tests {
             DestroyWindow(window).unwrap();
             UnregisterClassW(class, Some(instance)).unwrap();
         }
+    }
+
+    #[test]
+    fn file_dialogs_belong_to_the_settings_window() {
+        let owner = HWND(0x5a5a0 as *mut core::ffi::c_void);
+        let (filter, title) = ([0u16; 2], [0u16; 1]);
+        let mut file = [0u16; 16];
+        let dialog = file_dialog(Some(owner), &filter, &title, &mut file, OFN_EXPLORER).unwrap();
+        assert_eq!(dialog.hwndOwner, owner);
+        assert_eq!(dialog.nMaxFile, 16);
+        let dialog = file_dialog(None, &filter, &title, &mut file, OFN_EXPLORER).unwrap();
+        assert!(dialog.hwndOwner.0.is_null());
     }
 
     #[test]

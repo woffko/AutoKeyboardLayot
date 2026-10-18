@@ -340,7 +340,7 @@ pub(super) fn wire(
             .collect();
         hotkey_capture::stop();
         ui.set_package_import_busy(true);
-        let paths = choose_files(true);
+        let paths = choose_files(true, own_settings_window());
         ui.set_package_import_busy(false);
         let Some(paths) = paths else {
             return;
@@ -480,7 +480,7 @@ pub(super) fn wire(
         // The native dialog pumps messages. Guard all import callbacks while
         // it is open, even though no worker receiver exists yet.
         ui.set_package_import_busy(true);
-        let path = choose_file();
+        let path = choose_file(own_settings_window());
         ui.set_package_import_busy(false);
         let Some(path) = path else {
             return;
@@ -900,11 +900,11 @@ pub(super) fn wire(
     timer
 }
 
-fn choose_file() -> Option<PathBuf> {
-    choose_files(false)?.into_iter().next()
+fn choose_file(owner: Option<HWND>) -> Option<PathBuf> {
+    choose_files(false, owner)?.into_iter().next()
 }
 
-fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
+fn choose_files(multiple: bool, owner: Option<HWND>) -> Option<Vec<PathBuf>> {
     let filter: Vec<u16> = "*.aklp\0*.aklp\0\0".encode_utf16().collect();
     let title: Vec<u16> = if multiple {
         tr("migration.choose")
@@ -919,15 +919,7 @@ fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
     if multiple {
         flags |= windows::Win32::UI::Controls::Dialogs::OFN_ALLOWMULTISELECT;
     }
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).ok()?,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(file.as_mut_ptr()),
-        nMaxFile: u32::try_from(file.len()).ok()?,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: flags,
-        ..Default::default()
-    };
+    let mut dialog = file_dialog(owner, &filter, &title, &mut file, flags)?;
     if !unsafe { GetOpenFileNameW(&raw mut dialog) }.as_bool() {
         return None;
     }
