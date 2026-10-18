@@ -60,7 +60,8 @@ class InstallerMessageTests(unittest.TestCase):
         self.assertEqual(used, set(catalog))
         self.assertTrue(all(catalog.values()))
         self.assertEqual({key for key, text in pairs if '%1' in text},
-                         {'AkCloseBusy', 'AkProfileReadFailed', 'AkBaseProbeCode'})
+                         {'AkCloseBusy', 'AkProfileReadFailed', 'AkBaseProbeCode', 'AkFenceInvalid'})
+        self.assertEqual({key for key, text in pairs if '%2' in text}, {'AkFenceInvalid'})
         # Native language names are deliberately data, not translated UI prose.
         # Keep the no-hardcoded-messages check on all remaining installer code.
         names = re.search(r"function PackageName\(Id: String\): String;.*?\nend;", source, re.S)

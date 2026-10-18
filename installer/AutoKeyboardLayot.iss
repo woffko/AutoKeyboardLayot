@@ -85,6 +85,7 @@ const
   AgentMutexName = 'Local\AutoKeyboardLayot.Agent';
   SettingsMutexName = 'Local\AutoKeyboardLayot.Settings.Singleton';
   AlreadyExists = 183;
+  SharingViolation = 32;
   NotModularBase = 23;
 var
   AgentLease, SettingsLease, InstallationFence: THandle;
@@ -126,25 +127,38 @@ begin
   end;
 end;
 
-function AcquireInstallationFence: Boolean;
-var Name: String; HighSize, Attributes: LongWord;
+function InstallationFenceName: String;
 begin
-  Name := ExpandConstant('{localappdata}\AutoKeyboardLayot.installation.lock');
+  Result := ExpandConstant('{localappdata}\AutoKeyboardLayot.installation.lock');
+end;
+
+// Returns '' once the fence is held, otherwise the reason. A sharing violation means
+// another setup, uninstall, agent or settings of this user holds the file (possibly in
+// another session); any other failure means the file cannot serve as the fence.
+function AcquireInstallationFence: String;
+var HighSize, Attributes, ErrorCode: LongWord;
+begin
+  Result := '';
   // OPEN_ALWAYS without truncation, GENERIC_READ|WRITE, no sharing. New agents
   // and settings retain read-only sharing handles for their complete lifetime.
-  InstallationFence := NativeCreateFence(Name, $C0000000, 0, 0, 4, $00200080, 0);
+  InstallationFence := NativeCreateFence(InstallationFenceName, $C0000000, 0, 0, 4, $00200080, 0);
+  ErrorCode := DLLGetLastError;
   if InstallationFence = THandle($FFFFFFFF) then begin
     InstallationFence := 0;
-    Result := False;
+    if ErrorCode = SharingViolation then
+      Result := CustomMessage('AkFenceBusy')
+    else
+      Result := FmtMessage(CustomMessage('AkFenceInvalid'), [InstallationFenceName, IntToStr(ErrorCode)]);
     Exit;
   end;
   HighSize := 0;
-  Attributes := NativeFenceAttributes(Name);
-  Result := (InstallationFence <> 0) and (NativeFenceType(InstallationFence) = 1) and
-    ((Attributes and $410) = 0) and (NativeFenceSize(InstallationFence, HighSize) = 0) and (HighSize = 0);
-  if not Result then begin
-    NativeCloseHandle(InstallationFence);
+  Attributes := NativeFenceAttributes(InstallationFenceName);
+  if (InstallationFence = 0) or (NativeFenceType(InstallationFence) <> 1) or
+      ((Attributes and $410) <> 0) or (NativeFenceSize(InstallationFence, HighSize) <> 0) or (HighSize <> 0) then begin
+    if InstallationFence <> 0 then
+      NativeCloseHandle(InstallationFence);
     InstallationFence := 0;
+    Result := FmtMessage(CustomMessage('AkFenceInvalid'), [InstallationFenceName, '0']);
   end;
 end;
 
@@ -184,10 +198,9 @@ begin
     Result := CustomMessage('AkSettingsRestarted');
     Exit;
   end;
-  if not AcquireInstallationFence then begin
+  Result := AcquireInstallationFence;
+  if Result <> '' then
     ReleaseLeases;
-    Result := FmtMessage(CustomMessage('AkCloseBusy'), ['12']);
-  end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

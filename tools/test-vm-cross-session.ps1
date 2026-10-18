@@ -35,7 +35,8 @@ function Drop-Task([string]$Name) { Unregister-ScheduledTask -TaskName $Name -Co
 
 $reader = $null
 try {
-    if ($env:COMPUTERNAME -ne $ExpectedComputer -or (Get-CimInstance Win32_ComputerSystem).Manufacturer -notlike '*VMware*') { throw 'Wrong guest' }
+    $manufacturer = (Get-CimInstance Win32_ComputerSystem).Manufacturer
+    if ($env:COMPUTERNAME -ne $ExpectedComputer -or ($manufacturer -notlike '*VMware*' -and $manufacturer -notlike '*QEMU*')) { throw 'Wrong guest' }
     if ((Hash $setup) -ne $SetupSha256) { throw 'Setup hash' }
     Drop-Task $installTask
     if ((& "$env:SystemRoot\System32\query.exe" user 2>&1 | Out-String) -notmatch 'console\s+1\s+Active') { throw 'No active console session' }
@@ -62,10 +63,11 @@ try {
     $result.install_session = 1
     $result.installer_last_result = (Get-ScheduledTaskInfo -TaskName $installTask).LastTaskResult
     $logText = if (Test-Path -LiteralPath $log) { [IO.File]::ReadAllText($log) } else { '' }
-    $result.blocked_log_has_code12 = $logText -like '*Helper code: 12*'
+    # The fence has its own message (AkFenceBusy), distinct from a busy program's AkCloseBusy.
+    $result.blocked_log_reports_fence = $logText -like '*Another setup or uninstall of AutoKeyboardLayot is running*'
     $result.no_install_target = -not (Test-Path -LiteralPath (Join-Path $installTarget 'AutoKeyboardLayot.exe'))
     $result.reader_still_holds = -not (FenceFree)
-    if (-not ($result.blocked_log_has_code12 -and $result.no_install_target -and $result.reader_still_holds)) { throw 'Cross-session exclusion did not refuse the installer' }
+    if (-not ($result.blocked_log_reports_fence -and $result.no_install_target -and $result.reader_still_holds)) { throw 'Cross-session exclusion did not refuse the installer' }
     $result.phase = 'release'
     $reader.Dispose(); $reader = $null
     $deadline = [DateTime]::UtcNow.AddSeconds(20)

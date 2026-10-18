@@ -25,3 +25,5 @@ AkPackageLocal=Ouvrir un catalogue local…
 AkPackagePending=Terminez ou annulez la sélection des paquets avant de continuer.
 AkPackageDone=Paquets installés.
 AkBaseProbeCode=Le programme fourni a échoué à son autotest (code %1). L’installation n’a pas commencé.
+AkFenceBusy=Une autre installation ou désinstallation d’AutoKeyboardLayot est en cours, ou AutoKeyboardLayot s’exécute dans une autre session de cet utilisateur. Attendez la fin de l’autre opération ou fermez AutoKeyboardLayot, puis réessayez.
+AkFenceInvalid=Le fichier de verrouillage de l’installation %1 est inutilisable (code %2). Il doit s’agir d’un fichier ordinaire vide : supprimez-le, puis réessayez.
