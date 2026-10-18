@@ -179,15 +179,21 @@ begin
   if (AgentLease <> 0) and (SettingsLease <> 0) and (InstallationFence <> 0) then
     Exit;
   ReleaseLeases;
-  if not Exec(Helper, '--prepare-upgrade "' + ExpandConstant('{app}') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
-    Result := CustomMessage('AkCloseHelperFailed');
-    Exit;
-  end;
-  if ExitCode <> 0 then begin
-    Result := FmtMessage(CustomMessage('AkCloseBusy'), [IntToStr(ExitCode)]);
-    Exit;
-  end;
+  // Without the installed program (quarantined, deleted, or an interrupted upgrade) nothing
+  // can run from it, so there is nothing to close; the leases and the fence below still
+  // keep a program from elsewhere and other setups out.
+  if FileExists(Helper) then begin
+    if not Exec(Helper, '--prepare-upgrade "' + ExpandConstant('{app}') + '"',
+        '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
+      Result := CustomMessage('AkCloseHelperFailed');
+      Exit;
+    end;
+    if ExitCode <> 0 then begin
+      Result := FmtMessage(CustomMessage('AkCloseBusy'), [IntToStr(ExitCode)]);
+      Exit;
+    end;
+  end else
+    Log('The installed program is missing; no running instance needs to be closed.');
   if not AcquireLease(AgentMutexName, AgentLease) then begin
     ReleaseLeases;
     Result := CustomMessage('AkAgentRestarted');
