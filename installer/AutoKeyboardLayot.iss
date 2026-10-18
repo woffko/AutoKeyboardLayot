@@ -85,6 +85,7 @@ const
   AgentMutexName = 'Local\AutoKeyboardLayot.Agent';
   SettingsMutexName = 'Local\AutoKeyboardLayot.Settings.Singleton';
   AlreadyExists = 183;
+  NotModularBase = 23;
 var
   AgentLease, SettingsLease, InstallationFence: THandle;
 
@@ -206,8 +207,12 @@ begin
     Result := CustomMessage('AkBaseProbeFailed');
     Exit;
   end;
-  if ExitCode <> 0 then begin
+  if ExitCode = NotModularBase then begin
     Result := CustomMessage('AkNotModularBase');
+    Exit;
+  end;
+  if ExitCode <> 0 then begin
+    Result := FmtMessage(CustomMessage('AkBaseProbeCode'), [IntToStr(ExitCode)]);
     Exit;
   end;
   Result := StopAndLease(Helper);

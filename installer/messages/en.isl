@@ -25,3 +25,4 @@ AkPackageIntro=Choose the languages to add, then click Next. English is always i
 AkPackageLocal=Open local catalog…
 AkPackagePending=Finish or cancel package selection before continuing.
 AkPackageDone=Packages installed.
+AkBaseProbeCode=The bundled program failed its self-check (code %1). Installation was not started.

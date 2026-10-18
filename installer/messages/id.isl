@@ -24,3 +24,4 @@ AkPackageIntro=Bahasa Inggris sudah disertakan. Paket opsional hanya dipasang se
 AkPackageLocal=Buka katalog lokal…
 AkPackagePending=Selesaikan atau batalkan pemilihan paket sebelum melanjutkan.
 AkPackageDone=Paket terpasang.
+AkBaseProbeCode=Program bawaan gagal dalam pemeriksaan mandiri (kode %1). Instalasi tidak dimulai.

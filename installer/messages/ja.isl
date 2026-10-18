@@ -24,3 +24,4 @@ AkPackageIntro=英語は含まれています。追加パッケージは確認�
 AkPackageLocal=ローカルカタログを開く…
 AkPackagePending=続行する前に、パッケージの選択を完了するかキャンセルしてください。
 AkPackageDone=パッケージをインストールしました。
+AkBaseProbeCode=同梱のプログラムが自己診断に失敗しました (コード %1)。インストールは開始されていません。

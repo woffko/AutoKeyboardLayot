@@ -24,3 +24,4 @@ AkPackageIntro=O inglês está incluído. Pacotes opcionais só são instalados 
 AkPackageLocal=Abrir catálogo local…
 AkPackagePending=Conclua ou cancele a seleção de pacotes antes de continuar.
 AkPackageDone=Pacotes instalados.
+AkBaseProbeCode=O programa incluído falhou no autoteste (código %1). A instalação não foi iniciada.

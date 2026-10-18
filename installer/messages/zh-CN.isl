@@ -24,3 +24,4 @@ AkPackageIntro=已包含英语。可选语言包仅在您确认后安装。
 AkPackageLocal=打开本地目录文件…
 AkPackagePending=继续前，请完成或取消语言包选择。
 AkPackageDone=语言包已安装。
+AkBaseProbeCode=随附的程序未通过自检（代码 %1）。安装未开始。

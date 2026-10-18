@@ -24,3 +24,4 @@ AkPackageIntro=Inglise keel on kaasas. Valikulised paketid paigaldatakse alles p
 AkPackageLocal=Ava kohalik kataloog…
 AkPackagePending=Enne jätkamist lõpetage või tühistage pakettide valik.
 AkPackageDone=Paketid paigaldatud.
+AkBaseProbeCode=Kaasasolev programm ei läbinud enesekontrolli (kood %1). Paigaldamist ei alustatud.
