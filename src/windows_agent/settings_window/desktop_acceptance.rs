@@ -781,6 +781,60 @@ fn the_settings_window_on_the_desktop_shows_a_long_message_in_full() {
 
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_shows_a_refused_save_in_full() {
+    let profile = Profile::legacy();
+    let configuration = profile.directory().join("config.ini");
+    let window = Window::open(profile);
+    window.place(900, 740);
+    let ui = Automation::new();
+    let english = ui
+        .choices(window.handle, "English")
+        .into_iter()
+        .next()
+        .expect("English");
+    click(english.center());
+    // Another writer chooses a third interface language meanwhile, so Apply cannot save the choice.
+    std::fs::write(&configuration, format!("{LEGACY}ui_language=et\n")).expect("outside change");
+    ui.wait(
+        window.handle,
+        UIA_ButtonControlTypeId,
+        &tr("button.apply"),
+        Duration::from_secs(5),
+    )
+    .expect("Apply")
+    .invoke();
+    let template = tr("settings.merge_conflict");
+    let prefix = template.split("{fields}").next().unwrap_or_default();
+    let message = within(Duration::from_secs(10), || {
+        ui.texts(window.handle)
+            .into_iter()
+            .find(|text| text.name.starts_with(prefix))
+    });
+    let _ = screenshot("settings-refused-save.bmp");
+    let client = window.client();
+    // The page area right of the 252 px navigation, without its 30 px paddings.
+    let content_width = client.right - client.left - 252 - 60;
+    let shown = message
+        .as_ref()
+        .map(|message| (message.width(), message.height(), message.name.clone()));
+    eprintln!("message={shown:?} content_width={content_width}");
+    // Cancel discards the choice the window still shows.
+    if let Some(cancel) = ui.find(window.handle, UIA_ButtonControlTypeId, &tr("button.cancel")) {
+        cancel.invoke();
+    }
+    let closed = window.closed_within(Duration::from_secs(30));
+    let (width, height, _) = shown.expect("no message about the refused save");
+    assert!(
+        width >= content_width - 8,
+        "the message does not span the window: {width} of {content_width}"
+    );
+    // Two lines of the 14 px text.
+    assert!(height >= 26, "the message is not wrapped: {height} px high");
+    assert!(closed, "the window did not close on Cancel");
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_keeps_one_interface_language_marked() {
     let window = Window::open(Profile::legacy());
     let ui = Automation::new();

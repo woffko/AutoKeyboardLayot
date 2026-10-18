@@ -113,7 +113,8 @@ for the session and exposes a technical failure counter in the tray status.
   icon once the taskbar is there;
 - on the same desktop, the settings window, driven through UI Automation and input:
   the installer's graceful-close property appears once the window exists and the
-  window closes on the installer's request; a long message is shown in full; one
+  window closes on the installer's request; long messages — the close guard's and that
+  of a save refused by a change made outside the window — are shown in full; one
   interface language stays marked after several clicks; the online review shows each
   chosen package's license through its package picker, which stays clear of the
   preview; the Add language dialog shows its failures inside; in Arabic the language
