@@ -411,7 +411,7 @@ end;
 procedure StopPackageHelper;
 var WaitResult: DWORD;
 begin
-  if PackageTimer <> 0 then PackageKillTimer(0, PackageTimer);
+  if PackageTimer <> 0 then begin PackageKillTimer(0, PackageTimer); PackageTimer := 0; end;
   if PackageReady and (PackageAwaiting < 0) then PackageSend('{"action":"close"}', 'close');
   if PackageProcess <> 0 then begin
     // Never release the installer leases merely because a timeout elapsed.
@@ -427,4 +427,7 @@ begin
     end;
     NativeCloseHandle(PackageProcess); PackageProcess := 0;
   end;
+  // The helper has ended (a close request gets no reply): nothing is pending any more, so the
+  // remaining pages, Finish included, are not held back.
+  PackageReady := False; PackageStarted := False; PackageBusy := False; PackageAwaiting := -1;
 end;

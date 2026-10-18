@@ -248,6 +248,16 @@ begin
     ReleaseLeases;
 end;
 
+// The files are in place: from here on the new shortcuts must be able to start the
+// program, also while the Finished page is still open.
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then begin
+    StopPackageHelper;
+    ReleaseLeases;
+  end;
+end;
+
 procedure DeinitializeSetup;
 begin
   StopPackageHelper;
