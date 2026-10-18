@@ -3271,7 +3271,9 @@ fn add_tray(hwnd: HWND, status: TrayStatus) -> bool {
                 }
             });
             // Dropping an icon deletes it from the shell by id, which would remove the live one.
-            core::mem::forget(duplicate);
+            if let Some(duplicate) = duplicate {
+                duplicate.discard_replaced();
+            }
             UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None);
             true
         }
@@ -4041,18 +4043,28 @@ fn update_tray(indicator: LayoutIndicator, now: Instant) {
     // pump messages and re-enter either the window procedure or a hook.
     let updated = tray.update(status).is_ok();
     let window = tray.hwnd;
-    let mut tray_slot = Some(tray);
-    APP_STATE.with(|slot| {
-        if let Some(state) = slot.borrow_mut().as_mut()
-            && state.tray.is_none()
-        {
-            state.tray = tray_slot.take();
+    // The icon comes back when it cannot be put back: the state is gone (shutdown), or a message
+    // dispatched during the update (TaskbarCreated) added a new icon meanwhile.
+    let left_over = APP_STATE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(state) if state.tray.is_none() => {
+            state.tray = Some(tray);
             if updated {
                 state.last_tray_status = status;
             }
+            None
         }
+        Some(_) => Some((tray, true)),
+        None => Some((tray, false)),
     });
-    if updated && notify_failure {
+    let stored = left_over.is_none();
+    match left_over {
+        // The shell knows the new icon by the same id: deleting this one would remove it. The
+        // next refresh shows the status in the new icon and announces a failure there.
+        Some((stale, true)) => stale.discard_replaced(),
+        Some((gone, false)) => drop(gone),
+        None => {}
+    }
+    if updated && notify_failure && stored {
         show_tray_information(
             window,
             tr("conversion.paused_title"),
@@ -4153,6 +4165,16 @@ impl TrayIcon {
             }
         }
         Ok(())
+    }
+
+    /// Destroys the image of an icon that a newer one replaced under the same window and id,
+    /// and leaves the notification icon alone: deleting it would remove the newer one.
+    fn discard_replaced(self) {
+        let icon = self.icon;
+        core::mem::forget(self);
+        unsafe {
+            let _ = DestroyIcon(icon);
+        }
     }
 }
 
@@ -14593,11 +14615,13 @@ mod tests {
         assert_ne!(rasters[1], rasters[2]);
     }
 
-    /// One call to the scripted notification area: the message, its flags and the tooltip.
+    /// One call to the scripted notification area: the message, its flags, the icon image and
+    /// the tooltip.
     #[derive(Debug, Clone)]
     struct ShellCall {
         message: NOTIFY_ICON_MESSAGE,
         flags: windows::Win32::UI::Shell::NOTIFY_ICON_DATA_FLAGS,
+        icon: usize,
         tip: String,
     }
 
@@ -14636,6 +14660,7 @@ mod tests {
             shell.calls.push(ShellCall {
                 message,
                 flags: data.uFlags,
+                icon: data.hIcon.0 as usize,
                 tip: wide_text(&data.szTip),
             });
             let during = shell
@@ -14783,6 +14808,104 @@ mod tests {
         assert_eq!(added.len(), 2);
         assert!(!added[0].contains("conversion failures"), "{}", added[0]);
         assert!(added[1].contains("conversion failures: 1"), "{}", added[1]);
+    }
+
+    /// Runs `body` with this thread's scripted notification area.
+    fn scripted_shell<T>(body: impl FnOnce(&mut ScriptedShell) -> T) -> T {
+        SCRIPTED_SHELL.with(|slot| body(slot.borrow_mut().as_mut().expect("scripted shell")))
+    }
+
+    fn icon_exists(icon: usize) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
+        let mut info = ICONINFO::default();
+        let exists = unsafe { GetIconInfo(HICON(icon as *mut c_void), &mut info) }.is_ok();
+        if exists {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+                let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+            }
+        }
+        exists
+    }
+
+    #[test]
+    fn an_icon_added_again_during_an_update_stays_in_the_shell() {
+        // Explorer restarts while an update's shell call runs, and the new taskbar's message adds
+        // the icon again in the middle of it. The updated, stale icon must not delete the new
+        // one, which the shell knows by the same id.
+        let (state, _receiver) = test_gate_state(1);
+        let indicator = LayoutIndicator::English;
+        let ((shown, stored), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            scripted_shell(|shell| {
+                shell.during = Some((
+                    NIM_MODIFY,
+                    Box::new(|| {
+                        scripted_shell(|shell| shell.icons.clear());
+                        recreate_tray(HWND::default());
+                    }),
+                ));
+            });
+            update_tray(indicator, Instant::now());
+            let shown = scripted_shell(|shell| shell.icons.contains(&TRAY_ID));
+            let stored = APP_STATE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|state| state.tray.as_ref())
+                    .map(|tray| tray.icon.0 as usize)
+            });
+            drop(take_app_state());
+            (shown, stored)
+        });
+        let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
+        assert_eq!(
+            messages,
+            [
+                NIM_ADD,
+                NIM_SETVERSION,
+                NIM_MODIFY,
+                NIM_ADD,
+                NIM_SETVERSION,
+                NIM_DELETE
+            ],
+            "only the final teardown deletes"
+        );
+        assert!(shown, "the new icon was deleted");
+        // The state keeps the new icon, and the stale one's image is destroyed.
+        assert_eq!(stored, Some(shell.calls[3].icon));
+        assert!(!icon_exists(shell.calls[2].icon));
+    }
+
+    #[test]
+    fn an_icon_added_while_another_is_stored_gives_up_its_image_only() {
+        // An addition that finds an icon stored already (a nested addition won) keeps that one:
+        // the shell shows one icon per id, and deleting the extra one would remove it.
+        let (state, _receiver) = test_gate_state(1);
+        let indicator = LayoutIndicator::English;
+        let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            // A restarted shell shows nothing yet, so the second addition succeeds.
+            scripted_shell(|shell| shell.icons.clear());
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            assert!(scripted_shell(|shell| shell.icons.contains(&TRAY_ID)));
+            drop(take_app_state());
+        });
+        let added: Vec<_> = shell
+            .calls
+            .iter()
+            .filter(|call| call.message == NIM_ADD)
+            .map(|call| call.icon)
+            .collect();
+        assert_eq!(added.len(), 2);
+        assert!(!icon_exists(added[1]), "the extra icon's image leaked");
+        let deletes = shell
+            .calls
+            .iter()
+            .filter(|call| call.message == NIM_DELETE)
+            .count();
+        assert_eq!(deletes, 1, "only the final teardown deletes");
     }
 
     #[test]
