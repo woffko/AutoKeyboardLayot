@@ -987,8 +987,10 @@ export component SettingsWindow inherits Window {
 
                     ScrollView {
                         vertical-stretch: 1;
+                        // Items keep their size; the space the dialog has to spare stays below them.
                         VerticalLayout {
                             spacing: 8px;
+                            alignment: start;
 
                             UiText { text: Localization.text("download.repository", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
                             LocalizedTextEdit {
