@@ -125,6 +125,10 @@ class Notice(unittest.TestCase):
                 self.assertIn(entry['sha256'], text)
         self.assertIn('German, French and Spanish words from wordfreq', text)
 
+    def test_the_shipped_notice_is_the_one_written_from_the_receipt(self):
+        shipped = (TOOLS.parent / 'data/layout-model/NOTICE.md').read_text(encoding='utf-8')
+        self.assertEqual(shipped, notice.render(config_receipt()))
+
     def test_subtlex_is_credited_for_the_wordfreq_languages_that_carry_it(self):
         text = notice.render(config_receipt())
         for title in ('SUBTLEX-US', 'SUBTLEX-UK', 'SUBTLEX-DE'):
