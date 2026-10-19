@@ -643,7 +643,12 @@ the plan. See [`docs/host-deployment.md`](docs/host-deployment.md).
 an isolated temporary profile for adapter tests. `tools/start-windows-build.ps1`
 launches that script independently of SSH through WMI and monitors its result.
 Each run requires a fresh log directory; per-stage logs and `result.json`
-remain there even if the monitoring connection is interrupted.
+remain there even if the monitoring connection is interrupted. The build retries
+replacing `result.json` while the monitor holds it open, and the monitor reads a
+receipt it could not read again on its next check. `tools/test-build-scripts.ps1`
+checks these scripts and `tools/run-installer-boundary-tests.ps1` (which reads a
+test's output while it runs) on a Windows machine with stand-ins for cargo and
+for a test executable.
 
 ## Security
 
