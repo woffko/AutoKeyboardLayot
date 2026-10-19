@@ -25,7 +25,7 @@ jobs:
       - run: cargo test --locked --no-default-features --features installer-tools -- --test-threads=1
       - run: cargo clippy --locked --no-default-features --features installer-tools --all-targets -- -D warnings
       - run: cargo clippy --locked --features signing-tools --all-targets -- -D warnings
-      - run: cargo test --locked --features signing-tools -- --test-threads=1
+      - run: cargo test --locked --features signing-tools --all-targets -- --test-threads=1
       - run: cargo run --locked --example validate_locales -- data/package-locales --require-complete
       - run: python -m unittest discover -s tools -p "test_*.py"
       - run: cargo build --locked --release --no-default-features --features installer-tools --bins

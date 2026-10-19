@@ -21,7 +21,8 @@ ENFORCING = {
     r'cargo install cargo-deny --version \d+\.\d+\.\d+ --locked': LINUX_ONLY,
     r'cargo deny check licenses bans sources': LINUX_ONLY,
     r'cargo clippy --locked --features signing-tools --all-targets -- -D warnings': None,
-    r'cargo test --locked --features signing-tools -- --test-threads=1': None,
+    # --all-targets runs the unit tests of the examples that need signing-tools, too.
+    r'cargo test --locked --features signing-tools --all-targets -- --test-threads=1': None,
     r'python -m unittest discover -s tools -p "test_\*\.py"': None,
 }
 # The reviewed license allow-list of deny.toml, exactly: any addition is a decision to review.
@@ -168,7 +169,7 @@ class WorkflowSteps(unittest.TestCase):
 class SigningToolsInCi(unittest.TestCase):
     def test_clippy_and_tests_build_the_signing_tools(self):
         enforced(self, r'cargo clippy --locked --features signing-tools --all-targets -- -D warnings')
-        enforced(self, r'cargo test --locked --features signing-tools -- --test-threads=1')
+        enforced(self, r'cargo test --locked --features signing-tools --all-targets -- --test-threads=1')
 
     def test_the_matrix_covers_both_systems(self):
         self.assertRegex(WORKFLOW, r'os:\s*\[ubuntu-latest,\s*windows-latest\]')

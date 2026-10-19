@@ -32,7 +32,7 @@ Runs the complete local verification gate from WSL, one logged step at a time:
   09 windows-tests     cross-build the Windows unit tests with cargo-xwin and run them on the
                        Windows host with LOCALAPPDATA pointing at a temporary directory
   10 clippy-signing    cargo clippy --locked --features signing-tools --all-targets -- -D warnings
-  11 test-signing      cargo test --locked --features signing-tools
+  11 test-signing      cargo test --locked --features signing-tools --all-targets
   12 clippy-windows-installer
                        cargo clippy --locked --target x86_64-pc-windows-msvc --no-default-features --features installer-tools --all-targets -- -D warnings
   13 clippy-windows-signing
@@ -212,7 +212,7 @@ step_test_no_default() { run_logged cargo test --locked --no-default-features; }
 step_validate_locales() { run_logged cargo run --locked --example validate_locales -- data/package-locales --require-complete; }
 step_python_tests() { run_logged env PYTHONUTF8=1 python3 -m unittest discover -s tools -p 'test_*.py'; }
 step_clippy_signing() { run_logged cargo clippy --locked --features signing-tools --all-targets -- -D warnings; }
-step_test_signing() { run_logged cargo test --locked --features signing-tools; }
+step_test_signing() { run_logged cargo test --locked --features signing-tools --all-targets; }
 step_clippy_windows_installer() { run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --no-default-features --features installer-tools --all-targets -- -D warnings; }
 step_clippy_windows_signing() { run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --features signing-tools --all-targets -- -D warnings; }
 
