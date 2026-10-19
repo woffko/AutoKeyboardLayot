@@ -16,10 +16,10 @@ class ReleaseRustflagsTests(unittest.TestCase):
             (root / '.cargo/config.toml').write_text(
                 '[target.x86_64-pc-windows-msvc]\nrustflags = ["-C", "target-feature=+crt-static"]\n',
                 encoding='utf-8')
-            flags = release_rustflags(root, Path('/home/builder/.cargo'), Path('/opt/toolchain'))
+            flags = release_rustflags(root, Path('/srv/builder/.cargo'), Path('/opt/toolchain'))
         self.assertEqual(flags, [
             '-C', 'target-feature=+crt-static',
-            '--remap-path-prefix=/home/builder/.cargo=/cargo',
+            '--remap-path-prefix=/srv/builder/.cargo=/cargo',
             '--remap-path-prefix=/opt/toolchain=/rust',
             f'--remap-path-prefix={root}=.',
         ])
@@ -34,10 +34,10 @@ class ReleaseRustflagsTests(unittest.TestCase):
         self.assertEqual(flags[:-3], configured['target']['x86_64-pc-windows-msvc']['rustflags'])
 
     def test_a_machine_path_left_in_an_executable_is_reported(self):
-        paths = [Path('/home/builder/.cargo'), Path('/home/builder/checkout')]
+        paths = [Path('/srv/builder/.cargo'), Path('/srv/builder/checkout')]
         clean = b'\x00/cargo/registry/src/fst-0.4.7/src/raw.rs\x00./src/main.rs\x00'
         self.assertEqual(leaked_paths(clean, paths), [])
-        self.assertEqual(leaked_paths(clean + b'/home/builder/checkout/src/lib.rs', paths), [paths[1]])
+        self.assertEqual(leaked_paths(clean + b'/srv/builder/checkout/src/lib.rs', paths), [paths[1]])
 
 
 class InstallerBuildWiringTests(unittest.TestCase):

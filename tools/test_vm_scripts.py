@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,13 @@ BUILD = 'target/installer-vm-candidate-20260913-03'
 DRIVER_ARGUMENTS = {'run_vm_cross_session.py': (BUILD,), 'run_vm_installer_ui.py': (BUILD, 'retry', 'missing-exe')}
 # Values that tie a script to one machine or one person. Written in pieces so that a scan for
 # these values does not flag this file.
-MACHINE_LOCAL = ['192' + '.168.', 'C:\\Users\\', '/home/', 'root' + '@', 'DESKTOP-', 'w0' + 'w']
+MACHINE_LOCAL = ['192' + '.168.', 'C:\\Users\\', '/ho' + 'me/', 'root' + '@', 'DESK' + 'TOP-', 'w0' + 'w']
+# Tracked tools that may hold one of them, with the reason. Every other tracked file below tools/
+# must hold none.
+MACHINE_LOCAL_EXCEPTIONS = {
+    ('test_deploy_host_script.py', '/ho' + 'me/'): "the deploy script's own hygiene pattern",
+}
+ROOT = TOOLS.parent
 
 ENVIRONMENT = {
     'AKL_VM_HOST': 'vm.test.invalid',
@@ -105,11 +112,43 @@ class SettingsTests(unittest.TestCase):
 
 
 class HygieneTests(unittest.TestCase):
-    def test_no_machine_or_person_is_named_in_the_scripts_or_the_settings_module(self):
-        for name in SCRIPTS + ['vm_config.py']:
-            text = (TOOLS / name).read_text(encoding='utf-8')
+    def test_no_tracked_tool_names_a_machine_or_a_person(self):
+        found = set()
+        for name in tracked_tools():
+            text = (TOOLS / name).read_bytes().decode('utf-8', 'replace')
             for marker in MACHINE_LOCAL:
-                self.assertNotIn(marker, text, f'{name} mentions {marker!r}')
+                if marker in text:
+                    found.add((name, marker))
+        unexpected = sorted(found - MACHINE_LOCAL_EXCEPTIONS.keys())
+        self.assertEqual(unexpected, [], 'tracked tools name a machine or a person')
+        self.assertEqual(sorted(MACHINE_LOCAL_EXCEPTIONS.keys() - found), [], 'stale exceptions')
+
+    def test_the_ui_probe_builder_checks_its_compiler_and_notices_before_building(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            # A cargo that records being started: nothing may be built with a wrong argument.
+            stub = Path(scratch) / 'bin'
+            stub.mkdir()
+            started = Path(scratch) / 'cargo-started'
+            (stub / 'cargo').write_text(f'#!/bin/sh\ntouch {started}\nexit 1\n')
+            (stub / 'cargo').chmod(0o755)
+            env = dict(os.environ, PATH=f'{stub}{os.pathsep}{os.environ.get("PATH", "")}')
+            output = f'target/ui-probe-argument-test-{os.getpid()}'
+            self.addCleanup(shutil.rmtree, ROOT / output, ignore_errors=True)
+            missing = str(Path(scratch) / 'missing' / 'ISCC.exe')
+            notices = Path(scratch) / 'NOTICES.txt'
+            notices.write_text('notices')
+            runs = {
+                'no compiler': ['--output', output, '--notices', str(notices)],
+                'missing compiler': ['--output', output, '--iscc', missing, '--notices', str(notices)],
+                'missing notices': ['--output', output, '--iscc', str(notices),
+                                    '--notices', str(Path(scratch) / 'missing.txt')],
+            }
+            for case, arguments in runs.items():
+                run = subprocess.run([sys.executable, str(TOOLS / 'build_installer_ui_probe.py'), *arguments],
+                                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(run.returncode, 0, case)
+                self.assertFalse(started.exists(), f'{case}: cargo was started')
+                self.assertFalse((ROOT / output).exists(), f'{case}: the output was created')
 
     def test_every_script_still_compiles(self):
         for name in DRIVERS + ['vm_config.py']:
@@ -121,6 +160,20 @@ class HygieneTests(unittest.TestCase):
             self.assertIn('[Parameter(Mandatory=$true)][string]$ExpectedComputer', text, name)
             self.assertIn('[Parameter(Mandatory=$true)][string]$LocalAppData', text, name)
             self.assertIn('$env:COMPUTERNAME -ne $ExpectedComputer', text, name)
+
+
+def tracked_tools():
+    """The names below tools/ that git tracks (every file there outside a checkout)."""
+    try:
+        listed = subprocess.run(['git', '-C', str(ROOT), 'ls-files', '-z', '--', 'tools'],
+                                capture_output=True, check=True).stdout.decode('utf-8')
+        names = [path[len('tools/'):] for path in listed.split('\0') if path]
+    except (OSError, subprocess.CalledProcessError):
+        names = [str(path.relative_to(TOOLS)) for path in TOOLS.rglob('*')
+                 if path.is_file() and '__pycache__' not in path.parts]
+    if not names:
+        raise AssertionError('no tracked tools found')
+    return names
 
 
 class FakeVm:
