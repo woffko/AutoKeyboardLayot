@@ -1313,6 +1313,46 @@ fn the_settings_window_on_the_desktop_keeps_the_arabic_profile_choice_inside_its
 
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_keeps_the_cards_of_a_short_page_compact() {
+    // A managed profile with English alone: the languages page is shorter than the window.
+    let window = Window::open(Profile::managed("system"));
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let refresh = ui
+        .wait(
+            window.handle,
+            UIA_ButtonControlTypeId,
+            &tr("remove.refresh"),
+            Duration::from_secs(10),
+        )
+        .expect("Refresh installed packages");
+    let tools = ui
+        .choices(window.handle, &tr("languages.advanced"))
+        .into_iter()
+        .next()
+        .expect("the tools box");
+    let title = ui
+        .texts(window.handle)
+        .into_iter()
+        .find(|text| text.name == tr("languages.add_title"))
+        .expect("the Add a language title");
+    let _ = screenshot("settings-short-page.bmp");
+    // Between the cards: one card's padding (18), the page's spacing (14) and the next card's
+    // padding (18). Cards that share the page's spare height grow apart.
+    let gap = tools.rect.top - refresh.rect.bottom;
+    eprintln!(
+        "title={:?} refresh={:?} tools={:?} gap={gap}",
+        title.rect, refresh.rect, tools.rect
+    );
+    window.request_close();
+    assert!(
+        (48..=52).contains(&gap),
+        "the cards are not compact: {gap} px between them"
+    );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_starts_recording_with_space() {
     let window = Window::open(Profile::legacy());
     let ui = Automation::new();

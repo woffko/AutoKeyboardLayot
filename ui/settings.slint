@@ -613,6 +613,9 @@ export component SettingsWindow inherits Window {
                 ScrollView {
                     VerticalLayout {
                         spacing: 12px;
+                        // A page shorter than the window keeps its cards at their size; the spare
+                        // height stays below them instead of opening gaps inside them.
+                        alignment: start;
                         SettingsCard {
                             height: settings_card_1.preferred-height;
                             settings_card_1 := VerticalLayout {
@@ -693,6 +696,9 @@ export component SettingsWindow inherits Window {
                 ScrollView {
                     VerticalLayout {
                         spacing: 12px;
+                        // A page shorter than the window keeps its cards at their size; the spare
+                        // height stays below them instead of opening gaps inside them.
+                        alignment: start;
                         SettingsCard {
                             height: settings_card_4.preferred-height;
                             settings_card_4 := VerticalLayout {
@@ -726,6 +732,9 @@ export component SettingsWindow inherits Window {
                     VerticalLayout {
                         padding: 4px;
                         spacing: 14px;
+                        // A page shorter than the window keeps its cards at their size; the spare
+                        // height stays below them instead of opening gaps inside them.
+                        alignment: start;
 
                         SettingsCard {
                             VerticalLayout {
@@ -889,6 +898,7 @@ export component SettingsWindow inherits Window {
                             VerticalLayout {
                                 padding: 8px;
                                 spacing: 4px;
+                                alignment: start;
                                 for process-name in root.running-processes: Button {
                                     text: process-name;
                                     clicked => { root.add-running-process(process-name); }
