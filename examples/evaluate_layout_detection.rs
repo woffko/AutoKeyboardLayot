@@ -1,20 +1,22 @@
 //! Offline evaluation of the current dictionary detector on generated typing
 //! cases. Not installed, published or used by the agent.
 //!
-//! Usage: evaluate_layout_detection STORE_COPY INPUT.jsonl OUTPUT.jsonl [--model MODEL.aklm]
-//!        [--single-letter-words]
+//! Usage: evaluate_layout_detection (STORE_COPY | --bundled) INPUT.jsonl OUTPUT.jsonl
+//!        [--model MODEL.aklm] [--single-letter-words]
 //!
 //! The detector runs with the program's default settings; --single-letter-words turns on the
 //! conversion of single-letter words, which is off by default.
 //!
-//! STORE_COPY is a copy of an installed package store (never the live one).
+//! STORE_COPY is a copy of an installed package store (never the live one); with --bundled the
+//! dictionaries this build carries are used instead (data/language-packs in a default build),
+//! which measures a change of those source lists before any package is republished.
 //! Each input line is {"id": N, "typed": "en-US", "candidates": {"en-US":
 //! "...", "ru-RU": "...", "et-EE": "..."}}: the same physical keys mapped to
 //! every layout. Each output line is {"id": N, "target": "ru-RU" | null}.
 //! With --model the given layout model is enabled as the second stage and the
 //! case's "context" (layouts of previous words) is passed to it.
 use autokeyboardlayot::{
-    Detector, DetectorConfig, Language, PackId,
+    Detector, DetectorConfig, DictionaryRegistry, Language, PackId,
     installed_packages::InstalledPackages,
     language_package::PackageTrust,
     package_store::PackageStore,
@@ -59,13 +61,14 @@ impl KeyboardProfileProbe for Fixture {
     }
 }
 
-const USAGE: &str = "usage: evaluate_layout_detection STORE_COPY INPUT.jsonl OUTPUT.jsonl \
-                     [--model MODEL.aklm] [--single-letter-words]";
+const USAGE: &str = "usage: evaluate_layout_detection (STORE_COPY | --bundled) INPUT.jsonl \
+                     OUTPUT.jsonl [--model MODEL.aklm] [--single-letter-words]";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 struct Options {
-    store: OsString,
+    /// None: the dictionaries this build carries.
+    store: Option<OsString>,
     input: OsString,
     output: OsString,
     model: Option<OsString>,
@@ -76,17 +79,26 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     let mut positional = Vec::new();
     let mut model = None;
     let mut single_letter_words = false;
+    let mut bundled = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         if arg == "--model" {
             model = Some(rest.next().ok_or(USAGE)?.clone());
         } else if arg == "--single-letter-words" {
             single_letter_words = true;
+        } else if arg == "--bundled" {
+            bundled = true;
         } else {
             positional.push(arg.clone());
         }
     }
-    let [store, input, output] = <[OsString; 3]>::try_from(positional).map_err(|_| USAGE)?;
+    let (store, input, output) = if bundled {
+        let [input, output] = <[OsString; 2]>::try_from(positional).map_err(|_| USAGE)?;
+        (None, input, output)
+    } else {
+        let [store, input, output] = <[OsString; 3]>::try_from(positional).map_err(|_| USAGE)?;
+        (Some(store), input, output)
+    };
     Ok(Options {
         store,
         input,
@@ -113,15 +125,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model,
         single_letter_words,
     } = options(&args)?;
-    let trust = PackageTrust::release()?;
-    let snapshot = PackageStore::open(Path::new(&store))?.load(&trust)?;
-    let selected: BTreeSet<PackId> = ["en-US", "ru-RU", "et-EE"]
-        .into_iter()
-        .map(|id| PackId::parse(id).expect("valid ID"))
-        .collect();
-    let installed = InstalledPackages::from_store(&snapshot, &selected)?;
-    let mut detector =
-        Detector::with_registry(detector_config(single_letter_words), installed.dictionaries);
+    let dictionaries = match store {
+        Some(store) => {
+            let trust = PackageTrust::release()?;
+            let snapshot = PackageStore::open(Path::new(&store))?.load(&trust)?;
+            let selected: BTreeSet<PackId> = ["en-US", "ru-RU", "et-EE"]
+                .into_iter()
+                .map(|id| PackId::parse(id).expect("valid ID"))
+                .collect();
+            InstalledPackages::from_store(&snapshot, &selected)?.dictionaries
+        }
+        None => std::sync::Arc::new(DictionaryRegistry::embedded()),
+    };
+    let mut detector = Detector::with_registry(detector_config(single_letter_words), dictionaries);
     let profiles = resolve_keyboard_profiles(&mut Fixture(0x0409))?;
     detector.set_resolved_profiles(Some(&profiles));
     if let Some(path) = model {
@@ -197,8 +213,23 @@ mod tests {
             &["store", "in.jsonl"][..],
             &["store", "in.jsonl", "out.jsonl", "--model"],
             &["store", "in.jsonl", "out.jsonl", "extra"],
+            &["--bundled", "store", "in.jsonl", "out.jsonl"],
         ] {
             assert!(options(&args(wrong)).is_err(), "{wrong:?}");
         }
+    }
+
+    #[test]
+    fn bundled_takes_the_dictionaries_of_the_build_instead_of_a_store() {
+        assert_eq!(
+            options(&args(&["store", "in.jsonl", "out.jsonl"]))
+                .unwrap()
+                .store,
+            Some(OsString::from("store"))
+        );
+        let bundled = options(&args(&["--bundled", "in.jsonl", "out.jsonl"])).unwrap();
+        assert_eq!(bundled.store, None);
+        assert_eq!(bundled.input, OsString::from("in.jsonl"));
+        assert_eq!(bundled.output, OsString::from("out.jsonl"));
     }
 }
