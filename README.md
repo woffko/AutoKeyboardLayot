@@ -503,7 +503,14 @@ returns), every later check used to report "queue busy" and privacy stayed
 unavailable for good. A provider that keeps the queue busy for 5 seconds is now
 abandoned and replaced by a fresh one on a new thread, at most three times; the
 diagnostics log records `event=probe respawned=N`, and the hung thread is never
-joined. The other UI Automation calls of an edit run on the worker itself. When the
+joined. The text barrier's reads (whether the text before the caret is the word an
+edit is about to replace) also run on a provider thread of their own: the worker waits
+for an answer no longer than the barrier's deadline, at most 150 ms per read, a read left
+behind changes nothing in the field, the barrier report then names `stage=Provider`, and a
+provider that keeps the queue busy for 2 seconds is replaced, at most three times.
+Selecting the word and collapsing that selection again run on the worker itself: they
+change the field, and a call abandoned at a deadline could still take effect later, under
+keys typed meanwhile. When the
 worker is still busy two seconds after a gate broke for a cause that hands its keys
 back without being asked (its deadline, a full gate, a full input queue or a hook
 reinstall), the UI thread hands the keys back itself, provided the input target is

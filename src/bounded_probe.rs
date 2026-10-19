@@ -76,7 +76,7 @@ pub struct BoundedProbe<K, V> {
     respawns: u32,
 }
 
-impl<K: Copy + Eq + Send + 'static, V: Send + 'static> BoundedProbe<K, V> {
+impl<K: Clone + Eq + Send + 'static, V: Send + 'static> BoundedProbe<K, V> {
     pub fn spawn<Factory, Provider>(name: &str, factory: Factory) -> io::Result<Self>
     where
         Factory: FnOnce() -> Provider + Send + 'static,
@@ -171,7 +171,10 @@ impl<K: Copy + Eq + Send + 'static, V: Send + 'static> BoundedProbe<K, V> {
         }
         if self.pending.is_none() {
             let (reply, receiver) = sync_channel(1);
-            let request = Request { key, reply };
+            let request = Request {
+                key: key.clone(),
+                reply,
+            };
             let request = match self.sender.try_send(request) {
                 Ok(()) => {
                     // The provider took the previous request, so it is alive, however slow.

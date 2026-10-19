@@ -257,6 +257,10 @@ const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
 /// A privacy provider that keeps the probe busy this long without answering is replaced.
 const PRIVACY_PROBE_STUCK_AFTER_SECS: u64 = 5;
 const PRIVACY_PROBE_MAX_RESPAWNS: usize = 3;
+/// A text-barrier provider that has not taken a new read for this long is replaced by a fresh
+/// one, at most this many times.
+const BARRIER_PROBE_STUCK_AFTER_MS: u64 = 2_000;
+const BARRIER_PROBE_MAX_RESPAWNS: usize = 3;
 /// A hook callback slower than this is recorded; Windows gives hooks a tight time budget.
 const HOOK_SLOW_DIAGNOSTIC_MS: u64 = 50;
 /// Timer ticks are 250 ms apart; a longer gap means the UI thread was blocked.
@@ -2074,6 +2078,9 @@ enum TextBarrierStage {
     TextCompared,
     SelectCall,
     SelectionConfirm,
+    /// The barrier's provider thread did not answer by the deadline, or was still busy with an
+    /// earlier read.
+    Provider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -6530,6 +6537,47 @@ fn classify_text_barrier(
     }
 }
 
+/// The text barrier's question: is the text before the caret of the focused field of
+/// `process_id` the word an edit is about to replace?
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BarrierRead {
+    process_id: u32,
+    text: String,
+}
+
+/// Text-barrier reads on a provider thread of their own, answered with the barrier's report.
+type BarrierProbe = BoundedProbe<BarrierRead, (TextBarrierStatus, TextBarrierReport)>;
+
+/// The answer to `read` from `probe` by `deadline`, or `Unavailable` at the stage `Provider` when
+/// the provider is busy with an earlier read, stuck or late. The barrier only reads, so a read
+/// left behind at the deadline changes nothing in the field.
+fn barrier_answer(
+    probe: &mut BarrierProbe,
+    read: BarrierRead,
+    deadline: Instant,
+) -> (TextBarrierStatus, TextBarrierReport) {
+    let expected_chars = read.text.chars().count();
+    let wait = deadline.saturating_duration_since(Instant::now());
+    probe
+        .query_result(
+            read,
+            wait,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+        )
+        .unwrap_or_else(|_| unanswered_barrier(expected_chars))
+}
+
+fn unanswered_barrier(expected_chars: usize) -> (TextBarrierStatus, TextBarrierReport) {
+    (
+        TextBarrierStatus::Unavailable,
+        TextBarrierReport {
+            stage: TextBarrierStage::Provider,
+            expected_chars,
+            ..TextBarrierReport::default()
+        },
+    )
+}
+
 fn format_text_barrier_report(report: TextBarrierReport) -> String {
     format!(
         "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_matches={},drop_last_matches={},leading={:?},trailing={:?},confirm={:?},attempts={},cleanup={:?}",
@@ -7025,6 +7073,10 @@ struct InputProcessor {
     privacy_guard: PrivacyGuard,
     // Keyed by the input target, the input epoch and the privacy generation.
     privacy_probe: Option<BoundedProbe<(ForegroundContext, u64, u64), Option<PrivacyBlockReason>>>,
+    // The text barrier's reads, bounded by the barrier's own deadline. Selecting and collapsing
+    // change the field and stay on the worker: abandoned at a deadline they could still take
+    // effect later, under keys the user types meanwhile.
+    barrier_probe: RefCell<Option<BarrierProbe>>,
     exclusion_policy: ExclusionPolicy,
     backend_rules: BackendRules,
     settings: Settings,
@@ -7195,6 +7247,23 @@ impl InputProcessor {
                 PRIVACY_PROBE_MAX_RESPAWNS,
             )
             .ok(),
+            // A barrier read that never returns would hold the worker, which waits for it, for
+            // good. On a thread of its own it holds no longer than the barrier's deadline.
+            barrier_probe: RefCell::new(
+                BoundedProbe::spawn_resilient(
+                    "autokey-barrier",
+                    || {
+                        let guard = PrivacyGuard::new();
+                        move |read: BarrierRead| {
+                            let status = guard.preceding_text_status(read.process_id, &read.text);
+                            (status, guard.last_barrier_report.get())
+                        }
+                    },
+                    Duration::from_millis(BARRIER_PROBE_STUCK_AFTER_MS),
+                    BARRIER_PROBE_MAX_RESPAWNS,
+                )
+                .ok(),
+            ),
             exclusion_policy: configuration.process_exclusions,
             backend_rules: configuration.backend_rules,
             settings: configuration.settings,
@@ -7263,13 +7332,38 @@ impl InputProcessor {
 
     /// Whether the text before the caret is the word an edit is about to replace, as its settle
     /// step reads it. Tests script it.
-    fn settle_text_status(&self, process_id: u32, expected_text: &str) -> TextBarrierStatus {
+    fn settle_text_status(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        deadline: Instant,
+    ) -> TextBarrierStatus {
         #[cfg(test)]
         if let Some(seam) = &self.paste_seam {
             return seam.borrow_mut().settle();
         }
-        self.privacy_guard
-            .preceding_text_status(process_id, expected_text)
+        self.barrier_text_status(process_id, expected_text, deadline)
+    }
+
+    /// Whether the text before the caret is `expected_text`, as the barrier's provider thread
+    /// reads it, waited for until `deadline` at most. Without a provider the barrier is
+    /// unavailable, and no edit that needs it goes ahead.
+    fn barrier_text_status(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        deadline: Instant,
+    ) -> TextBarrierStatus {
+        let read = BarrierRead {
+            process_id,
+            text: expected_text.to_owned(),
+        };
+        let (status, report) = match self.barrier_probe.borrow_mut().as_mut() {
+            Some(probe) => barrier_answer(probe, read, deadline),
+            None => unanswered_barrier(expected_text.chars().count()),
+        };
+        self.privacy_guard.last_barrier_report.set(report);
+        status
     }
 
     /// The image path and the integrity level of `process_id`. Tests describe the process.
@@ -9882,7 +9976,7 @@ impl InputProcessor {
             }
             if self.text_edit_backend.requires_text_barrier()
                 && matches!(
-                    self.settle_text_status(foreground.process_id, expected_text),
+                    self.settle_text_status(foreground.process_id, expected_text, settle_deadline),
                     TextBarrierStatus::Match
                 )
             {
@@ -9919,8 +10013,7 @@ impl InputProcessor {
                 return ReplayAttempt::Failed;
             }
             if matches!(
-                self.privacy_guard
-                    .preceding_text_status(foreground.process_id, expected_text),
+                self.barrier_text_status(foreground.process_id, expected_text, deadline),
                 TextBarrierStatus::Match
             ) {
                 return ReplayAttempt::Applied;
@@ -9946,10 +10039,7 @@ impl InputProcessor {
             {
                 return TextBarrierStatus::Mismatch;
             }
-            match self
-                .privacy_guard
-                .preceding_text_status(foreground.process_id, expected_text)
-            {
+            match self.barrier_text_status(foreground.process_id, expected_text, deadline) {
                 TextBarrierStatus::Match => return TextBarrierStatus::Match,
                 TextBarrierStatus::Mismatch => saw_mismatch = true,
                 TextBarrierStatus::Unavailable => {}
@@ -20081,6 +20171,128 @@ mod tests {
         assert_eq!(
             selected, 7,
             "the first attempt leaves a selection it finds alone"
+        );
+    }
+
+    /// A barrier answer that names itself through the report's character count.
+    fn marked_barrier_answer(mark: usize) -> (TextBarrierStatus, TextBarrierReport) {
+        (
+            TextBarrierStatus::Match,
+            TextBarrierReport {
+                stage: TextBarrierStage::TextCompared,
+                expected_chars: mark,
+                ..TextBarrierReport::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_barrier_read_that_never_returns_holds_the_worker_only_until_its_deadline() {
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawned);
+        let (hanging, hung) = std::sync::mpsc::channel::<()>();
+        // The first provider hangs in its first read for good, once it has said so; the ones
+        // after it answer.
+        let mut probe: BarrierProbe = BoundedProbe::spawn_resilient(
+            "barrier-hang-test",
+            move || {
+                let hangs = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                let hanging = hanging.clone();
+                move |_: BarrierRead| {
+                    if hangs {
+                        let _ = hanging.send(());
+                        loop {
+                            thread::park();
+                        }
+                    }
+                    marked_barrier_answer(41)
+                }
+            },
+            Duration::from_millis(300),
+            1,
+        )
+        .expect("barrier provider");
+        let read = |text: &str| BarrierRead {
+            process_id: 7,
+            text: text.to_owned(),
+        };
+        // A read whose deadline has come does not wait at all, whatever the provider does.
+        let started = Instant::now();
+        let (status, report) = barrier_answer(&mut probe, read("ghbdtn "), started);
+        assert_eq!(status, TextBarrierStatus::Unavailable);
+        assert_eq!(report.stage, TextBarrierStage::Provider);
+        assert_eq!(report.expected_chars, 7);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        // The provider has taken that read and hangs in it. The next read waits in the queue no
+        // longer than its own deadline.
+        hung.recv_timeout(Duration::from_secs(10))
+            .expect("the provider took the read");
+        let next = Instant::now();
+        let (status, _) =
+            barrier_answer(&mut probe, read("vbh "), next + Duration::from_millis(50));
+        assert_eq!(status, TextBarrierStatus::Unavailable);
+        assert!(
+            next.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            next.elapsed()
+        );
+        // With the queue full, a read is refused at once, however long it may wait.
+        let refused = Instant::now();
+        let (status, report) =
+            barrier_answer(&mut probe, read("lf "), refused + Duration::from_secs(30));
+        assert_eq!(
+            (status, report.stage),
+            (TextBarrierStatus::Unavailable, TextBarrierStage::Provider)
+        );
+        assert!(
+            refused.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            refused.elapsed()
+        );
+        // Stuck past its time, the provider is replaced and a fresh one answers.
+        thread::sleep(Duration::from_millis(350));
+        let (status, report) = barrier_answer(
+            &mut probe,
+            read("lf "),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(
+            (status, report.expected_chars),
+            (TextBarrierStatus::Match, 41)
+        );
+        assert_eq!(probe.respawn_count(), 1);
+        assert_eq!(spawned.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_text_barrier_asks_its_provider_and_keeps_its_report() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new(metrics, 0);
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-answer-test", || {
+                |read: BarrierRead| marked_barrier_answer(read.text.chars().count() + 100)
+            })
+            .expect("barrier provider"),
+        );
+        let status =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        assert_eq!(status, TextBarrierStatus::Match);
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().expected_chars,
+            107
+        );
+        // Without a provider the barrier is unavailable, never a match.
+        *processor.barrier_probe.borrow_mut() = None;
+        let status =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        assert_eq!(status, TextBarrierStatus::Unavailable);
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().stage,
+            TextBarrierStage::Provider
         );
     }
 
