@@ -97,6 +97,34 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+/// How long a request may stay unreadable: a virus scanner can hold a new file for a moment, and
+/// that must not end the session (it did, with a sharing violation, on the test VM).
+const REQUEST_READ_PATIENCE: Duration = Duration::from_secs(5);
+
+/// The request at `path`, read once no other process holds it; a sharing, lock or access error
+/// that lasts longer than `patience` is returned like any other.
+fn read_request(path: &Path, patience: Duration) -> Result<Vec<u8>> {
+    let started = Instant::now();
+    loop {
+        match read_bounded(path, 8192) {
+            Err(error)
+                if held_by_another_process(error.as_ref()) && started.elapsed() < patience =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION.
+fn held_by_another_process(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| matches!(code, 5 | 32 | 33))
+}
+
 fn publish(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     plain_path(root)?;
     let target = root.join(name);
@@ -258,7 +286,7 @@ pub fn run() -> Result<()> {
                 continue;
             }
             let command = decoder
-                .accept(&read_bounded(&request, 8192)?)
+                .accept(&read_request(&request, REQUEST_READ_PATIENCE)?)
                 .map_err(|e| format!("protocol: {e:?}"))?;
             let ids = if matches!(command, Command::Select { .. }) {
                 Some(
@@ -459,6 +487,54 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::WAIT_FAILED;
+
+    #[test]
+    fn a_request_held_for_a_moment_is_read_once_it_is_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request-1.json");
+        fs::write(&path, br#"{"format":1}"#).unwrap();
+        // As a scanner may: open without sharing, then let go.
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            read_request(&path, Duration::from_secs(5)).unwrap(),
+            br#"{"format":1}"#
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_held_longer_than_the_patience_ends_the_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request-1.json");
+        fs::write(&path, b"{}").unwrap();
+        let _held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = read_request(&path, Duration::from_millis(200)).unwrap_err();
+        assert!(held_by_another_process(error.as_ref()), "{error}");
+        // Other failures are not waited for.
+        let started = Instant::now();
+        assert!(
+            read_request(
+                &directory.path().join("missing.json"),
+                Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn a_missing_store_has_its_own_reason_and_the_others_keep_theirs() {
