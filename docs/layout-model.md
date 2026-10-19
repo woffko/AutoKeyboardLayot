@@ -133,10 +133,18 @@ the model (rule 4), and the dictionary stage ignores punctuation typed after a
 word it knows: `key.` stays English although `луню` is a Russian word. Of the
 punctuated English words in `tests/fixtures/punctuated-english.txt` neither
 stage converts any. The cost is paid by words that start or end with
-a key that is a letter only in the other layout: the Estonian `üle`, `ära` and
-`töö` or the Russian `был` and `мою` are corrected only when the dictionaries
-know them, and `'kke` stays unconverted after Estonian words although the model
-is 91% sure of `äkke` there.
+a key that is a letter only in the other layout: they are corrected only when
+the dictionaries know them, and `'kke` stays unconverted after Estonian words
+although the model is 91% sure of `äkke` there. Three-letter words are left to
+the short-word lists, which since 2026-10-19 hold the commonest of these: the
+Russian `был` and `мою` and the Estonian `üle`, `ühe`, `ära` and `töö` (`ühe`
+only from the Russian layout: in the English one `[he` stays the English `he`).
+With them the realistic sample's corrections rise from 86.4% to 86.9% for the
+dictionary detector and from 95.2% to 95.5% with the model, with no more
+correct words changed (measured on the build's own dictionaries with
+`evaluate_layout_detection --bundled`). Installed packages get them when the
+Russian and Estonian packages are published again; the table above was
+measured on the published ones.
 
 **Code is left to the dictionaries too.** Inside a token the model read the
 colons of `Default::default` and `std::fs` as the Estonian `Ö` and turned

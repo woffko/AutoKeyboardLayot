@@ -2218,6 +2218,49 @@ mod tests {
     }
 
     #[test]
+    fn short_words_on_a_punctuation_key_at_an_edge_are_in_the_short_lists() {
+        // They never reach the model (a key outside the typed alphabet at an
+        // edge), and the dictionary stage leaves three-letter words to the
+        // short-word lists, so only those lists convert them.
+        let detector = crate::test_support::detector();
+        for (typed, expected) in [(",sk", "был"), ("vj.", "мою")] {
+            let detection = detector
+                .detect(typed, Language::English)
+                .unwrap_or_else(|| panic!("{typed} is converted"));
+            assert_eq!(detection.replacement, expected);
+        }
+        for (typed, russian, estonian) in [
+            ("[le", "хду", "üle"),
+            ("'ra", "экф", "ära"),
+            ("t;;", "ежж", "töö"),
+        ] {
+            let detection = detector
+                .detect_mapped_candidates_in_context(
+                    typed,
+                    Language::English,
+                    &russian_or_estonian(russian, estonian),
+                    &[],
+                )
+                .unwrap_or_else(|| panic!("{typed} is converted"));
+            assert_eq!(detection.replacement, estonian);
+        }
+        // In the English layout "[he" stays the English "he" with a bracket before it; typed in
+        // the Russian layout the same keys read "хру" and convert.
+        let detection = detector
+            .detect_mapped_candidates_in_context(
+                "хру",
+                Language::Russian,
+                &[
+                    (Language::English, "[he".to_owned()),
+                    (Language::Estonian, "ühe".to_owned()),
+                ],
+                &[],
+            )
+            .expect("хру is converted");
+        assert_eq!(detection.replacement, "ühe");
+    }
+
+    #[test]
     fn punctuation_after_a_known_word_does_not_turn_it_into_a_russian_word() {
         let detector = crate::test_support::detector();
         for (typed, russian) in [
