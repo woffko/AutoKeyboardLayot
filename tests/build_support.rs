@@ -6,12 +6,15 @@ mod build_support;
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime},
 };
 
-use build_support::{describe_checkout, format_commit, is_up_to_date};
+use build_support::{
+    GIT_LOCATION_VARIABLES, describe_checkout_with, format_commit, git_command, is_up_to_date,
+    watched_git_paths,
+};
 
 #[test]
 fn commit_labels_mark_a_dirty_tree() {
@@ -26,8 +29,39 @@ fn git_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn git(directory: &Path, args: &[&str]) {
-    let output = Command::new("git")
+/// Git that gives the same answer on every machine: no global or system configuration, no hooks,
+/// and no checkout above the test's own directory.
+struct Isolation {
+    home: tempfile::TempDir,
+    ceiling: PathBuf,
+}
+
+impl Isolation {
+    fn around(root: &Path) -> Self {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("gitconfig"), "").unwrap();
+        Self {
+            home,
+            ceiling: root.parent().unwrap().to_path_buf(),
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("GIT_CONFIG_GLOBAL", self.home.path().join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CEILING_DIRECTORIES", &self.ceiling);
+    }
+}
+
+fn git(isolation: &Isolation, directory: &Path, args: &[&str]) {
+    let mut command = git_command(directory);
+    isolation.apply(&mut command);
+    let hooks = format!(
+        "core.hooksPath={}",
+        isolation.home.path().join("no-hooks").display()
+    );
+    let output = command
         .args([
             "-c",
             "user.name=Test",
@@ -35,9 +69,10 @@ fn git(directory: &Path, args: &[&str]) {
             "user.email=test@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            &hooks,
         ])
         .args(args)
-        .current_dir(directory)
         .output()
         .expect("git can be started");
     assert!(
@@ -61,6 +96,10 @@ fn checkout_label_follows_edits_of_tracked_build_inputs_only() {
     }
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
+    let isolation = Isolation::around(root);
+    let describe_checkout =
+        |root: &Path| describe_checkout_with(root, &|command| isolation.apply(command));
+    let git = |root: &Path, args: &[&str]| git(&isolation, root, args);
     git(root, &["init", "-q"]);
     write(root, "src/lib.rs", "fn main() {}\n");
     write(root, "README.md", "readme\n");
@@ -101,7 +140,76 @@ fn a_directory_that_is_not_a_checkout_has_no_label() {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
-    assert_eq!(describe_checkout(directory.path()), None);
+    let isolation = Isolation::around(directory.path());
+    assert_eq!(
+        describe_checkout_with(directory.path(), &|command| isolation.apply(command)),
+        None
+    );
+}
+
+#[test]
+fn git_drops_inherited_variables_that_point_at_another_repository() {
+    let command = git_command(Path::new("."));
+    let removed: Vec<String> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+    ] {
+        assert!(GIT_LOCATION_VARIABLES.contains(&variable), "{variable}");
+        assert!(
+            removed.iter().any(|name| name == variable),
+            "{variable} is kept"
+        );
+    }
+}
+
+#[test]
+fn the_build_script_watches_only_git_paths_that_exist() {
+    if !git_available() {
+        eprintln!("git is not installed; skipping");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let isolation = Isolation::around(root);
+    let watched = || watched_git_paths(root, &|command| isolation.apply(command));
+    git(&isolation, root, &["init", "-q", "-b", "trunk"]);
+    write(root, "src/lib.rs", "fn main() {}\n");
+    git(&isolation, root, &["add", "src/lib.rs"]);
+    git(&isolation, root, &["commit", "-q", "-m", "initial"]);
+    let git_dir = root.join(".git");
+
+    // A fresh checkout has its branch as a loose ref and no packed-refs yet: the refs/heads
+    // directory stands in, where packing the branch will show.
+    let loose = watched();
+    assert!(loose.iter().all(|path| path.exists()), "{loose:?}");
+    let canonical = |paths: &[PathBuf]| -> Vec<PathBuf> {
+        paths
+            .iter()
+            .map(|path| fs::canonicalize(path).unwrap())
+            .collect()
+    };
+    let expected_loose = canonical(&[
+        git_dir.join("HEAD"),
+        git_dir.join("refs/heads/trunk"),
+        git_dir.join("refs/heads"),
+    ]);
+    assert_eq!(canonical(&loose), expected_loose);
+
+    // Packed, the branch lives in packed-refs.
+    git(&isolation, root, &["pack-refs", "--all"]);
+    let packed = watched();
+    assert!(packed.iter().all(|path| path.exists()), "{packed:?}");
+    assert_eq!(
+        canonical(&packed),
+        canonical(&[git_dir.join("HEAD"), git_dir.join("packed-refs")])
+    );
 }
 
 fn set_modified(path: &Path, modified: SystemTime) {

@@ -109,15 +109,8 @@ fn build_commit(manifest: &Path) -> String {
     for input in build_support::BUILD_INPUTS {
         println!("cargo:rerun-if-changed={input}");
     }
-    let mut watched = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
-    watched.extend(build_support::git(
-        manifest,
-        &["symbolic-ref", "-q", "HEAD"],
-    ));
-    for name in watched {
-        if let Some(path) = build_support::git(manifest, &["rev-parse", "--git-path", &name]) {
-            println!("cargo:rerun-if-changed={}", manifest.join(path).display());
-        }
+    for path in build_support::watched_git_paths(manifest, &|_| {}) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     build_support::describe_checkout(manifest).unwrap_or_else(|| "unknown".to_owned())
 }
