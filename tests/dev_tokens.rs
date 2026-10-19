@@ -1,16 +1,18 @@
 //! Ratchets for unwanted conversions of text typed correctly in the English
 //! layout: command, tool and package names in terminals (audit finding F14),
-//! and English words with punctuation next to them (findings C1-1 and C1-2).
+//! English words with punctuation next to them (findings C1-1 and C1-2), and
+//! code paths, file names and identifiers with punctuation between letters.
 //!
 //! Each token is replayed through the detector as if the same physical keys
 //! had been read in the Russian and Estonian layouts. The detector converts a
 //! few command names; the budgets below are the numbers measured when that
 //! corpus was added (6 of 1659 by the dictionary detector, 1 more by the layout
-//! model). It converts none of the punctuated words. The budgets may only go
-//! down.
+//! model). It converts none of the punctuated words and none of the technical
+//! tokens. The budgets may only go down.
 //!
 //! Re-baselining: run `cargo run --example measure_token_false_positives` (add
-//! `--punctuated` for the punctuated words) to list the converted tokens, then
+//! `--punctuated` for the punctuated words or `--technical` for the technical
+//! tokens) to list the converted tokens, then
 //! change the constants in the same commit as the detector or corpus change and
 //! give the reason in the commit message. A higher budget is a detection-policy
 //! decision (D4 of the audit remediation plan), not a test fix.
@@ -22,7 +24,8 @@ mod token_measure;
 use autokeyboardlayot::{DictionaryRegistry, Language};
 use std::sync::Arc;
 use token_measure::{
-    CORPUS, LAYOUTS, Layouts, PUNCTUATED, detectors, measure, parse_punctuated_tokens, parse_tokens,
+    CORPUS, LAYOUTS, Layouts, PUNCTUATED, TECHNICAL, detectors, measure, parse_punctuated_tokens,
+    parse_technical_tokens, parse_tokens,
 };
 
 /// A smaller corpus would make the percentages meaningless.
@@ -35,6 +38,10 @@ const MODEL_EXTRA_BUDGET: usize = 1;
 const MINIMUM_PUNCTUATED_TOKENS: usize = 2500;
 const PUNCTUATED_DICTIONARY_BUDGET: usize = 0;
 const PUNCTUATED_MODEL_EXTRA_BUDGET: usize = 0;
+/// The same for the code paths, file names and identifiers.
+const MINIMUM_TECHNICAL_TOKENS: usize = 5000;
+const TECHNICAL_DICTIONARY_BUDGET: usize = 0;
+const TECHNICAL_MODEL_EXTRA_BUDGET: usize = 0;
 
 const REBASELINE: &str = "If the change is intended, follow the re-baselining steps at the top of tests/dev_tokens.rs. \
                           Raising a budget changes detection policy and needs an explicit decision.";
@@ -100,6 +107,58 @@ fn punctuated_english_false_positive_budget() {
         PUNCTUATED_DICTIONARY_BUDGET,
         PUNCTUATED_MODEL_EXTRA_BUDGET,
     );
+}
+
+#[test]
+fn technical_tokens_false_positive_budget() {
+    let tokens = parse_technical_tokens(TECHNICAL).expect("technical corpus");
+    assert_within_budget(
+        &tokens,
+        TECHNICAL_DICTIONARY_BUDGET,
+        TECHNICAL_MODEL_EXTRA_BUDGET,
+    );
+}
+
+#[test]
+fn the_technical_corpus_is_a_sorted_unique_list_with_a_provenance_header() {
+    let tokens = parse_technical_tokens(TECHNICAL).expect("technical corpus");
+    assert!(
+        tokens.len() >= MINIMUM_TECHNICAL_TOKENS,
+        "{} tokens, at least {MINIMUM_TECHNICAL_TOKENS} are needed",
+        tokens.len()
+    );
+    assert_provenance_header(TECHNICAL);
+    for required in ["Default::default", "LANGID:KLID", "key.md"] {
+        assert!(
+            tokens.binary_search(&required.to_owned()).is_ok(),
+            "{required:?} is part of the corpus"
+        );
+    }
+    assert!(
+        parse_technical_tokens("key.md\nkey.md\n").is_err(),
+        "repeats are rejected"
+    );
+    assert!(
+        parse_technical_tokens("ab.cd\naa.bb\n").is_err(),
+        "unsorted input is rejected"
+    );
+    assert!(
+        parse_technical_tokens("key\n").is_err(),
+        "a token needs a separator"
+    );
+    assert!(
+        parse_technical_tokens("a.md\n").is_err(),
+        "one-letter parts are rejected"
+    );
+    assert!(
+        parse_technical_tokens("key.\n").is_err(),
+        "edges are letters"
+    );
+    assert!(
+        parse_technical_tokens("key:::md\n").is_err(),
+        "at most two colons"
+    );
+    assert!(parse_technical_tokens("key.m2\n").is_err(), "letters only");
 }
 
 fn assert_provenance_header(corpus: &str) {

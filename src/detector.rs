@@ -259,8 +259,11 @@ impl Detector {
     ///
     /// The model reads every key as a letter of some layout, so it never sees
     /// a word with a character outside the typed alphabet at either edge ("it."
-    /// would become "шею", "\"Tallinn" would become "ÄTallinn") or a
-    /// contraction ("don't" would become "donät"). Only the dictionary stage
+    /// would become "шею", "\"Tallinn" would become "ÄTallinn"), a
+    /// contraction ("don't" would become "donät") or such a character after a
+    /// word the typed language knows ("key.md" would become "лунюьв"), and it
+    /// never reads such a character inside the word as a capital letter
+    /// ("LANGID:KLID" would become "LANGIDÖKLID"). Only the dictionary stage
     /// judges them.
     fn detect_with_layout_model(
         &self,
@@ -281,6 +284,8 @@ impl Detector {
             || self.word_exclusions.contains(current_language, word)
             || self.letter_core(current_language, word) != word
             || self.is_contraction(current_language, word)
+            || self.follows_known_word(current_language, word)
+            || period_between_letters(word)
         {
             return None;
         }
@@ -327,7 +332,10 @@ impl Detector {
         let best = confident_layout(&probabilities, threshold)?;
         let replacement = texts[best]?;
         let target_language = model.languages()[best];
-        if best == typed || replacement == word || !self.accepts_word(target_language, replacement)
+        if best == typed
+            || replacement == word
+            || !self.accepts_word(target_language, replacement)
+            || self.capital_from_punctuation(current_language, word, replacement)
         {
             return None;
         }
@@ -420,6 +428,40 @@ impl Detector {
         };
         self.knows_letter_core(language, first)
             || (parts.len() == 2 && first.chars().count() >= 3 && last.chars().count() == 1)
+    }
+
+    /// "key.md", "Default::default", "self.items": a character outside the
+    /// typed alphabet right after three or more letters that make a word the
+    /// typed language knows, as in a file name or a code path. A word typed in
+    /// the wrong layout rarely spells a word of the typed language before one
+    /// of its letters on a punctuation key.
+    fn follows_known_word(&self, language: Language, word: &str) -> bool {
+        let mut run = String::new();
+        for character in word.chars() {
+            if self.accepts_character(language, character) {
+                run.push(character);
+                continue;
+            }
+            if run.chars().count() >= MINIMUM_BASE_LIST_CHARACTERS
+                && self.knows_letter_core(language, &run.to_lowercase())
+            {
+                return true;
+            }
+            run.clear();
+        }
+        false
+    }
+
+    /// Whether `replacement` reads a key that types no letter of the typed
+    /// language as a capital letter: inside a word that comes from Shift
+    /// between letters, as in a code path ("std::fs" reads "stdÖÖfs") or an
+    /// identifier ("LANGID:KLID"). A word typed in the wrong layout in lower
+    /// case reads those keys as small letters, and one that starts with such a
+    /// capital never reaches the model.
+    fn capital_from_punctuation(&self, language: Language, word: &str, replacement: &str) -> bool {
+        word.chars()
+            .zip(replacement.chars())
+            .any(|(typed, read)| !self.accepts_character(language, typed) && read.is_uppercase())
     }
 
     fn accepts_character(&self, language: Language, character: char) -> bool {
@@ -782,6 +824,24 @@ fn ngram_score(
             }
         })
         .sum()
+}
+
+/// "ui.py", "IN.txt": a period between two runs of two or more letters, as in a
+/// file name or a member access. The period is a letter only in the Russian
+/// layout, and the Russian words it spells there (`утюги` is `en.ub`) are in
+/// the dictionary, which judges them before the model.
+fn period_between_letters(word: &str) -> bool {
+    let runs: Vec<usize> = word
+        .split(|character: char| !character.is_alphabetic() && character != '.')
+        .flat_map(|chunk| {
+            let parts: Vec<usize> = chunk.split('.').map(|part| part.chars().count()).collect();
+            parts
+                .windows(2)
+                .map(|pair| pair[0].min(pair[1]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    runs.iter().any(|shorter| *shorter >= 2)
 }
 
 /// The most probable layout, when its probability reaches `threshold`. A NaN
@@ -1199,6 +1259,55 @@ mod tests {
                 .is_none(),
             "a known word of the typed layout is not converted"
         );
+    }
+
+    #[test]
+    fn layout_model_never_converts_code_paths_file_names_or_identifiers() {
+        let detector = model_detector();
+        // On its own the model is sure of another layout for each of these; each group is kept
+        // English by one rule alone.
+        for (word, russian, estonian) in [
+            // A word the typed language knows before a key outside its alphabet.
+            ("items[key", "шеуьыхлун", "itemsükey"),
+            ("list[index", "дшыехштвуч", "listüindex"),
+            ("value;return", "мфдгужкуегкт", "valueöreturn"),
+            ("Default::default", "ВуафгдеЖЖвуафгде", "DefaultÖÖdefault"),
+            ("key.md", "лунюьв", "key.md"),
+            // Such a key read as a capital letter inside the word.
+            ("LANGID:KLID", "ДФТПШВЖЛДШВ", "LANGIDÖKLID"),
+            ("HKL:KLID", "РЛДЖЛДШВ", "HKLÖKLID"),
+            ("std::fs", "ыевЖЖаы", "stdÖÖfs"),
+            // A period between runs of two or more letters.
+            ("ui.py", "гшюзн", "ui.py"),
+            ("IN.txt", "ШТюече", "IN.txt"),
+            ("et.as", "уеюфы", "et.as"),
+        ] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let probabilities = model_probabilities(&detector, word, &candidates, &[]);
+            let sure = probability_of(&probabilities, Language::Russian)
+                .max(probability_of(&probabilities, Language::Estonian));
+            assert!(
+                sure >= LAYOUT_MODEL_THRESHOLD,
+                "premise: the model alone converts {word} ({sure}); the model changed, pick another token"
+            );
+            assert!(
+                detector
+                    .detect_mapped_candidates_in_context(word, Language::English, &candidates, &[])
+                    .is_none(),
+                "{word}"
+            );
+        }
+        // The period is the Russian "ю": Russian words with it between letters are in the
+        // dictionary, which still converts them.
+        let detection = detector
+            .detect_mapped_candidates_in_context(
+                "en.ub",
+                Language::English,
+                &russian_or_estonian("утюги", "en.ub"),
+                &[],
+            )
+            .expect("en.ub is converted");
+        assert_eq!(detection.replacement, "утюги");
     }
 
     #[test]

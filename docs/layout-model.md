@@ -34,8 +34,13 @@ converted only when all of the following hold:
 4. it has no character outside the typed language's alphabet at either edge
    and is not a contraction: an apostrophe after a word the typed language
    knows (`don't`, `I've`), or a single apostrophe after three or more
-   characters and before one letter (`hadn't`, `Inno's`);
-5. the target reading uses the target language's alphabet;
+   characters and before one letter (`hadn't`, `Inno's`); nor is it shaped like
+   code: such a character after three or more letters that make a word the
+   typed language knows (`key.md`, `items[key`, `Default::default`), or a
+   period between runs of two or more letters (`ui.py`, `IN.txt`);
+5. the target reading uses the target language's alphabet and reads no key
+   outside the typed alphabet as a capital letter, which inside a word comes
+   from Shift between letters (`LANGID:KLID` would read as `LANGIDÖKLID`);
 6. the model is at least 90% sure of another layout (97% for three-letter
    words).
 
@@ -59,16 +64,20 @@ the default settings follow it.
 | | Dictionary detector | With layout model |
 |---|---|---|
 | Realistic: wrong-layout words corrected | 86.4% | 95.2% |
-| — English / Russian / Estonian | 91.6% / 94.8% / 59.5% | 95.1% / 97.1% / 90.6% |
+| — English / Russian / Estonian | 91.8% / 94.8% / 59.5% | 95.3% / 97.1% / 90.5% |
 | Realistic: correct words changed by mistake | 0.09% | 0.10% |
-| Rare words: wrong-layout words corrected | 65.8% | 90.6% |
+| Rare words: wrong-layout words corrected | 65.8% | 90.4% |
 | Rare words: correct words changed by mistake | 0.06% | 0.10% |
 
 With the default settings (single-letter words left as typed) the realistic
 sample gives 78.6% and 87.4% of the wrong-layout words corrected (English /
-Russian / Estonian 88.1% / 82.0% / 59.4% and 91.6% / 84.4% / 90.5%) and 0.02%
+Russian / Estonian 88.1% / 82.0% / 59.4% and 91.6% / 84.3% / 90.4%) and 0.02%
 and 0.04% of the correct words changed; the rare-word rates do not change.
-Measured on 2026-10-19 with the shipped model and the September test sets.
+Measured on 2026-10-19 with the shipped model and the September test sets,
+after the rules for code-shaped tokens (rules 4 and 5). Before them the model
+corrected 95.26% of the realistic words (Estonian 90.58%), 87.45% with the
+default settings and 90.61% of the rare ones; the generated typing has no
+code, so here the rules only cost (0.04 points realistic, 0.20 points rare).
 
 Before rule 4 and the dictionary veto on punctuation after a known word (see
 [Limits](#limits)), the dictionary detector corrected 86.5% and the model
@@ -86,7 +95,7 @@ are synthetic measurements, not a substitute for real typing acceptance; see
 ## Limits
 
 The model is a statistical second opinion, not a language identifier. Its limits
-are known. The first four are covered by tests in `src/detector.rs`, the
+are known. The first five are covered by tests in `src/detector.rs`, the
 numbers come from `examples/measure_token_false_positives.rs`, and
 `tests/dev_tokens.rs` stops the real-token numbers from growing unnoticed.
 
@@ -129,6 +138,17 @@ a key that is a letter only in the other layout: the Estonian `üle`, `ära` and
 know them, and `'kke` stays unconverted after Estonian words although the model
 is 91% sure of `äkke` there.
 
+**Code is left to the dictionaries too.** Inside a token the model read the
+colons of `Default::default` and `std::fs` as the Estonian `Ö` and turned
+`key.md` into the Russian `лунюьв`: of the 5 826 code paths, file names and
+identifiers of `tests/fixtures/technical-tokens.txt` it converted 1 151 (1 145
+into Estonian, 1 141 of them with `::`). Rules 4 and 5 stop all of them. Their
+cost is paid by words whose letter on a punctuation key follows letters that
+spell a word of the typed language, or that have the Russian `ю` between runs
+of two or more letters, when the dictionaries do not know them: the Russian
+`утюги` (`en.ub`) is converted by the dictionary, an unknown form of that shape
+no longer by the model.
+
 **Synthetic and real numbers differ.** The table above measures generated
 sentences of real words and shows about 0.1% unwanted changes. Text that is not
 a sentence behaves differently. Every row is typed correctly in the English
@@ -138,6 +158,7 @@ layout and judged as a first word (no context):
 |---|---|---|
 | 1 659 command, tool and package names | 0.36% | 0.06% |
 | 3 016 English words with punctuation next to them | 0% | 0% |
+| 5 826 code paths, file names and identifiers | 0% | 0% |
 | Random lowercase letters, 3 letters | 0.36% | 3.3% |
 | 4 letters | 1.5% | 2.4% |
 | 6 letters | 0.05% | 1.7% |
@@ -149,8 +170,8 @@ The random rows are a worst case (40 000 uniformly random strings per row), not
 typical typing. They show what no dictionary protects: machine-generated
 lowercase text. Reproduce a row with
 `cargo run --release --example measure_token_false_positives -- --random 6 40000`,
-the first row with the same command without arguments and the second with
-`--punctuated`.
+the first row with the same command without arguments, the second with
+`--punctuated` and the third with `--technical`.
 
 **False-positive classes** seen in these measurements:
 
@@ -304,4 +325,5 @@ takes about a minute on a GPU and longer on a CPU).
 | `examples/measure_token_false_positives.rs` | Counts unwanted conversions on developer tokens or random strings |
 | `tests/dev_tokens.rs`, `tests/fixtures/dev-tokens.txt` | Budget for those conversions on 1 659 real tokens |
 | `tests/fixtures/punctuated-english.txt` | The same for 3 016 English words with punctuation |
+| `tests/fixtures/technical-tokens.txt` | The same for 5 826 code paths, file names and identifiers |
 | `tools/layout_model/pipeline.sh` | All steps in order |

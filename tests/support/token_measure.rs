@@ -19,6 +19,8 @@ use std::{collections::BTreeMap, sync::Arc};
 pub const CORPUS: &str = include_str!("../fixtures/dev-tokens.txt");
 /// English words with punctuation next to them, see its header for the sources.
 pub const PUNCTUATED: &str = include_str!("../fixtures/punctuated-english.txt");
+/// Code paths, file names and identifiers, see its header for the sources.
+pub const TECHNICAL: &str = include_str!("../fixtures/technical-tokens.txt");
 /// The punctuation keys that print letters in the Russian or Estonian layout.
 pub const LETTER_PUNCTUATION: &str = "[];',.{}:\"<>";
 /// The US, Russian and Estonian layouts the corpora are read through.
@@ -56,6 +58,31 @@ pub fn parse_punctuated_tokens(text: &str) -> Result<Vec<String>, String> {
                     .all(|byte| byte.is_ascii_lowercase() || punctuation(&byte))
         },
         "two or more lowercase letters with a punctuation key that prints a letter elsewhere",
+    )
+}
+
+/// Letters joined by `.`, `:` or `::`, two or more letters in every part, one
+/// per line, sorted and unique, as `parse_tokens`.
+pub fn parse_technical_tokens(text: &str) -> Result<Vec<String>, String> {
+    parse_sorted(
+        text,
+        |line| {
+            let parts: Vec<&str> = line
+                .split([':', '.'])
+                .filter(|part| !part.is_empty())
+                .collect();
+            parts.len() >= 2
+                && parts.iter().all(|part| {
+                    part.len() >= 2 && part.bytes().all(|byte| byte.is_ascii_alphabetic())
+                })
+                && !line.starts_with([':', '.'])
+                && !line.ends_with([':', '.'])
+                && !line.contains(".:")
+                && !line.contains(":.")
+                && !line.contains("..")
+                && !line.contains(":::")
+        },
+        "letters joined by \".\", \":\" or \"::\", two or more in every part",
     )
 }
 
