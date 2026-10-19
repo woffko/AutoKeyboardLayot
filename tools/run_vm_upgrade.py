@@ -1,11 +1,16 @@
-"""Stage candidate1 and candidate3 on the VM and run the upgrade/interruption test.
+"""Stage two installer builds on the VM and run the upgrade/interruption test.
 
-Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment (see vm_config.py).
+Usage: run_vm_upgrade.py OUTPUT_DIRECTORY OLD_BUILD_DIRECTORY NEW_BUILD_DIRECTORY < identity-path
+
+The build directories are outputs of tools/build_experimental_installer.py, relative to the
+repository: the old build is installed first, the new one upgrades it. Needs AKL_VM_HOST,
+AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment (see vm_config.py); the ssh identity path
+comes on standard input.
 """
 import base64, json, os, stat, subprocess, sys
 from pathlib import Path
 
-from vm_config import VmSettings, VmSettingsError, sftp_path
+from vm_config import VmSettings, VmSettingsError, build_artifacts, sftp_path
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE_NAME = 'akl-upgrade'
@@ -16,8 +21,13 @@ def main():
     except VmSettingsError as error:
         print(error, file=sys.stderr)
         return 2
+    if len(sys.argv) != 4:
+        print(__doc__, file=sys.stderr)
+        return 2
     output = Path(sys.argv[1]).resolve()
     output.mkdir()
+    old_directory = (ROOT / sys.argv[2]).resolve()
+    new_directory = (ROOT / sys.argv[3]).resolve()
     raw = bytearray(sys.stdin.buffer.read(4097))
     result = {'state': 'failed_before_execution', 'execution_requested': False}
     try:
@@ -42,17 +52,9 @@ def main():
                     result['remote_stderr'] = run.stderr.decode('utf-8', 'replace')[-2000:]
                     raise ValueError('remote command')
                 return run.stdout.decode('utf-8', 'replace')
-            old_build = json.loads((ROOT / 'target/installer-vm-candidate-20260913-01/build.json').read_text())
-            new_build = json.loads((ROOT / 'target/installer-vm-candidate-20260913-03/build.json').read_text())
-            def art(build, suffix):
-                return next(a['sha256'] for a in build['artifacts'] if a['file'].endswith(suffix))
-            old_setup = ROOT / 'target/installer-vm-candidate-20260913-01/AutoKeyboardLayot-0.1.0-setup-experimental.exe'
-            new_setup = ROOT / 'target/installer-vm-candidate-20260913-03/AutoKeyboardLayot-0.1.0-setup-experimental.exe'
+            old_setup, old_setup_sha, old_app_sha = build_artifacts(old_directory)
+            new_setup, new_setup_sha, new_app_sha = build_artifacts(new_directory)
             script = ROOT / 'tools/test-vm-upgrade.ps1'
-            old_setup_sha = art(old_build, 'setup-experimental.exe')
-            new_setup_sha = art(new_build, 'setup-experimental.exe')
-            old_app_sha = art(old_build, 'release/AutoKeyboardLayot.exe')
-            new_app_sha = art(new_build, 'release/AutoKeyboardLayot.exe')
             preflight = remote(vm.preflight_script())
             result['preflight'] = preflight.strip().splitlines()
             if not vm.preflight_ok(preflight):

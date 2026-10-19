@@ -27,8 +27,13 @@ from vm_config import VmSettings, VmSettingsError, sftp_path  # noqa: E402
 DRIVERS = ['run_vm_cross_session.py', 'run_vm_installer_ui.py', 'run_vm_upgrade.py']
 SCRIPTS = DRIVERS + ['test-vm-cross-session.ps1', 'test-vm-upgrade.ps1', 'test-installer-ui.ps1']
 # The build directory (and scenarios) the drivers that take them get in these tests.
-BUILD = 'target/installer-vm-candidate-20260913-03'
-DRIVER_ARGUMENTS = {'run_vm_cross_session.py': (BUILD,), 'run_vm_installer_ui.py': (BUILD, 'retry', 'missing-exe')}
+BUILD = 'target/installer-build-a'
+# A build whose program was signed: the receipt names it below signed-inputs/.
+SIGNED_BUILD = 'target/installer-build-b'
+DRIVER_ARGUMENTS = {'run_vm_cross_session.py': (SIGNED_BUILD,), 'run_vm_installer_ui.py': (BUILD, 'retry', 'missing-exe'),
+                    'run_vm_upgrade.py': (BUILD, SIGNED_BUILD)}
+# The receipts' digests: setup and program of BUILD, then of SIGNED_BUILD.
+DIGESTS = {'a-setup': 'a' * 64, 'a-program': 'b' * 64, 'b-setup': 'c' * 64, 'b-program': 'd' * 64}
 # Values that tie a script to one machine or one person. Written in pieces so that a scan for
 # these values does not flag this file.
 MACHINE_LOCAL = ['192' + '.168.', 'C:\\Users\\', '/ho' + 'me/', 'root' + '@', 'DESK' + 'TOP-', 'w0' + 'w']
@@ -221,13 +226,22 @@ class FakeVm:
         return ''
 
 
+def receipt(setup, setup_digest, program, program_digest):
+    return json.dumps({'artifacts': [{'file': program, 'sha256': program_digest},
+                                     {'file': 'target/release/installer-package-helper.exe', 'sha256': 'e' * 64},
+                                     {'file': setup, 'sha256': setup_digest}]})
+
+
 def artifacts(root):
-    for candidate in ('20260913-01', '20260913-03'):
-        folder = root / 'target' / f'installer-vm-candidate-{candidate}'
-        folder.mkdir(parents=True)
-        (folder / 'build.json').write_text(
-            '{"artifacts": [{"file": "AutoKeyboardLayot-0.1.0-setup-experimental.exe", "sha256": "%s"},'
-            ' {"file": "target/release/AutoKeyboardLayot.exe", "sha256": "%s"}]}' % ('a' * 64, 'b' * 64))
+    builds = {
+        BUILD: receipt(f'{BUILD}/AutoKeyboardLayot-0.1.1-setup-experimental.exe', DIGESTS['a-setup'],
+                       'target/xwin-hotkeys/x86_64-pc-windows-msvc/release/AutoKeyboardLayot.exe', DIGESTS['a-program']),
+        SIGNED_BUILD: receipt(f'{SIGNED_BUILD}/AutoKeyboardLayot-0.1.2-setup-experimental.exe', DIGESTS['b-setup'],
+                              f'{SIGNED_BUILD}/signed-inputs/AutoKeyboardLayot.exe', DIGESTS['b-program']),
+    }
+    for folder, text in builds.items():
+        (root / folder).mkdir(parents=True)
+        (root / folder / 'build.json').write_text(text)
 
 
 def run_driver(name, environment, fake, arguments=None):
@@ -334,10 +348,44 @@ class DriverTests(unittest.TestCase):
         fake = FakeVm()
         _, controller = run_driver('run_vm_installer_ui.py', ENVIRONMENT, fake)
         uploads = ''.join(batch for _, batch in fake.sftp)
-        self.assertIn('installer-vm-candidate-20260913-03/AutoKeyboardLayot-0.1.0-setup-experimental.exe', uploads)
+        self.assertIn('installer-build-a/AutoKeyboardLayot-0.1.1-setup-experimental.exe', uploads)
         self.assertIn('run-retry.cmd', uploads)
         self.assertIn('run-missing-exe.cmd', uploads)
         self.assertEqual(set(json.loads(controller)['scenarios']), {'retry', 'missing-exe'})
+
+    def test_the_upgrade_driver_installs_the_named_old_build_then_the_new_one(self):
+        fake = FakeVm()
+        _, controller = run_driver('run_vm_upgrade.py', ENVIRONMENT, fake)
+        uploads = ''.join(batch for _, batch in fake.sftp)
+        self.assertIn('installer-build-a/AutoKeyboardLayot-0.1.1-setup-experimental.exe" "', uploads)
+        self.assertIn('/old-setup.exe', uploads)
+        self.assertIn('installer-build-b/AutoKeyboardLayot-0.1.2-setup-experimental.exe" "', uploads)
+        self.assertIn('/new-setup.exe', uploads)
+        invocation = next(script for _, script in fake.ssh if '-OldAppSha256' in script)
+        for parameter, digest in (('-OldSetupSha256', 'a-setup'), ('-OldAppSha256', 'a-program'),
+                                  ('-NewSetupSha256', 'b-setup'), ('-NewAppSha256', 'b-program')):
+            self.assertIn(f"{parameter} '{DIGESTS[digest]}'", invocation)
+
+    def test_the_upgrade_driver_needs_both_builds(self):
+        fake = FakeVm()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, _ = run_driver('run_vm_upgrade.py', ENVIRONMENT, fake, (BUILD,))
+        self.assertEqual(code, 2)
+        self.assertEqual(fake.ssh + fake.sftp, [])
+
+    def test_a_receipt_without_one_setup_and_one_program_is_refused(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            program = 'target/release/AutoKeyboardLayot.exe'
+            setup = 'AutoKeyboardLayot-0.1.1-setup-experimental.exe'
+            for text in (json.dumps({'artifacts': [{'file': program, 'sha256': 'b' * 64}]}),
+                         json.dumps({'artifacts': [{'file': setup, 'sha256': 'a' * 64}]}),
+                         receipt(setup, 'a' * 64, program, 'not a digest')):
+                (folder / 'build.json').write_text(text)
+                with self.assertRaises(ValueError, msg=text):
+                    vm_config.build_artifacts(folder)
+            (folder / 'build.json').write_text(receipt(setup, 'a' * 64, 'out/signed-inputs/AutoKeyboardLayot.exe', 'b' * 64))
+            self.assertEqual(vm_config.build_artifacts(folder), (folder / setup, 'a' * 64, 'b' * 64))
 
     def test_an_unknown_scenario_or_a_missing_build_stops_before_anything_runs(self):
         for arguments in [(BUILD,), (BUILD, 'probe'), (BUILD, 'retry', 'unknown')]:

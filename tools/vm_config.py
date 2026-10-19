@@ -16,8 +16,10 @@ missing one stops before it touches the VM:
 What the VM reports is the ssh account's LOCALAPPDATA, so when AKL_VM_TEST_USER names another
 user, AKL_VM_LOCALAPPDATA and AKL_VM_STAGE are required: a directory both users can use.
 """
+import json
 import os
 import re
+from pathlib import PurePosixPath
 
 # A name or address that ssh cannot mistake for an option, and that cannot carry a command.
 _HOST = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$')
@@ -116,6 +118,23 @@ class VmSettings:
         if self.stage:
             return self.stage.rstrip('\\')
         return f'{self.effective_local_app_data(preflight_text).rstrip(chr(92))}\\Temp\\{name}'
+
+
+def build_artifacts(build_directory):
+    """(setup path, setup SHA-256, program SHA-256) from the receipt of build_experimental_installer.py.
+
+    The program is found by its name wherever the build put it: below release/ for an unsigned build,
+    in signed-inputs/ for a signed one. The setup is the one -setup-experimental.exe of the build.
+    """
+    build = json.loads((build_directory / 'build.json').read_text())
+    setups = [entry for entry in build['artifacts'] if entry['file'].endswith('-setup-experimental.exe')]
+    programs = [entry for entry in build['artifacts'] if PurePosixPath(entry['file']).name == 'AutoKeyboardLayot.exe']
+    if len(setups) != 1 or len(programs) != 1:
+        raise ValueError('the receipt names no single setup and program')
+    for digest in (setups[0]['sha256'], programs[0]['sha256']):
+        if not re.fullmatch('[0-9a-f]{64}', digest):
+            raise ValueError('receipt hash')
+    return build_directory / PurePosixPath(setups[0]['file']).name, setups[0]['sha256'], programs[0]['sha256']
 
 
 def sftp_path(windows_path):

@@ -8,27 +8,16 @@ except probe, which needs a /DInstallerUiProbe build and runs directly in the se
 Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment; AKL_VM_TEST_USER names
 the interactive user (see vm_config.py). The ssh identity path comes on standard input.
 """
-import base64, json, os, re, subprocess, sys
-from pathlib import Path, PurePosixPath
+import base64, json, os, subprocess, sys
+from pathlib import Path
 
-from vm_config import VmSettings, VmSettingsError, sftp_path
+from vm_config import VmSettings, VmSettingsError, build_artifacts, sftp_path
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE_NAME = 'akl-installer-ui'
 TASK = 'AklInstallerAcceptance'
 SCENARIOS = ('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
              'startup-removal', 'fence-invalid', 'settings-open')
-
-
-def artifacts(build_directory):
-    """(setup path, setup SHA-256, program SHA-256) from the build receipt."""
-    build = json.loads((build_directory / 'build.json').read_text())
-    setup = next(a for a in build['artifacts'] if a['file'].endswith('setup-experimental.exe'))
-    app = next(a for a in build['artifacts'] if PurePosixPath(a['file']).name == 'AutoKeyboardLayot.exe')
-    for digest in (setup['sha256'], app['sha256']):
-        if not re.fullmatch('[0-9a-f]{64}', digest):
-            raise ValueError('receipt hash')
-    return build_directory / PurePosixPath(setup['file']).name, setup['sha256'], app['sha256']
 
 
 def main():
@@ -78,7 +67,7 @@ def main():
                 raise ValueError('preflight result')
             stage = vm.stage_directory(STAGE_NAME, preflight)
             stage_unix = sftp_path(stage)
-            setup, setup_sha, app_sha = artifacts(build_directory)
+            setup, setup_sha, app_sha = build_artifacts(build_directory)
             result.update(phase='upload', setup_sha256=setup_sha, app_sha256=app_sha)
             remote(f"""$ErrorActionPreference='Stop'
 $s='{stage}'

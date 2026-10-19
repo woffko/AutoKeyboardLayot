@@ -6,9 +6,9 @@ BUILD_DIRECTORY is an output of tools/build_experimental_installer.py, relative 
 Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment (see vm_config.py).
 """
 import base64, json, os, stat, subprocess, sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-from vm_config import VmSettings, VmSettingsError, sftp_path
+from vm_config import VmSettings, VmSettingsError, build_artifacts, sftp_path
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE_NAME = 'akl-cross-session'
@@ -50,9 +50,7 @@ def main():
                     raise ValueError('remote command')
                 return run.stdout.decode('utf-8', 'replace')
             script = ROOT / 'tools/test-vm-cross-session.ps1'
-            build = json.loads((build_directory / 'build.json').read_text())
-            entry = next(a for a in build['artifacts'] if a['file'].endswith('setup-experimental.exe'))
-            setup, setup_sha = build_directory / PurePosixPath(entry['file']).name, entry['sha256']
+            setup, setup_sha, _ = build_artifacts(build_directory)
             preflight = remote(vm.preflight_script())
             result['preflight'] = preflight.strip().splitlines()
             if not vm.preflight_ok(preflight):
