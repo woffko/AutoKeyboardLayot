@@ -67,6 +67,19 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.scheduled_task_user, 'TESTGUEST01\\console')
         self.assertEqual(settings.stage_directory('akl-upgrade', ''), 'D:\\Stage\\akl')
 
+    def test_another_tested_user_needs_its_profile_and_a_stage_from_the_settings(self):
+        other = dict(ENVIRONMENT, AKL_VM_TEST_USER='console')
+        complete = dict(other, AKL_VM_LOCALAPPDATA='D:\\Profiles\\console\\AppData\\Local',
+                        AKL_VM_STAGE='D:\\Stage\\akl')
+        for missing in ['AKL_VM_LOCALAPPDATA', 'AKL_VM_STAGE']:
+            env = {key: value for key, value in complete.items() if key != missing}
+            with self.assertRaises(VmSettingsError) as caught:
+                VmSettings.from_environment(env)
+            self.assertIn(missing, str(caught.exception))
+        self.assertEqual(VmSettings.from_environment(complete).test_user, 'console')
+        # The same account in another case is the same Windows user.
+        self.assertEqual(VmSettings.from_environment(dict(ENVIRONMENT, AKL_VM_TEST_USER='TESTER')).test_user, 'TESTER')
+
     def test_unusable_values_are_refused_before_they_can_reach_a_command_line(self):
         bad = {
             'AKL_VM_HOST': ['-oProxyCommand=x', 'host name', 'host;reboot', '$(id)', 'a' * 300, '-host'],
@@ -307,7 +320,9 @@ class DriverTests(unittest.TestCase):
             self.assertIn("-LocalAppData 'E:\\Users\\console\\AppData\\Local'", invocation, name)
 
     def test_the_interactive_task_runs_as_the_configured_user(self):
-        environment = dict(ENVIRONMENT, AKL_VM_TEST_USER='console')
+        environment = dict(ENVIRONMENT, AKL_VM_TEST_USER='console',
+                           AKL_VM_LOCALAPPDATA='D:\\Profiles\\console\\AppData\\Local',
+                           AKL_VM_STAGE='D:\\Stage\\akl')
         fake = FakeVm()
         run_driver('run_vm_installer_ui.py', environment, fake)
         tasks = [script for _, script in fake.ssh if 'Register-ScheduledTask' in script]

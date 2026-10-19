@@ -12,6 +12,9 @@ missing one stops before it touches the VM:
   AKL_VM_HOST_KEY_ALIAS  name under which the host key is pinned in known_hosts (default: the host)
   AKL_VM_LOCALAPPDATA    LOCALAPPDATA of the tested user (default: asked from the VM)
   AKL_VM_STAGE           staging directory on the VM (default: Temp under that LOCALAPPDATA)
+
+What the VM reports is the ssh account's LOCALAPPDATA, so when AKL_VM_TEST_USER names another
+user, AKL_VM_LOCALAPPDATA and AKL_VM_STAGE are required: a directory both users can use.
 """
 import os
 import re
@@ -60,6 +63,12 @@ class VmSettings:
         local = _read(env, 'AKL_VM_LOCALAPPDATA', _WINDOWS_DIRECTORY, 'a Windows path such as D:\\Users\\name\\AppData\\Local',
                       required=False)
         stage = _read(env, 'AKL_VM_STAGE', _WINDOWS_DIRECTORY, 'a Windows directory path', required=False)
+        if test_user.lower() != user.lower():
+            for name, value in (('AKL_VM_LOCALAPPDATA', local), ('AKL_VM_STAGE', stage)):
+                if value is None:
+                    raise VmSettingsError(
+                        f'Set {name}: AKL_VM_TEST_USER {test_user} is not the ssh account {user}, whose profile '
+                        'the VM would report.')
         return cls(host, user, computer, test_user, alias, local, stage)
 
     @property
@@ -78,7 +87,7 @@ class VmSettings:
         profile = "(Join-Path $env:LOCALAPPDATA 'AutoKeyboardLayot')"
         if self.local_app_data:
             profile = f"(Join-Path '{self.local_app_data}' 'AutoKeyboardLayot')"
-        return ("$P='SilentlyContinue'\n"
+        return ("$ProgressPreference='SilentlyContinue'\n"
                 "'COMPUTER='+$env:COMPUTERNAME\n"
                 "'LOCALAPPDATA='+$env:LOCALAPPDATA\n"
                 "'APP_PROC='+@(Get-Process -Name AutoKeyboardLayot -ErrorAction SilentlyContinue).Count\n"
