@@ -197,7 +197,9 @@ takes about a minute on a GPU and longer on a CPU).
    powershell -ExecutionPolicy Bypass -File tools\layout_model\export_layouts.ps1 -Output target\layout-model\layouts.json
    ```
 
-   The script is read-only; it never loads, activates or removes layouts.
+   The script is read-only; it never loads, activates or removes layouts. Each
+   layout carries its KLID, which tells layouts of one language apart (US
+   `00000409` and US-International `00020409` are both language `0409`).
 
 2. **Language entry.** Add an object to `languages` in
    `tools/layout_model/languages.json`:
@@ -205,11 +207,15 @@ takes about a minute on a GPU and longer on a CPU).
    - `id`: the input pack ID (for example `de-DE`);
    - `language_id`: the Windows layout language as exported in step 1 (for
      example `0407`);
+   - `layout`: the exact layout's KLID as exported in step 1 (for example
+     `00000407`); the tools stop when two exported layouts could be meant;
    - `frequency`: `wordfreq:de` for a language covered by
      [wordfreq](https://github.com/rspeer/wordfreq), or `file:NAME` for a
      `word count` list (most frequent first) placed in
      `target/layout-model/sources/`, for example from
-     [FrequencyWords](https://github.com/hermitdave/FrequencyWords);
+     [FrequencyWords](https://github.com/hermitdave/FrequencyWords); a
+     `file:` source also needs `sha256` (of the reviewed file) and `source`
+     (how the notice names it, with its license);
    - `dictionary`: the main and short word lists, relative to
      `target/layout-model/dicts/` (the same lists as the language's input
      pack);
@@ -219,11 +225,15 @@ takes about a minute on a GPU and longer on a CPU).
    Languages written with an IME (Japanese, Chinese) are not supported: their
    text is composed, not produced by one key per character.
 
+   `wordfreq` at the top of the file is the wordfreq version every `wordfreq:`
+   source and the noise come from (3.1.1 for the shipped model); install that
+   version in step 3, or change it on purpose.
+
 3. **Python environment.**
 
    ```sh
    uv venv target/layout-model/.venv --python 3.12
-   VIRTUAL_ENV=target/layout-model/.venv uv pip install torch numpy wordfreq
+   VIRTUAL_ENV=target/layout-model/.venv uv pip install torch numpy wordfreq==3.1.1
    ```
 
 4. **Baseline store (optional).** Copy an installed package store to
@@ -236,8 +246,13 @@ takes about a minute on a GPU and longer on a CPU).
    tools/layout_model/pipeline.sh
    ```
 
-   It prepares vocabularies, generates 4 million training cases and two test
-   sets, trains, exports `target/layout-model/model.aklm`, checks the
+   It checks the inputs (the installed wordfreq version, each `file:` source's
+   SHA-256, one exported layout per language), prepares vocabularies (a
+   language without words stops it) and records them with their inputs in
+   `target/layout-model/vocab/provenance.json`, writes
+   `target/layout-model/NOTICE.md` from that receipt, generates 4 million
+   training cases and two test sets (any failed generator stops it), trains,
+   exports `target/layout-model/model.aklm`, checks the
    quantized export against a reference implementation and, with a store copy,
    prints the comparison tables. Accept a model only if the unwanted-change
    rate on real words (all `kind:` rows except `random`) stays at the
@@ -246,8 +261,9 @@ takes about a minute on a GPU and longer on a CPU).
 6. **Build it in.** Copy `target/layout-model/model.aklm` over
    `data/layout-model/en-ru-et.aklm` and `target/layout-model/fixture.json`
    over `tests/fixtures/layout-model-fixture.json`, run `cargo test`, and build
-   the application as usual. Update `data/layout-model/NOTICE.md` with the
-   sources of the new frequency data.
+   the application as usual. Copy `target/layout-model/NOTICE.md` over
+   `data/layout-model/NOTICE.md`: it names the sources of that model, with
+   their versions and hashes and the credits wordfreq requires for SUBTLEX.
 
 ## Files
 
@@ -258,7 +274,8 @@ takes about a minute on a GPU and longer on a CPU).
 | `data/layout-model/en-ru-et.aklm` | Shipped EN/RU/ET model |
 | `tools/layout_model/languages.json` | Languages of a model |
 | `tools/layout_model/export_layouts.ps1` | Read-only Windows layout export |
-| `tools/layout_model/prepare_vocab.py` | Frequency vocabularies |
+| `tools/layout_model/prepare_vocab.py` | Input checks, frequency vocabularies and their provenance receipt |
+| `tools/layout_model/notice.py` | The model's NOTICE, written from that receipt |
 | `tools/layout_model/generate_cases.py` | Synthetic typing cases |
 | `tools/layout_model/train.py` | Features, training, prediction |
 | `tools/layout_model/export.py` | Binary export and reference check |

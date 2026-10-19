@@ -1,9 +1,11 @@
 {
-  "comment": "Languages of the layout model, in model order. id: input pack id; language_id: Windows layout language (LANGID, hex) as exported by export_layouts.ps1; frequency: 'wordfreq:CODE' or 'file:NAME' (a 'word count' list in the sources directory); share: how often generated sentences use it as the main language; dictionary: main and short word lists relative to the dictionary directory. noise: wordfreq codes of other languages whose words, typed on noise_layout, must stay unchanged.",
+  "comment": "Languages of the layout model, in model order. id: input pack id; language_id: Windows layout language (LANGID, hex) as exported by export_layouts.ps1; layout: the exact Windows layout (KLID); frequency: 'wordfreq:CODE' or 'file:NAME' (a 'word count' list in the sources directory); sha256 and source: the reviewed file and how its notice names it; share: how often generated sentences use it as the main language; dictionary: main and short word lists relative to the dictionary directory. wordfreq: the wordfreq version the wordfreq: sources and the noise come from. noise: wordfreq codes of other languages whose words, typed on noise_layout, must stay unchanged.",
+  "wordfreq": "3.1.1",
   "languages": [
     {
       "id": "en-US",
       "language_id": "0409",
+      "layout": "00000409",
       "share": 0.4,
       "dictionary": [
         "en-US/words.txt.gz",
@@ -14,6 +16,7 @@
     {
       "id": "ru-RU",
       "language_id": "0419",
+      "layout": "00000419",
       "share": 0.4,
       "dictionary": [
         "ru-RU/words.txt",
@@ -24,12 +27,15 @@
     {
       "id": "et-EE",
       "language_id": "0425",
+      "layout": "00000425",
       "share": 0.2,
       "dictionary": [
         "et-EE/words.txt",
         "et-EE/short-words.txt"
       ],
-      "frequency": "file:et_full.txt"
+      "frequency": "file:et_full.txt",
+      "sha256": "8b0dbb18efd797a497878caae9597fe230be5162dcc6a39d4a35299bb8c60e14",
+      "source": "FrequencyWords by Hermit Dave (<https://github.com/hermitdave/FrequencyWords>), content licensed CC BY-SA 4.0, derived from OpenSubtitles 2018 (<http://www.opensubtitles.org/>). File `content/2018/et/et_full.txt`"
     }
   ],
   "noise_layout": "en-US",

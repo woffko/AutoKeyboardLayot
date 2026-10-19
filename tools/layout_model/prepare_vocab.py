@@ -12,13 +12,19 @@ Only lowercase alphabetic words whose every letter exists on the language's
 own layout (with or without Shift, excluding dead keys) are kept.
 noise.tsv collects words of the "noise" languages that are fully typeable on
 noise_layout and unknown to the model languages; they must stay unchanged.
+
+The inputs are checked first: the installed wordfreq must be the version languages.json names,
+and every file: source must have the SHA-256 recorded beside it. A language or the noise without
+a single word stops the run. provenance.json in OUTPUT_DIRECTORY records what was used, and
+notice.py writes the model's NOTICE from it.
 """
+import hashlib
+import json
 import sys
+from importlib import metadata
 from pathlib import Path
 
-import wordfreq
-
-from common import load_config, load_layouts
+from common import CONFIG, exported_klid, load_config, select_layouts
 
 TOP_N = 200_000
 NOISE_PER_LANGUAGE = 30_000
@@ -44,7 +50,62 @@ def write(path, entries):
     print(f"{path.name}: {len(entries)} words")
 
 
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def source_digests(config, sources_dir):
+    """SHA-256 of every file: source, each checked against the one languages.json records."""
+    digests = {}
+    for language in config["languages"]:
+        kind, _, name = language["frequency"].partition(":")
+        if kind != "file":
+            continue
+        expected = language.get("sha256")
+        if not expected:
+            raise SystemExit(f"{language['id']}: languages.json records no sha256 for {name}")
+        actual = sha256(sources_dir / name)
+        if actual != expected:
+            raise SystemExit(f"{name} is not the recorded source: sha256 {actual}, languages.json {expected}")
+        digests[language["id"]] = actual
+    return digests
+
+
+def check_wordfreq(config, installed):
+    """The installed wordfreq must be the version the wordfreq: sources were taken from."""
+    expected = config.get("wordfreq")
+    if not expected:
+        raise SystemExit("languages.json records no wordfreq version")
+    if installed != expected:
+        raise SystemExit(f"wordfreq {installed} is installed; languages.json was built with {expected}")
+
+
+def require_words(name, entries):
+    if not entries:
+        raise SystemExit(f"{name}: no words; check its source and its layout")
+    return entries
+
+
+def provenance(config, digests, wordfreq_version, layouts, vocabulary):
+    """The receipt of one run: inputs with their versions and hashes, and what came out."""
+    return {
+        "format": 1,
+        "languages_json_sha256": sha256(CONFIG),
+        "wordfreq": wordfreq_version,
+        "languages": [
+            {"id": language["id"], "frequency": language["frequency"], "sha256": digests.get(language["id"]),
+             "source": language.get("source"), "layout": layouts[language["id"]]}
+            for language in config["languages"]
+        ],
+        "noise": config["noise"],
+        "noise_layout": config["noise_layout"],
+        "vocabulary": vocabulary,
+    }
+
+
 def frequencies(source, sources_dir, letters):
+    import wordfreq
+
     kind, _, name = source.partition(":")
     if kind == "wordfreq":
         return [
@@ -69,22 +130,35 @@ def frequencies(source, sources_dir, letters):
 def main():
     layouts_path, sources_dir, output = map(Path, sys.argv[1:4])
     config = load_config()
-    layouts = load_layouts(layouts_path)
+    digests = source_digests(config, sources_dir)
+    installed = metadata.version("wordfreq")
+    check_wordfreq(config, installed)
+    import wordfreq
+
+    layouts = select_layouts(config, layouts_path)
     output.mkdir(parents=True, exist_ok=True)
     known = set()
+    files = []
     for language in config["languages"]:
-        letters = layout_letters(layouts[language["language_id"]])
-        entries = frequencies(language["frequency"], sources_dir, letters)
-        write(output / f"{language['id']}.tsv", entries)
+        letters = layout_letters(layouts[language["id"]])
+        entries = require_words(language["id"], frequencies(language["frequency"], sources_dir, letters))
+        files.append((output / f"{language['id']}.tsv", entries))
         known.update(word for word, _ in entries)
-    noise_language = next(l for l in config["languages"] if l["id"] == config["noise_layout"])
-    letters = layout_letters(layouts[noise_language["language_id"]])
+    letters = layout_letters(layouts[config["noise_layout"]])
     noise = []
     for code in config["noise"]:
         for word in wordfreq.top_n_list(code, NOISE_PER_LANGUAGE):
             if keep(word, letters) and word not in known and len(word) > 1:
                 noise.append((word, wordfreq.word_frequency(word, code)))
-    write(output / "noise.tsv", noise)
+    files.append((output / "noise.tsv", require_words("noise", noise)))
+    vocabulary = {}
+    for path, entries in files:
+        write(path, entries)
+        vocabulary[path.name] = {"words": len(entries), "sha256": sha256(path)}
+    receipt = provenance(config, digests, installed,
+                         {key: exported_klid(layout) for key, layout in layouts.items()}, vocabulary)
+    (output / "provenance.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    print(f"provenance.json: wordfreq {installed}, {len(digests)} file source(s) checked")
 
 
 if __name__ == "__main__":
