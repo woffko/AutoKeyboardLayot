@@ -2,6 +2,10 @@
 //! cases. Not installed, published or used by the agent.
 //!
 //! Usage: evaluate_layout_detection STORE_COPY INPUT.jsonl OUTPUT.jsonl [--model MODEL.aklm]
+//!        [--single-letter-words]
+//!
+//! The detector runs with the program's default settings; --single-letter-words turns on the
+//! conversion of single-letter words, which is off by default.
 //!
 //! STORE_COPY is a copy of an installed package store (never the live one).
 //! Each input line is {"id": N, "typed": "en-US", "candidates": {"en-US":
@@ -19,6 +23,7 @@ use autokeyboardlayot::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     fs,
     io::{BufRead, BufReader, BufWriter, Write},
     path::Path,
@@ -54,34 +59,69 @@ impl KeyboardProfileProbe for Fixture {
     }
 }
 
+const USAGE: &str = "usage: evaluate_layout_detection STORE_COPY INPUT.jsonl OUTPUT.jsonl \
+                     [--model MODEL.aklm] [--single-letter-words]";
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+struct Options {
+    store: OsString,
+    input: OsString,
+    output: OsString,
+    model: Option<OsString>,
+    single_letter_words: bool,
+}
+
+fn options(args: &[OsString]) -> Result<Options, String> {
+    let mut positional = Vec::new();
+    let mut model = None;
+    let mut single_letter_words = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--model" {
+            model = Some(rest.next().ok_or(USAGE)?.clone());
+        } else if arg == "--single-letter-words" {
+            single_letter_words = true;
+        } else {
+            positional.push(arg.clone());
+        }
+    }
+    let [store, input, output] = <[OsString; 3]>::try_from(positional).map_err(|_| USAGE)?;
+    Ok(Options {
+        store,
+        input,
+        output,
+        model,
+        single_letter_words,
+    })
+}
+
+/// The program's default detector settings, with single-letter words converted only when asked.
+fn detector_config(single_letter_words: bool) -> DetectorConfig {
+    DetectorConfig {
+        single_letter_words,
+        ..Default::default()
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let (store, input, output, model) = match args.as_slice() {
-        [store, input, output] => (store, input, output, None),
-        [store, input, output, flag, model] if flag == "--model" => {
-            (store, input, output, Some(model))
-        }
-        _ => {
-            return Err(
-                "usage: evaluate_layout_detection STORE_COPY INPUT.jsonl OUTPUT.jsonl [--model MODEL.aklm]"
-                    .into(),
-            );
-        }
-    };
+    let Options {
+        store,
+        input,
+        output,
+        model,
+        single_letter_words,
+    } = options(&args)?;
     let trust = PackageTrust::release()?;
-    let snapshot = PackageStore::open(Path::new(store))?.load(&trust)?;
+    let snapshot = PackageStore::open(Path::new(&store))?.load(&trust)?;
     let selected: BTreeSet<PackId> = ["en-US", "ru-RU", "et-EE"]
         .into_iter()
         .map(|id| PackId::parse(id).expect("valid ID"))
         .collect();
     let installed = InstalledPackages::from_store(&snapshot, &selected)?;
-    let mut detector = Detector::with_registry(
-        DetectorConfig {
-            single_letter_words: true,
-            ..Default::default()
-        },
-        installed.dictionaries,
-    );
+    let mut detector =
+        Detector::with_registry(detector_config(single_letter_words), installed.dictionaries);
     let profiles = resolve_keyboard_profiles(&mut Fixture(0x0409))?;
     detector.set_resolved_profiles(Some(&profiles));
     if let Some(path) = model {
@@ -120,4 +160,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_detector_runs_with_the_programs_defaults_unless_asked_otherwise() {
+        let plain = options(&args(&["store", "in.jsonl", "out.jsonl"])).unwrap();
+        assert!(!plain.single_letter_words);
+        assert_eq!(plain.model, None);
+        assert_eq!(
+            plain.single_letter_words,
+            DetectorConfig::default().single_letter_words
+        );
+        let asked = options(&args(&[
+            "--single-letter-words",
+            "store",
+            "in.jsonl",
+            "out.jsonl",
+            "--model",
+            "model.aklm",
+        ]))
+        .unwrap();
+        assert!(asked.single_letter_words);
+        assert_eq!(asked.model, Some(OsString::from("model.aklm")));
+        assert_eq!(asked.output, OsString::from("out.jsonl"));
+        assert!(!detector_config(plain.single_letter_words).single_letter_words);
+        assert!(detector_config(asked.single_letter_words).single_letter_words);
+        for wrong in [
+            &["store", "in.jsonl"][..],
+            &["store", "in.jsonl", "out.jsonl", "--model"],
+            &["store", "in.jsonl", "out.jsonl", "extra"],
+        ] {
+            assert!(options(&args(wrong)).is_err(), "{wrong:?}");
+        }
+    }
 }

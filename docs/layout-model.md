@@ -51,7 +51,10 @@ three languages, and a word is typed in the wrong layout when the user
 switches language but forgets to switch the layout. "Realistic" samples words
 by real frequency; "rare words" samples each vocabulary uniformly. Words used
 only for testing are held out from training. Both detectors use the bundled
-English, Russian and Estonian dictionaries.
+English, Russian and Estonian dictionaries. The table was measured with
+single-letter words converted ("Automatically convert single-letter words",
+`evaluate_layout_detection --single-letter-words`), which is off by default;
+the default settings follow it.
 
 | | Dictionary detector | With layout model |
 |---|---|---|
@@ -60,6 +63,12 @@ English, Russian and Estonian dictionaries.
 | Realistic: correct words changed by mistake | 0.09% | 0.10% |
 | Rare words: wrong-layout words corrected | 65.8% | 90.6% |
 | Rare words: correct words changed by mistake | 0.06% | 0.10% |
+
+With the default settings (single-letter words left as typed) the realistic
+sample gives 78.6% and 87.4% of the wrong-layout words corrected (English /
+Russian / Estonian 88.1% / 82.0% / 59.4% and 91.6% / 84.4% / 90.5%) and 0.02%
+and 0.04% of the correct words changed; the rare-word rates do not change.
+Measured on 2026-10-19 with the shipped model and the September test sets.
 
 Before rule 4 and the dictionary veto on punctuation after a known word (see
 [Limits](#limits)), the dictionary detector corrected 86.5% and the model

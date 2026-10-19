@@ -42,12 +42,17 @@ done
 "$PYTHON" export.py "$WORK/model.pt" "$OUTPUT"
 "$PYTHON" export.py check "$OUTPUT" "$WORK/dicts" "$WORK/test.jsonl" "$WORK/test.model.jsonl" "$THRESHOLD" "$WORK/fixture.json"
 
+# With the default settings and with single-letter words converted (the published table's setting).
 if [ -d "$WORK/store-copy" ]; then
     for set in test uniform; do
-        (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
-            "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.baseline.jsonl")
-        (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
-            "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.agent.jsonl" --model "$OUTPUT")
-        "$PYTHON" score.py "$WORK/$set.jsonl" "$WORK/$set.baseline.jsonl" "$WORK/$set.agent.jsonl"
+        for setting in default single-letter-words; do
+            flag=()
+            [ "$setting" = default ] || flag=(--single-letter-words)
+            (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
+                "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.baseline.$setting.jsonl" ${flag[@]+"${flag[@]}"})
+            (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
+                "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.agent.$setting.jsonl" --model "$OUTPUT" ${flag[@]+"${flag[@]}"})
+        done
+        "$PYTHON" score.py "$WORK/$set.jsonl" "$WORK/$set".{baseline,agent}.{default,single-letter-words}.jsonl
     done
 fi
