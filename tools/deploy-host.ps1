@@ -10,13 +10,16 @@ seconds), copy the installed executable to AutoKeyboardLayot.exe.before-<BackupS
 executable, verify the installed hash, start the new agent, verify exactly one agent process with its
 observer window, and prune older AutoKeyboardLayot.exe.before-* backups so that the newest KeepBackups
 remain. An agent that does not close in time keeps running and nothing is changed: it declines while it
-holds typed input or is busy, and stopping it by force would lose that input. Any later failure stops
-the new agent and waits for it to exit, restores the backup when the executable was already replaced,
-and restarts the previous agent when one was running.
+holds typed input or is busy, and stopping it by force would lose that input. An agent that closes only
+during the following CloseGraceSeconds was still finishing its work: it is started again from the
+unchanged executable and nothing is replaced. Any later failure stops the new agent and waits for it to
+exit, restores the backup (retried, then verified) when the executable was already replaced, and
+restarts the previous agent when one was running and the installed executable is the previous one
+again; a restore that fails names the original failure and the backup to restore by hand.
 
 The installation directory is derived from %LOCALAPPDATA%. With -WhatIf the script performs only read-only
-checks, prints the plan and changes nothing (the candidate preflight is not run). -Confirm asks before
-the replacement starts.
+checks, prints the plan and changes nothing (the candidate preflight is not run). -Confirm asks once,
+before the replacement starts.
 
 .EXAMPLE
 powershell -NoProfile -File deploy-host.ps1 -Source .\AutoKeyboardLayot.exe -ExpectedSha256 <64 hex digits> -BackupSuffix r1 -WhatIf
@@ -26,7 +29,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Source,
     [Parameter(Mandatory = $true)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedSha256,
     [Parameter(Mandatory = $true)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$BackupSuffix,
-    [ValidateRange(1, 100)][int]$KeepBackups = 3
+    [ValidateRange(1, 100)][int]$KeepBackups = 3,
+    [ValidateRange(0, 600)][int]$CloseGraceSeconds = 60
 )
 $ErrorActionPreference = 'Stop'
 # Some read-only cmdlets (Get-FileHash, for one) also honor -WhatIf and then return nothing, so the
@@ -34,6 +38,10 @@ $ErrorActionPreference = 'Stop'
 # script itself stops before the first change.
 $dryRun = [bool]$WhatIfPreference
 $WhatIfPreference = $false
+# -Confirm would likewise ask before each read-only check and each later step, and a No there would
+# skip the backup or a rollback step: it is asked once, before the first change (see ShouldProcess).
+$askFirst = $ConfirmPreference
+$ConfirmPreference = 'None'
 
 if ([string]::IsNullOrEmpty($env:LOCALAPPDATA)) { throw 'LOCALAPPDATA is not set.' }
 $installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\AutoKeyboardLayot'
@@ -87,13 +95,17 @@ function Get-Backups {
         Sort-Object -Property CreationTimeUtc -Descending)
 }
 
-# Closes one agent through its graceful-close window; $true when it exited in time.
+# Closes one agent through its graceful-close window: 'closed' when it exited within 10 seconds,
+# 'pending' when it was asked and is still running, 'unavailable' when it could not be asked.
 function Close-Agent($process) {
     $window = [AgentWindow]::Find([uint32]$process.Id)
-    if ($window -eq [IntPtr]::Zero) { return $false }
-    if (-not [AgentWindow]::PostMessage($window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) { return $false }
-    return $process.WaitForExit(10000)
+    if ($window -eq [IntPtr]::Zero) { return 'unavailable' }
+    if (-not [AgentWindow]::PostMessage($window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)) { return 'unavailable' }
+    if ($process.WaitForExit(10000)) { return 'closed' }
+    return 'pending'
 }
+
+function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 # --- Read-only checks (run for -WhatIf as well) ---
 if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw 'Candidate executable not found.' }
@@ -135,7 +147,10 @@ if ($dryRun) {
     Write-Output 'WHATIF: checks passed; nothing was changed.'
     return
 }
-if (-not $PSCmdlet.ShouldProcess($destination, 'Replace with the verified candidate (backup, graceful close, restart, rollback on failure)')) {
+$ConfirmPreference = $askFirst
+$proceed = $PSCmdlet.ShouldProcess($destination, 'Replace with the verified candidate (backup, graceful close, restart, rollback on failure)')
+$ConfirmPreference = 'None'
+if (-not $proceed) {
     return
 }
 
@@ -150,7 +165,15 @@ if ($check.ExitCode -ne 0) { throw 'Candidate profile preflight failed; installe
 
 # --- Graceful close: an agent that declines keeps running and nothing is changed ---
 foreach ($process in $running) {
-    if (-not (Close-Agent $process)) {
+    $closing = Close-Agent $process
+    if ($closing -eq 'pending' -and $process.WaitForExit($CloseGraceSeconds * 1000)) {
+        # It accepted the close and needed longer for its work: nothing is replaced, and the agent
+        # comes back from the unchanged executable.
+        Start-Process -FilePath $destination | Out-Null
+        throw ('The running agent closed only after more than 10 seconds; it was started again from the unchanged ' +
+            'executable and nothing was replaced. Run the script again.')
+    }
+    if ($closing -ne 'closed') {
         throw 'The running agent did not close within 10 seconds (it declines while it holds typed input or is busy); nothing was changed.'
     }
 }
@@ -162,7 +185,7 @@ try {
     Copy-Item -LiteralPath $destination -Destination $backup
     $replaced = $true
     Copy-Item -LiteralPath $Source -Destination $destination -Force
-    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+    if ((Get-Sha256 $destination) -ne $expected) {
         throw 'Installed hash mismatch.'
     }
     $agent = Start-Process -FilePath $destination -PassThru
@@ -175,14 +198,33 @@ try {
 } catch {
     $failure = $_.Exception.Message
     foreach ($process in @(Get-AgentProcesses)) {
-        if (-not (Close-Agent $process)) { Stop-Process -Id $process.Id -Force }
+        # The process may already be gone; a failed stop must not end the rollback.
+        if ((Close-Agent $process) -ne 'closed') { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
         # Stop-Process does not wait, and the executable stays locked until the process is gone.
         if (-not $process.WaitForExit(10000)) {
-            throw ('Deployment failed (' + $failure + ') and an agent process did not exit; the backup was not restored.')
+            throw ('Deployment failed (' + $failure + ') and an agent process did not exit; the backup ' + $backup +
+                ' was not restored.')
         }
     }
-    if ($replaced) { Copy-Item -LiteralPath $backup -Destination $destination -Force }
-    if ($running.Count -gt 0) { Start-Process -FilePath $destination }
+    if ($replaced) {
+        # A scanner may hold the executable for a moment: retry, then compare with the backup.
+        $restoreError = 'the restored executable differs from the backup'
+        $restored = $false
+        for ($attempt = 1; $attempt -le 20 -and -not $restored; $attempt++) {
+            try {
+                Copy-Item -LiteralPath $backup -Destination $destination -Force
+                $restored = (Get-Sha256 $destination) -eq (Get-Sha256 $backup)
+            } catch {
+                $restoreError = $_.Exception.Message
+            }
+            if (-not $restored) { Start-Sleep -Milliseconds 500 }
+        }
+        if (-not $restored) {
+            throw ('Deployment failed (' + $failure + ') and restoring the previous executable failed (' + $restoreError +
+                '); no agent was started. Copy ' + $backup + ' over ' + $destination + ' by hand.')
+        }
+    }
+    if ($running.Count -gt 0) { Start-Process -FilePath $destination | Out-Null }
     throw ('Deployment failed and was rolled back: ' + $failure)
 }
 
