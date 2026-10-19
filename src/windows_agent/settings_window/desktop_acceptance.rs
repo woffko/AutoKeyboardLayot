@@ -1144,8 +1144,18 @@ fn the_settings_window_on_the_desktop_mirrors_the_language_rows_in_arabic() {
     };
     let right_end = accent_pixels(row.rect.right - 40, row.rect.right);
     let left_end = accent_pixels(row.rect.left, row.rect.left + 40);
+    let mark = accent_rows(
+        &screen,
+        accent,
+        &RECT {
+            left: row.rect.right - 36,
+            top: row.rect.top,
+            right: row.rect.right - 8,
+            bottom: row.rect.bottom,
+        },
+    );
     eprintln!(
-        "row={:?} picker={:?} accent={accent:06x} accent pixels: right end {right_end}, left end {left_end}",
+        "row={:?} picker={:?} accent={accent:06x} accent pixels: right end {right_end}, left end {left_end}, mark rows {mark:?}",
         row.rect,
         picker.as_ref().map(|picker| picker.rect)
     );
@@ -1159,6 +1169,81 @@ fn the_settings_window_on_the_desktop_mirrors_the_language_rows_in_arabic() {
     assert!(
         right_end >= 200,
         "no ticked mark at the row's right edge: {right_end} accent pixels"
+    );
+    let (top, bottom) = mark.expect("no ticked mark");
+    assert!(
+        (top + bottom - (row.rect.top + row.rect.bottom - 1)).abs() <= 4,
+        "the mark is not in the middle of its row: rows {top}..={bottom} in {:?}",
+        row.rect
+    );
+}
+
+/// The vertical extent of the accent-colored pixels of `area` on `screen`, if there are any.
+fn accent_rows(screen: &(Vec<u32>, i32), accent: u32, area: &RECT) -> Option<(i32, i32)> {
+    let rows: Vec<i32> = (area.top..area.bottom)
+        .filter(|y| {
+            (area.left..area.right).any(|x| close_colors(pixel(screen, POINT { x, y: *y }), accent))
+        })
+        .collect();
+    Some((*rows.first()?, *rows.last()?))
+}
+
+/// The accent color, as the navigation item of the shown page carries it.
+fn accent_color(ui: &Automation, window: &Window, screen: &(Vec<u32>, i32)) -> u32 {
+    let page = ui
+        .elements(window.handle)
+        .into_iter()
+        .find(|element| element.is(UIA_ButtonControlTypeId) && element.name == tr("nav.languages"))
+        .expect("the page's navigation item");
+    let edge = if super::super::ui_localization::is_rtl() {
+        page.rect.right - 6
+    } else {
+        page.rect.left + 6
+    };
+    pixel(
+        screen,
+        POINT {
+            x: edge,
+            y: (page.rect.top + page.rect.bottom) / 2,
+        },
+    )
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_centers_the_language_mark_in_its_row() {
+    let window = Window::open(Profile::legacy());
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let row = ui
+        .wait(
+            window.handle,
+            UIA_CheckBoxControlTypeId,
+            "English",
+            Duration::from_secs(10),
+        )
+        .expect("the English row");
+    let screen = screenshot("settings-language-mark.bmp");
+    let accent = accent_color(&ui, &window, &screen);
+    // The ticked 20 px mark lies 12 px from the row's left edge.
+    let mark = accent_rows(
+        &screen,
+        accent,
+        &RECT {
+            left: row.rect.left + 8,
+            top: row.rect.top,
+            right: row.rect.left + 36,
+            bottom: row.rect.bottom,
+        },
+    );
+    eprintln!("row={:?} accent={accent:06x} mark rows={mark:?}", row.rect);
+    window.request_close();
+    let (top, bottom) = mark.expect("no ticked mark in the English row");
+    let (mark_center, row_center) = (top + bottom, row.rect.top + row.rect.bottom - 1);
+    assert!(
+        (mark_center - row_center).abs() <= 4,
+        "the mark is not in the middle of its row: rows {top}..={bottom} in {:?}",
+        row.rect
     );
 }
 
