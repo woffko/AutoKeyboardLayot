@@ -1522,6 +1522,303 @@ fn the_settings_window_on_the_desktop_leaves_the_chosen_folder_free_after_a_file
     assert!(renamed.is_ok(), "the chosen folder is still in use");
 }
 
+/// A width at which the cards' English texts wrap onto more lines than at the default width.
+/// It is below the window's 900 px minimum, which only the user's resizing respects: the old
+/// conditional containers were measured as if the window were 900 px wide.
+const NARROW: i32 = 620;
+
+/// Scrolls the page with the pointer over the cards' padding until `found` gives a value.
+fn scroll_page_until<T>(
+    window: &Window,
+    timeout: Duration,
+    mut found: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let client = window.client();
+    // The content starts right of the 252 px navigation (left to right); its cards begin a few
+    // pixels later.
+    let point = POINT {
+        x: client.left + 295,
+        y: (client.top + client.bottom) / 2,
+    };
+    within(timeout, || {
+        let value = found();
+        if value.is_none() {
+            wheel(point, -3);
+            thread::sleep(Duration::from_millis(600));
+        }
+        value
+    })
+}
+
+/// The bottom of the page's scrolled area: above it are the separator and the window's buttons,
+/// each 16 px apart.
+fn page_bottom(ui: &Automation, window: &Window) -> i32 {
+    ui.find(window.handle, UIA_ButtonControlTypeId, &tr("button.cancel"))
+        .expect("Cancel")
+        .rect
+        .top
+        - 16
+        - 1
+        - 16
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_keeps_the_legacy_card_around_its_text_when_narrow() {
+    let window = Window::open(Profile::legacy());
+    window.place(NARROW, 740);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let tools = scroll_page_until(&window, Duration::from_secs(40), || {
+        ui.choices(window.handle, &tr("languages.advanced"))
+            .into_iter()
+            .next()
+    })
+    .expect("the tools box");
+    let migrate = ui
+        .find(
+            window.handle,
+            UIA_ButtonControlTypeId,
+            &tr("migration.choose"),
+        )
+        .expect("Choose migration packages");
+    let text = ui
+        .texts(window.handle)
+        .into_iter()
+        .find(|text| text.name == tr("import.legacy"))
+        .expect("the legacy text");
+    let _ = screenshot("settings-legacy-card-narrow.bmp");
+    // Below the button: the card's padding (18), the page's spacing (14) and the next card's
+    // padding (18). A card measured for fewer lines than its text has ends above its button.
+    let gap = tools.rect.top - migrate.rect.bottom;
+    eprintln!(
+        "text={:?} button={:?} tools={:?} gap={gap}",
+        text.rect, migrate.rect, tools.rect
+    );
+    window.request_close();
+    assert!(
+        text.height() > 28,
+        "the legacy text did not wrap onto three lines"
+    );
+    assert!(
+        migrate.rect.top >= text.rect.bottom,
+        "the button lies over the text"
+    );
+    assert!(
+        gap >= 48,
+        "the legacy card ends above its button (gap {gap} px)"
+    );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_shows_the_whole_tools_hint_when_narrow() {
+    let window = Window::open(Profile::legacy());
+    window.place(NARROW, 740);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let tools = scroll_page_until(&window, Duration::from_secs(40), || {
+        ui.choices(window.handle, &tr("languages.advanced"))
+            .into_iter()
+            .next()
+    })
+    .expect("the tools box");
+    click(tools.center());
+    let hint = within(Duration::from_secs(10), || {
+        ui.texts(window.handle)
+            .into_iter()
+            .find(|text| text.name == tr("languages.advanced_hint"))
+    })
+    .expect("the tools hint");
+    // To the end of the page: the hint is the last thing a legacy profile's tools show.
+    let _ = scroll_page_until(&window, Duration::from_secs(15), || None::<()>);
+    let hint = ui
+        .texts(window.handle)
+        .into_iter()
+        .find(|text| text.name == hint.name)
+        .expect("the tools hint");
+    let bottom = page_bottom(&ui, &window);
+    let _ = screenshot("settings-tools-hint-narrow.bmp");
+    eprintln!("hint={:?} page_bottom={bottom}", hint.rect);
+    window.request_close();
+    assert!(hint.height() > 28, "the hint did not wrap onto three lines");
+    assert!(
+        hint.rect.bottom <= bottom,
+        "the page cannot scroll to the hint's last line ({} > {bottom})",
+        hint.rect.bottom
+    );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_shows_the_whole_tools_section_in_spanish_at_the_least_width()
+{
+    // Spanish texts are about a third longer than English ones: at the window's least width
+    // the tools hint wraps onto one more line than in English.
+    let profile = Profile::managed("es");
+    install_published(&profile, &["es-ES"]);
+    let window = Window::open(profile);
+    window.place(900, 740);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let tools = scroll_page_until(&window, Duration::from_secs(40), || {
+        ui.choices(window.handle, &tr("languages.advanced"))
+            .into_iter()
+            .next()
+    })
+    .expect("the tools box");
+    click(tools.center());
+    thread::sleep(Duration::from_secs(2));
+    // To the end of the page: rolling back is the last of the tools.
+    let _ = scroll_page_until(&window, Duration::from_secs(15), || None::<()>);
+    let hint = ui
+        .texts(window.handle)
+        .into_iter()
+        .find(|text| text.name == tr("languages.advanced_hint"))
+        .expect("the tools hint");
+    let last = ui
+        .find(
+            window.handle,
+            UIA_ButtonControlTypeId,
+            &tr("rollback.choose"),
+        )
+        .expect("the rollback button");
+    let bottom = page_bottom(&ui, &window);
+    let _ = screenshot("settings-tools-spanish.bmp");
+    eprintln!(
+        "hint={:?} last={:?} page_bottom={bottom}",
+        hint.rect, last.rect
+    );
+    window.request_close();
+    assert!(hint.height() > 14, "the hint did not wrap");
+    // Below the last tool: the card's padding (18 px) and the page column's (4 px). A section
+    // measured for fewer lines than its hint has ends that much higher, inside its card's padding.
+    assert!(
+        last.rect.bottom + 18 + 4 <= bottom + 2,
+        "the tools run into their card's padding ({} + 22 > {bottom})",
+        last.rect.bottom
+    );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_keeps_the_running_applications_below_their_buttons_when_narrow()
+ {
+    let window = Window::open(Profile::legacy());
+    window.place(NARROW, 740);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.process_exclusions"));
+    ui.wait(
+        window.handle,
+        UIA_ButtonControlTypeId,
+        &tr("process_exclusions.choose_running"),
+        Duration::from_secs(10),
+    )
+    .expect("Choose running applications")
+    .invoke();
+    let hide = ui
+        .wait(
+            window.handle,
+            UIA_ButtonControlTypeId,
+            &tr("process_exclusions.hide_running"),
+            Duration::from_secs(10),
+        )
+        .expect("Hide running applications");
+    let browse = ui
+        .find(
+            window.handle,
+            UIA_ButtonControlTypeId,
+            &tr("process_exclusions.browse"),
+        )
+        .expect("Browse");
+    let names = running_process_names();
+    let first = within(Duration::from_secs(20), || {
+        ui.elements(window.handle)
+            .into_iter()
+            .find(|element| element.is(UIA_ButtonControlTypeId) && names.contains(&element.name))
+    })
+    .expect("no running application listed");
+    let bottom = page_bottom(&ui, &window);
+    let _ = screenshot("settings-running-applications-narrow.bmp");
+    eprintln!(
+        "browse={:?} hide={:?} first={:?} page_bottom={bottom}",
+        browse.rect, hide.rect, first.rect
+    );
+    window.request_close();
+    assert!(
+        first.rect.top > browse.rect.bottom.max(hide.rect.bottom),
+        "the list lies over its buttons"
+    );
+    assert!(first.rect.top < bottom, "the list is below the page");
+}
+
+/// Whether two rectangles share any pixel.
+fn overlap(left: &RECT, right: &RECT) -> bool {
+    left.left < right.right
+        && right.left < left.right
+        && left.top < right.bottom
+        && right.top < left.bottom
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_keeps_the_catalog_rows_apart_in_a_narrow_dialog() {
+    let window = Window::open(Profile::managed("system"));
+    let ui = Automation::new();
+    open_add_language(&ui, &window);
+    // The dialog is 60 px narrower than the window: its package details wrap.
+    window.place(420, 740);
+    thread::sleep(Duration::from_secs(5));
+    let dialog = dialog_box(&window);
+    // The rows' own elements: a package's box, its details and its note. The page behind the
+    // dialog's shade is still in the tree.
+    let details = tr("download.row");
+    let details = details.split('{').next().expect("prefix");
+    let notes = [
+        tr("download.input_component"),
+        tr("download.ui_only"),
+        tr("download.unavailable"),
+    ];
+    let package = |name: &str| PackId::parse(name).is_ok();
+    let rows: Vec<Element> = ui
+        .elements(window.handle)
+        .into_iter()
+        .filter(|element| {
+            let own = if element.is(UIA_TextControlTypeId) {
+                element.name.starts_with(details) || notes.contains(&element.name)
+            } else {
+                element.checked().is_some() && package(&element.name)
+            };
+            own && inside(&element.rect, &dialog) && element.height() > 0
+        })
+        .collect();
+    let wrapped = rows
+        .iter()
+        .filter(|row| row.is(UIA_TextControlTypeId) && row.height() > 20)
+        .count();
+    let overlapping: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(index, row)| {
+            rows[index + 1..]
+                .iter()
+                .filter(|other| overlap(&row.rect, &other.rect))
+                .map(move |other| format!("{:?} / {:?}", row.name, other.name))
+        })
+        .collect();
+    let _ = screenshot("settings-catalog-rows-narrow.bmp");
+    eprintln!(
+        "rows={} wrapped={wrapped} overlapping={overlapping:#?}",
+        rows.len()
+    );
+    window.request_close();
+    assert!(wrapped > 0, "no package detail wrapped");
+    assert!(
+        overlapping.is_empty(),
+        "catalog rows overlap: {overlapping:?}"
+    );
+}
+
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_stays_maximized_when_opened_again() {

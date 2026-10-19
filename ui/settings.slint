@@ -769,21 +769,24 @@ export component SettingsWindow inherits Window {
                             }
                         }
 
-                        if !root.package-import-allowed: SettingsCard {
-                            VerticalLayout {
-                                padding: 18px;
-                                spacing: 8px;
-                                UiText { text: Localization.text("import.legacy", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
-                                Button { text: Localization.text("migration.choose", Localization.revision); enabled: !root.package-import-busy; clicked => { root.prepare-migration(); } }
-                            }
-                        }
-
-                        // A prepared change waits for confirmation here, outside the collapsible section,
-                        // so that choosing migration packages visibly leads somewhere. The card collapses
-                        // instead of being conditional: a conditional container measures its wrapped text
-                        // at a width it does not have yet, and the summary and the package picker then lie
-                        // over the preview.
+                        // The cards below collapse instead of being conditional: a conditional container
+                        // measures its wrapped text at a width it does not have yet, so a narrow window
+                        // cut its last line off or let its button run out of the card. The group has no
+                        // spacing of its own; the spacers give a shown card the page's spacing.
                         VerticalLayout {
+                            legacy := SettingsCard {
+                                visible: !root.package-import-allowed;
+                                height: self.visible ? legacy-card.preferred-height : 0px;
+                                legacy-card := VerticalLayout {
+                                    padding: 18px;
+                                    spacing: 8px;
+                                    UiText { text: Localization.text("import.legacy", Localization.revision); wrap: word-wrap; color: Palette.foreground; }
+                                    Button { text: Localization.text("migration.choose", Localization.revision); enabled: !root.package-import-busy; clicked => { root.prepare-migration(); } }
+                                }
+                            }
+                            Rectangle { height: legacy.visible ? 14px : 0px; }
+                            // A prepared change waits for confirmation here, outside the collapsible section,
+                            // so that choosing migration packages visibly leads somewhere.
                             review := SettingsCard {
                                 visible: root.package-import-ready && !root.package-online;
                                 height: self.visible ? review-card.preferred-height : 0px;
@@ -813,23 +816,27 @@ export component SettingsWindow inherits Window {
                             SettingsCard {
                                 VerticalLayout {
                                     padding: 18px;
-                                    spacing: 8px;
                                     DirectionalCheckBox { text: Localization.text("languages.advanced", Localization.revision); checked <=> root.advanced-visible; }
-                                    if root.advanced-visible: VerticalLayout {
-                                        spacing: 8px;
-                                        UiText { text: Localization.text("languages.advanced_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
-                                        if root.package-import-allowed: Button {
-                                            text: Localization.text("import.choose", Localization.revision);
-                                            enabled: root.package-import-allowed && !root.package-import-busy;
-                                            clicked => { root.inspect-package(); }
-                                        }
-                                        if root.package-import-busy: UiText { text: Localization.text("import.busy", Localization.revision); color: Palette.foreground; }
-                                        if root.package-import-allowed: ComboBox { model: root.installed-package-names; current-index <=> root.installed-package-index; enabled: !root.package-import-busy && !root.package-import-ready; }
-                                        if root.package-import-allowed: Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
-                                        if root.package-import-allowed: Button {
-                                            text: Localization.text("rollback.choose", Localization.revision);
-                                            enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-index >= 0 && root.installed-package-index < root.installed-package-rollback.length && root.installed-package-rollback[root.installed-package-index];
-                                            clicked => { root.prepare-package-rollback(); }
+                                    Rectangle { height: tools.visible ? 8px : 0px; }
+                                    tools := Rectangle {
+                                        visible: root.advanced-visible;
+                                        height: self.visible ? tools-content.preferred-height : 0px;
+                                        tools-content := VerticalLayout {
+                                            spacing: 8px;
+                                            UiText { text: Localization.text("languages.advanced_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
+                                            if root.package-import-allowed: Button {
+                                                text: Localization.text("import.choose", Localization.revision);
+                                                enabled: root.package-import-allowed && !root.package-import-busy;
+                                                clicked => { root.inspect-package(); }
+                                            }
+                                            if root.package-import-busy: UiText { text: Localization.text("import.busy", Localization.revision); color: Palette.foreground; }
+                                            if root.package-import-allowed: ComboBox { model: root.installed-package-names; current-index <=> root.installed-package-index; enabled: !root.package-import-busy && !root.package-import-ready; }
+                                            if root.package-import-allowed: Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
+                                            if root.package-import-allowed: Button {
+                                                text: Localization.text("rollback.choose", Localization.revision);
+                                                enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-index >= 0 && root.installed-package-index < root.installed-package-rollback.length && root.installed-package-rollback[root.installed-package-index];
+                                                clicked => { root.prepare-package-rollback(); }
+                                            }
                                         }
                                     }
                                 }
@@ -855,22 +862,28 @@ export component SettingsWindow inherits Window {
                 spacing: 14px;
                 SectionTitle { title: Localization.text("nav.process_exclusions", Localization.revision); description: Localization.text("process_exclusions.description", Localization.revision); }
                 LocalizedTextEdit { text <=> root.process-exclusions-text; accessible-name: Localization.text("nav.process_exclusions", Localization.revision); }
-                DirectionalButtonPair {
-                    spacing: 10px;
-                    first-text: Localization.text("process_exclusions.browse", Localization.revision);
-                    second-text: root.process-picker-visible ? Localization.text("process_exclusions.hide_running", Localization.revision) : Localization.text("process_exclusions.choose_running", Localization.revision);
-                    first-clicked => { root.browse-executable(); }
-                    second-clicked => { root.process-picker-visible = !root.process-picker-visible; if root.process-picker-visible { root.refresh-processes(); } }
-                }
-                if root.process-picker-visible: SettingsCard {
-                    height: 210px;
-                    ScrollView {
-                        VerticalLayout {
-                            padding: 8px;
-                            spacing: 4px;
-                            for process-name in root.running-processes: Button {
-                                text: process-name;
-                                clicked => { root.add-running-process(process-name); }
+                // The picker collapses rather than being conditional, like the cards of the languages
+                // page; the group has no spacing of its own.
+                VerticalLayout {
+                    DirectionalButtonPair {
+                        spacing: 10px;
+                        first-text: Localization.text("process_exclusions.browse", Localization.revision);
+                        second-text: root.process-picker-visible ? Localization.text("process_exclusions.hide_running", Localization.revision) : Localization.text("process_exclusions.choose_running", Localization.revision);
+                        first-clicked => { root.browse-executable(); }
+                        second-clicked => { root.process-picker-visible = !root.process-picker-visible; if root.process-picker-visible { root.refresh-processes(); } }
+                    }
+                    Rectangle { height: picker.visible ? 14px : 0px; }
+                    picker := SettingsCard {
+                        visible: root.process-picker-visible;
+                        height: self.visible ? 210px : 0px;
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 4px;
+                                for process-name in root.running-processes: Button {
+                                    text: process-name;
+                                    clicked => { root.add-running-process(process-name); }
+                                }
                             }
                         }
                     }
@@ -1020,27 +1033,32 @@ export component SettingsWindow inherits Window {
 
                             if root.download-active || root.download-catalog-ready: UiText { text: root.download-summary; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
 
-                            if root.download-catalog-ready: VerticalLayout {
-                                spacing: 8px;
-                                for row in root.download-rows: VerticalLayout {
-                                    DirectionalCheckBox {
-                                        text: row.id; checked: row.selected;
-                                        enabled: row.available && !root.package-import-busy && !root.package-import-ready;
-                                        toggled => { root.toggle-download(row.id, self.checked); }
+                            // Collapsed rather than conditional, like the review below.
+                            Rectangle {
+                                visible: root.download-catalog-ready;
+                                height: self.visible ? catalog-rows.preferred-height : 0px;
+                                catalog-rows := VerticalLayout {
+                                    spacing: 8px;
+                                    for row in root.download-rows: VerticalLayout {
+                                        DirectionalCheckBox {
+                                            text: row.id; checked: row.selected;
+                                            enabled: row.available && !root.package-import-busy && !root.package-import-ready;
+                                            toggled => { root.toggle-download(row.id, self.checked); }
+                                        }
+                                        UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                        if row.has-input: UiText { text: Localization.text("download.input_component", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
+                                        if !row.has-input: UiText { text: Localization.text("download.ui_only", Localization.revision); wrap: word-wrap; color: Palette.foreground; opacity: 0.75; font-size: 12px; }
+                                        if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
                                     }
-                                    UiText { text: row.details; wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
-                                    if row.has-input: UiText { text: Localization.text("download.input_component", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
-                                    if !row.has-input: UiText { text: Localization.text("download.ui_only", Localization.revision); wrap: word-wrap; color: Palette.foreground; opacity: 0.75; font-size: 12px; }
-                                    if !row.available: UiText { text: Localization.text("download.unavailable", Localization.revision); wrap: word-wrap; color: Palette.foreground; font-size: 12px; }
-                                }
-                                DirectionalButtonPair {
-                                    spacing: 10px;
-                                    first-text: Localization.text("download.start", Localization.revision);
-                                    first-enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready;
-                                    second-text: Localization.text("download.discard", Localization.revision);
-                                    second-enabled: !root.package-import-busy && !root.package-import-ready;
-                                    first-clicked => { root.start-selected-download(); }
-                                    second-clicked => { root.discard-download-catalog(); }
+                                    DirectionalButtonPair {
+                                        spacing: 10px;
+                                        first-text: Localization.text("download.start", Localization.revision);
+                                        first-enabled: root.download-has-selection && !root.package-import-busy && !root.package-import-ready;
+                                        second-text: Localization.text("download.discard", Localization.revision);
+                                        second-enabled: !root.package-import-busy && !root.package-import-ready;
+                                        first-clicked => { root.start-selected-download(); }
+                                        second-clicked => { root.discard-download-catalog(); }
+                                    }
                                 }
                             }
 
