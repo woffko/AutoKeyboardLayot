@@ -1452,6 +1452,56 @@ fn the_settings_window_on_the_desktop_opens_its_file_dialogs_as_modal() {
 
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_leaves_the_chosen_folder_free_after_a_file_dialog() {
+    let folder = tempfile::tempdir().expect("folder");
+    let chosen = folder.path().join("chosen");
+    std::fs::create_dir(&chosen).expect("chosen folder");
+    std::fs::write(chosen.join("tool.exe"), b"MZ").expect("program file");
+    let window = Window::open(Profile::legacy());
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.process_exclusions"));
+    ui.wait(
+        window.handle,
+        UIA_ButtonControlTypeId,
+        &tr("process_exclusions.browse"),
+        Duration::from_secs(10),
+    )
+    .expect("Browse")
+    .invoke();
+    let dialog = within(Duration::from_secs(15), || own_dialogs().into_iter().next())
+        .expect("no file dialog");
+    choose_in_dialog(dialog, &chosen, &["tool.exe".to_owned()]);
+    let closed = within(Duration::from_secs(10), || {
+        own_dialogs().is_empty().then_some(())
+    });
+    // The window says so when the dialog handed it a program, after the dialog returned.
+    let chosen_listed = within(Duration::from_secs(5), || {
+        ui.texts(window.handle)
+            .into_iter()
+            .any(|text| text.name == tr("process_exclusions.added"))
+            .then_some(())
+    })
+    .is_some();
+    let current = std::env::current_dir().ok();
+    // Windows cannot rename or remove a folder that is a process's current directory: a USB drive
+    // chosen there could not be ejected.
+    let renamed = std::fs::rename(&chosen, folder.path().join("renamed"));
+    eprintln!(
+        "closed={} current={current:?} renamed={renamed:?} listed={chosen_listed}",
+        closed.is_some()
+    );
+    window.request_close();
+    assert!(closed.is_some(), "the file dialog did not close");
+    assert!(chosen_listed, "the chosen program was not added");
+    assert!(
+        current.is_some_and(|current| !current.ends_with("chosen")),
+        "the process stayed in the chosen folder"
+    );
+    assert!(renamed.is_ok(), "the chosen folder is still in use");
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_stays_maximized_when_opened_again() {
     let window = Window::open(Profile::legacy());
     unsafe {

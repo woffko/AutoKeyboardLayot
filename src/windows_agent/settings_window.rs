@@ -1022,6 +1022,41 @@ fn file_dialog(
     })
 }
 
+/// Shows an open-file dialog and puts the process's current directory back afterwards. The dialog
+/// leaves the process in the folder the user chose (`OFN_NOCHANGEDIR` has no effect on Open
+/// dialogs), and Windows cannot remove a folder that is a process's current directory: a USB drive
+/// or network share chosen once could not be ejected while Settings stayed open.
+fn show_open_dialog(dialog: &mut OPENFILENAMEW) -> bool {
+    keeping_current_directory(
+        || std::env::current_dir().ok(),
+        |directory| std::env::set_current_dir(directory).is_ok(),
+        || {
+            std::env::current_exe()
+                .ok()
+                .and_then(|program| program.parent().map(Path::to_path_buf))
+        },
+        || unsafe { GetOpenFileNameW(dialog) }.as_bool(),
+    )
+}
+
+/// Runs `run`, then sets the current directory back to the one `current` gave before it, or to
+/// `fallback` when that one is unknown or gone.
+fn keeping_current_directory<T>(
+    current: impl Fn() -> Option<std::path::PathBuf>,
+    set: impl Fn(&Path) -> bool,
+    fallback: impl FnOnce() -> Option<std::path::PathBuf>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let before = current();
+    let result = run();
+    if !before.as_deref().is_some_and(&set)
+        && let Some(fallback) = fallback()
+    {
+        set(&fallback);
+    }
+    result
+}
+
 fn browse_for_executable(owner: Option<HWND>) -> Option<String> {
     let filter: Vec<u16> = format!(
         "{}\0*.exe\0{}\0*.*\0\0",
@@ -1042,7 +1077,7 @@ fn browse_for_executable(owner: Option<HWND>) -> Option<String> {
         &mut file,
         OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
     )?;
-    if !unsafe { GetOpenFileNameW(&raw mut dialog) }.as_bool() {
+    if !show_open_dialog(&mut dialog) {
         return None;
     }
     let length = file.iter().position(|character| *character == 0)?;
@@ -1413,6 +1448,41 @@ mod tests {
         assert_eq!(dialog.nMaxFile, 16);
         let dialog = file_dialog(None, &filter, &title, &mut file, OFN_EXPLORER).unwrap();
         assert!(dialog.hwndOwner.0.is_null());
+    }
+
+    #[test]
+    fn the_current_directory_comes_back_after_a_file_dialog() {
+        use std::{cell::RefCell, path::PathBuf};
+        let directory = RefCell::new(Some(PathBuf::from(r"C:\Start")));
+        let gone = RefCell::new(Vec::<PathBuf>::new());
+        let current = || directory.borrow().clone();
+        let set = |path: &Path| {
+            let exists = !gone.borrow().iter().any(|removed| removed == path);
+            if exists {
+                *directory.borrow_mut() = Some(path.to_path_buf());
+            }
+            exists
+        };
+        let fallback = || Some(PathBuf::from(r"C:\Program"));
+        // The dialog moves the process into the chosen folder; it comes back to where it was.
+        let chosen = keeping_current_directory(current, set, fallback, || {
+            *directory.borrow_mut() = Some(PathBuf::from(r"E:\Packages"));
+            7
+        });
+        assert_eq!(chosen, 7);
+        assert_eq!(*directory.borrow(), Some(PathBuf::from(r"C:\Start")));
+        // A starting folder that is gone meanwhile gives way to the program's folder.
+        gone.borrow_mut().push(PathBuf::from(r"C:\Start"));
+        keeping_current_directory(current, set, fallback, || {
+            *directory.borrow_mut() = Some(PathBuf::from(r"E:\Packages"));
+        });
+        assert_eq!(*directory.borrow(), Some(PathBuf::from(r"C:\Program")));
+        // So does a current directory that could not be read before the dialog.
+        *directory.borrow_mut() = None;
+        keeping_current_directory(current, set, fallback, || {
+            *directory.borrow_mut() = Some(PathBuf::from(r"E:\Packages"));
+        });
+        assert_eq!(*directory.borrow(), Some(PathBuf::from(r"C:\Program")));
     }
 
     #[test]

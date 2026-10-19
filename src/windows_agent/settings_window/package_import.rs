@@ -987,7 +987,7 @@ fn choose_files(multiple: bool, owner: Option<HWND>) -> Option<Vec<PathBuf>> {
         flags |= windows::Win32::UI::Controls::Dialogs::OFN_ALLOWMULTISELECT;
     }
     let mut dialog = file_dialog(owner, &filter, &title, &mut file, flags)?;
-    if !unsafe { GetOpenFileNameW(&raw mut dialog) }.as_bool() {
+    if !show_open_dialog(&mut dialog) {
         return None;
     }
     decode_selected_files(&file, multiple)
