@@ -695,14 +695,16 @@ impl CorrectionGate {
             && !self.awaiting_worker_ack
     }
 
-    fn handoff(&mut self, old_token: u64, new_token: u64) -> bool {
+    /// Hands the gate to `new_token` when the budget prepared for it still fits before the
+    /// deadline at `now`.
+    fn handoff(&mut self, old_token: u64, new_token: u64, now: Instant) -> bool {
         if !self.active
             || self.cancelled
             || !self.awaiting_worker_ack
             || self.token != old_token
             || new_token == 0
             || self.handoff_budget_ms == 0
-            || self.deadline.saturating_duration_since(Instant::now())
+            || self.deadline.saturating_duration_since(now)
                 < Duration::from_millis(self.handoff_budget_ms)
         {
             return false;
@@ -5363,7 +5365,9 @@ fn acknowledge_correction_gate_drain(old_token: u64, new_token: u64) -> bool {
                 .load(Ordering::Acquire)
                 != new_token
                 || !state.metrics.auto_enabled.load(Ordering::Acquire)
-                || !state.correction_gate.handoff(old_token, new_token)
+                || !state
+                    .correction_gate
+                    .handoff(old_token, new_token, Instant::now())
             {
                 return false;
             }
@@ -6085,22 +6089,21 @@ fn retry_unshown_selection(
 }
 
 /// Confirms that the selection made by `Select()` holds the expected text, polling until
-/// `timeout`. Every outcome but `Confirmed` collapses the selection, exactly once: the selection
+/// `expired` says the time for it is over. Every outcome but `Confirmed` collapses the selection, exactly once: the selection
 /// is ours, made a moment ago, and must not be left behind to be typed over. This runs only
 /// after our own successful `Select()`, so a selection the user made is never collapsed.
 /// Returns the outcome and, when the selection was collapsed, what became of it.
 fn confirm_selection(
-    timeout: Duration,
+    mut expired: impl FnMut() -> bool,
     mut poll: impl FnMut() -> SelectionPoll,
     text_matches: impl Fn(&str) -> bool,
     mut sleep: impl FnMut(),
     collapse: impl FnOnce() -> SelectionCleanup,
 ) -> (SelectionConfirmation, Option<SelectionCleanup>) {
-    let deadline = Instant::now() + timeout;
     let mut saw_other_text = false;
     let mut saw_not_shown = false;
     let outcome = loop {
-        if Instant::now() >= deadline {
+        if expired() {
             break if saw_other_text {
                 SelectionConfirmation::OtherText
             } else if saw_not_shown {
@@ -6393,8 +6396,9 @@ fn select_preceding_text_in<F: TextField>(
             cleanup: Some(cleanup),
         };
     }
+    let confirm_deadline = Instant::now() + confirm_timeout;
     let (confirmation, cleanup) = confirm_selection(
-        confirm_timeout,
+        || Instant::now() >= confirm_deadline,
         || match field.selection() {
             SelectionRead::Unreadable | SelectionRead::RangeUnreadable => SelectionPoll::Unreadable,
             SelectionRead::NotOneRange => SelectionPoll::NotOneRange,
@@ -13533,15 +13537,29 @@ mod tests {
         );
     }
 
-    fn scripted_polls(polls: Vec<SelectionPoll>) -> impl FnMut() -> SelectionPoll {
-        let mut polls = std::collections::VecDeque::from(polls);
-        move || polls.pop_front().unwrap_or(SelectionPoll::Unreadable)
+    /// The polls of `polls` in order, and a clock that runs out once every one has been read:
+    /// the outcome never depends on how fast the test runs. A poll after the clock ran out fails
+    /// the test.
+    fn scripted_polls(
+        polls: Vec<SelectionPoll>,
+    ) -> (impl FnMut() -> bool, impl FnMut() -> SelectionPoll) {
+        let polls = std::rc::Rc::new(RefCell::new(VecDeque::from(polls)));
+        let script = std::rc::Rc::clone(&polls);
+        (
+            move || script.borrow().is_empty(),
+            move || {
+                polls
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("polled after the time for confirmation ran out")
+            },
+        )
     }
 
     #[test]
     fn a_confirmed_selection_is_kept_and_every_other_outcome_collapses_it_exactly_once() {
         let text = |value: &str| SelectionPoll::Text(value.to_owned());
-        // (path, scripted polls; an exhausted script reads as unreadable, expected status, collapses)
+        // (path, scripted polls; the time runs out when the script does, expected status, collapses)
         let cases = [
             (
                 "match at once",
@@ -13598,11 +13616,12 @@ mod tests {
         ];
         for (path, polls, expected, collapses) in cases {
             let collapsed = Cell::new(0);
+            let (expired, poll) = scripted_polls(polls);
             let (status, cleanup) = confirm_selection(
-                Duration::from_millis(40),
-                scripted_polls(polls),
+                expired,
+                poll,
                 |actual| actual == "ghbdtn",
-                || thread::sleep(Duration::from_millis(1)),
+                || {},
                 || {
                     collapsed.set(collapsed.get() + 1);
                     SelectionCleanup::Unverified
@@ -16052,18 +16071,20 @@ mod tests {
         assert_eq!(paste_gate_budget_ms(true), 1_035);
         assert!(paste_gate_budget_ms(true) <= CORRECTION_GATE_MAX_HOLD_MS);
 
+        // The handoff is judged at a fixed instant, so it fits exactly when the budget does.
+        let now = Instant::now();
         let mut gate = CorrectionGate::default();
         gate.activate(10);
         gate.awaiting_worker_ack = true;
         assert!(gate.prepare_handoff_budget(10, 839));
-        gate.deadline = Instant::now() + Duration::from_millis(838);
-        assert!(!gate.handoff(10, 20));
+        gate.deadline = now + Duration::from_millis(838);
+        assert!(!gate.handoff(10, 20, now));
 
         gate.activate(10);
         gate.awaiting_worker_ack = true;
         assert!(gate.prepare_handoff_budget(10, 789));
-        gate.deadline = Instant::now() + Duration::from_millis(850);
-        assert!(gate.handoff(10, 20));
+        gate.deadline = now + Duration::from_millis(789);
+        assert!(gate.handoff(10, 20, now));
     }
 
     #[test]
@@ -16175,9 +16196,10 @@ mod tests {
         gate.held
             .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0));
         let deadline = gate.deadline;
+        let now = deadline - Duration::from_secs(1);
 
         assert!(gate.prepare_handoff_budget(10, 100));
-        assert!(gate.handoff(10, 20));
+        assert!(gate.handoff(10, 20, now));
         assert!(gate.active);
         assert_eq!(gate.token, 20);
         assert_eq!(gate.fence_marker, GATE_FENCE_MARKER_BASE | 20);
@@ -16186,7 +16208,7 @@ mod tests {
         assert_eq!(gate.current_drain_count, 0);
         assert!(!gate.awaiting_worker_ack);
         assert_eq!(gate.deadline, deadline);
-        assert!(!gate.handoff(10, 30));
+        assert!(!gate.handoff(10, 30, now));
     }
 
     #[test]
@@ -16200,8 +16222,9 @@ mod tests {
         gate.awaiting_worker_ack = true;
         assert!(!gate.can_start_drain(10));
         assert!(gate.prepare_handoff_budget(10, 200));
-        gate.deadline = Instant::now() + Duration::from_millis(199);
-        assert!(!gate.handoff(10, 20));
+        let now = Instant::now();
+        gate.deadline = now + Duration::from_millis(199);
+        assert!(!gate.handoff(10, 20, now));
         assert_eq!(gate.token, 10);
     }
 
