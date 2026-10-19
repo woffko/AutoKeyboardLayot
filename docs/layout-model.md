@@ -267,6 +267,16 @@ takes about a minute on a GPU and longer on a CPU).
    rate on real words (all `kind:` rows except `random`) stays at the
    dictionary detector's level.
 
+   Training is seeded (`train.py fit --seed`, 1 by default) and uses torch's
+   deterministic algorithms, and `model.pt.json` and `model.aklm.json` record
+   the seed, the Python, torch and numpy versions, the device and the SHA-256
+   of the cases, of `languages.json` and of the model. The same inputs, seed,
+   versions and device give the same model byte for byte (CPU and GPU may
+   differ from each other). The shipped `en-ru-et.aklm` was trained before
+   seeding, so it can be retrained to the same quality but not rebuilt byte
+   for byte. `tools/test_layout_model_training.py` checks the seeding with
+   the environment of step 3.
+
 6. **Build it in.** Copy `target/layout-model/model.aklm` over
    `data/layout-model/en-ru-et.aklm` and `target/layout-model/fixture.json`
    over `tests/fixtures/layout-model-fixture.json`, run `cargo test`, and build
@@ -285,6 +295,7 @@ takes about a minute on a GPU and longer on a CPU).
 | `tools/layout_model/export_layouts.ps1` | Read-only Windows layout export |
 | `tools/layout_model/prepare_vocab.py` | Input checks, frequency vocabularies and their provenance receipt |
 | `tools/layout_model/notice.py` | The model's NOTICE, written from that receipt |
+| `tools/test_layout_model.py`, `tools/test_layout_model_training.py` | Tests of the tools; the second needs the training environment |
 | `tools/layout_model/generate_cases.py` | Synthetic typing cases |
 | `tools/layout_model/train.py` | Features, training, prediction |
 | `tools/layout_model/export.py` | Binary export and reference check |
