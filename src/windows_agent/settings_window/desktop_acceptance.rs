@@ -27,14 +27,15 @@ use windows::Win32::{
             IUIAutomationSelectionItemPattern, IUIAutomationTogglePattern, IUIAutomationTreeWalker,
             IUIAutomationValuePattern, ToggleState_On, UIA_ButtonControlTypeId, UIA_CONTROLTYPE_ID,
             UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_EditControlTypeId,
-            UIA_InvokePatternId, UIA_SelectionItemPatternId, UIA_TextControlTypeId,
-            UIA_TogglePatternId, UIA_ValuePatternId,
+            UIA_InvokePatternId, UIA_ListItemControlTypeId, UIA_SelectionItemPatternId,
+            UIA_TextControlTypeId, UIA_TogglePatternId, UIA_ValuePatternId,
         },
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, IsWindowEnabled, KEYBDINPUT,
             KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE,
             MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-            MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, VIRTUAL_KEY, VK_A, VK_CONTROL, VK_SPACE,
+            MOUSEEVENTF_WHEEL, MOUSEINPUT, MapVirtualKeyW, VIRTUAL_KEY, VK_A, VK_CONTROL,
+            VK_ESCAPE, VK_SPACE,
         },
         WindowsAndMessaging::{
             EnumWindows, GW_OWNER, GetClassNameW, GetClientRect, GetDlgItem, GetPropW,
@@ -1245,6 +1246,69 @@ fn the_settings_window_on_the_desktop_centers_the_language_mark_in_its_row() {
         "the mark is not in the middle of its row: rows {top}..={bottom} in {:?}",
         row.rect
     );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_keeps_the_arabic_profile_choice_inside_its_box() {
+    let profile = Profile::managed("ar");
+    install_published(&profile, &["ar-SA"]);
+    let window = Window::open(profile);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let row = ui
+        .wait(
+            window.handle,
+            UIA_CheckBoxControlTypeId,
+            "English",
+            Duration::from_secs(10),
+        )
+        .expect("the English row");
+    let picker = ui
+        .elements(window.handle)
+        .into_iter()
+        .find(|element| {
+            element.is(UIA_ComboBoxControlTypeId)
+                && element.rect.top >= row.rect.top - 2
+                && element.rect.bottom <= row.rect.bottom + 2
+        })
+        .expect("the profile picker");
+    let screen = screenshot("settings-arabic-profile-choice.bmp");
+    // Left of the box are the row's padding, the card's edge and the page's margin: no text.
+    let client = window.client();
+    let dark = (picker.rect.top + 6..picker.rect.bottom - 6)
+        .flat_map(|y| (client.left + 4..picker.rect.left - 2).map(move |x| POINT { x, y }))
+        .filter(|point| {
+            let color = pixel(&screen, *point);
+            let channel = |shift: u32| (color >> shift) & 0xff;
+            channel(0) + channel(8) + channel(16) < 3 * 110
+        })
+        .count();
+    // The clip must not cut the list off: the choices still open.
+    click(picker.center());
+    let choices = within(Duration::from_secs(10), || {
+        let items: Vec<Element> = ui
+            .elements(window.handle)
+            .into_iter()
+            .filter(|element| element.is(UIA_ListItemControlTypeId) && element.height() > 10)
+            .collect();
+        (items.len() > 1).then_some(items)
+    });
+    let _ = screenshot("settings-arabic-profile-choices.bmp");
+    keys(&[(VK_ESCAPE, true), (VK_ESCAPE, false)]);
+    eprintln!(
+        "picker={:?} dark pixels left of it: {dark}; choices: {:?}",
+        picker.rect,
+        choices
+            .as_ref()
+            .map(|items| items.iter().map(|item| item.rect).collect::<Vec<_>>())
+    );
+    window.request_close();
+    assert!(
+        dark == 0,
+        "the profile choice runs out of its box: {dark} dark pixels"
+    );
+    assert!(choices.is_some(), "the profile choices do not open");
 }
 
 #[test]
