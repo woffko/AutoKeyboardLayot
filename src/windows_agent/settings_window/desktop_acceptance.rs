@@ -41,7 +41,7 @@ use windows::Win32::{
             GetSystemMetrics, GetWindow, IsWindowVisible, IsZoomed, SM_CXSCREEN,
             SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
             SM_YVIRTUALSCREEN, SW_MAXIMIZE, SendMessageW, ShowWindow, WM_CLOSE, WM_COMMAND,
-            WM_SETTEXT,
+            WM_GETTEXT, WM_SETTEXT,
         },
     },
 };
@@ -176,6 +176,12 @@ impl Window {
         let thread = thread::spawn(run);
         let handle = within(Duration::from_secs(60), own_settings_window)
             .expect("the settings window did not open");
+        // The window exists before its first frame. Its event loop runs once the graceful-close
+        // property appears; with software rendering on a busy machine that took 34 s.
+        within(Duration::from_secs(120), || {
+            graceful_close_advertised(handle).then_some(())
+        })
+        .expect("the settings window's event loop did not start");
         let window = Self {
             handle,
             thread,
@@ -614,8 +620,24 @@ fn choose_in_dialog(dialog: HWND, directory: &Path, names: &[String]) {
         let _ = PostMessageW(Some(dialog), WM_COMMAND, WPARAM(OPEN as usize), LPARAM(0));
         thread::sleep(Duration::from_millis(1_500));
     };
+    let text = || {
+        let mut buffer = [0u16; 1_024];
+        let length = unsafe {
+            SendMessageW(
+                edit,
+                WM_GETTEXT,
+                Some(WPARAM(buffer.len())),
+                Some(LPARAM(buffer.as_mut_ptr() as isize)),
+            )
+        }
+        .0
+        .clamp(0, buffer.len() as isize) as usize;
+        String::from_utf16_lossy(&buffer[..length])
+    };
     set(&directory.to_string_lossy());
     open();
+    // The dialog empties the box once it shows the folder, which takes long on a busy machine.
+    let _ = within(Duration::from_secs(30), || text().is_empty().then_some(()));
     let list = names
         .iter()
         .map(|name| format!("\"{name}\""))
