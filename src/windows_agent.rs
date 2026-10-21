@@ -6641,11 +6641,14 @@ fn classify_text_barrier(
 }
 
 /// The text barrier's question: is the text before the caret of the focused field of
-/// `process_id` the word an edit is about to replace?
+/// `process_id` the word an edit is about to replace? `check` numbers the barrier checks: a read
+/// still running when its check gave up answers for the field as it was then, never for a later
+/// check of the same word.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BarrierRead {
     process_id: u32,
     text: String,
+    check: u64,
 }
 
 /// Text-barrier reads on a provider thread of their own, answered with the barrier's report.
@@ -7239,6 +7242,8 @@ struct InputProcessor {
     held_keys_kept_for: Option<u64>,
     // When the gate holding the keys typed after the word being converted lets them go.
     edit_deadline: Cell<Option<Instant>>,
+    // Numbers the text barrier's checks (see BarrierRead).
+    barrier_checks: Cell<u64>,
     // Clipboard brokers the worker stopped waiting for.
     clipboard_brokers: ClipboardBrokers,
     // Policy D1: how often automatic conversion may resume after a recovered gate abort.
@@ -7406,6 +7411,7 @@ impl InputProcessor {
             last_gate_retention_token: 0,
             held_keys_kept_for: None,
             edit_deadline: Cell::new(None),
+            barrier_checks: Cell::new(0),
             clipboard_brokers: ClipboardBrokers::default(),
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
@@ -7458,9 +7464,12 @@ impl InputProcessor {
         expected_text: &str,
         deadline: Instant,
     ) -> TextBarrierStatus {
+        self.barrier_checks
+            .set(self.barrier_checks.get().wrapping_add(1));
         let read = BarrierRead {
             process_id,
             text: expected_text.to_owned(),
+            check: self.barrier_checks.get(),
         };
         let (status, report) = match self.barrier_probe.borrow_mut().as_mut() {
             Some(probe) => barrier_answer(probe, read, deadline),
@@ -20842,6 +20851,7 @@ mod tests {
         let read = |text: &str| BarrierRead {
             process_id: 7,
             text: text.to_owned(),
+            check: 1,
         };
         // A read whose deadline has come does not wait at all, whatever the provider does.
         let started = Instant::now();
@@ -20893,6 +20903,43 @@ mod tests {
         );
         assert_eq!(probe.respawn_count(), 1);
         assert_eq!(spawned.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_late_answer_to_an_earlier_barrier_check_never_answers_the_next_one() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new(metrics, 0);
+        let (release, released) = sync_channel::<()>(1);
+        // The first read sees the field before the edit, and finishes only once released.
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-late-test", move || {
+                let mut reads = 0;
+                move |_: BarrierRead| {
+                    reads += 1;
+                    if reads == 1 {
+                        let _ = released.recv();
+                        (TextBarrierStatus::Mismatch, TextBarrierReport::default())
+                    } else {
+                        marked_barrier_answer(41)
+                    }
+                }
+            })
+            .expect("barrier provider"),
+        );
+        let first =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_millis(30));
+        assert_eq!(first, TextBarrierStatus::Unavailable);
+        // Its answer arrives just after that check ended.
+        release.send(()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        // The next check of the same word reads the field again.
+        let next =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        assert_eq!(next, TextBarrierStatus::Match);
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().expected_chars,
+            41
+        );
     }
 
     #[test]

@@ -525,7 +525,9 @@ joined. The text barrier's reads (whether the text before the caret is the word 
 edit is about to replace) also run on a provider thread of their own: the worker waits
 for an answer no longer than the barrier's deadline, at most 150 ms per read, a read left
 behind changes nothing in the field, the barrier report then names `stage=Provider`, and a
-provider that keeps the queue busy for 2 seconds is replaced, at most three times.
+provider that keeps the queue busy for 2 seconds is replaced, at most three times. Each
+check reads the field afresh: the late answer of a read left behind describes the field as
+it was then and never answers a later check, even of the same word.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
 keys typed meanwhile. When the
