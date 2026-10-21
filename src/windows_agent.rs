@@ -1694,18 +1694,51 @@ unsafe extern "system" fn clipboard_broker_procedure(
                 LRESULT(0)
             }
             WM_RENDERALLFORMATS => {
-                if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
-                    if unsafe { GetClipboardOwner().ok() } == Some(hwnd) {
-                        render_replacement(false);
-                    }
-                    let _ = unsafe { CloseClipboard() };
-                }
+                render_before_destroy(
+                    |retries| ClipboardOpenGuard::open(hwnd, retries),
+                    || unsafe { GetClipboardOwner().ok() } == Some(hwnd),
+                    || render_replacement(false),
+                );
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         },
         || LRESULT(0),
     )
+}
+
+/// Before the broker window goes away it renders the replacement, so that one left on the
+/// clipboard stays readable: with the clipboard open (`open` with its retries: another program
+/// may hold it a moment, as for every opening) and only while the window still owns it. True when
+/// it rendered.
+fn render_before_destroy<G>(
+    open: impl FnOnce(usize) -> Option<G>,
+    owned: impl FnOnce() -> bool,
+    render: impl FnOnce(),
+) -> bool {
+    let Some(_open) = open(CLIPBOARD_OPEN_RETRIES) else {
+        return false;
+    };
+    if !owned() {
+        return false;
+    }
+    render();
+    true
+}
+
+/// Restores the user's clipboard with it open (`open`). Only then does `forget` end the broker's
+/// rendering of the replacement: a restore that cannot open the clipboard leaves the replacement
+/// there, and the broker window renders it before it goes away, so it stays readable.
+fn restore_holding_clipboard<G>(
+    open: impl FnOnce() -> Option<G>,
+    forget: impl FnOnce(),
+    restore: impl FnOnce(&G) -> bool,
+) -> bool {
+    let Some(open) = open() else {
+        return false;
+    };
+    forget();
+    restore(&open)
 }
 
 fn forget_replacement() {
@@ -1833,10 +1866,12 @@ impl ClipboardSystem for SystemClipboard {
     }
 
     fn restore(&mut self, expected: Option<u32>, snapshot: &mut Self::Snapshot) -> bool {
-        // From here the replacement is not the broker's to render any more, not even when its
-        // window, the owner of the restored clipboard, goes away.
-        forget_replacement();
-        restore_materialized_clipboard(self.owner.0, expected, snapshot)
+        let owner = self.owner.0;
+        restore_holding_clipboard(
+            || ClipboardOpenGuard::open(owner, CLIPBOARD_RESTORE_OPEN_RETRIES),
+            forget_replacement,
+            |_open| restore_materialized_clipboard(owner, expected, snapshot),
+        )
     }
 
     fn wait(
@@ -2006,14 +2041,13 @@ fn global_utf16(text: &str) -> Option<OwnedClipboardHandle> {
     global_bytes(bytes)
 }
 
+/// Puts `entries` on the clipboard, which the caller holds open, with `expected_sequence` only
+/// while the clipboard still holds `owner`'s item of that sequence.
 fn restore_materialized_clipboard(
     owner: HWND,
     expected_sequence: Option<u32>,
     entries: &mut [MaterializedClipboardEntry],
 ) -> bool {
-    let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_RESTORE_OPEN_RETRIES) else {
-        return false;
-    };
     if expected_sequence.is_some_and(|sequence| {
         (unsafe { GetClipboardSequenceNumber() }) != sequence
             || (unsafe { GetClipboardOwner().ok() }) != Some(owner)
@@ -21883,6 +21917,52 @@ mod tests {
         assert!(brokers.reap().is_empty());
         assert_eq!(state.lock().unwrap().text, "theirs");
         assert_eq!(state.lock().unwrap().restores, 0);
+    }
+
+    #[test]
+    fn a_broker_window_going_away_renders_the_replacement_past_a_busy_clipboard() {
+        // Another program holds the clipboard at the first attempt.
+        let mut asked = 0;
+        let mut rendered = false;
+        assert!(render_before_destroy(
+            |retries| {
+                asked = retries;
+                (retries > 1).then_some(())
+            },
+            || true,
+            || rendered = true,
+        ));
+        assert!(rendered);
+        assert_eq!(asked, CLIPBOARD_OPEN_RETRIES);
+        // The clipboard is not the window's any more: nothing is rendered.
+        let mut rendered = false;
+        assert!(!render_before_destroy(
+            |_| Some(()),
+            || false,
+            || rendered = true
+        ));
+        assert!(!rendered);
+    }
+
+    #[test]
+    fn a_restore_that_cannot_open_the_clipboard_keeps_the_replacement_renderable() {
+        let mut forgotten = false;
+        assert!(!restore_holding_clipboard(
+            || None::<()>,
+            || forgotten = true,
+            |_| true
+        ));
+        assert!(
+            !forgotten,
+            "the window still renders it before it goes away"
+        );
+        let mut forgotten = false;
+        assert!(restore_holding_clipboard(
+            || Some(()),
+            || forgotten = true,
+            |_| true
+        ));
+        assert!(forgotten);
     }
 
     #[test]
