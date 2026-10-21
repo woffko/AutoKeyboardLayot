@@ -5013,11 +5013,12 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             state.correction_gate.pending_hotkey = None;
                         }
                         if state.correction_gate.active && key_down {
-                            // The async state is updated after this hook: it still tells whether
-                            // the key was already down before this edge.
-                            raw.repeat = unsafe { GetAsyncKeyState(event.vkCode as i32) } as u16
-                                & 0x8000
-                                != 0;
+                            raw.repeat =
+                                gated_key_down_repeats(&state.correction_gate.held, &raw, || {
+                                    let key_state =
+                                        unsafe { GetAsyncKeyState(event.vkCode as i32) };
+                                    key_state as u16 & 0x8000 != 0
+                                });
                         }
                         if state.hold_gated_edge(raw) {
                             swallow = true;
@@ -5252,26 +5253,49 @@ fn retained_hotkey_events(
     (key, recovery)
 }
 
+/// Whether a key-down a gate is about to hold repeats a key that is already down. The last edge of
+/// the same key the gate holds decides: the system never saw it, so its key state still shows a
+/// key released in the gate as down. Without one, `system_down` reads the async key state, which
+/// the hook updates only after this edge: it still tells whether the key was down before it.
+fn gated_key_down_repeats(
+    held: &[RawKeyEvent],
+    raw: &RawKeyEvent,
+    system_down: impl FnOnce() -> bool,
+) -> bool {
+    let key = (raw.virtual_key, raw.scan_code, raw.extended);
+    held.iter()
+        .rev()
+        .find(|event| (event.virtual_key, event.scan_code, event.extended) == key)
+        .map_or_else(system_down, |last| {
+            matches!(last.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        })
+}
+
 /// Splits edges that leave a gate without being typed into the ones that stay retained and the
 /// key-ups that must be delivered now. A key-up with no earlier fresh key-down of the same key in
 /// `events` belongs to a key whose key-down reached the application before the gate (directly or
 /// as the first of an auto-repeat): it types nothing, and withholding it would leave the key
-/// logically pressed system-wide.
+/// logically pressed system-wide. A key-down after a key-up of the same key in `events` is fresh
+/// whatever it is marked.
 fn split_delivered_key_releases(events: Vec<RawKeyEvent>) -> (Vec<RawKeyEvent>, Vec<RawKeyEvent>) {
     let mut pressed = std::collections::BTreeSet::new();
+    let mut released = std::collections::BTreeSet::new();
     let mut retained = Vec::with_capacity(events.len());
     let mut releases = Vec::new();
     for event in events {
         let key = (event.virtual_key, event.scan_code, event.extended);
         if matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            if !event.repeat {
+            if !event.repeat || released.contains(&key) {
                 pressed.insert(key);
             }
             retained.push(event);
-        } else if pressed.remove(&key) {
-            retained.push(event);
         } else {
-            releases.push(event);
+            released.insert(key);
+            if pressed.remove(&key) {
+                retained.push(event);
+            } else {
+                releases.push(event);
+            }
         }
     }
     (retained, releases)
@@ -18816,6 +18840,89 @@ mod tests {
                 .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
         );
         assert!(state.decline_reasons().is_empty());
+    }
+
+    #[test]
+    fn a_held_edge_of_the_same_key_decides_whether_a_gated_key_down_repeats() {
+        let down = test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0);
+        let other = test_raw_key(WM_KEYUP, VK_RSHIFT, 0, 0);
+        // No held edge of the key: the system's key state answers.
+        assert!(gated_key_down_repeats(&[other], &down, || true));
+        assert!(!gated_key_down_repeats(&[other], &down, || false));
+        // Released in the gate: the swallowed key-up never reached the system's key state.
+        let released = [test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0), other];
+        assert!(!gated_key_down_repeats(&released, &down, || true));
+        // Pressed in the gate: neither did the swallowed key-down.
+        let pressed = [released[0], down, other];
+        assert!(gated_key_down_repeats(&pressed, &down, || false));
+    }
+
+    #[test]
+    fn a_key_down_after_a_key_up_of_the_same_key_owns_the_next_key_up() {
+        // A key-down marked as a repeat after the key was released in `events` is a new press.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0),
+            key_with_repeat(WM_KEYDOWN, VK_LSHIFT, true),
+            test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0),
+        ]);
+        assert_eq!(
+            virtual_keys(&retained),
+            [
+                (WM_KEYDOWN, u32::from(VK_LSHIFT.0)),
+                (WM_KEYUP, u32::from(VK_LSHIFT.0))
+            ]
+        );
+        assert_eq!(
+            virtual_keys(&releases),
+            [(WM_KEYUP, u32::from(VK_LSHIFT.0))]
+        );
+    }
+
+    #[test]
+    fn shift_released_and_pressed_again_in_the_gate_is_recovered_balanced() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let shift = u32::from(VK_LSHIFT.0);
+        state.correction_gate.activate(10);
+        // Shift went down before the gate. The gate swallows its key-up, so the system's key
+        // state shows it down for the rest of the gate.
+        for (message, key) in [
+            (WM_KEYUP, VK_LSHIFT),
+            (WM_KEYDOWN, VK_LSHIFT),
+            (WM_KEYDOWN, VIRTUAL_KEY(0x41)),
+            (WM_KEYUP, VIRTUAL_KEY(0x41)),
+            (WM_KEYUP, VK_LSHIFT),
+            (WM_KEYDOWN, VIRTUAL_KEY(0x42)),
+            (WM_KEYUP, VIRTUAL_KEY(0x42)),
+        ] {
+            let mut raw = test_raw_key(message, key, 0, 0);
+            if message == WM_KEYDOWN {
+                raw.repeat =
+                    gated_key_down_repeats(&state.correction_gate.held, &raw, || key == VK_LSHIFT);
+            }
+            assert!(state.hold_gated_edge(raw));
+        }
+        state.break_correction_gate_fail_open(GateFailureCause::Deadline);
+        assert_eq!(
+            virtual_keys(&state.pending_key_releases),
+            [(WM_KEYUP, shift)]
+        );
+        let retained = state.metrics.retained_input.lock().unwrap().take().unwrap();
+        // "Ab": Shift goes up between the letters, and recovery leaves nothing down.
+        assert_eq!(
+            virtual_keys(&retained.events),
+            [
+                (WM_KEYDOWN, shift),
+                (WM_KEYDOWN, 0x41),
+                (WM_KEYUP, 0x41),
+                (WM_KEYUP, shift),
+                (WM_KEYDOWN, 0x42),
+                (WM_KEYUP, 0x42)
+            ]
+        );
+        assert_eq!(
+            build_recovery_inputs(&retained.events).unwrap().len(),
+            retained.events.len()
+        );
     }
 
     #[test]
