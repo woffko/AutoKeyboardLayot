@@ -3714,6 +3714,32 @@ fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, 
     }
 }
 
+/// Deletes the held keys the user confirmed deleting. True when they were deleted: their lifetime
+/// may have ended while the question was open, or the worker may be typing them right now.
+fn discard_confirmed_retained_input(state: &mut AppState) -> bool {
+    let discarded = {
+        let mut retained = state
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if retained.as_ref().is_some_and(|input| !input.recovering) {
+            retained.take()
+        } else {
+            None
+        }
+    };
+    state.metrics.recovery_armed.store(false, Ordering::Release);
+    let Some(discarded) = discarded else {
+        return false;
+    };
+    state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
+    // Deleting a key-up whose key-down was typed would leave that key pressed.
+    let (_, releases) = split_delivered_key_releases(discarded.events);
+    state.queue_delivered_key_releases(releases);
+    true
+}
+
 fn discard_retained_input(hwnd: HWND) {
     let confirmed = unsafe {
         MessageBoxW(
@@ -3726,27 +3752,10 @@ fn discard_retained_input(hwnd: HWND) {
     if confirmed != IDYES {
         return;
     }
-    // The keys' lifetime may have ended while the question was open.
     let discarded = APP_STATE.with(|slot| {
-        let mut state = slot.borrow_mut();
-        let Some(state) = state.as_mut() else {
-            return false;
-        };
-        let discarded = state
-            .metrics
-            .retained_input
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        state.metrics.recovery_armed.store(false, Ordering::Release);
-        let Some(discarded) = discarded else {
-            return false;
-        };
-        state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
-        // Deleting a key-up whose key-down was typed would leave that key pressed.
-        let (_, releases) = split_delivered_key_releases(discarded.events);
-        state.queue_delivered_key_releases(releases);
-        true
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(discard_confirmed_retained_input)
     });
     if discarded {
         show_tray_information(
@@ -19074,6 +19083,29 @@ mod tests {
         assert_eq!(virtual_keys(&pending), [(WM_KEYUP, 0x41)]);
         cancel_superseded_key_release(&mut pending, &test_raw_key(WM_KEYUP, VK_RSHIFT, 0, 0));
         assert_eq!(pending.len(), 1, "another key cancels nothing");
+    }
+
+    #[test]
+    fn confirming_the_deletion_leaves_keys_the_worker_is_sending_alone() {
+        let (mut state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let mut record = stalled_record(Instant::now());
+        record.recovering = true;
+        *metrics.retained_input.lock().unwrap() = Some(record);
+        // The worker began typing them while the question was open.
+        assert!(!discard_confirmed_retained_input(&mut state));
+        assert!(metrics.retained_input.lock().unwrap().is_some());
+        // A recovery that did not finish hands the record back for another attempt or deletion.
+        metrics
+            .retained_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .recovering = false;
+        assert!(discard_confirmed_retained_input(&mut state));
+        assert!(!has_retained_input(&metrics));
+        assert!(!discard_confirmed_retained_input(&mut state));
     }
 
     #[test]

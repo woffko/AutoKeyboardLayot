@@ -468,7 +468,8 @@ recovered are deleted after their minute, which a tray notice reports. Either
 way it resumes at most three times an hour, and never when an automatic edit
 failed because of the same abort. A failed or partial recovery waits for that
 minute; an explicit recovery or any other pause stays paused. Keys that are being
-replayed when their minute ends are not deleted under the replay, and a recovery is
+replayed when their minute ends, or when a deletion from the tray is confirmed, are
+not deleted under the replay, and a recovery is
 carried out even when a configuration reload or a hook reinstall came after it was
 requested. The replayed keys
 bypass the hooks, so the word at the caret is not converted until that word ends
