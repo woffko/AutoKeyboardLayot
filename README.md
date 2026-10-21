@@ -454,7 +454,9 @@ now asks whether to exit anyway and names those reasons; it warns that
 keystrokes held back for recovery are lost. Retained input deletes itself after
 its minute, so it does not block Exit for longer. A worker thread that has
 already finished never blocks Exit, not even with a configuration reload it can no
-longer acknowledge. Installer-driven closes never force an exit.
+longer acknowledge or held keys only it could recover, and a recovery prepared from the
+tray is cancelled when the worker stops, so Pause is no longer swallowed for it.
+Installer-driven closes never force an exit.
 
 A Space that arms the correction gate is always released once the worker has
 handled it, whichever path it took (stale input epoch, pending configuration,

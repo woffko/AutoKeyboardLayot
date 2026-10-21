@@ -2369,6 +2369,8 @@ impl AppState {
             self.metrics
                 .configuration_pending
                 .store(false, Ordering::Release);
+            // Nor carry out a prepared recovery: Pause must not be swallowed for it.
+            self.metrics.recovery_armed.store(false, Ordering::Release);
         }
         self.gate_diagnostic(
             "fault",
@@ -3562,12 +3564,16 @@ struct ShutdownFacts {
     hotkey_waiting_for_release: bool,
 }
 
-/// The reasons for declining Exit, in reporting order. A finished worker thread cannot be busy or
-/// acknowledge a reload, so the stale flags a crashed worker leaves behind are ignored.
+/// The reasons for declining Exit, in reporting order. A finished worker thread cannot be busy,
+/// acknowledge a reload or recover held keys, so the stale flags a crashed worker leaves behind
+/// are ignored, and so are held keys only it could bring back.
 fn shutdown_blockers(facts: &ShutdownFacts) -> Vec<&'static str> {
     [
         ("correction-gate", facts.correction_gate_active),
-        ("retained-input", facts.retained_input),
+        (
+            "retained-input",
+            facts.retained_input && !facts.worker_finished,
+        ),
         ("worker-busy", facts.worker_busy && !facts.worker_finished),
         (
             "configuration-pending",
@@ -14351,10 +14357,12 @@ mod tests {
             worker_finished: true,
             ..all
         };
-        // A finished worker can neither be busy nor acknowledge the pending reload.
-        assert_eq!(shutdown_blockers(&finished).len(), 4);
-        assert!(!shutdown_blockers(&finished).contains(&"worker-busy"));
-        assert!(!shutdown_blockers(&finished).contains(&"configuration-pending"));
+        // A finished worker can neither be busy, acknowledge the pending reload nor recover the
+        // held keys.
+        assert_eq!(
+            shutdown_blockers(&finished),
+            ["correction-gate", "undo-hotkey", "hotkey-release"]
+        );
         let idle = ShutdownFacts {
             correction_gate_active: false,
             retained_input: false,
@@ -19121,6 +19129,24 @@ mod tests {
             state.metrics.last_failure_reason.load(Ordering::Acquire),
             ConversionFailureReason::InternalFault as u8
         );
+    }
+
+    #[test]
+    fn a_worker_that_stopped_leaves_no_recovery_armed() {
+        for worker_dead in [false, true] {
+            let (mut state, _receiver) = test_gate_state(8);
+            state.metrics.recovery_armed.store(true, Ordering::Release);
+            state
+                .metrics
+                .worker_dead
+                .store(worker_dead, Ordering::Release);
+            state.record_engine_fault_with_target(None);
+            // Only a living worker can still carry out the recovery Pause would ask for.
+            assert_eq!(
+                state.metrics.recovery_armed.load(Ordering::Acquire),
+                !worker_dead
+            );
+        }
     }
 
     #[test]
