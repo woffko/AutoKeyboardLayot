@@ -8297,6 +8297,9 @@ impl InputProcessor {
             self.modifiers = Modifiers::from_held(event.held_modifiers);
         }
         let modifier_event = self.modifiers.update(event.virtual_key, key_down, key_up);
+        if key_down && !modifier_event {
+            self.modifiers.forget_released(event.held_modifiers);
+        }
         if event.hotkey_trigger {
             let released = self.settings.pause_break_undo && self.wait_for_hotkey_release(event);
             self.diagnostic(
@@ -11918,6 +11921,24 @@ impl Modifiers {
             control_mask: (held >> 2) & 0b11,
             alt_mask: (held >> 4) & 0b11,
             win_mask: (held >> 6) & 0b11,
+        }
+    }
+
+    /// Forgets every modifier the hook found released for an event: its key-up may never have
+    /// reached the worker, as when it went to the secure desktop of Ctrl+Alt+Del or of a UAC
+    /// prompt and the same window has the focus again. A modifier held on either side stays as
+    /// tracked.
+    fn forget_released(&mut self, held: u8) {
+        let held = Self::from_held(held);
+        for (mask, held) in [
+            (&mut self.shift_mask, held.shift_mask),
+            (&mut self.control_mask, held.control_mask),
+            (&mut self.alt_mask, held.alt_mask),
+            (&mut self.win_mask, held.win_mask),
+        ] {
+            if held == 0 {
+                *mask = 0;
+            }
         }
     }
 
@@ -16734,6 +16755,45 @@ mod tests {
     }
 
     #[test]
+    fn modifiers_released_on_the_secure_desktop_are_forgotten_in_the_same_window() {
+        // Ctrl+Alt+Del: the worker sees Ctrl and Alt go down, then the secure desktop takes the
+        // keys, and their key-ups never come here.
+        let press_control_alt = |processor: &mut InputProcessor, foreground| {
+            for (sequence, key, held) in [
+                (1, VK_LCONTROL, held_keys(&[VK_LCONTROL])),
+                (2, VK_LMENU, held_keys(&[VK_LCONTROL, VK_LMENU])),
+            ] {
+                processor.process_key(RawKeyEvent {
+                    held_modifiers: held,
+                    foreground,
+                    ..test_raw_key(WM_KEYDOWN, key, sequence, 0)
+                });
+            }
+        };
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        press_control_alt(&mut processor, foreground);
+        // Cancel returns to the same window with every key released: the letter is typed.
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x30,
+            foreground,
+            ..letter(0x42, 3)
+        });
+        assert!(!processor.modifiers.has_shortcut_modifier());
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        // A modifier still held stays: Ctrl kept down makes a shortcut, without the Alt let go.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        press_control_alt(&mut processor, foreground);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2e,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            foreground,
+            ..letter(0x43, 3)
+        });
+        assert_eq!(processor.last_word_reset, "shortcut");
+        assert!(processor.modifiers.control() && !processor.modifiers.alt());
+    }
+
+    #[test]
     fn modifiers_held_into_a_new_input_epoch_come_from_the_key_event() {
         let (mut processor, foreground) = processor_typing_in(0x0409);
         type_keys(&mut processor, foreground, &[0x22]);
@@ -20060,8 +20120,8 @@ mod tests {
             (none, VK_TAB),
             (&[VK_LSHIFT][..], VK_TAB),
             (none, VK_RETURN),
-            (&[VK_CONTROL][..], VK_TAB),
-            (&[VK_MENU][..], VIRTUAL_KEY(0x46)),
+            (&[VK_LCONTROL][..], VK_TAB),
+            (&[VK_LMENU][..], VIRTUAL_KEY(0x46)),
         ] {
             let (mut processor, _receiver) = processor_in_field(EDITOR, None);
             processor.process_key(letter(0x41, 1));
@@ -20074,7 +20134,10 @@ mod tests {
             });
             let generation = processor.privacy_generation;
             processor.modifiers = held_modifiers(modifiers);
-            processor.process_key(test_raw_key(WM_KEYDOWN, key, 2, 0));
+            processor.process_key(RawKeyEvent {
+                held_modifiers: held_keys(modifiers),
+                ..test_raw_key(WM_KEYDOWN, key, 2, 0)
+            });
             assert!(processor.privacy_needs_check, "{key:?}");
             assert!(processor.recent_privacy_ok.is_none(), "{key:?}");
             assert_ne!(processor.privacy_generation, generation, "{key:?}");

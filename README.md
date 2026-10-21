@@ -234,7 +234,9 @@ Session identity uses the stable top-level window and process, while the
 focused input thread is tracked separately for HKL and focused-child routing.
 Modifier keys held across a focus change or a new input epoch keep counting: the
 worker takes their physical state from the next key instead of assuming them
-released.
+released. Conversely, a modifier whose key-up never reached the worker, such as Ctrl
+and Alt released on the secure desktop of Ctrl+Alt+Del or of a UAC prompt before the
+same window has the focus again, stops counting at the next key that finds it released.
 Ordinary focus changes and mouse clicks re-check privacy on the first printable
 key without suppressing that first word. Esc, the function keys and the menu key,
 which can move the focus inside a window, do the same. A field check that was still
