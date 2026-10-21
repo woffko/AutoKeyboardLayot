@@ -2459,12 +2459,18 @@ impl AppState {
         if !previous_packages.accepts_reload(snapshot.package_source) {
             return ConfigurationHandoff::Refused;
         }
+        // One snapshot at a time: the slot holds it until the UI published or dropped it, and a
+        // newer one queued over it would be lost with it when the newer one is rejected. A
+        // rejected revision is settled like an acknowledged one.
+        let settled = self
+            .metrics
+            .configuration_ack
+            .load(Ordering::Acquire)
+            .max(self.metrics.configuration_rejected.load(Ordering::Acquire));
         if self.correction_gate.active
             || has_retained_input(&self.metrics)
-            || self
-                .next_configuration_revision
-                .saturating_sub(self.metrics.configuration_ack.load(Ordering::Acquire))
-                >= 2
+            || self.pending_configuration.is_some()
+            || self.next_configuration_revision.saturating_sub(settled) >= 2
         {
             return ConfigurationHandoff::Busy;
         }
@@ -4612,8 +4618,9 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             hook_watchdog_tick(hwnd);
             retry_missing_hooks(hwnd);
             retry_tray(hwnd);
-            finish_configuration_load(hwnd);
+            // Publishing first frees the slot for a configuration loaded meanwhile.
             finish_configuration_reload(hwnd);
+            finish_configuration_load(hwnd);
             expire_correction_gate();
             expire_retained_input(hwnd, Instant::now());
             hand_back_stalled_retained_input(
@@ -13164,24 +13171,36 @@ mod tests {
     }
 
     #[test]
-    fn rapid_reloads_require_latest_ack_and_bound_outstanding_snapshots() {
+    fn rapid_reloads_wait_for_the_pending_one_and_old_snapshots_never_apply() {
         let (mut state, receiver) = test_gate_state(4);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
         assert_eq!(
             state.enqueue_configuration(test_reload_snapshot("first.exe")),
             ConfigurationHandoff::Queued
         );
+        // One snapshot at a time: the next one waits until this one is published or dropped.
         assert_eq!(
             state.enqueue_configuration(test_reload_snapshot("second.exe")),
-            ConfigurationHandoff::Queued
-        );
-        assert_eq!(
-            state.enqueue_configuration(test_reload_snapshot("third.exe")),
             ConfigurationHandoff::Busy
         );
         let first = receiver.try_recv().unwrap();
         processor.process(first.clone());
-        assert!(state.take_acknowledged_configuration().is_none());
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy,
+            "acknowledged but not published yet"
+        );
+        assert!(
+            state
+                .publish_acknowledged_configuration()
+                .unwrap()
+                .process_exclusions
+                .is_excluded("first.exe")
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Queued
+        );
         processor.process(receiver.try_recv().unwrap());
         assert!(
             state
@@ -13194,6 +13213,52 @@ mod tests {
         assert_eq!(state.metrics.configuration_ack.load(Ordering::Acquire), 2);
         assert!(processor.exclusion_policy.is_excluded("second.exe"));
         assert!(!processor.exclusion_policy.is_excluded("first.exe"));
+    }
+
+    #[test]
+    fn reloads_the_worker_rejected_do_not_keep_later_ones_busy() {
+        let (mut state, _receiver) = test_gate_state(4);
+        for (revision, program) in [(1, "first.exe"), (2, "second.exe")] {
+            assert_eq!(
+                state.enqueue_configuration(test_reload_snapshot(program)),
+                ConfigurationHandoff::Queued
+            );
+            // The worker panicked applying it (see reject_faulted_configuration).
+            state
+                .metrics
+                .configuration_rejected
+                .store(revision, Ordering::Release);
+            assert!(state.drop_rejected_configuration());
+        }
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("third.exe")),
+            ConfigurationHandoff::Queued
+        );
+    }
+
+    #[test]
+    fn a_reload_never_replaces_one_the_worker_runs_but_the_ui_has_not_published() {
+        let (mut state, receiver) = test_gate_state(4);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("first.exe")),
+            ConfigurationHandoff::Queued
+        );
+        processor.process(receiver.try_recv().unwrap());
+        assert_eq!(state.metrics.configuration_ack.load(Ordering::Acquire), 1);
+        // Replacing it now would lose it: were the newer one rejected, the UI would keep the
+        // settings before both while the worker runs the first.
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy
+        );
+        assert!(
+            state
+                .publish_acknowledged_configuration()
+                .unwrap()
+                .process_exclusions
+                .is_excluded("first.exe")
+        );
     }
 
     #[test]

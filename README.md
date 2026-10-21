@@ -439,8 +439,9 @@ keys held by the correction gate are released unchanged (or kept for recovery wh
 the input field changed meanwhile), automatic conversion is paused and a tray notice
 points to `crash.log`. A configuration reload whose application panicked is
 rejected with a notice, and the previous settings stay in force. A reload that the
-worker cannot take at that moment (a correction gate or retained keys, two reloads it
-has not acknowledged yet, a full queue) is kept and handed over on a later timer tick,
+worker cannot take at that moment (a correction gate or retained keys, a previous
+reload not yet applied and published or rejected, a full queue) is kept and handed over
+on a later timer tick,
 and a newer save replaces it; earlier builds reported it as an unreadable configuration
 and dropped it. Only a configuration that cannot be read is reported as a read error;
 one the agent can never apply (its worker stopped, or it would take back a
