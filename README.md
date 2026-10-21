@@ -219,7 +219,10 @@ In applications on the protected-paste backend, whose edit checks the exact text
 before the caret before it replaces anything, Pause does more. It waits up to 100
 ms for the field to confirm the selection of the word and selects a second time
 when the field did not show it (automatic conversions keep 50 ms, which the
-correction gate's budget accounts for). After you switch to another window and
+correction gate's budget accounts for). The selection starts as soon as one attempt,
+the least clipboard installation and everything after the Ctrl+V fit in the time the
+gate has left, and the second attempt is made only while they fit again, so a slow
+field check before it no longer cancels the conversion. After you switch to another window and
 back, or click, Pause can still convert the last word of that window for two
 minutes: the word is used only if it is still exactly before the caret, and
 nothing is typed otherwise (`event=hotkey source=remembered`). Applying settings or

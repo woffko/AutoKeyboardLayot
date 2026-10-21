@@ -6001,24 +6001,15 @@ impl PrivacyGuard {
         expected_process_id: u32,
         expected_text: &str,
         patience: PastePatience,
+        budget: PasteBudget,
     ) -> (TextBarrierStatus, Option<SelectionCleanup>) {
-        let (attempt, attempts) = retry_unshown_selection(patience.attempts(), |earlier| {
-            self.last_barrier_report.set(TextBarrierReport {
-                expected_chars: expected_text.chars().count(),
-                ..TextBarrierReport::default()
-            });
-            select_preceding_text_in(
-                expected_text,
-                patience.confirm_timeout(),
-                earlier,
-                &self.last_barrier_report,
-                || self.focused_text_field(expected_process_id),
-            )
-        });
-        let mut report = self.last_barrier_report.get();
-        report.attempts = attempts;
-        self.last_barrier_report.set(report);
-        (attempt.status, attempt.cleanup)
+        select_preceding_text_retrying(
+            expected_text,
+            patience,
+            budget,
+            &self.last_barrier_report,
+            || self.focused_text_field(expected_process_id),
+        )
     }
 
     /// Collapses the agent's confirmed selection when the edit does not go ahead after all, and
@@ -6298,11 +6289,13 @@ const fn paste_patience(forced: bool) -> PastePatience {
 }
 
 /// Runs selection attempts until one is not an unshown selection or `attempts` have run. Only a
-/// selection the field did not show, and that was collapsed again, is tried again; every attempt
-/// reads and checks the text before the caret again before it selects, and is told whether an
-/// earlier attempt ran. Returns the last attempt and how many attempts ran.
+/// selection the field did not show, and that was collapsed again, is tried again, and only while
+/// `may_retry` says another attempt still fits the gate; every attempt reads and checks the text
+/// before the caret again before it selects, and is told whether an earlier attempt ran. Returns
+/// the last attempt and how many attempts ran.
 fn retry_unshown_selection(
     attempts: u32,
+    mut may_retry: impl FnMut() -> bool,
     mut attempt: impl FnMut(bool) -> SelectionAttempt,
 ) -> (SelectionAttempt, u32) {
     let mut ran = 0;
@@ -6311,7 +6304,7 @@ fn retry_unshown_selection(
         ran += 1;
         let unshown = result.confirmation == Some(SelectionConfirmation::NotShown)
             && result.cleanup == Some(SelectionCleanup::Collapsed);
-        if !unshown || ran >= attempts {
+        if !unshown || ran >= attempts || !may_retry() {
             return (result, ran);
         }
     }
@@ -6573,6 +6566,35 @@ fn read_preceding_text<F: TextField>(
 /// the text, select it, confirm the selection and collapse it again unless it was confirmed.
 /// After an earlier attempt, text selected at the caret is that attempt's selection shown late,
 /// and is collapsed too; a first attempt leaves a selection it finds alone, as the user made it.
+/// The attempts of `PrivacyGuard::select_preceding_text` on the field `resolve` finds each time: a
+/// second attempt only while `budget` leaves it its time. The report counts the attempts.
+fn select_preceding_text_retrying<F: TextField>(
+    expected_text: &str,
+    patience: PastePatience,
+    budget: PasteBudget,
+    report: &Cell<TextBarrierReport>,
+    mut resolve: impl FnMut() -> core::result::Result<F, TextBarrierStatus>,
+) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+    let may_retry = || budget.allows_selection(Instant::now(), patience);
+    let (attempt, attempts) = retry_unshown_selection(patience.attempts(), may_retry, |earlier| {
+        report.set(TextBarrierReport {
+            expected_chars: expected_text.chars().count(),
+            ..TextBarrierReport::default()
+        });
+        select_preceding_text_in(
+            expected_text,
+            patience.confirm_timeout(),
+            earlier,
+            report,
+            &mut resolve,
+        )
+    });
+    let mut counted = report.get();
+    counted.attempts = attempts;
+    report.set(counted);
+    (attempt.status, attempt.cleanup)
+}
+
 fn select_preceding_text_in<F: TextField>(
     expected_text: &str,
     confirm_timeout: Duration,
@@ -7616,13 +7638,14 @@ impl InputProcessor {
         process_id: u32,
         expected_text: &str,
         patience: PastePatience,
+        budget: PasteBudget,
     ) -> (TextBarrierStatus, Option<SelectionCleanup>) {
         #[cfg(test)]
         if let Some(seam) = &self.paste_seam {
             return seam.borrow_mut().select();
         }
         self.privacy_guard
-            .select_preceding_text(process_id, expected_text, patience)
+            .select_preceding_text(process_id, expected_text, patience, budget)
     }
 
     /// Puts a paste's replacement on the clipboard. Tests give it a clipboard of their own.
@@ -10529,7 +10552,7 @@ impl InputProcessor {
             return TextEditAttempt::Cancelled;
         }
         let (selection, cleanup) =
-            self.paste_select(foreground.process_id, expected_source, patience);
+            self.paste_select(foreground.process_id, expected_source, patience, budget);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=selection result={selection:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
         if cleanup == Some(SelectionCleanup::Unverified) {
@@ -11885,10 +11908,10 @@ impl PasteBudget {
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    /// Whether the selection may start: its confirmation, the least installation and everything
-    /// after the Ctrl+V still fit.
+    /// Whether a selection attempt may start: its confirmation, the least installation and
+    /// everything after the Ctrl+V still fit. Pause's second attempt is asked again.
     fn allows_selection(self, now: Instant, patience: PastePatience) -> bool {
-        let needed = patience.confirm_timeout() * patience.attempts()
+        let needed = patience.confirm_timeout()
             + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS);
         self.remaining(now)
             .is_none_or(|remaining| remaining >= needed)
@@ -14156,15 +14179,63 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_selects_again_only_while_another_attempt_fits() {
+        // Pause in a program on the capability probe: the gate it armed lets the keys go after
+        // its longest hold, and its whole patience fits in it.
+        assert!(
+            INPUT_SETTLE_AFTER_FORWARD_MS
+                + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+                + u64::from(PastePatience::Manual.attempts())
+                    * UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS
+                + PASTE_MIN_INSTALL_MS
+                + PASTE_AFTER_SUBMIT_MS
+                <= CORRECTION_GATE_MAX_HOLD_MS
+        );
+        let armed = Instant::now();
+        let budget = PasteBudget {
+            deadline: Some(armed + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS)),
+        };
+        // The settle step took 38 ms and the barrier matched at 165 ms: the selection starts.
+        let selecting = armed + Duration::from_millis(203);
+        assert!(budget.allows_selection(selecting, PastePatience::Manual));
+        // The field did not show it; a second attempt would no longer leave the rest its time.
+        let not_shown = SelectionAttempt {
+            status: TextBarrierStatus::Mismatch,
+            confirmation: Some(SelectionConfirmation::NotShown),
+            cleanup: Some(SelectionCleanup::Collapsed),
+        };
+        let after_first =
+            selecting + Duration::from_millis(UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS);
+        let mut attempts = 0;
+        let (result, ran) = retry_unshown_selection(
+            PastePatience::Manual.attempts(),
+            || budget.allows_selection(after_first, PastePatience::Manual),
+            |_| {
+                attempts += 1;
+                not_shown
+            },
+        );
+        assert_eq!((result, ran, attempts), (not_shown, 1, 1));
+        // With time to spare it selects again.
+        let (_, ran) =
+            retry_unshown_selection(PastePatience::Manual.attempts(), || true, |_| not_shown);
+        assert_eq!(ran, 2);
+    }
+
+    #[test]
     fn only_a_selection_the_field_did_not_show_is_tried_again() {
         use SelectionConfirmation::{Confirmed, NotShown, OtherText, Unreadable};
         let run = |attempts: u32, script: Vec<SelectionAttempt>| {
             let mut script = std::collections::VecDeque::from(script);
             let mut earlier = Vec::new();
-            let result = retry_unshown_selection(attempts, |earlier_attempt| {
-                earlier.push(earlier_attempt);
-                script.pop_front().expect("no more attempts than scripted")
-            });
+            let result = retry_unshown_selection(
+                attempts,
+                || true,
+                |earlier_attempt| {
+                    earlier.push(earlier_attempt);
+                    script.pop_front().expect("no more attempts than scripted")
+                },
+            );
             // Every attempt after the first is told that an earlier one ran.
             assert!(
                 earlier
@@ -20773,6 +20844,8 @@ mod tests {
         collapse_fails: bool,
         /// Selecting an empty range is accepted but changes nothing.
         ignores_collapse: bool,
+        /// Select() is accepted, but the field never shows the selection.
+        never_shows: bool,
         selected_once: Cell<bool>,
     }
 
@@ -20797,6 +20870,7 @@ mod tests {
             unreadable_after_select: false,
             collapse_fails: false,
             ignores_collapse: false,
+            never_shows: false,
             selected_once: Cell::new(false),
         }
     }
@@ -20852,6 +20926,9 @@ mod tests {
                 return true;
             }
             self.selected_once.set(true);
+            if self.never_shows {
+                return true;
+            }
             if !self.select_fails || self.select_applies {
                 let length = range.end - range.start.get();
                 let short = usize::from(self.select_short && length > 0);
@@ -20886,6 +20963,33 @@ mod tests {
             || Ok(field),
         );
         (attempt, report.get(), selected.get())
+    }
+
+    #[test]
+    fn pause_selects_a_field_that_did_not_show_it_again_only_with_time_for_it() {
+        // The field never shows one selection; with a gate holding a second attempt's time the
+        // word is selected twice, without it once.
+        for (left_ms, attempts) in [(None, 2), (Some(900), 1)] {
+            let budget = PasteBudget {
+                deadline: left_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            };
+            let report = Cell::new(TextBarrierReport::default());
+            let (status, cleanup) = select_preceding_text_retrying(
+                "ghbdtn ",
+                PastePatience::Manual,
+                budget,
+                &report,
+                || {
+                    Ok(FakeField {
+                        never_shows: true,
+                        ..fake_field("hello ghbdtn ")
+                    })
+                },
+            );
+            assert_eq!(status, TextBarrierStatus::Mismatch, "{left_ms:?}");
+            assert_eq!(cleanup, Some(SelectionCleanup::Collapsed), "{left_ms:?}");
+            assert_eq!(report.get().attempts, attempts, "{left_ms:?}");
+        }
     }
 
     #[test]
@@ -22284,9 +22388,10 @@ mod tests {
             UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
         assert!(at(automatic).allows_selection(now, PastePatience::Automatic));
         assert!(!at(automatic - 1).allows_selection(now, PastePatience::Automatic));
-        let manual = 2 * UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS
-            + PASTE_MIN_INSTALL_MS
-            + PASTE_AFTER_SUBMIT_MS;
+        // Pause starts as soon as one attempt fits; a second one has to fit again (see
+        // a_pause_selects_again_only_while_another_attempt_fits).
+        let manual =
+            UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
         assert!(at(manual).allows_selection(now, PastePatience::Manual));
         assert!(!at(manual - 1).allows_selection(now, PastePatience::Manual));
         // Less than the least installation is no installation.
