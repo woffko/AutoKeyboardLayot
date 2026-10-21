@@ -267,7 +267,9 @@ moment (a hung or busy window) does not keep them back. Whenever a gate gives up
 the key-ups of keys that were pressed before it armed are delivered at once: they
 type nothing, and holding them back would leave Shift, Ctrl or Space pressed; a gate
 that held nothing else keeps nothing back and does not pause automatic conversion.
-After an internal fault the held keys are replayed unchanged to the same field.
+After an internal fault the held keys are replayed unchanged to the same field. A
+key that such a replay, a hand-back or a recovery would leave pressed (its physical key-up
+passed through after the gate gave up) is released at the end of it.
 Held keys that are not handed back (the gate ended at a click, physical or injected
 by another program, a focus change, injected input, a failed submission or an
 internal fault after the field changed, or the hand-back was refused) wait in memory
@@ -517,6 +519,9 @@ reinstall), the UI thread hands the keys back itself, provided the input target 
 the same, nothing was typed or clicked since and no modifier key is held, no
 password field or excluded or elevated program was found, and the worker is not
 inside an edit that may have selected or typed text (`phase=recovery_handed_back`).
+The worker then finishes that recovery as if it had sent the keys itself: the word at the
+caret is not converted until the next boundary, a prepared recovery is cancelled, and
+automatic conversion resumes when every key went out (policy above).
 
 The tray icon's tooltip shows the mode (or the safety pause and its reason), the
 layout code and the counters. The icon uses version 4 of the notification-area protocol,

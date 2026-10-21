@@ -756,6 +756,13 @@ enum RawInputEvent {
     },
     /// Held keys nobody recovered were deleted; automatic conversion may resume (policy D1).
     RetainedInputExpired,
+    /// The UI thread sent `submitted` of the `requested` inputs of the retained record `token`
+    /// past a stalled worker; the worker finishes that recovery.
+    RetainedInputHandedBack {
+        token: u64,
+        submitted: usize,
+        requested: usize,
+    },
     GateDrainReady {
         token: u64,
         drained_count: usize,
@@ -2277,8 +2284,11 @@ struct AppState {
     diagnostic_worker: Option<JoinHandle<()>>,
     /// Key-ups of keys pressed before a gate, delivered after that gate broke.
     pending_key_releases: Vec<RawKeyEvent>,
-    /// Held keys handed back unchanged after a contained internal fault.
+    /// Held keys handed back unchanged after a contained internal fault, or past a stalled worker.
     pending_held_replay: Vec<RawKeyEvent>,
+    /// The token of the retained record the UI thread handed back past a stalled worker: once its
+    /// keys were sent, the worker finishes the recovery.
+    pending_hand_back: Option<u64>,
     /// Physical key-downs that reached the application, clicks and input injected by other
     /// programs, counted by the hooks. Retained keys are handed back past a busy worker only when
     /// none came after them, as they would land after that newer input.
@@ -4466,6 +4476,7 @@ pub fn run() -> Result<()> {
                 diagnostic_worker: Some(diagnostic_worker),
                 pending_key_releases: Vec::new(),
                 pending_held_replay: Vec::new(),
+                pending_hand_back: None,
                 typed_input: 0,
             });
         });
@@ -5312,34 +5323,57 @@ fn cancel_superseded_key_release(pending: &mut Vec<RawKeyEvent>, event: &RawKeyE
     }
 }
 
-/// Sends what a broken gate queued: the held keys handed back unchanged after a contained fault,
-/// then the key-ups of keys pressed before the gate. Runs in the window procedure, never in a hook.
+/// Held keys a broken gate queued for the window procedure, ready to send.
+struct HeldKeysReturn {
+    inputs: Vec<INPUT>,
+    /// The retained record handed back with them past a stalled worker.
+    handed_back: Option<u64>,
+}
+
+/// Takes what a broken gate queued: the held keys handed back unchanged after a contained fault or
+/// past a stalled worker, then the key-ups of keys pressed before the gate. A key they leave down
+/// is released at the end, as in a recovery.
+fn take_held_keys_return(state: &mut AppState) -> Option<HeldKeysReturn> {
+    if state.pending_held_replay.is_empty() && state.pending_key_releases.is_empty() {
+        return None;
+    }
+    let mut events = core::mem::take(&mut state.pending_held_replay);
+    events.append(&mut state.pending_key_releases);
+    Some(HeldKeysReturn {
+        inputs: build_balanced_replay_inputs(&events).unwrap_or_default(),
+        handed_back: state.pending_hand_back.take(),
+    })
+}
+
+/// Records that `sent` of the inputs of `held` were sent; a record handed back past a stalled
+/// worker is reported to the worker, which finishes its recovery.
+fn finish_held_keys_return(state: &AppState, held: &HeldKeysReturn, sent: usize) {
+    state.gate_diagnostic(
+        "returned",
+        format!("requested={} submitted={sent}", held.inputs.len()),
+    );
+    if let Some(token) = held.handed_back {
+        let _ = state.enqueue(RawInputEvent::RetainedInputHandedBack {
+            token,
+            submitted: sent,
+            requested: held.inputs.len(),
+        });
+    }
+}
+
+/// Sends what a broken gate queued (see take_held_keys_return). Runs in the window procedure,
+/// never in a hook.
 fn send_pending_held_keys() {
-    let pending = APP_STATE.with(|slot| {
-        let mut borrowed = slot.borrow_mut();
-        let state = borrowed.as_mut()?;
-        if state.pending_held_replay.is_empty() && state.pending_key_releases.is_empty() {
-            return None;
-        }
-        let mut events = core::mem::take(&mut state.pending_held_replay);
-        events.append(&mut state.pending_key_releases);
-        Some(events)
-    });
-    let Some(events) = pending else {
+    let Some(held) = APP_STATE.with(|slot| take_held_keys_return(slot.borrow_mut().as_mut()?))
+    else {
         return;
     };
-    let Some(inputs) = build_raw_replay_inputs(&events, INJECTED_EVENT_MARKER) else {
-        return;
-    };
-    let sent = send_input_count(&inputs);
+    let sent = send_input_count(&held.inputs);
     APP_STATE.with(|slot| {
         if let Ok(borrowed) = slot.try_borrow()
             && let Some(state) = borrowed.as_ref()
         {
-            state.gate_diagnostic(
-                "returned",
-                format!("requested={} submitted={sent}", inputs.len()),
-            );
+            finish_held_keys_return(state, &held, sent);
         }
     });
 }
@@ -5519,11 +5553,13 @@ fn hand_back_stalled_retained_input(
         let Some(record) = record else {
             return;
         };
+        state.metrics.recovery_armed.store(false, Ordering::Release);
         state.gate_diagnostic(
             "recovery_handed_back",
             format!("token={} held={}", record.token, record.events.len()),
         );
         state.pending_held_replay.extend(record.events);
+        state.pending_hand_back = Some(record.token);
         state.post_held_keys_return();
     });
 }
@@ -7669,6 +7705,7 @@ impl InputProcessor {
                 RawInputEvent::ProfileRefresh => "profiles",
                 RawInputEvent::RecoverInput { .. } => "recovery",
                 RawInputEvent::RetainedInputExpired => "recovery_expired",
+                RawInputEvent::RetainedInputHandedBack { .. } => "recovery_handed_back",
                 RawInputEvent::Mouse => "mouse",
                 RawInputEvent::ExternalInjection => "external",
                 RawInputEvent::ReloadConfiguration => "configuration",
@@ -7714,6 +7751,16 @@ impl InputProcessor {
         if matches!(queued.event, RawInputEvent::RetainedInputExpired) {
             // Not input: a newer input epoch must not drop the decision to resume.
             self.resume_after_recovered_abort(Instant::now());
+            return;
+        }
+        if let RawInputEvent::RetainedInputHandedBack {
+            token,
+            submitted,
+            requested,
+        } = queued.event
+        {
+            // Not input either: the keys were typed whatever epoch the queue is in now.
+            self.finish_recovery(token, false, submitted, requested);
             return;
         }
         let current_epoch = self.metrics.input_epoch.load(Ordering::Acquire);
@@ -7807,6 +7854,7 @@ impl InputProcessor {
             }
             RawInputEvent::ReloadConfiguration => unreachable!(),
             RawInputEvent::RetainedInputExpired => unreachable!(),
+            RawInputEvent::RetainedInputHandedBack { .. } => unreachable!(),
             RawInputEvent::GateDrainReady { .. } => unreachable!(),
         }
     }
@@ -11681,6 +11729,11 @@ fn build_recovery_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
     if held.is_empty() || held.len() > CORRECTION_GATE_CAPACITY * 2 + 1 {
         return None;
     }
+    build_balanced_replay_inputs(held)
+}
+
+/// Replays `held` and then releases every key it leaves down.
+fn build_balanced_replay_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
     let mut inputs = build_raw_replay_inputs(held, INJECTED_EVENT_MARKER)?;
     // Physical key-ups may have passed through after the gate was cancelled.
     // Balance every remaining down edge, so restoring cannot latch Win/Ctrl.
@@ -13371,6 +13424,7 @@ mod tests {
             diagnostic_worker: None,
             pending_key_releases: Vec::new(),
             pending_held_replay: Vec::new(),
+            pending_hand_back: None,
             typed_input: 0,
         };
         (state, receiver)
@@ -20762,6 +20816,130 @@ mod tests {
         }
         assert_eq!(privacy_reason_from_code(PRIVACY_ALLOWED), None);
         assert_eq!(privacy_reason_from_code(PRIVACY_UNAVAILABLE), unavailable);
+    }
+
+    /// The scan code and whether it is a key-up, of every keyboard input.
+    fn scan_edges(inputs: &[INPUT]) -> Vec<(u16, bool)> {
+        inputs
+            .iter()
+            .map(|input| {
+                let key = unsafe { input.Anonymous.ki };
+                (key.wScan, key.dwFlags.contains(KEYEVENTF_KEYUP))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_keys_the_ui_thread_returns_leave_no_key_down() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let edge = |message, key, scan_code| RawKeyEvent {
+            scan_code,
+            ..test_raw_key(message, key, 0, 0)
+        };
+        // Shift is still down when the gate breaks; its physical key-up passes through later.
+        state.pending_held_replay.extend([
+            edge(WM_KEYDOWN, VK_LSHIFT, 0x2a),
+            edge(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0x22),
+            edge(WM_KEYUP, VIRTUAL_KEY(0x47), 0x22),
+        ]);
+        state
+            .pending_key_releases
+            .push(edge(WM_KEYUP, VK_LCONTROL, 0x1d));
+        let held = take_held_keys_return(&mut state).unwrap();
+        assert_eq!(
+            scan_edges(&held.inputs),
+            [
+                (0x2a, false),
+                (0x22, false),
+                (0x22, true),
+                (0x1d, true),
+                (0x2a, true)
+            ]
+        );
+        assert_eq!(held.handed_back, None);
+        assert!(state.pending_held_replay.is_empty());
+        assert!(state.pending_key_releases.is_empty());
+        assert!(take_held_keys_return(&mut state).is_none());
+    }
+
+    #[test]
+    fn keys_handed_back_past_a_stalled_worker_disarm_recovery_and_report_to_it() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(retained_at));
+        metrics.worker_busy.store(true, Ordering::Release);
+        metrics.recovery_armed.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let mut state = take_app_state().unwrap();
+        assert!(metrics.retained_input.lock().unwrap().is_none());
+        // Pause no longer has anything to recover.
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+        let held = take_held_keys_return(&mut state).unwrap();
+        assert_eq!(held.handed_back, Some(10));
+        assert_eq!(held.inputs.len(), 2, "the held G is released as well");
+        finish_held_keys_return(&state, &held, 1);
+        let reports: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|queued| match queued.event {
+                RawInputEvent::RetainedInputHandedBack {
+                    token,
+                    submitted,
+                    requested,
+                } => Some((token, submitted, requested)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports, [(10, 1, 2)]);
+        // Keys a broken gate returns by itself are no recovery: nothing to report.
+        state
+            .pending_key_releases
+            .push(test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0));
+        let held = take_held_keys_return(&mut state).unwrap();
+        finish_held_keys_return(&state, &held, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_worker_finishes_the_recovery_of_keys_the_ui_thread_handed_back() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let pause = || {
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.safety_paused.store(true, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(ConversionFailureReason::GateDrain as u8, Ordering::Release);
+        };
+        let handed_back = |processor: &mut InputProcessor, submitted| {
+            let queued_epoch = metrics.input_epoch.load(Ordering::Acquire);
+            // The gate abort and the stale recovery the worker found nothing for moved it on.
+            metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+            processor.process_event(QueuedInputEvent {
+                epoch: queued_epoch,
+                captured_at: Instant::now(),
+                event: RawInputEvent::RetainedInputHandedBack {
+                    token: 10,
+                    submitted,
+                    requested: 2,
+                },
+                configuration: None,
+            });
+        };
+        // Only some of the keys went out: the session is unknown, the pause stays.
+        pause();
+        handed_back(&mut processor, 1);
+        assert!(processor.session.is_suppressed());
+        assert!(processor.recovered_mid_word);
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        // All of them: policy D1 resumes automatic conversion.
+        processor.session.clear();
+        handed_back(&mut processor, 2);
+        assert!(processor.session.is_suppressed());
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(!metrics.safety_paused.load(Ordering::Acquire));
     }
 
     #[test]
