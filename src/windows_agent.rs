@@ -729,18 +729,29 @@ impl CorrectionGate {
         true
     }
 
-    fn prepare_handoff_budget(&mut self, old_token: u64, required_ms: u64) -> bool {
+    /// Prepares handing the gate of `old_token` over to a conversion that needs `required_ms`.
+    /// Returns what the gate has left at `now`, which the conversion may use, when that covers
+    /// `required_ms`.
+    fn prepare_handoff_budget(
+        &mut self,
+        old_token: u64,
+        required_ms: u64,
+        now: Instant,
+    ) -> Option<u64> {
+        let remaining_ms =
+            u64::try_from(self.deadline.saturating_duration_since(now).as_millis()).ok()?;
         if !self.active
             || self.cancelled
             || !self.awaiting_worker_ack
             || self.token != old_token
             || required_ms == 0
             || required_ms > CORRECTION_GATE_MAX_HOLD_MS
+            || remaining_ms < required_ms
         {
-            return false;
+            return None;
         }
         self.handoff_budget_ms = required_ms;
-        true
+        Some(remaining_ms)
     }
 }
 
@@ -4816,14 +4827,17 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         GATE_HANDOFF_BUDGET_MESSAGE => {
             let old_token = wparam.0 as u64;
             let required_ms = u64::try_from(lparam.0).unwrap_or_default();
-            let prepared = APP_STATE.with(|slot| {
-                slot.borrow_mut().as_mut().is_some_and(|state| {
-                    state
-                        .correction_gate
-                        .prepare_handoff_budget(old_token, required_ms)
+            // What the gate has left, or 0 when it cannot be handed over.
+            let remaining_ms = APP_STATE.with(|slot| {
+                slot.borrow_mut().as_mut().and_then(|state| {
+                    state.correction_gate.prepare_handoff_budget(
+                        old_token,
+                        required_ms,
+                        Instant::now(),
+                    )
                 })
             });
-            LRESULT(prepared as isize)
+            LRESULT(remaining_ms.map_or(0, |remaining_ms| remaining_ms as isize))
         }
         LEXICON_SAVED_MESSAGE => {
             finish_lexicon_saves(hwnd);
@@ -8167,16 +8181,14 @@ impl InputProcessor {
                             conversion_gate_budget_ms(step_count, false, false)
                         }
                     });
-            if pending_matches
-                && required_ms.is_some_and(|required_ms| {
+            let deadline = required_ms
+                .filter(|_| pending_matches)
+                .and_then(|required_ms| {
                     self.handoff_correction_gate(token, deferred.boundary_sequence, required_ms)
-                })
-            {
-                // The handed-over gate had at least `required_ms` left.
-                self.edit_deadline.set(
-                    required_ms
-                        .map(|required_ms| Instant::now() + Duration::from_millis(required_ms)),
-                );
+                });
+            if let Some(deadline) = deadline {
+                // The edit has what the handed-over gate has left, at least `required_ms`.
+                self.edit_deadline.set(Some(deadline));
                 self.execute_pending_conversion(deferred.boundary_sequence);
                 return;
             }
@@ -10892,31 +10904,40 @@ impl InputProcessor {
         armed
     }
 
-    fn handoff_correction_gate(&self, old_token: u64, new_token: u64, required_ms: u64) -> bool {
-        self.prepare_gate_handoff_budget(old_token, required_ms)
-            && self.send_gate_drain_ack(old_token, new_token) == GateAckOutcome::Accepted
+    /// Hands the gate of `old_token` over to the conversion of `new_token`, which needs
+    /// `required_ms`. Returns the gate's deadline, which the conversion's edit may use.
+    fn handoff_correction_gate(
+        &self,
+        old_token: u64,
+        new_token: u64,
+        required_ms: u64,
+    ) -> Option<Instant> {
+        let deadline = self.prepare_gate_handoff_budget(old_token, required_ms)?;
+        (self.send_gate_drain_ack(old_token, new_token) == GateAckOutcome::Accepted)
+            .then_some(deadline)
     }
 
-    fn prepare_gate_handoff_budget(&self, old_token: u64, required_ms: u64) -> bool {
+    /// Asks the UI thread to prepare a handoff; it answers what the gate has left (0: no). The
+    /// deadline is counted from before the question, so it is never later than the gate's.
+    fn prepare_gate_handoff_budget(&self, old_token: u64, required_ms: u64) -> Option<Instant> {
         if old_token == 0 || required_ms == 0 || self.gate_window == 0 {
-            return false;
+            return None;
         }
-        let Ok(required_ms) = isize::try_from(required_ms) else {
-            return false;
-        };
+        let required = isize::try_from(required_ms).ok()?;
+        let asked_at = Instant::now();
         let mut message_result = 0usize;
         let sent = unsafe {
             SendMessageTimeoutW(
                 HWND(self.gate_window as *mut c_void),
                 GATE_HANDOFF_BUDGET_MESSAGE,
                 WPARAM(old_token as usize),
-                LPARAM(required_ms),
+                LPARAM(required),
                 SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
                 100,
                 Some(&mut message_result),
             )
         };
-        sent.0 != 0 && message_result == 1
+        handed_over_gate_deadline(sent.0 != 0, asked_at, message_result, required_ms)
     }
 
     fn acknowledge_correction_gate_drain(&self, token: u64) {
@@ -11506,6 +11527,20 @@ const fn should_arm_space_decision_gate(
         && privacy_reason == PRIVACY_ALLOWED
         && !gate_active
         && shortcut_modifiers_released
+}
+
+/// The deadline of a gate handed over to a conversion: `answer` is what the gate had left when
+/// the UI thread was asked at `asked_at` (0: it cannot be handed over). An answer short of
+/// `required_ms` refuses it as well.
+fn handed_over_gate_deadline(
+    sent: bool,
+    asked_at: Instant,
+    answer: usize,
+    required_ms: u64,
+) -> Option<Instant> {
+    let remaining_ms = u64::try_from(answer).ok()?;
+    (sent && remaining_ms != 0 && remaining_ms >= required_ms)
+        .then(|| asked_at + Duration::from_millis(remaining_ms))
 }
 
 fn post_layout_switch(expected: ForegroundContext, target_layout: HKL) -> bool {
@@ -16516,15 +16551,43 @@ mod tests {
         let mut gate = CorrectionGate::default();
         gate.activate(10);
         gate.awaiting_worker_ack = true;
-        assert!(gate.prepare_handoff_budget(10, 839));
+        assert!(
+            gate.prepare_handoff_budget(10, 839, Instant::now())
+                .is_some()
+        );
         gate.deadline = now + Duration::from_millis(838);
         assert!(!gate.handoff(10, 20, now));
 
         gate.activate(10);
         gate.awaiting_worker_ack = true;
-        assert!(gate.prepare_handoff_budget(10, 789));
+        assert!(
+            gate.prepare_handoff_budget(10, 789, Instant::now())
+                .is_some()
+        );
         gate.deadline = now + Duration::from_millis(789);
         assert!(gate.handoff(10, 20, now));
+    }
+
+    #[test]
+    fn a_handed_over_gate_gives_its_conversion_what_it_has_left() {
+        // The UI thread answers what the gate has left, when that covers the conversion.
+        let now = Instant::now();
+        let mut gate = CorrectionGate::default();
+        gate.activate(10);
+        gate.awaiting_worker_ack = true;
+        gate.deadline = now + Duration::from_millis(900);
+        assert_eq!(gate.prepare_handoff_budget(10, 901, now), None);
+        assert_eq!(gate.prepare_handoff_budget(10, 800, now), Some(900));
+        assert_eq!(gate.handoff_budget_ms, 800);
+        // The worker counts it from before it asked.
+        let asked_at = Instant::now();
+        assert_eq!(
+            handed_over_gate_deadline(true, asked_at, 1_080, 770),
+            Some(asked_at + Duration::from_millis(1_080))
+        );
+        assert_eq!(handed_over_gate_deadline(true, asked_at, 0, 770), None);
+        assert_eq!(handed_over_gate_deadline(true, asked_at, 769, 770), None);
+        assert_eq!(handed_over_gate_deadline(false, asked_at, 1_080, 770), None);
     }
 
     #[test]
@@ -16638,7 +16701,10 @@ mod tests {
         let deadline = gate.deadline;
         let now = deadline - Duration::from_secs(1);
 
-        assert!(gate.prepare_handoff_budget(10, 100));
+        assert!(
+            gate.prepare_handoff_budget(10, 100, Instant::now())
+                .is_some()
+        );
         assert!(gate.handoff(10, 20, now));
         assert!(gate.active);
         assert_eq!(gate.token, 20);
@@ -16661,7 +16727,10 @@ mod tests {
         gate.drain_in_flight = false;
         gate.awaiting_worker_ack = true;
         assert!(!gate.can_start_drain(10));
-        assert!(gate.prepare_handoff_budget(10, 200));
+        assert!(
+            gate.prepare_handoff_budget(10, 200, Instant::now())
+                .is_some()
+        );
         let now = Instant::now();
         gate.deadline = now + Duration::from_millis(199);
         assert!(!gate.handoff(10, 20, now));
@@ -22235,7 +22304,11 @@ mod tests {
         assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
     }
 
-    /// A gate window that arms a gate, prepares a handoff and accepts a drain whenever asked.
+    /// What the gate of `accepting_gate_window` has left when the worker prepares a handoff.
+    const ACCEPTING_GATE_REMAINING_MS: u64 = 1_080;
+
+    /// A gate window that arms a gate, prepares a handoff (its gate has
+    /// `ACCEPTING_GATE_REMAINING_MS` left) and accepts a drain whenever asked.
     unsafe extern "system" fn accepting_gate_procedure(
         hwnd: HWND,
         message: u32,
@@ -22243,7 +22316,8 @@ mod tests {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
-            GATE_ARM_MESSAGE | GATE_HANDOFF_BUDGET_MESSAGE | GATE_DRAIN_ACK_MESSAGE => LRESULT(1),
+            GATE_HANDOFF_BUDGET_MESSAGE => LRESULT(ACCEPTING_GATE_REMAINING_MS as isize),
+            GATE_ARM_MESSAGE | GATE_DRAIN_ACK_MESSAGE => LRESULT(1),
             _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         }
     }
@@ -22301,7 +22375,8 @@ mod tests {
             &processor
         ));
 
-        // Handed over to the next word: the gate keeps the keys for what the word's route needs.
+        // Handed over to the next word: the edit has what the gate has left, not only what the
+        // word's route needs (1 ms of scheduling more would otherwise cancel a chained paste).
         let detection = Detection {
             source_language: Language::English,
             target_language: Language::Russian,
@@ -22339,10 +22414,24 @@ mod tests {
             });
             let before = Instant::now();
             processor.process_gate_drain_ready(6, 0, true);
+            assert!(required_ms < ACCEPTING_GATE_REMAINING_MS, "{backend:?}");
             assert!(
-                lets_go_after(before, required_ms, &processor),
+                lets_go_after(before, ACCEPTING_GATE_REMAINING_MS, &processor),
                 "{backend:?}"
             );
+            if backend != TextEditBackend::PhysicalReplay {
+                // A settle step that took 151 ms leaves the selection its time.
+                let budget = PasteBudget {
+                    deadline: processor.edit_deadline.get(),
+                };
+                assert!(
+                    budget.allows_selection(
+                        before + Duration::from_millis(151),
+                        PastePatience::Automatic
+                    ),
+                    "{backend:?}"
+                );
+            }
         }
         // The release the conversion posted is not handled here.
         let mut message = MSG::default();

@@ -321,7 +321,9 @@ stays as well. A paste handled late therefore inserts the replacement rather tha
 the user's previous clipboard (a password, say), unless the program read the
 clipboard on its own and handles the paste more than half a second later. Every
 wait of a paste is fitted
-into the time the correction gate has left: the selection, the clipboard and the
+into the time the correction gate has left, also when the gate was handed over to
+the next word's conversion (the conversion gets what the gate has left, not only what
+its route needs): the selection, the clipboard and the
 Ctrl+V are skipped when what follows them would not fit (`phase=budget`), and a
 Pause press may then wait less than 0.5 seconds for the clipboard.
 Third-party local clipboard readers remain outside the confidentiality
