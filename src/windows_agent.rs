@@ -7212,7 +7212,8 @@ struct InputProcessor {
     // Plays the conversion sounds; started on the first cue while they are enabled.
     sound_player: Option<SyncSender<SoundCue>>,
     // Held keys were replayed without the hooks seeing them, so the word at the caret is unknown:
-    // the next epoch reset keeps the session suppressed instead of clearing it.
+    // until that word ends (a boundary, a click, a focus change), an epoch reset keeps the
+    // session suppressed instead of clearing it.
     recovered_mid_word: bool,
     // The cancelled gate token at the time an automatic edit last failed (0 when none). An edit
     // that failed because of a gate abort forbids resuming after that abort (policy D1).
@@ -7822,6 +7823,7 @@ impl InputProcessor {
                 }
                 self.log_word_discard("mouse", WordDiscardDetail::None);
                 self.last_word_reset = "mouse";
+                self.recovered_mid_word = false;
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
                 self.last_boundary = None;
@@ -8203,6 +8205,7 @@ impl InputProcessor {
                 );
             }
             self.last_word_reset = "focus";
+            self.recovered_mid_word = false;
             self.recent_languages.clear();
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -8578,6 +8581,7 @@ impl InputProcessor {
                 let boundary = input_event == InputEvent::Boundary;
                 if boundary {
                     self.last_word_reset = "boundary";
+                    self.recovered_mid_word = false;
                 }
                 let buffered_before = self.session.buffered_character_count();
                 let token_keys =
@@ -12535,7 +12539,7 @@ mod tests {
     /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
     /// punctuation key prints nothing here.
     pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
-        const KEYS: [(u16, [char; 3]); 43] = [
+        const KEYS: [(u16, [char; 3]); 44] = [
             (0x02, ['1', '1', '1']),
             (0x03, ['2', '2', '2']),
             (0x04, ['3', '3', '3']),
@@ -12578,6 +12582,7 @@ mod tests {
             (0x32, ['m', 'ь', 'm']),
             (0x33, [',', 'б', ',']),
             (0x34, ['.', 'ю', '.']),
+            (0x35, ['/', '.', '-']),
             (0x39, [' ', ' ', ' ']),
         ];
         let column = match layout {
@@ -19350,6 +19355,53 @@ mod tests {
         let epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         processor.reset_for_epoch(epoch);
         assert!(!processor.session.is_suppressed());
+    }
+
+    #[test]
+    fn the_word_a_recovery_left_ends_at_punctuation_a_click_and_a_focus_change() {
+        type EndWord = fn(&mut InputProcessor, ForegroundContext);
+        let endings: [(&str, EndWord); 3] = [
+            ("punctuation", |processor, foreground| {
+                // "/", which no target layout reads as a letter.
+                processor.process_key(RawKeyEvent {
+                    scan_code: 0x35,
+                    foreground,
+                    ..letter(0xbf, 1)
+                });
+            }),
+            ("click", |processor, _| {
+                processor.process_event(QueuedInputEvent {
+                    epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+                    captured_at: Instant::now(),
+                    event: RawInputEvent::Mouse,
+                    configuration: None,
+                });
+            }),
+            ("focus", |processor, foreground| {
+                let elsewhere = ForegroundContext {
+                    hwnd: foreground.hwnd + 8,
+                    focus: foreground.focus + 8,
+                    ..foreground
+                };
+                processor.foreground_override = Some(elsewhere);
+                processor.process_key(RawKeyEvent {
+                    scan_code: 0x1e,
+                    foreground: elsewhere,
+                    ..letter(0x41, 1)
+                });
+            }),
+        ];
+        for (ending, end_word) in endings {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            // An explicit recovery: the input epoch stays.
+            processor.finish_recovery(10, true, 2, 2);
+            end_word(&mut processor, foreground);
+            assert!(!processor.recovered_mid_word, "{ending}");
+            // Turning automatic conversion back on later must not suppress the next word.
+            let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            processor.reset_for_epoch(epoch);
+            assert!(!processor.session.is_suppressed(), "{ending}");
+        }
     }
 
     #[test]

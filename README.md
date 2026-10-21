@@ -469,8 +469,9 @@ minute; an explicit recovery or any other pause stays paused. Keys that are bein
 replayed when their minute ends are not deleted under the replay, and a recovery is
 carried out even when a configuration reload or a hook reinstall came after it was
 requested. The replayed keys
-bypass the hooks, so the word at the caret is not converted until the next word
-boundary. The optional diagnostics log records `phase=armed`, `phase=abort` (with
+bypass the hooks, so the word at the caret is not converted until that word ends
+(a word boundary such as a Space or punctuation, a click or a focus change); once it
+has ended, a later reset no longer holds back the next word. The optional diagnostics log records `phase=armed`, `phase=abort` (with
 counts of `returned` key-ups and `replayed` keys), `phase=returned`,
 `phase=release_forced`, `phase=recovery_discarded` (`reason=expired` after the
 minute), `phase=auto_resumed`, `phase=auto_resume_declined`, `event=ui_stall`
