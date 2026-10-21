@@ -7771,6 +7771,15 @@ impl InputProcessor {
             return;
         }
         let current_epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        if let RawInputEvent::RecoverInput { sequence, explicit } = queued.event {
+            // Held keys are no stale input: a published configuration or a hook reinstall since
+            // the request, or a pending reload, must not leave them waiting until they expire.
+            if self.last_input_epoch != current_epoch {
+                self.reset_for_epoch(current_epoch);
+            }
+            self.recover_retained_input(sequence, explicit);
+            return;
+        }
         if queued.epoch != current_epoch {
             if self.last_input_epoch != current_epoch {
                 self.reset_for_epoch(current_epoch);
@@ -7827,9 +7836,6 @@ impl InputProcessor {
                 self.mark_privacy_dirty(true);
             }
             RawInputEvent::Key(event) => self.process_key(event),
-            RawInputEvent::RecoverInput { sequence, explicit } => {
-                self.recover_retained_input(sequence, explicit)
-            }
             RawInputEvent::ProfileRefresh => {
                 // Like the privacy refresh, never in the way of a fence acknowledgement.
                 if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
@@ -7860,6 +7866,7 @@ impl InputProcessor {
                 self.last_refresh_check = Some((foreground, started.elapsed()));
             }
             RawInputEvent::ReloadConfiguration => unreachable!(),
+            RawInputEvent::RecoverInput { .. } => unreachable!(),
             RawInputEvent::RetainedInputExpired => unreachable!(),
             RawInputEvent::RetainedInputHandedBack { .. } => unreachable!(),
             RawInputEvent::GateDrainReady { .. } => unreachable!(),
@@ -19291,6 +19298,42 @@ mod tests {
         assert!(state.pending_configuration.is_none());
         assert!(!metrics.configuration_pending.load(Ordering::Acquire));
         assert!(!state.drop_rejected_configuration());
+    }
+
+    #[test]
+    fn a_recovery_request_is_handled_after_the_epoch_moved_and_while_a_reload_is_pending() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let (sender, diagnostics) = sync_channel(16);
+        processor.diagnostic_sender = Some(sender);
+        metrics.diagnostics_enabled.store(true, Ordering::Release);
+        // The paste of its gate may have left the word selected: the worker answers without
+        // sending anything.
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(Instant::now()));
+        metrics.selection_left_token.store(10, Ordering::Release);
+        let mut request = |epoch| {
+            processor.process_event(QueuedInputEvent {
+                epoch,
+                captured_at: Instant::now(),
+                event: RawInputEvent::RecoverInput {
+                    sequence: 0,
+                    explicit: false,
+                },
+                configuration: None,
+            });
+            diagnostics
+                .try_iter()
+                .any(|line| line.contains("result=retained reason=selection-left"))
+        };
+        // A configuration was published after the request was queued.
+        let queued_epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        assert!(request(queued_epoch));
+        metrics.configuration_pending.store(true, Ordering::Release);
+        assert!(request(metrics.input_epoch.load(Ordering::Acquire)));
+        assert_eq!(
+            processor.last_input_epoch,
+            metrics.input_epoch.load(Ordering::Acquire)
+        );
     }
 
     #[test]
