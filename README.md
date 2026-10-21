@@ -407,7 +407,12 @@ password field, or an excluded, elevated or uninspectable program or field),
 nothing about the typing there is written at all: no key, word, candidate, Pause,
 queue or field-check line, and switching to a blocked program leaves no line
 either, because even a counter or a timestamp per key would tell a secret's length
-and rhythm. A suppressed word also names what
+and rhythm. An excluded or elevated program is blocked from its first key there,
+whatever key it is (a shortcut, Space, Backspace), and from a configuration reload
+that excludes it; a Space there arms no correction gate, also before the worker has
+seen the program; a shortcut is written only once its field was checked (Tab may
+have moved to a password field); and a key's queue wait is written only while its
+field is known to be allowed. A suppressed word also names what
 cancelled it (`reset=` `unsupported`, `layout`, `shortcut`, `mouse`, `focus`,
 `backspace`, `delete`, `navigation` or `external-input`), and an unsupported key is
 logged by class only (`class=no-character` for a key that prints nothing,

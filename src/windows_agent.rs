@@ -398,6 +398,9 @@ struct ObserverMetrics {
     configuration_rejected: AtomicU64,
     last_input_layout: AtomicUsize,
     privacy_reason: AtomicU8,
+    // The process whose policy the worker applied to `privacy_reason` (0 before any). A key in
+    // another process meets a verdict that is not its own.
+    privacy_process_id: AtomicU32,
     auto_enabled: AtomicBool,
     safety_paused: AtomicBool,
     pause_break_undo: AtomicBool,
@@ -454,6 +457,7 @@ impl Default for ObserverMetrics {
             configuration_rejected: AtomicU64::new(0),
             last_input_layout: AtomicUsize::new(0),
             privacy_reason: AtomicU8::new(PRIVACY_UNAVAILABLE),
+            privacy_process_id: AtomicU32::new(0),
             auto_enabled: AtomicBool::new(false),
             safety_paused: AtomicBool::new(false),
             pause_break_undo: AtomicBool::new(true),
@@ -4857,7 +4861,13 @@ fn report_slow_hook(started: Instant, hook: &str) {
         // The callback may run while this thread holds the state; skip the record then.
         if let Ok(borrowed) = slot.try_borrow()
             && let Some(state) = borrowed.as_ref()
-            && slow_hook_may_be_logged(hook, state.metrics.privacy_reason.load(Ordering::Acquire))
+            && slow_hook_may_be_logged(
+                hook,
+                hook_privacy_reason(
+                    &state.metrics,
+                    current_foreground_context().map_or(0, |current| current.process_id),
+                ),
+            )
         {
             state.event_diagnostic(
                 "hook_slow",
@@ -4865,6 +4875,16 @@ fn report_slow_hook(started: Instant, hook: &str) {
             );
         }
     });
+}
+
+/// The privacy verdict the hooks act on for input to `process_id`: the worker's, once it applied
+/// that process's policy; before that the program may be an excluded one, so it is unknown. The
+/// worker publishes the process after the verdict.
+fn hook_privacy_reason(metrics: &ObserverMetrics, process_id: u32) -> u8 {
+    if metrics.privacy_process_id.load(Ordering::Acquire) != process_id {
+        return PRIVACY_UNAVAILABLE;
+    }
+    metrics.privacy_reason.load(Ordering::Acquire)
 }
 
 /// A slow keyboard callback is one line per key when the system is loaded: while privacy blocks
@@ -5080,7 +5100,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         key_down,
                         event.vkCode as u16,
                         state.metrics.auto_enabled.load(Ordering::Acquire),
-                        state.metrics.privacy_reason.load(Ordering::Acquire),
+                        hook_privacy_reason(&state.metrics, foreground.process_id),
                         state.correction_gate.active,
                         shortcut_modifiers_released(),
                     ) && !has_retained_input(&state.metrics)
@@ -7733,13 +7753,22 @@ impl InputProcessor {
                 RawInputEvent::ExternalInjection => "external",
                 RawInputEvent::ReloadConfiguration => "configuration",
             };
-            self.diagnostic(
-                "input_queue",
-                format!(
-                    "kind={kind} wait_ms={queue_wait_ms} queued_epoch={}",
-                    queued.epoch
-                ),
+            // A key's wait is about typing: it is not written while the privacy of its input
+            // target is unknown (a new window, a field not checked since the focus may have moved)
+            // or blocked.
+            let unknown_target = matches!(
+                &queued.event,
+                RawInputEvent::Key(key) if !self.privacy_known_allowed(key.foreground)
             );
+            if !unknown_target {
+                self.diagnostic(
+                    "input_queue",
+                    format!(
+                        "kind={kind} wait_ms={queue_wait_ms} queued_epoch={}",
+                        queued.epoch
+                    ),
+                );
+            }
         }
         match queued.event {
             RawInputEvent::PrivacyRefresh(_) => self
@@ -7961,6 +7990,10 @@ impl InputProcessor {
         self.last_process_id = None;
         self.process_reason = None;
         self.mark_privacy_dirty(false);
+        // The program in use may be excluded now: blocked at once, not at its next letter.
+        if let Some(foreground) = self.last_key_foreground {
+            self.refresh_process_policy(foreground.process_id);
+        }
         self.diagnostic(
             "configuration",
             format!(
@@ -8205,6 +8238,11 @@ impl InputProcessor {
             if let Some(previous) = self.last_key_foreground {
                 self.remember_word(previous, self.last_layout, Instant::now());
             }
+            // A new window may belong to a new process that reuses the previous one's ID: its
+            // image, integrity and exclusion are read again instead of taken from the cache. A
+            // blocked program is blocked before anything about this key is written.
+            self.last_process_id = None;
+            self.refresh_process_policy(event.foreground.process_id);
             if let Some((hwnd, focus, process_id)) = self.last_foreground {
                 // Handles are opaque identities; only which parts changed is
                 // recorded, to explain words split by transient focus changes.
@@ -8234,10 +8272,6 @@ impl InputProcessor {
             self.resync_modifiers = true;
             self.last_foreground = Some(foreground_key);
             self.last_layout = Some(event.foreground.layout);
-            // A new window may belong to a new process that reuses the previous one's ID: its
-            // image, integrity and exclusion are read again instead of taken from the cache.
-            self.last_process_id = None;
-            self.refresh_process_policy(event.foreground.process_id);
             self.mark_privacy_dirty(false);
         } else if self.last_layout != Some(event.foreground.layout) {
             let expected_switch = self
@@ -8380,6 +8414,10 @@ impl InputProcessor {
                 return;
             }
             let kind = shortcut_kind(event.virtual_key, self.modifiers);
+            // The shortcut may be the first key in a password field (after Tab in a web form):
+            // the field is checked before anything about the shortcut is written.
+            self.ensure_privacy(event.foreground, ProbeTrigger::Typing);
+            self.last_word_reset = "shortcut";
             self.diagnostic(
                 "input",
                 format!("result=suppressed reason=shortcut kind={kind}"),
@@ -9369,6 +9407,14 @@ impl InputProcessor {
         self.execute_pending_conversion(sequence);
     }
 
+    /// Whether `foreground` is the input target the last privacy check found allowed, with no
+    /// reason since to check it again.
+    fn privacy_known_allowed(&self, foreground: ForegroundContext) -> bool {
+        !self.privacy_needs_check
+            && self.privacy_reason.is_none()
+            && self.last_foreground == Some(foreground_identity_key(foreground))
+    }
+
     fn ensure_privacy(&mut self, foreground: ForegroundContext, trigger: ProbeTrigger) -> bool {
         self.refresh_process_policy(foreground.process_id);
         if self.privacy_needs_check {
@@ -9546,6 +9592,14 @@ impl InputProcessor {
             _ => Some(PrivacyBlockReason::InspectionUnavailable),
         };
         self.privacy_needs_check = true;
+        // A blocked program is blocked from its first key on, whatever key that is, and for the
+        // hooks as well: they take the verdict once it names this process.
+        if self.process_reason.is_some() {
+            self.set_privacy_reason(self.process_reason);
+        }
+        self.metrics
+            .privacy_process_id
+            .store(process_id, Ordering::Release);
         // A blocked process leaves no line: it would mark when typing there began.
         if self.process_reason.is_none() {
             self.diagnostic(
@@ -18762,6 +18816,9 @@ mod tests {
         processor.last_foreground = Some(foreground_identity_key(event.foreground));
         processor.last_layout = Some(event.foreground.layout);
         processor.last_process_id = Some(event.foreground.process_id);
+        // A field already checked and allowed, as after typing in it; in one never checked the
+        // shortcut is not written (see a_shortcut_in_a_field_found_to_be_a_password_field_…).
+        processor.privacy_needs_check = false;
         processor.process_key(event);
         let lines: Vec<String> = receiver
             .try_iter()
@@ -19964,6 +20021,125 @@ mod tests {
         assert_eq!(
             processor.privacy_reason,
             Some(PrivacyBlockReason::ExcludedProcess)
+        );
+    }
+
+    #[test]
+    fn the_first_keys_in_an_excluded_program_block_it_at_once_and_leave_no_line() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        let (sender, receiver) = sync_channel(64);
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        // A word begun in the editor, discarded by the switch.
+        type_keys(&mut processor, foreground, &[0x1e, 0x1f]);
+        assert_eq!(processor.session.buffered_character_count(), 2);
+        let _ = receiver.try_iter().count();
+        let keepass = ForegroundContext {
+            hwnd: 50,
+            focus: 50,
+            process_id: 60,
+            ..foreground
+        };
+        processor.foreground_override = Some(keepass);
+        processor.process_override = Some((Some(KEEPASS.to_owned()), Some(0x2000)));
+        // Ctrl+V and keys that type nothing, each slow in the queue.
+        let control = held_keys(&[VK_LCONTROL]);
+        let blocked = privacy_reason_code(Some(PrivacyBlockReason::ExcludedProcess));
+        for event in [
+            RawKeyEvent {
+                held_modifiers: control,
+                ..test_raw_key(WM_KEYDOWN, VK_LCONTROL, 3, 0)
+            },
+            RawKeyEvent {
+                scan_code: 0x2f,
+                held_modifiers: control,
+                ..letter(0x56, 4)
+            },
+            test_raw_key(WM_KEYUP, VK_LCONTROL, 5, 0),
+            test_raw_key(WM_KEYDOWN, VK_BACK, 6, 0),
+            test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0),
+        ] {
+            let event = RawKeyEvent {
+                foreground: keepass,
+                ..event
+            };
+            processor.process(queued_key(&processor, event, Duration::from_millis(100)));
+            // Blocked from the first key on, for the hooks as well: a Space arms no gate there.
+            assert_eq!(
+                processor.privacy_reason,
+                Some(PrivacyBlockReason::ExcludedProcess)
+            );
+            assert_eq!(hook_privacy_reason(&processor.metrics, 60), blocked);
+        }
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    #[test]
+    fn a_shortcut_in_a_field_found_to_be_a_password_field_leaves_no_line() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        // The user name is fine; the field Tab moves to in the same window is a password field.
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-password-next", || {
+                let mut handled = 0;
+                move |_: (ForegroundContext, u64, u64)| {
+                    handled += 1;
+                    (handled > 1).then_some(PrivacyBlockReason::PasswordField)
+                }
+            })
+            .unwrap(),
+        );
+        processor.process_key(letter(0x41, 1));
+        assert!(processor.privacy_reason.is_none());
+        processor.process_key(test_raw_key(WM_KEYDOWN, VK_TAB, 2, 0));
+        let _ = receiver.try_iter().count();
+        let control = held_keys(&[VK_LCONTROL]);
+        for event in [
+            RawKeyEvent {
+                held_modifiers: control,
+                ..test_raw_key(WM_KEYDOWN, VK_LCONTROL, 3, 0)
+            },
+            RawKeyEvent {
+                scan_code: 0x2f,
+                held_modifiers: control,
+                ..letter(0x56, 4)
+            },
+        ] {
+            processor.process(queued_key(&processor, event, Duration::from_millis(100)));
+        }
+        assert!(processor.privacy_reason.is_some());
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    #[test]
+    fn the_hooks_take_a_privacy_verdict_only_for_the_process_it_belongs_to() {
+        let metrics = ObserverMetrics::default();
+        metrics
+            .privacy_reason
+            .store(PRIVACY_ALLOWED, Ordering::Release);
+        metrics.privacy_process_id.store(3, Ordering::Release);
+        assert_eq!(hook_privacy_reason(&metrics, 3), PRIVACY_ALLOWED);
+        // A program the worker has not seen yet may be excluded: its first Space arms no gate.
+        assert_eq!(hook_privacy_reason(&metrics, 4), PRIVACY_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_reload_that_excludes_the_program_in_use_blocks_it_at_once() {
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.process_key(letter(0x41, 1));
+        assert!(processor.privacy_reason.is_none());
+        processor.apply_configuration_reload(Ok(test_reload_snapshot("editor.exe")));
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::ExcludedProcess)
+        );
+        assert_eq!(
+            hook_privacy_reason(&processor.metrics, test_foreground().process_id),
+            privacy_reason_code(Some(PrivacyBlockReason::ExcludedProcess))
         );
     }
 
