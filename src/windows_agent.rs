@@ -98,8 +98,9 @@ use windows::{
                 MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_APPS,
                 VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
                 VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
-                VK_MENU, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_RCONTROL, VK_RETURN, VK_RIGHT,
-                VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+                VK_MENU, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
+                VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+                VK_UP,
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD,
@@ -8452,49 +8453,19 @@ impl InputProcessor {
                 );
             }
             key if key == VK_LEFT.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_left,
-                );
+                self.navigate(language, self.settings.suppress_after_left);
             }
             key if key == VK_RIGHT.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_right,
-                );
+                self.navigate(language, self.settings.suppress_after_right);
             }
             key if key == VK_UP.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_up,
-                );
+                self.navigate(language, self.settings.suppress_after_up);
             }
             key if key == VK_DOWN.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_down,
-                );
+                self.navigate(language, self.settings.suppress_after_down);
             }
             key if key == VK_HOME.0 || key == VK_END.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_home_end,
-                );
+                self.navigate(language, self.settings.suppress_after_home_end);
             }
             key if key == VK_SPACE.0 => {
                 let last_keys = self.replay_keys.clone();
@@ -8565,12 +8536,9 @@ impl InputProcessor {
             }
             key if may_move_focus_within_window(key) => {
                 // These keys type nothing but can move the focus inside the window (closing a
-                // dialog, switching panes, opening a menu): the next key gets a fresh privacy
-                // check, and no earlier good check stands for it.
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(InputEvent::Navigation, language, true);
-                self.mark_privacy_dirty(false);
+                // dialog, switching panes, opening a menu, paging a form): they always end the
+                // word.
+                self.navigate(language, true);
             }
             key if key == VK_RETURN.0 => {
                 self.last_boundary = None;
@@ -9009,6 +8977,17 @@ impl InputProcessor {
         self.replay_keys = last.replay_keys;
         self.manual_only_word = true;
         true
+    }
+
+    /// A key that moves the caret or the focus without typing. It may have moved to another field
+    /// of the same window (Down from a user name to a password field in a web form), so the next
+    /// key gets a fresh privacy check and no earlier good check stands for it, also when the
+    /// word goes on.
+    fn navigate(&mut self, language: Option<Language>, suppress_until_boundary: bool) {
+        self.last_word_reset = "navigation";
+        self.replay_keys.clear();
+        self.handle_switching_rule(InputEvent::Navigation, language, suppress_until_boundary);
+        self.mark_privacy_dirty(false);
     }
 
     fn handle_switching_rule(
@@ -11127,11 +11106,14 @@ impl WordDiscardDetail {
     }
 }
 
-/// Keys that type nothing but can move the focus within one window: Esc, the function keys and
-/// the menu key. Tab, Enter and shortcuts with Ctrl, Alt or Win are handled on their own paths.
+/// Keys that type nothing but can move the focus within one window: Esc, the function keys, the
+/// menu key, Page Up and Page Down. Tab, Enter, the arrows, Home, End and shortcuts with Ctrl, Alt
+/// or Win are handled on their own paths.
 fn may_move_focus_within_window(virtual_key: u16) -> bool {
     virtual_key == VK_ESCAPE.0
         || virtual_key == VK_APPS.0
+        || virtual_key == VK_PRIOR.0
+        || virtual_key == VK_NEXT.0
         || (VK_F1.0..=VK_F24.0).contains(&virtual_key)
 }
 
@@ -20280,6 +20262,33 @@ mod tests {
         assert!(processor.privacy_reason.is_some());
         assert_eq!(processor.last_word_reset, "privacy");
         drop(release);
+    }
+
+    #[test]
+    fn navigation_keys_ask_for_a_fresh_privacy_check_even_when_the_word_goes_on() {
+        // Down may move from a user name to a password field of the same window (a web form).
+        for key in [
+            VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_HOME, VK_END, VK_PRIOR, VK_NEXT,
+        ] {
+            let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+            processor.settings.suppress_after_left = false;
+            processor.settings.suppress_after_right = false;
+            processor.settings.suppress_after_up = false;
+            processor.settings.suppress_after_down = false;
+            processor.settings.suppress_after_home_end = false;
+            processor.process_key(letter(0x41, 1));
+            assert!(!processor.privacy_needs_check, "{key:?}");
+            processor.recent_privacy_ok = Some(RecentPrivacyOk {
+                foreground: test_foreground(),
+                epoch: 0,
+                at: Instant::now(),
+            });
+            let generation = processor.privacy_generation;
+            processor.process_key(test_raw_key(WM_KEYDOWN, key, 2, 0));
+            assert!(processor.privacy_needs_check, "{key:?}");
+            assert!(processor.recent_privacy_ok.is_none(), "{key:?}");
+            assert_ne!(processor.privacy_generation, generation, "{key:?}");
+        }
     }
 
     #[test]

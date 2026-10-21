@@ -239,7 +239,9 @@ and Alt released on the secure desktop of Ctrl+Alt+Del or of a UAC prompt before
 same window has the focus again, stops counting at the next key that finds it released.
 Ordinary focus changes and mouse clicks re-check privacy on the first printable
 key without suppressing that first word. Esc, the function keys and the menu key,
-which can move the focus inside a window, do the same. A field check that was still
+Page Up and Page Down, the arrows, Home and End, which can move the focus inside a
+window (Down from a user name to a password field of a web form), do the same, also
+when the settings let the word go on after an arrow, Home or End. A field check that was still
 running when such a key, Tab, Enter, a click or a shortcut arrived never decides
 the field after it. A new foreground window always has its program read again, so
 a program that reuses the process ID of a closed one does not inherit its verdict.
