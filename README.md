@@ -530,7 +530,13 @@ check reads the field afresh: the late answer of a read left behind describes th
 it was then and never answers a later check, even of the same word.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
-keys typed meanwhile. When the
+keys typed meanwhile. This is deliberate (audit finding E-new-3, kept as it is): if a
+field's provider hangs inside one of these calls, the worker waits with it. The gate then
+breaks at its 1.2 second deadline and keeps the keys typed meanwhile; they are not handed
+back by the UI thread, because the word may be selected and they would type over it, and a
+recovery with Pause waits behind the hung call. Automatic conversion stays paused until the
+call returns; the kept keys are deleted after their minute, with a tray notice, and Exit
+asks whether to exit anyway. When the
 worker is still busy two seconds after a gate broke for a cause that hands its keys
 back without being asked (its deadline, a full gate, a full input queue or a hook
 reinstall), the UI thread hands the keys back itself, provided the input target is
