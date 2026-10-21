@@ -151,6 +151,8 @@
     "recovery.discarded_title": "Entrada retenida eliminada",
     "recovery.discarded_body": "Las pulsaciones se han eliminado de la memoria a petición suya y ya no pueden recuperarse.",
     "recovery.expired_body": "Las pulsaciones retenidas no se recuperaron en un minuto y se han eliminado de la memoria.",
+    "clipboard.not_restored_title": "Portapapeles no restaurado",
+    "clipboard.not_restored_body": "Se pegó una palabra convertida a través del portapapeles y no se pudo devolver lo que había copiado antes. Cópielo de nuevo si todavía lo necesita.",
     "settings.reloaded": "Configuración y listas recargadas.",
     "dictionary.destination": "el diccionario del usuario",
     "word_exclusions.destination": "las palabras excluidas",

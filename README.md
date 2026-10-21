@@ -311,7 +311,8 @@ replacement in time (a busy program), the replacement stays on the clipboard
 until the paste's target process has read it, and the user's clipboard comes back
 half a second after that (the read may be the program's own look at the new
 clipboard, with its paste right behind it); a target that has not read it within
-5 seconds leaves the replacement there (`phase=broker_end result=Unread`). A program
+5 seconds leaves the replacement there (`phase=broker_end result=Unread`, with a tray
+notice that the clipboard was not restored). A program
 that opens the clipboard without a window, as .NET programs, consoles and many
 toolkits do, cannot be named by the clipboard: such a read after the Ctrl+V counts as
 the target's, one before it does not. Only the first program to read the
@@ -511,7 +512,11 @@ When the text edit is
 confirmed but the previous clipboard contents cannot be put back (restoring
 waits up to 60 ms for the clipboard), the conversion still counts as done:
 automatic conversion stays on and the diagnostics log records
-`clipboard_restored=false`. A field that could not be inspected or selected is
+`clipboard_restored=false`. Whenever the user's clipboard does not come back (before
+the Ctrl+V, after a paste that failed later, after a restore that took too long and
+then failed, or when an unconfirmed paste's target never read the replacement), a tray
+notice says so, once for the failures since the last notice, so that the user can copy
+it again; a restore that is merely slow and then succeeds is not reported. A field that could not be inspected or selected is
 no failed edit either. Failures after the paste name their own reason in the
 tray: `text-commit` (the replacement did not show), `layout-switch` (the layout
 did not switch after it) or `clipboard-edit` (the paste chord was not sent

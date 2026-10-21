@@ -151,6 +151,8 @@
     "recovery.discarded_title": "Zurückgehaltene Eingabe gelöscht",
     "recovery.discarded_body": "Die Tastendrücke wurden auf Ihren Wunsch aus dem Speicher gelöscht und können nicht mehr wiederhergestellt werden.",
     "recovery.expired_body": "Die zurückgehaltenen Tastendrücke wurden nicht innerhalb einer Minute wiederhergestellt und wurden aus dem Speicher gelöscht.",
+    "clipboard.not_restored_title": "Zwischenablage nicht wiederhergestellt",
+    "clipboard.not_restored_body": "Ein umgewandeltes Wort wurde über die Zwischenablage eingefügt, und was Sie zuvor kopiert hatten, konnte nicht zurückgelegt werden. Kopieren Sie es erneut, wenn Sie es noch brauchen.",
     "settings.reloaded": "Einstellungen und Listen neu geladen.",
     "dictionary.destination": "das Benutzerwörterbuch",
     "word_exclusions.destination": "die Wortausnahmen",

@@ -163,6 +163,8 @@
     "recovery.discarded_title": "Retained input deleted",
     "recovery.discarded_body": "The keystrokes were removed from memory at your request and can no longer be recovered.",
     "recovery.expired_body": "The retained keystrokes were not recovered within a minute and have been deleted from memory.",
+    "clipboard.not_restored_title": "Clipboard not restored",
+    "clipboard.not_restored_body": "A converted word was pasted through the clipboard, and what you had copied before could not be put back. Copy it again if you still need it.",
     "settings.reloaded": "Settings and lists reloaded.",
     "dictionary.destination": "the user dictionary",
     "word_exclusions.destination": "word exclusions",

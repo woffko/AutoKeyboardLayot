@@ -148,6 +148,8 @@
     "recovery.discarded_title": "保持された入力を削除しました",
     "recovery.discarded_body": "指定されたとおり、キー入力をメモリから削除しました。これ以降は復元できません。",
     "recovery.expired_body": "保持されたキー入力が1分以内に復元されなかったため、メモリから削除しました。",
+    "clipboard.not_restored_title": "クリップボードを元に戻せませんでした",
+    "clipboard.not_restored_body": "変換した単語をクリップボード経由で貼り付けましたが、以前コピーした内容を戻せませんでした。まだ必要な場合はもう一度コピーしてください。",
     "settings.reloaded": "設定とリストを再読み込みしました。",
     "dictionary.destination": "ユーザー辞書",
     "word_exclusions.destination": "除外する単語の一覧",

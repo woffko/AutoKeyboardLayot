@@ -1493,6 +1493,8 @@ struct ProtectedClipboard<'a> {
     active: bool,
     /// When the Ctrl+V was about to be sent.
     submitted_at: Option<Instant>,
+    /// The last command was not answered in time: the broker finishes on its own.
+    lingering: bool,
 }
 
 impl<'a> ProtectedClipboard<'a> {
@@ -1556,6 +1558,7 @@ impl<'a> ProtectedClipboard<'a> {
                 probe,
                 active: true,
                 submitted_at: None,
+                lingering: false,
             }),
             _ => {
                 shared.cancelled.store(true, Ordering::Release);
@@ -1578,7 +1581,7 @@ impl<'a> ProtectedClipboard<'a> {
 
     /// Puts the user's clipboard back if the clipboard still holds the replacement. Waits
     /// `CLIPBOARD_RESTORE_WAIT_MS` for the broker; a restore that takes longer finishes on its
-    /// own and is logged when it is over.
+    /// own and is logged and counted when it is over (`restore_pending`).
     fn restore(&mut self) -> bool {
         if !self.active {
             return true;
@@ -1591,6 +1594,12 @@ impl<'a> ProtectedClipboard<'a> {
             let _ = self.finish(ClipboardBrokerCommand::Abandon);
             false
         }
+    }
+
+    /// The restore did not answer in time: whether the user's clipboard came back is known only
+    /// once its broker is over.
+    fn restore_pending(&self) -> bool {
+        self.lingering
     }
 
     /// The Ctrl+V was sent and not confirmed: the broker leaves the replacement until the paste's
@@ -1625,6 +1634,7 @@ impl<'a> ProtectedClipboard<'a> {
             if response.is_some() {
                 let _ = worker.join();
             } else {
+                self.lingering = true;
                 self.brokers.linger(worker, Arc::clone(&self.shared));
             }
         }
@@ -2320,6 +2330,8 @@ struct AppState {
     /// The token of the retained record the UI thread handed back past a stalled worker: once its
     /// keys were sent, the worker finishes the recovery.
     pending_hand_back: Option<u64>,
+    /// `ObserverMetrics::clipboard_restore_failures` as last announced to the user.
+    announced_clipboard_failures: u64,
     /// Physical key-downs that reached the application, clicks and input injected by other
     /// programs, counted by the hooks. Retained keys are handed back past a busy worker only when
     /// none came after them, as they would land after that newer input.
@@ -4242,6 +4254,37 @@ fn update_tray(indicator: LayoutIndicator, now: Instant) {
     }
 }
 
+/// Whether `current` restore failures (`ObserverMetrics::clipboard_restore_failures`) hold one not
+/// announced yet; `announced` then catches up with them.
+fn clipboard_failures_to_announce(announced: &mut u64, current: u64) -> bool {
+    if current <= *announced {
+        return false;
+    }
+    *announced = current;
+    true
+}
+
+/// Tells the user when the clipboard they had did not come back after a paste (once for the
+/// failures since the last notice).
+fn announce_clipboard_failures(hwnd: HWND) {
+    let announce = APP_STATE.with(|slot| {
+        slot.borrow_mut().as_mut().is_some_and(|state| {
+            let current = state
+                .metrics
+                .clipboard_restore_failures
+                .load(Ordering::Relaxed);
+            clipboard_failures_to_announce(&mut state.announced_clipboard_failures, current)
+        })
+    });
+    if announce {
+        show_tray_information(
+            hwnd,
+            tr("clipboard.not_restored_title"),
+            tr("clipboard.not_restored_body"),
+        );
+    }
+}
+
 fn should_notify_conversion_failure(previous: TrayStatus, current: TrayStatus) -> bool {
     !current.auto_enabled && current.failures > previous.failures
 }
@@ -4529,6 +4572,7 @@ pub fn run() -> Result<()> {
                 pending_key_releases: Vec::new(),
                 pending_held_replay: Vec::new(),
                 pending_hand_back: None,
+                announced_clipboard_failures: 0,
                 typed_input: 0,
             });
         });
@@ -4669,6 +4713,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             finish_configuration_load(hwnd);
             expire_correction_gate();
             expire_retained_input(hwnd, Instant::now());
+            announce_clipboard_failures(hwnd);
             hand_back_stalled_retained_input(
                 current_foreground_context(),
                 physical_modifiers_released(),
@@ -7731,9 +7776,15 @@ impl InputProcessor {
     }
 
     /// Logs how each clipboard broker the worker stopped waiting for ended, once it is over.
+    /// Logs how each broker the worker stopped waiting for ended, and counts the user's clipboard
+    /// it did not put back (a deferred paste whose target never read the replacement, a restore or
+    /// an installation that took too long and failed).
     fn log_finished_clipboard_brokers(&self) {
         for end in self.clipboard_brokers.reap() {
             self.diagnostic("paste", format!("phase=broker_end result={end:?}"));
+            if matches!(end, BrokerEnd::NotRestored | BrokerEnd::Unread) {
+                self.count_clipboard_not_restored();
+            }
         }
     }
 
@@ -10481,6 +10532,9 @@ impl InputProcessor {
             // Nothing was sent yet, so putting the user's clipboard back cannot reach the field.
             let restored = clipboard.restore();
             self.diagnostic("paste", format!("sequence={input_sequence} phase=before_submit result=cancelled restored={restored} budget_ok={submit_fits}"));
+            if !restored && !clipboard.restore_pending() {
+                self.count_clipboard_not_restored();
+            }
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         }
 
@@ -10526,6 +10580,9 @@ impl InputProcessor {
         let owned_before_restore = clipboard.is_current();
         let clipboard_restored = clipboard.restore();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
+        if !clipboard_restored && !clipboard.restore_pending() {
+            self.count_clipboard_not_restored();
+        }
         let switched = self.paste_switch_layout(foreground, target_layout, input_sequence);
         self.diagnostic(
             "paste",
@@ -10627,7 +10684,11 @@ impl InputProcessor {
         match attempt {
             TextEditAttempt::Applied => Some(EditStrategy::ProtectedPaste),
             TextEditAttempt::AppliedClipboardNotRestored => {
-                self.note_clipboard_not_restored(sequence);
+                // Counted by the paste, where the clipboard did not come back.
+                self.diagnostic(
+                    "paste",
+                    format!("sequence={sequence} clipboard_restored=false edit=confirmed"),
+                );
                 Some(EditStrategy::ProtectedPaste)
             }
             TextEditAttempt::Cancelled | TextEditAttempt::Unsupported => {
@@ -10659,14 +10720,11 @@ impl InputProcessor {
         }
     }
 
-    fn note_clipboard_not_restored(&self, sequence: u64) {
+    /// Counts a user's clipboard that did not come back after a paste; the tray then says so.
+    fn count_clipboard_not_restored(&self) {
         self.metrics
             .clipboard_restore_failures
             .fetch_add(1, Ordering::Relaxed);
-        self.diagnostic(
-            "paste",
-            format!("sequence={sequence} clipboard_restored=false edit=confirmed"),
-        );
     }
 
     fn perform_physical_edit(
@@ -13609,6 +13667,7 @@ mod tests {
             pending_key_releases: Vec::new(),
             pending_held_replay: Vec::new(),
             pending_hand_back: None,
+            announced_clipboard_failures: 0,
             typed_input: 0,
         };
         (state, receiver)
@@ -14212,10 +14271,7 @@ mod tests {
             processor.apply_paste_attempt_result(TextEditAttempt::Applied, 5, PasteRoute::Backend),
             Some(EditStrategy::ProtectedPaste)
         );
-        assert_eq!(
-            metrics.clipboard_restore_failures.load(Ordering::Acquire),
-            0
-        );
+        // The clipboard is counted by the paste (every_paste_that_could_not_give_the_…).
         assert_eq!(
             processor.apply_paste_attempt_result(
                 TextEditAttempt::AppliedClipboardNotRestored,
@@ -14223,10 +14279,6 @@ mod tests {
                 PasteRoute::Backend
             ),
             Some(EditStrategy::ProtectedPaste)
-        );
-        assert_eq!(
-            metrics.clipboard_restore_failures.load(Ordering::Acquire),
-            1
         );
         assert_eq!(
             processor.apply_paste_attempt_result(
@@ -21599,6 +21651,7 @@ mod tests {
         writer_during_snapshot: Option<String>,
         open_fails: bool,
         install_fails_after_empty: bool,
+        restore_fails: bool,
         /// Processes that read the replacement (0: without a window), and when.
         readers: Vec<(u32, Instant)>,
     }
@@ -21661,9 +21714,11 @@ mod tests {
             let delay = self.0.lock().unwrap().restore_delay;
             thread::sleep(delay);
             let mut state = self.0.lock().unwrap();
-            if expected.is_some_and(|sequence| {
-                state.sequence != sequence || state.owner != FAKE_BROKER_OWNER
-            }) {
+            if state.restore_fails
+                || expected.is_some_and(|sequence| {
+                    state.sequence != sequence || state.owner != FAKE_BROKER_OWNER
+                })
+            {
                 return false;
             }
             state.restores += 1;
@@ -22752,6 +22807,91 @@ mod tests {
             "привет",
             patience,
         )
+    }
+
+    #[test]
+    fn every_paste_that_could_not_give_the_clipboard_back_is_counted_once() {
+        let failures = |processor: &InputProcessor| {
+            processor
+                .metrics
+                .clipboard_restore_failures
+                .load(Ordering::Acquire)
+        };
+        let reap = |processor: &InputProcessor| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while processor.clipboard_brokers.busy() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            processor.log_finished_clipboard_brokers();
+        };
+        // Before its Ctrl+V: the user clicked (what is selected is left to them), and the
+        // clipboard did not come back.
+        let (script, _steps, state) = scripted_paste();
+        state.lock().unwrap().restore_fails = true;
+        let processor = paste_processor(test_foreground(), |metrics| {
+            script.after("begin", user_clicks(metrics))
+        });
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert_eq!(failures(&processor), 1);
+        // After a paste whose layout switch failed.
+        let (mut script, _steps, state) = scripted_paste();
+        state.lock().unwrap().restore_fails = true;
+        script.layout = ReplayAttempt::Failed;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch)
+        );
+        assert_eq!(failures(&processor), 1);
+        // An unconfirmed paste whose target never read the replacement, once its broker is over.
+        let state = fake_clipboard("password");
+        let (mut script, _steps) = ScriptedPaste::new(PasteClipboard::Fake(
+            Arc::clone(&state),
+            Duration::from_millis(100),
+        ));
+        script.commits = vec![ReplayAttempt::Failed].into();
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+        assert_eq!(failures(&processor), 0, "not over yet");
+        reap(&processor);
+        assert_eq!(failures(&processor), 1);
+        // A restore that outlasts its wait: counted once its broker is over, and only if it
+        // failed.
+        for (fails, counted) in [(true, 1), (false, 0)] {
+            let (script, _steps, state) = scripted_paste();
+            {
+                let mut state = state.lock().unwrap();
+                state.restore_fails = fails;
+                state.restore_delay = Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS * 3);
+            }
+            let mut processor = paste_processor(test_foreground(), |_| script);
+            let outcome = run_paste(&processor, PastePatience::Automatic);
+            assert_eq!(outcome, TextEditAttempt::AppliedClipboardNotRestored);
+            processor.apply_paste_attempt_result(outcome, PASTE_SEQUENCE, PasteRoute::Backend);
+            assert_eq!(failures(&processor), 0, "fails={fails}: not known yet");
+            reap(&processor);
+            assert_eq!(failures(&processor), counted, "fails={fails}");
+            // Each end counts once.
+            processor.log_finished_clipboard_brokers();
+            assert_eq!(failures(&processor), counted, "fails={fails}");
+        }
+    }
+
+    #[test]
+    fn a_clipboard_that_did_not_come_back_is_announced_once_per_new_failure() {
+        let mut announced = 0;
+        assert!(!clipboard_failures_to_announce(&mut announced, 0));
+        assert!(clipboard_failures_to_announce(&mut announced, 1));
+        assert!(!clipboard_failures_to_announce(&mut announced, 1));
+        assert!(clipboard_failures_to_announce(&mut announced, 3));
+        assert_eq!(announced, 3);
     }
 
     #[test]

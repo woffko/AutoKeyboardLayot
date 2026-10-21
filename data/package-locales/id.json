@@ -151,6 +151,8 @@
     "recovery.discarded_title": "Masukan yang ditahan dihapus",
     "recovery.discarded_body": "Penekanan tombol dihapus dari memori atas permintaan Anda dan tidak dapat dipulihkan lagi.",
     "recovery.expired_body": "Penekanan tombol yang ditahan tidak dipulihkan dalam satu menit dan telah dihapus dari memori.",
+    "clipboard.not_restored_title": "Papan klip tidak dipulihkan",
+    "clipboard.not_restored_body": "Kata yang dikonversi ditempelkan melalui papan klip, dan apa yang Anda salin sebelumnya tidak dapat dikembalikan. Salin lagi jika Anda masih memerlukannya.",
     "settings.reloaded": "Pengaturan dan daftar dimuat ulang.",
     "dictionary.destination": "kamus pengguna",
     "word_exclusions.destination": "pengecualian kata",

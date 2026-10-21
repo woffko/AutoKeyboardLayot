@@ -148,6 +148,8 @@
     "recovery.discarded_title": "Säilitatud sisestus kustutati",
     "recovery.discarded_body": "Klahvisündmused eemaldati sinu soovil mälust ja neid ei saa enam taastada.",
     "recovery.expired_body": "Säilitatud klahvisündmusi ei taastatud ühe minuti jooksul ja need eemaldati mälust.",
+    "clipboard.not_restored_title": "Lõikelauda ei taastatud",
+    "clipboard.not_restored_body": "Teisendatud sõna kleebiti lõikelaua kaudu ja varem kopeeritut ei õnnestunud tagasi panna. Kopeerige see uuesti, kui seda veel vajate.",
     "settings.reloaded": "Seaded ja loendid loeti uuesti.",
     "dictionary.destination": "kasutaja sõnastikku",
     "word_exclusions.destination": "sõnade välistustesse",

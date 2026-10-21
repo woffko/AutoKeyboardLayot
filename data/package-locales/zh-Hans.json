@@ -155,6 +155,8 @@
     "recovery.discarded_title": "保留的输入已删除",
     "recovery.discarded_body": "已按您的要求从内存中删除按键，无法再恢复。",
     "recovery.expired_body": "保留的按键未在一分钟内恢复，已从内存中删除。",
+    "clipboard.not_restored_title": "剪贴板未恢复",
+    "clipboard.not_restored_body": "转换后的单词已通过剪贴板粘贴，但您之前复制的内容无法放回。如果仍然需要，请重新复制。",
     "settings.reloaded": "已重新加载设置和列表。",
     "dictionary.destination": "用户词典",
     "word_exclusions.destination": "词语排除列表",

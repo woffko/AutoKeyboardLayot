@@ -151,6 +151,8 @@
     "recovery.discarded_title": "Entrada retida excluída",
     "recovery.discarded_body": "Os pressionamentos de teclas foram removidos da memória a seu pedido e não podem mais ser recuperados.",
     "recovery.expired_body": "Os pressionamentos retidos não foram recuperados em um minuto e foram removidos da memória.",
+    "clipboard.not_restored_title": "Área de transferência não restaurada",
+    "clipboard.not_restored_body": "Uma palavra convertida foi colada pela área de transferência, e o que você havia copiado antes não pôde ser reposto. Copie novamente se ainda precisar.",
     "settings.reloaded": "Configurações e listas recarregadas.",
     "dictionary.destination": "o dicionário pessoal",
     "word_exclusions.destination": "as palavras excluídas",

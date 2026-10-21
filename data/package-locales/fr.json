@@ -151,6 +151,8 @@
     "recovery.discarded_title": "Saisie conservée supprimée",
     "recovery.discarded_body": "Les frappes ont été supprimées de la mémoire à votre demande et ne peuvent plus être récupérées.",
     "recovery.expired_body": "Les frappes conservées n’ont pas été récupérées dans la minute et ont été supprimées de la mémoire.",
+    "clipboard.not_restored_title": "Presse-papiers non restauré",
+    "clipboard.not_restored_body": "Un mot converti a été collé via le presse-papiers, et ce que vous aviez copié auparavant n'a pas pu être remis en place. Copiez-le à nouveau si vous en avez encore besoin.",
     "settings.reloaded": "Paramètres et listes rechargés.",
     "dictionary.destination": "le dictionnaire personnel",
     "word_exclusions.destination": "les mots exclus",

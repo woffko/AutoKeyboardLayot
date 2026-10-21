@@ -151,6 +151,8 @@
     "recovery.discarded_title": "حُذف الإدخال المحتفظ به",
     "recovery.discarded_body": "حُذفت ضغطات المفاتيح من الذاكرة بناءً على طلبك ولم تعد قابلة للاستعادة.",
     "recovery.expired_body": "لم تُستعد ضغطات المفاتيح المحتفظ بها خلال دقيقة، فحُذفت من الذاكرة.",
+    "clipboard.not_restored_title": "لم تُستعد الحافظة",
+    "clipboard.not_restored_body": "لُصقت كلمة محوّلة عبر الحافظة، وتعذّرت إعادة ما نسخته من قبل. انسخه مرة أخرى إن كنت لا تزال بحاجة إليه.",
     "settings.reloaded": "أُعيد تحميل الإعدادات والقوائم.",
     "dictionary.destination": "قاموس المستخدم",
     "word_exclusions.destination": "قائمة الكلمات المستثناة",
