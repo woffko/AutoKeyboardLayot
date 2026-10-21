@@ -311,7 +311,10 @@ replacement in time (a busy program), the replacement stays on the clipboard
 until the paste's target process has read it, and the user's clipboard comes back
 half a second after that (the read may be the program's own look at the new
 clipboard, with its paste right behind it); a target that has not read it within
-5 seconds leaves the replacement there. Only the first program to read the
+5 seconds leaves the replacement there (`phase=broker_end result=Unread`). A program
+that opens the clipboard without a window, as .NET programs, consoles and many
+toolkits do, cannot be named by the clipboard: such a read after the Ctrl+V counts as
+the target's, one before it does not. Only the first program to read the
 replacement is seen, so when another program reads it first, the replacement
 stays as well. A paste handled late therefore inserts the replacement rather than
 the user's previous clipboard (a password, say), unless the program read the

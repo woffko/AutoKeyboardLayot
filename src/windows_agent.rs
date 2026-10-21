@@ -1148,10 +1148,14 @@ enum ClipboardBrokerCommand {
     Restore,
     /// Leave the replacement there and drop the copy of the user's clipboard.
     Abandon,
-    /// The Ctrl+V was sent but not confirmed: leave the replacement until `process`, the paste's
-    /// target, has read it, then put the user's clipboard back (`TARGET_READ_GRACE_MS` after the
-    /// read); leave it for good after `wait`.
-    Defer { process: u32, wait: Duration },
+    /// The Ctrl+V was sent at `submitted_at` but not confirmed: leave the replacement until
+    /// `process`, the paste's target, has read it, then put the user's clipboard back
+    /// (`TARGET_READ_GRACE_MS` after the read); leave it for good after `wait`.
+    Defer {
+        process: u32,
+        wait: Duration,
+        submitted_at: Instant,
+    },
 }
 
 /// What a broker found while waiting for the worker.
@@ -1183,6 +1187,9 @@ enum BrokerEnd {
     NotRestored = 3,
     /// The replacement was left there on purpose: its paste was not confirmed.
     Kept = 4,
+    /// The paste was not confirmed and its target never read the replacement within the wait: it
+    /// stays, and the user's clipboard is lost.
+    Unread = 5,
 }
 
 impl BrokerEnd {
@@ -1192,6 +1199,7 @@ impl BrokerEnd {
             2 => Self::Restored,
             3 => Self::NotRestored,
             4 => Self::Kept,
+            5 => Self::Unread,
             _ => Self::Running,
         }
     }
@@ -1295,8 +1303,9 @@ trait ClipboardSystem {
         commands: Option<&Receiver<ClipboardBrokerCommand>>,
         timeout: Option<Duration>,
     ) -> BrokerWait;
-    /// Whether `process` has read the replacement since it was put on the clipboard.
-    fn read_by(&self, process: u32) -> bool;
+    /// Whether `process`, whose Ctrl+V was sent at `submitted_at`, has read the replacement since
+    /// it was put on the clipboard (see replacement_read_by).
+    fn read_by(&self, process: u32, submitted_at: Instant) -> bool;
 }
 
 /// The broker's work: copy the user's clipboard, put the replacement there, report it, and on
@@ -1345,11 +1354,15 @@ fn run_clipboard_broker<S: ClipboardSystem>(
             BrokerWait::Command(ClipboardBrokerCommand::Restore) => {
                 break restore_if_current(system, sequence, &mut snapshot);
             }
-            BrokerWait::Command(ClipboardBrokerCommand::Defer { process, wait }) => {
-                match wait_for_reader(system, commands, sequence, process, wait) {
+            BrokerWait::Command(ClipboardBrokerCommand::Defer {
+                process,
+                wait,
+                submitted_at,
+            }) => {
+                match wait_for_reader(system, commands, sequence, (process, submitted_at), wait) {
                     ReaderWait::Read => break restore_if_current(system, sequence, &mut snapshot),
                     ReaderWait::Replaced => break BrokerEnd::NotRestored,
-                    ReaderWait::Expired => break BrokerEnd::Kept,
+                    ReaderWait::Expired => break BrokerEnd::Unread,
                     ReaderWait::Command(command) => BrokerWait::Command(command),
                 }
             }
@@ -1390,13 +1403,14 @@ enum ReaderWait {
     Command(ClipboardBrokerCommand),
 }
 
-/// Waits up to `wait` for `process` to read the replacement, and `TARGET_READ_GRACE_MS` more once
-/// it did. Requests to render it are served meanwhile, also once the worker no longer listens.
+/// Waits up to `wait` for `target`, the paste's process and when its Ctrl+V was sent, to read the
+/// replacement, and `TARGET_READ_GRACE_MS` more once it did. Requests to render it are served
+/// meanwhile, also once the worker no longer listens.
 fn wait_for_reader<S: ClipboardSystem>(
     system: &mut S,
     commands: &Receiver<ClipboardBrokerCommand>,
     sequence: u32,
-    process: u32,
+    target: (u32, Instant),
     wait: Duration,
 ) -> ReaderWait {
     let mut deadline = Instant::now() + wait;
@@ -1407,7 +1421,7 @@ fn wait_for_reader<S: ClipboardSystem>(
             return ReaderWait::Replaced;
         }
         let now = Instant::now();
-        if !read && system.read_by(process) {
+        if !read && system.read_by(target.0, target.1) {
             read = true;
             deadline = now + Duration::from_millis(TARGET_READ_GRACE_MS);
         }
@@ -1477,7 +1491,8 @@ struct ProtectedClipboard<'a> {
     /// Reads the clipboard's sequence number and owner on the worker's side.
     probe: Box<dyn Fn() -> (u32, usize)>,
     active: bool,
-    submitted: bool,
+    /// When the Ctrl+V was about to be sent.
+    submitted_at: Option<Instant>,
 }
 
 impl<'a> ProtectedClipboard<'a> {
@@ -1540,7 +1555,7 @@ impl<'a> ProtectedClipboard<'a> {
                 brokers,
                 probe,
                 active: true,
-                submitted: false,
+                submitted_at: None,
             }),
             _ => {
                 shared.cancelled.store(true, Ordering::Release);
@@ -1558,7 +1573,7 @@ impl<'a> ProtectedClipboard<'a> {
     /// The Ctrl+V is about to be sent: from now on the replacement stays until the paste was
     /// confirmed (`restore`) or its target read it (`defer`).
     fn mark_submitted(&mut self) {
-        self.submitted = true;
+        self.submitted_at = Some(Instant::now());
     }
 
     /// Puts the user's clipboard back if the clipboard still holds the replacement. Waits
@@ -1589,6 +1604,7 @@ impl<'a> ProtectedClipboard<'a> {
         let _ = self.command.send(ClipboardBrokerCommand::Defer {
             process: self.target_process,
             wait: self.deferred_wait,
+            submitted_at: self.submitted_at.unwrap_or_else(Instant::now),
         });
         if let Some(worker) = self.worker.take() {
             self.brokers.linger(worker, Arc::clone(&self.shared));
@@ -1618,7 +1634,7 @@ impl<'a> ProtectedClipboard<'a> {
 
 impl Drop for ProtectedClipboard<'_> {
     fn drop(&mut self) {
-        if self.submitted {
+        if self.submitted_at.is_some() {
             self.defer();
         } else {
             let _ = self.restore();
@@ -1644,7 +1660,8 @@ thread_local! {
 
 struct BrokerRender {
     text: String,
-    readers: Vec<u32>,
+    /// The process of each request (0 when the clipboard was opened without a window) and when.
+    readers: Vec<(u32, Instant)>,
 }
 
 const CLIPBOARD_BROKER_CLASS: PCWSTR = w!("AutoKeyboardLayotClipboardBroker");
@@ -1686,7 +1703,8 @@ fn forget_replacement() {
 }
 
 /// Puts the replacement's text on the clipboard for a delayed-rendering request; when a program
-/// asked for it, the process of the window holding the clipboard open is noted as a reader.
+/// asked for it, the process of the window holding the clipboard open is noted as a reader, or 0
+/// when it was opened without a window (see replacement_read_by).
 fn render_replacement(requested: bool) {
     BROKER_RENDER.with(|render| {
         let mut render = render.borrow_mut();
@@ -1700,9 +1718,7 @@ fn render_replacement(requested: bool) {
                     GetWindowThreadProcessId(reader, Some(&mut process));
                 }
             }
-            if process != 0 {
-                render.readers.push(process);
-            }
+            render.readers.push((process, Instant::now()));
         }
         if let Some(mut data) = global_utf16(&render.text) {
             let _ = data.transfer(u32::from(CF_UNICODETEXT.0));
@@ -1821,14 +1837,24 @@ impl ClipboardSystem for SystemClipboard {
         wait_clipboard_broker_command(commands, timeout)
     }
 
-    fn read_by(&self, process: u32) -> bool {
+    fn read_by(&self, process: u32, submitted_at: Instant) -> bool {
         BROKER_RENDER.with(|render| {
             render
                 .borrow()
                 .as_ref()
-                .is_some_and(|render| render.readers.contains(&process))
+                .is_some_and(|render| replacement_read_by(&render.readers, process, submitted_at))
         })
     }
+}
+
+/// Whether the paste's target, `process`, has read the replacement among `readers`. A reader that
+/// held the clipboard open without a window (process 0) after the Ctrl+V was sent at
+/// `submitted_at` counts as the target: .NET, consoles and many toolkits read that way, and the
+/// clipboard cannot tell who they are. Before the Ctrl+V such a reader cannot be the paste.
+fn replacement_read_by(readers: &[(u32, Instant)], process: u32, submitted_at: Instant) -> bool {
+    readers
+        .iter()
+        .any(|&(reader, at)| reader == process || (reader == 0 && at >= submitted_at))
 }
 
 fn wait_clipboard_broker_command(
@@ -21548,7 +21574,7 @@ mod tests {
             test_clipboard_unicode(window).as_deref(),
             Some("akl-deferred-probe")
         );
-        assert_eq!(reap_all(&brokers), [BrokerEnd::Kept]);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Unread]);
         assert_eq!(
             test_clipboard_unicode(window).as_deref(),
             Some("akl-deferred-probe")
@@ -21573,8 +21599,8 @@ mod tests {
         writer_during_snapshot: Option<String>,
         open_fails: bool,
         install_fails_after_empty: bool,
-        /// Processes that read the replacement.
-        readers: Vec<u32>,
+        /// Processes that read the replacement (0: without a window), and when.
+        readers: Vec<(u32, Instant)>,
     }
 
     const FAKE_BROKER_OWNER: usize = 7;
@@ -21669,8 +21695,8 @@ mod tests {
             }
         }
 
-        fn read_by(&self, process: u32) -> bool {
-            self.0.lock().unwrap().readers.contains(&process)
+        fn read_by(&self, process: u32, submitted_at: Instant) -> bool {
+            replacement_read_by(&self.0.lock().unwrap().readers, process, submitted_at)
         }
     }
 
@@ -21765,13 +21791,17 @@ mod tests {
         clipboard.defer();
         drop(clipboard);
         // Another program reading it proves nothing: the replacement stays for the late paste.
-        state.lock().unwrap().readers.push(99);
+        state.lock().unwrap().readers.push((99, Instant::now()));
         thread::sleep(Duration::from_millis(50));
         assert_eq!(state.lock().unwrap().text, "привет");
         assert!(brokers.busy());
         // The target reads it. That may be its clipboard listener, with the queued Ctrl+V right
         // after: the replacement stays a moment longer.
-        state.lock().unwrap().readers.push(FAKE_TARGET);
+        state
+            .lock()
+            .unwrap()
+            .readers
+            .push((FAKE_TARGET, Instant::now()));
         thread::sleep(Duration::from_millis(100));
         assert_eq!(state.lock().unwrap().text, "привет");
         assert!(brokers.busy());
@@ -21801,6 +21831,75 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_without_a_window_after_the_ctrl_v_counts_as_the_pastes_target() {
+        let submitted = Instant::now();
+        let before = submitted - Duration::from_millis(1);
+        let after = submitted + Duration::from_millis(1);
+        // .NET, consoles and many toolkits open the clipboard without a window.
+        assert!(replacement_read_by(&[(0, after)], FAKE_TARGET, submitted));
+        // Before the Ctrl+V it cannot be the paste (a clipboard helper, say).
+        assert!(!replacement_read_by(&[(0, before)], FAKE_TARGET, submitted));
+        // Another program with a window proves nothing; the target itself does.
+        assert!(!replacement_read_by(&[(99, after)], FAKE_TARGET, submitted));
+        assert!(replacement_read_by(
+            &[(99, after), (FAKE_TARGET, before)],
+            FAKE_TARGET,
+            submitted
+        ));
+    }
+
+    #[test]
+    fn a_deferred_paste_read_without_a_window_gives_the_clipboard_back() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        // The field reads through OpenClipboard(NULL) while the worker still waits to see the
+        // replacement, and shows it too late for that wait.
+        thread::sleep(Duration::from_millis(5));
+        state.lock().unwrap().readers.push((0, Instant::now()));
+        thread::sleep(Duration::from_millis(5));
+        clipboard.defer();
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_replacement_read_only_before_its_ctrl_v_ends_unread_and_stays() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake_with(
+            &state,
+            &brokers,
+            Duration::from_secs(2),
+            Duration::from_millis(150),
+        )
+        .unwrap();
+        state.lock().unwrap().readers.push((0, Instant::now()));
+        thread::sleep(Duration::from_millis(5));
+        clipboard.mark_submitted();
+        clipboard.defer();
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Unread]);
+        assert_eq!(state.lock().unwrap().text, "привет");
+    }
+
+    #[test]
+    fn a_render_request_without_a_window_holding_the_clipboard_is_noted() {
+        BROKER_RENDER.with(|render| {
+            *render.borrow_mut() = Some(BrokerRender {
+                text: "привет".to_owned(),
+                readers: Vec::new(),
+            });
+        });
+        // Nobody here holds the clipboard open, and without opening it the text is not placed.
+        render_replacement(true);
+        let readers = BROKER_RENDER.with(|render| render.borrow_mut().take().map(|r| r.readers));
+        assert_eq!(readers.map(|readers| readers.len()), Some(1));
+    }
+
+    #[test]
     fn a_replacement_its_target_never_read_stays_on_the_clipboard() {
         // Dropped after the Ctrl+V (an early return), the transaction defers all the same.
         let state = fake_clipboard("password");
@@ -21814,7 +21913,7 @@ mod tests {
         .unwrap();
         clipboard.mark_submitted();
         drop(clipboard);
-        assert_eq!(reap_all(&brokers), [BrokerEnd::Kept]);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Unread]);
         assert_eq!(state.lock().unwrap().text, "привет");
         assert_eq!(state.lock().unwrap().restores, 0);
         // Another program that replaced the replacement keeps its content.
@@ -22702,13 +22801,13 @@ mod tests {
             );
             assert_eq!(steps.lock().unwrap().steps, expected, "{reason:?}");
             // Another program reading it proves nothing.
-            state.lock().unwrap().readers.push(99);
+            state.lock().unwrap().readers.push((99, Instant::now()));
             thread::sleep(Duration::from_millis(30));
             assert_eq!(state.lock().unwrap().text, "привет", "{reason:?}");
             assert!(processor.clipboard_brokers.busy(), "{reason:?}");
             // The field handles its Ctrl+V late and gets the replacement; then the password is
             // back.
-            state.lock().unwrap().readers.push(target);
+            state.lock().unwrap().readers.push((target, Instant::now()));
             assert_eq!(
                 reap_all(&processor.clipboard_brokers),
                 [BrokerEnd::Restored]
@@ -23063,7 +23162,7 @@ mod tests {
             .lock()
             .unwrap()
             .readers
-            .push(test_foreground().process_id);
+            .push((test_foreground().process_id, Instant::now()));
         assert_eq!(
             reap_all(&processor.clipboard_brokers),
             [BrokerEnd::Restored]
