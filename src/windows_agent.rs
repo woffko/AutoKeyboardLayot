@@ -24450,4 +24450,319 @@ public class AklBusyField : Form {
             "the agent did not stop cleanly"
         );
     }
+
+    // Privacy acceptance on the desktop of the test VM: nothing about typing in a blocked field.
+
+    /// A form with a user name box above a password box; its title is the first argument and its
+    /// top edge the second. The message 0x8041 brings it to the front with the user name box
+    /// focused, as a window switch would, without any input the agent could take for injected.
+    const PRIVACY_FORM_SCRIPT: &str = r#"param([string]$Title, [int]$Top)
+$ErrorActionPreference = 'Stop'
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class AklPrivacyForm : Form {
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr process);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    readonly TextBox user = new TextBox();
+    readonly TextBox password = new TextBox();
+    public AklPrivacyForm(string title, int top) {
+        Text = title;
+        StartPosition = FormStartPosition.Manual;
+        SetBounds(80, top, 640, 200);
+        System.Drawing.Font font = new System.Drawing.Font("Segoe UI", 16f);
+        password.UseSystemPasswordChar = true;
+        password.Dock = DockStyle.Bottom;
+        password.Font = font;
+        user.Dock = DockStyle.Top;
+        user.Font = font;
+        Controls.Add(password);
+        Controls.Add(user);
+    }
+    void TakeForeground() {
+        uint other = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint own = GetCurrentThreadId();
+        bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+        SetForegroundWindow(Handle);
+        Activate();
+        user.Focus();
+        if (attached) { AttachThreadInput(own, other, false); }
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x8041) {
+            TakeForeground();
+            m.Result = new IntPtr(1);
+            return;
+        }
+        base.WndProc(ref m);
+    }
+}
+'@
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::Run((New-Object AklPrivacyForm($Title, $Top)))
+"#;
+
+    /// A privacy form of `PRIVACY_FORM_SCRIPT` run by `host`; ended however the test ends.
+    struct PrivacyForm {
+        child: std::process::Child,
+        title: Vec<u16>,
+    }
+
+    impl PrivacyForm {
+        const ACTIVATE: u32 = 0x8041;
+
+        fn start(host: &Path, script: &Path, title: &str, top: i32) -> Self {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let child = std::process::Command::new(host)
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(script)
+                .arg(title)
+                .arg(top.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("start the form");
+            unsafe {
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(child.id());
+            }
+            Self {
+                child,
+                title: title.encode_utf16().chain([0]).collect(),
+            }
+        }
+
+        /// Asks the form to come to the front with its user name box focused, and waits until it
+        /// is there.
+        fn activate(&self) -> ForegroundContext {
+            use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Ok(window) = unsafe { FindWindowW(None, PCWSTR(self.title.as_ptr())) } {
+                    DesktopField::send(window.0 as usize, Self::ACTIVATE, 0, 0);
+                    let settled = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < settled {
+                        if let Some(context) = current_foreground_context()
+                            && context.process_id == self.child.id()
+                            && context.focus != 0
+                            && context.focus != context.hwnd
+                        {
+                            return context;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the form did not take the foreground: {:?}",
+                    current_foreground_context()
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+
+    impl Drop for PrivacyForm {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The `captured_ms` of a diagnostics record.
+    fn captured_ms(line: &str) -> Option<u128> {
+        line.split(' ')
+            .find_map(|field| field.strip_prefix("captured_ms="))
+            .and_then(|value| value.parse().ok())
+    }
+
+    fn now_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    #[test]
+    #[ignore = "runs the agent on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_writes_nothing_about_typing_in_an_excluded_program_or_a_password_field()
+     {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_CLOSE};
+        let profile =
+            std::env::temp_dir().join(format!("akl-privacy-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        // The excluded program is a copy of PowerShell under a name of its own.
+        let excluded_host = profile.join("akl-excluded-field.exe");
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let powershell =
+            PathBuf::from(system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        fs::copy(&powershell, &excluded_host).expect("copy PowerShell");
+        let script = profile.join("akl-privacy-form.ps1");
+        fs::write(&script, PRIVACY_FORM_SCRIPT).expect("form script");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        document.process_exclusions = vec!["akl-excluded-field.exe".to_owned()];
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let escape = [
+            keyboard_input(VK_ESCAPE, 0, Default::default()),
+            keyboard_input(VK_ESCAPE, 0, KEYEVENTF_KEYUP),
+        ];
+        assert!(send_input_batch(&escape));
+        let allowed =
+            PrivacyForm::start(&powershell, &script, "AutoKeyboardLayot allowed form", 60);
+        let excluded = PrivacyForm::start(
+            &excluded_host,
+            &script,
+            "AutoKeyboardLayot excluded form",
+            320,
+        );
+        put_user_clipboard("akl-password");
+        allowed.activate();
+        let agent = thread::spawn(run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let agent_window = loop {
+            if let Ok(window) = unsafe { FindWindowW(WINDOW_CLASS, None) } {
+                break window;
+            }
+            assert!(Instant::now() < deadline, "the agent did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        drop(std::panic::take_hook());
+        thread::sleep(Duration::from_secs(2));
+        let press = |keys: &[(VIRTUAL_KEY, bool)]| {
+            for &(key, up) in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                let flags = if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                };
+                let input = keyboard_input_with_marker(key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                assert!(send_input_batch(&[input]));
+                thread::sleep(Duration::from_millis(40));
+            }
+        };
+        let tap = |keys: &[VIRTUAL_KEY]| {
+            for &key in keys {
+                press(&[(key, false), (key, true)]);
+            }
+        };
+        let paste = || {
+            press(&[
+                (VK_LCONTROL, false),
+                (VIRTUAL_KEY(0x56), false),
+                (VIRTUAL_KEY(0x56), true),
+                (VK_LCONTROL, true),
+            ]);
+        };
+        // The keys of a blocked phase follow its focus change at once, as a user's would: given
+        // time, the periodic field check would find the field blocked before them.
+        // A word begun in the allowed form.
+        allowed.activate();
+        tap(&[VIRTUAL_KEY(0x47), VIRTUAL_KEY(0x48), VIRTUAL_KEY(0x42)]);
+        thread::sleep(Duration::from_millis(300));
+        // The excluded program: a paste, keys that type nothing, then letters.
+        let excluded_from = now_ms();
+        excluded.activate();
+        paste();
+        tap(&[
+            VK_SPACE,
+            VK_BACK,
+            VIRTUAL_KEY(0x41),
+            VIRTUAL_KEY(0x42),
+            VK_SPACE,
+        ]);
+        thread::sleep(Duration::from_millis(300));
+        let excluded_until = now_ms();
+        // Back in the allowed form: a user name, then Tab to its password box and a paste there.
+        allowed.activate();
+        tap(&[
+            VIRTUAL_KEY(0x55),
+            VIRTUAL_KEY(0x53),
+            VIRTUAL_KEY(0x45),
+            VIRTUAL_KEY(0x52),
+        ]);
+        press(&[(VK_TAB, false), (VK_TAB, true)]);
+        thread::sleep(Duration::from_millis(150));
+        let password_from = now_ms();
+        paste();
+        tap(&[VK_SPACE, VIRTUAL_KEY(0x41), VIRTUAL_KEY(0x42), VK_SPACE]);
+        thread::sleep(Duration::from_millis(1_500));
+        let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
+        while !agent.is_finished() && Instant::now() < deadline {
+            unsafe {
+                let _ = PostMessageW(Some(agent_window), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+        let stopped = agent.join();
+        let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+        drop(allowed);
+        drop(excluded);
+        let _ = fs::remove_dir_all(&profile);
+        // Lines about typing: keys, words, the field check, shortcuts, the gate, slow callbacks.
+        // The queue waits of the timer's own refreshes are not about keys.
+        let about_typing = |line: &str| {
+            let queued_typing = line.contains("event=input_queue ")
+                && ["kind=key ", "kind=gate_ack ", "kind=recovery"]
+                    .iter()
+                    .any(|kind| line.contains(kind));
+            queued_typing
+                || [
+                    "event=input ",
+                    "event=word ",
+                    "event=word_discard ",
+                    "event=candidate ",
+                    "event=hotkey ",
+                    "event=privacy_probe ",
+                    "event=gate ",
+                    "event=hook_slow hook=keyboard",
+                    "event=conversion ",
+                    "event=paste",
+                ]
+                .iter()
+                .any(|event| line.contains(event))
+        };
+        let mut leaks = Vec::new();
+        for line in log.lines() {
+            let at = captured_ms(line).unwrap_or(0);
+            let phase = if (excluded_from..excluded_until).contains(&at) {
+                "excluded"
+            } else if at >= password_from && !line.contains("phase=shutdown") {
+                "password"
+            } else {
+                "allowed"
+            };
+            eprintln!("{phase:>8} {line}");
+            if phase != "allowed" && about_typing(line) {
+                leaks.push(format!("{phase}: {line}"));
+            }
+        }
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the agent did not stop cleanly"
+        );
+        assert!(
+            leaks.is_empty(),
+            "lines about typing in a blocked field: {leaks:#?}"
+        );
+    }
 }
