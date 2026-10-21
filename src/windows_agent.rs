@@ -23914,6 +23914,74 @@ public class AklBusyField : Form {
 [System.Windows.Forms.Application]::Run((New-Object AklBusyField))
 "#;
 
+    /// A field that reads a paste the way .NET programs, consoles and many toolkits do: on Ctrl+V
+    /// it opens the clipboard without a window (`OpenClipboard(NULL)`), reads the text at once,
+    /// then stays busy for 400 ms before it shows it, too late for the paste's confirmation.
+    const WINDOWLESS_READER_FIELD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class AklWindowlessReader : Form {
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint format);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr process);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    readonly RichTextBox box = new RichTextBox();
+    public AklWindowlessReader() {
+        Text = "AutoKeyboardLayot windowless reader field";
+        StartPosition = FormStartPosition.Manual;
+        SetBounds(80, 80, 640, 140);
+        box.Multiline = false;
+        box.Dock = DockStyle.Fill;
+        box.Font = new System.Drawing.Font("Segoe UI", 16f);
+        Controls.Add(box);
+        Shown += delegate { TakeForeground(); };
+    }
+    void TakeForeground() {
+        uint other = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint own = GetCurrentThreadId();
+        bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+        SetForegroundWindow(Handle);
+        Activate();
+        box.Focus();
+        if (attached) { AttachThreadInput(own, other, false); }
+    }
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData) {
+        if (keyData == (Keys.Control | Keys.V)) {
+            string text = ReadWithoutWindow();
+            System.Threading.Thread.Sleep(400);
+            if (text != null) { box.SelectedText = text; }
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+    static string ReadWithoutWindow() {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            if (OpenClipboard(IntPtr.Zero)) {
+                try {
+                    IntPtr data = GetClipboardData(13);
+                    if (data == IntPtr.Zero) { return null; }
+                    IntPtr text = GlobalLock(data);
+                    try { return Marshal.PtrToStringUni(text); } finally { GlobalUnlock(data); }
+                } finally { CloseClipboard(); }
+            }
+            System.Threading.Thread.Sleep(2);
+        }
+        return null;
+    }
+}
+'@
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::Run((New-Object AklWindowlessReader))
+"#;
+
     /// The busy field of the desktop acceptance, in front on the interactive session's desktop.
     /// It is ended however the test ends.
     struct DesktopField {
@@ -23929,6 +23997,11 @@ public class AklBusyField : Form {
         /// the foreground by itself, and Start's search window can keep it after a first sign-in:
         /// the search is dismissed and the field is clicked, as the user would.
         fn start() -> Self {
+            Self::start_script(DESKTOP_FIELD_SCRIPT, w!("AutoKeyboardLayot busy field"))
+        }
+
+        /// Starts the field of `source`, whose window has the title `title`.
+        fn start_script(source: &str, title: PCWSTR) -> Self {
             use windows::Win32::Foundation::RECT;
             use windows::Win32::UI::Input::KeyboardAndMouse::{
                 INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
@@ -23946,7 +24019,7 @@ public class AklBusyField : Form {
             thread::sleep(Duration::from_millis(500));
             let script =
                 std::env::temp_dir().join(format!("akl-busy-field-{}.ps1", std::process::id()));
-            fs::write(&script, DESKTOP_FIELD_SCRIPT).expect("field script");
+            fs::write(&script, source).expect("field script");
             let child = {
                 use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -23977,8 +24050,7 @@ public class AklBusyField : Form {
                     field.context = context;
                     return field;
                 }
-                if let Ok(window) = unsafe { FindWindowW(None, w!("AutoKeyboardLayot busy field")) }
-                {
+                if let Ok(window) = unsafe { FindWindowW(None, title) } {
                     unsafe {
                         let _ = SetForegroundWindow(window);
                     }
@@ -24184,6 +24256,61 @@ public class AklBusyField : Form {
             assert_eq!(text, "привет", "{case}");
             assert_eq!(clipboard.as_deref(), Some("akl-password"), "{case}");
         }
+    }
+
+    #[test]
+    #[ignore = "drives a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn a_late_paste_read_without_a_window_on_the_desktop_gives_the_clipboard_back() {
+        let field = DesktopField::start_script(
+            WINDOWLESS_READER_FIELD_SCRIPT,
+            w!("AutoKeyboardLayot windowless reader field"),
+        );
+        let probe = clipboard_test_window(w!("AutoKeyboardLayot windowless reader probe"));
+        put_user_clipboard("akl-password");
+        field.set_text("ghbdtn");
+        // A window that just came up may not show UI Automation its focus yet.
+        thread::sleep(Duration::from_millis(500));
+        let foreground = current_foreground_context().expect("foreground");
+        assert!(
+            same_input_target(foreground, field.context),
+            "the field lost the foreground"
+        );
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor.foreground_override = Some(foreground);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(5, Ordering::Release);
+        let attempt = processor.perform_protected_paste(
+            foreground,
+            5,
+            foreground.layout,
+            HKL(foreground.layout as *mut c_void),
+            "ghbdtn",
+            "привет",
+            PastePatience::Manual,
+        );
+        // The clipboard is read only once the field settled: the field's own read comes first.
+        let text = field.settled_text("ghbdtn");
+        let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(8));
+        let brokers = reap_all(&processor.clipboard_brokers);
+        eprintln!(
+            "attempt={attempt:?} replaced={} clipboard_back={} brokers={brokers:?}",
+            text == "привет",
+            clipboard.as_deref() == Some("akl-password")
+        );
+        for line in receiver
+            .try_iter()
+            .filter(|line| line.starts_with("event=paste"))
+        {
+            eprintln!("  {line}");
+        }
+        unsafe {
+            DestroyWindow(probe).expect("destroy probe window");
+        }
+        drop(field);
+        assert_eq!(text, "привет");
+        assert_eq!(clipboard.as_deref(), Some("akl-password"));
     }
 
     #[test]
