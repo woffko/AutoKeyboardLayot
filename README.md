@@ -102,7 +102,10 @@ for the session and exposes a technical failure counter in the tray status.
   Automation, input and clipboard): the field ends with the replacement and the
   user's clipboard comes back. The test's typing is injected with a marker that
   only test builds take as the user's. These tests need that desktop, so they run
-  alone by name there; other runs pass `--skip on_the_desktop`;
+  alone by name there; other runs pass `--skip on_the_desktop`.
+  `tools/run-settings-desktop-tests.ps1 -TestExecutable <agent test exe> -LogDirectory <new dir>`,
+  started in that session, runs every settings window test below that way, each in a
+  process of its own with `--include-ignored`, and exits with 1 when one fails;
 - on the same desktop, the tray icon in the real notification area: hovering over it
   shows the standard tooltip with the status, and the shell does not ask the program
   for a popup of its own (`NIN_POPUPOPEN`) as it does without `NIF_SHOWTIP` (the XAML
@@ -725,9 +728,10 @@ Each run requires a fresh log directory; per-stage logs and `result.json`
 remain there even if the monitoring connection is interrupted. The build retries
 replacing `result.json` while the monitor holds it open, and the monitor reads a
 receipt it could not read again on its next check. `tools/test-build-scripts.ps1`
-checks these scripts and `tools/run-installer-boundary-tests.ps1` (which reads a
-test's output while it runs) on a Windows machine with stand-ins for cargo and
-for a test executable.
+checks these scripts, `tools/run-installer-boundary-tests.ps1` (which reads a
+test's output while it runs) and `tools/run-settings-desktop-tests.ps1` (one process
+per desktop test, only those of the settings window) on a Windows machine with
+stand-ins for cargo and for test executables.
 
 ## Security
 

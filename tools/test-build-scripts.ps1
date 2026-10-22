@@ -10,7 +10,10 @@ param(
 #                          a while; it reads it again and reports the finished build
 #   boundary-output        run-installer-boundary-tests.ps1 runs test executables that write more
 #                          than a pipe holds; every check passes instead of timing out
-# -ScriptDirectory holds the three scripts under test (the current ones or older copies).
+#   settings-desktop       run-settings-desktop-tests.ps1 runs each ignored settings window desktop
+#                          test in a process of its own with --include-ignored, no other test, and
+#                          reports the one that fails
+# -ScriptDirectory holds the four scripts under test (the current ones or older copies).
 $ErrorActionPreference = 'Stop'
 if (Test-Path -LiteralPath $OutputDirectory) { throw 'Use a new output directory.' }
 New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
@@ -39,6 +42,35 @@ public static class Tests {
         string line = new string('.', 1023);
         for (int i = 0; i < 256; i++) System.Console.WriteLine(line);
         System.Console.WriteLine("test result: ok. " + count + " passed; 0 failed; 0 ignored; 0 measured; 0 filtered out");
+        return 0;
+    }
+}
+'@
+# Desktop test executable stand-in: two settings window tests and an agent test, all ignored; a
+# run counts as one only with --include-ignored and --exact, and the test named *_fails fails.
+Add-Type -OutputType ConsoleApplication -OutputAssembly (Join-Path $bin 'desktoptests.exe') -TypeDefinition @'
+public static class DesktopTests {
+    public static int Main(string[] args) {
+        string line = string.Join(" ", args);
+        string module = "windows_agent::settings_window::desktop_acceptance::";
+        if (line.Contains("--list")) {
+            System.Console.WriteLine(module + "the_settings_window_on_the_desktop_opens: test");
+            System.Console.WriteLine(module + "the_settings_window_on_the_desktop_fails: test");
+            System.Console.WriteLine("windows_agent::tests::the_agent_on_the_desktop_types: test");
+            System.Console.WriteLine();
+            System.Console.WriteLine("3 tests, 0 benchmarks");
+            return 0;
+        }
+        System.IO.File.AppendAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, "runs.txt"), line + "\r\n");
+        if (!line.Contains("--include-ignored") || !line.Contains("--exact")) {
+            System.Console.WriteLine("test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 2 filtered out");
+            return 0;
+        }
+        if (line.Contains("_fails")) {
+            System.Console.WriteLine("test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out");
+            return 101;
+        }
+        System.Console.WriteLine("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out");
         return 0;
     }
 }
@@ -113,6 +145,22 @@ Start-Sleep -Seconds 20
     $run = Run-Script 'run-installer-boundary-tests.ps1' @('-ArtifactManifest', $manifest, '-TestDirectory', $tests, '-LogDirectory', (Join-Path $work 'boundary-logs')) 120
     $result.cases['boundary-output'] = [ordered]@{exit=$run.exit; passed=($run.exit -eq 0 -and $run.output -like '*INSTALLER_BOUNDARY_TESTS_PASSED*');
         timed_out=($run.output -like '*timed out*')}
+
+    # settings-desktop
+    $desktop = Join-Path $work 'desktop'
+    New-Item -ItemType Directory -Path $desktop | Out-Null
+    Copy-Item -LiteralPath (Join-Path $bin 'desktoptests.exe') -Destination $desktop
+    $logs = Join-Path $work 'desktop-logs'
+    $run = Run-Script 'run-settings-desktop-tests.ps1' @('-TestExecutable', (Join-Path $desktop 'desktoptests.exe'), '-LogDirectory', $logs) 60
+    $runs = @()
+    if (Test-Path -LiteralPath (Join-Path $desktop 'runs.txt')) { $runs = @(Get-Content -LiteralPath (Join-Path $desktop 'runs.txt')) }
+    $each = @($runs | Where-Object { $_ -match '^--include-ignored --exact windows_agent::settings_window::desktop_acceptance::the_settings_window_on_the_desktop_(opens|fails) ' })
+    $state = $null
+    try { $state = (Get-Content -LiteralPath (Join-Path $logs 'result.json') -Raw | ConvertFrom-Json) } catch {}
+    $result.cases['settings-desktop'] = [ordered]@{exit=$run.exit; runs=$runs.Count; receipt_state=$state.state;
+        passed=($run.exit -eq 1 -and $runs.Count -eq 2 -and $each.Count -eq 2 -and $state.state -eq 'failed' -and
+            $state.total -eq 2 -and $state.failed -eq 1 -and $run.output -like '*PASS the_settings_window_on_the_desktop_opens*' -and
+            $run.output -like '*FAIL the_settings_window_on_the_desktop_fails*')}
 
     $failed = @($result.cases.Values | Where-Object { -not $_.passed })
     $result.state = if ($failed.Count -eq 0) { 'passed' } else { 'failed' }
