@@ -346,6 +346,11 @@ lock or the disk. When the configuration has changed since the window was opened
 window changed wins, everything else is kept, and list entries added on either
 side stay. A value changed differently in both places is reported; the window then
 shows the current settings with the user's values for those, and Apply saves them.
+The hotkey (whether it is on, its key and its modifiers) is one value there: a key
+chosen in the window and modifiers changed outside never make a third shortcut, they
+are a conflict. A part that does not read back after the merge (more keyboard profiles
+or backend rules than allowed once both sides' additions meet) is reported the same
+way instead of silently keeping the window's.
 The settings application itself is excluded from conversion.
 
 Dictionary and word-exclusion entries take the form `en-US: word`, `ru-RU: слово`,

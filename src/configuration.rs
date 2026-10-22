@@ -487,15 +487,12 @@ impl ConfigurationDocument {
             &theirs.ui_language,
             &mut conflicts,
         );
-        let settings_text: String = merge_map(
+        let settings_text = settings_text(&merge_map(
             &settings_values(&base.settings),
             &settings_values(&ours.settings),
             &settings_values(&theirs.settings),
             &mut conflicts,
-        )
-        .iter()
-        .map(|(key, value)| format!("{key}={value}\n"))
-        .collect();
+        ));
         let profiles = merge_map(
             &profile_values(&base.input_profiles),
             &profile_values(&ours.input_profiles),
@@ -511,15 +508,28 @@ impl ConfigurationDocument {
         .iter()
         .map(|(pattern, strategy)| format!("{pattern} = {strategy}\n"))
         .collect();
+        let settings = parsed_or_ours(
+            "settings",
+            Settings::try_from_text(&settings_text),
+            &ours.settings,
+            &mut conflicts,
+        );
+        let input_profiles = parsed_or_ours(
+            "input_profiles",
+            crate::input_profile_selection::InputProfileSelections::parse(profiles.iter()),
+            &ours.input_profiles,
+            &mut conflicts,
+        );
+        let backend_rules = parsed_or_ours(
+            "backend_rules",
+            BackendRules::from_lines(rules.lines()),
+            &ours.backend_rules,
+            &mut conflicts,
+        );
         let document = Self {
             package_mode,
-            // Every value comes from one of three valid documents.
-            settings: Settings::try_from_text(&settings_text)
-                .unwrap_or_else(|_| ours.settings.clone()),
-            input_profiles: crate::input_profile_selection::InputProfileSelections::parse(
-                profiles.iter(),
-            )
-            .unwrap_or_else(|_| ours.input_profiles.clone()),
+            settings,
+            input_profiles,
             ui_language,
             user_dictionary: merge_entries(
                 &base.user_dictionary,
@@ -536,8 +546,7 @@ impl ConfigurationDocument {
                 &ours.process_exclusions,
                 &theirs.process_exclusions,
             ),
-            backend_rules: BackendRules::from_lines(rules.lines())
-                .unwrap_or_else(|_| ours.backend_rules.clone()),
+            backend_rules,
         };
         if document
             .word_exclusions
@@ -623,6 +632,21 @@ impl ConfigurationDocument {
     }
 }
 
+/// A part of the merge as parsed back. One that does not parse (more profiles or rules than
+/// allowed once both sides' additions meet) is a conflict that keeps the draft's part, never a
+/// silent choice of it that would drop the other side's changes unseen.
+fn parsed_or_ours<T: Clone, E>(
+    name: &str,
+    parsed: Result<T, E>,
+    ours: &T,
+    conflicts: &mut Vec<String>,
+) -> T {
+    parsed.unwrap_or_else(|_| {
+        conflicts.push(name.to_owned());
+        ours.clone()
+    })
+}
+
 /// A three-way merge of one value: the draft's change wins, otherwise the configuration's.
 fn merge_value<T: PartialEq + Clone>(
     name: &str,
@@ -681,15 +705,47 @@ fn merge_entries(base: &[String], ours: &[String], theirs: &[String]) -> Vec<Str
         .collect()
 }
 
+/// The settings keys of the hotkey: whether it is on, its key and its modifiers. They merge as one
+/// value (`HOTKEY_ENTRY`): a key chosen on one side and modifiers on the other would make a
+/// shortcut neither side chose (Shift+A, which swallows every capital A), and a hotkey both sides
+/// changed is a conflict.
+const HOTKEY_KEYS: [&str; 3] = [
+    "pause_break_undo",
+    "force_hotkey_key",
+    "force_hotkey_modifiers",
+];
+const HOTKEY_ENTRY: &str = "force_hotkey";
+
 fn settings_values(settings: &Settings) -> BTreeMap<String, String> {
-    settings
+    let mut values: BTreeMap<String, String> = settings
         .to_text()
         .lines()
         .map(str::trim)
         .filter(|line| !line.starts_with('#'))
         .filter_map(|line| line.split_once('='))
         .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-        .collect()
+        .collect();
+    let hotkey: Vec<String> = HOTKEY_KEYS
+        .iter()
+        .map(|key| values.remove(*key).unwrap_or_default())
+        .collect();
+    values.insert(HOTKEY_ENTRY.to_owned(), hotkey.join("\n"));
+    values
+}
+
+/// The settings text of merged `values`, the hotkey back in its keys.
+fn settings_text(values: &BTreeMap<String, String>) -> String {
+    let mut text = String::new();
+    for (key, value) in values {
+        if key == HOTKEY_ENTRY {
+            for (key, value) in HOTKEY_KEYS.iter().zip(value.split('\n')) {
+                text.push_str(&format!("{key}={value}\n"));
+            }
+        } else {
+            text.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    text
 }
 
 fn profile_values(
@@ -1359,6 +1415,68 @@ mod tests {
             ConfigurationDocument::merge(&base, &ours, &theirs).conflicts,
             ["user_dictionary, word_exclusions"]
         );
+    }
+
+    #[test]
+    fn a_hotkey_changed_on_both_sides_is_one_conflict_never_a_splice() {
+        use crate::hotkey::{HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT};
+        let mut base = ConfigurationDocument::default();
+        base.settings.force_hotkey_virtual_key = 0x7b;
+        base.settings.force_hotkey_modifiers = HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT;
+        // Ctrl+Shift+A in the window, Shift+F12 outside: never Shift+A.
+        let mut ours = base.clone();
+        ours.settings.force_hotkey_virtual_key = 0x41;
+        let mut theirs = base.clone();
+        theirs.settings.force_hotkey_modifiers = HOTKEY_MOD_SHIFT;
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, ["force_hotkey"]);
+        assert_eq!(
+            merged.document.settings.force_hotkey(),
+            Hotkey::new(0x41, HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT).unwrap()
+        );
+        // Switched off outside while another key is chosen in the window: the same one setting.
+        let mut theirs = base.clone();
+        theirs.settings.pause_break_undo = false;
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, ["force_hotkey"]);
+        assert!(merged.document.settings.pause_break_undo);
+        // Changed on one side only, it merges as before.
+        let merged = ConfigurationDocument::merge(&base, &ours, &base);
+        assert!(merged.conflicts.is_empty());
+        assert_eq!(merged.document.settings.force_hotkey_virtual_key, 0x41);
+        let merged = ConfigurationDocument::merge(&base, &base, &theirs);
+        assert!(merged.conflicts.is_empty());
+        assert!(!merged.document.settings.pause_break_undo);
+    }
+
+    #[test]
+    fn a_merge_that_does_not_parse_back_is_a_conflict_never_a_silent_choice() {
+        // More input profiles than allowed once both sides' additions meet.
+        let profiles = |range: std::ops::Range<usize>| {
+            crate::input_profile_selection::InputProfileSelections::parse(
+                range.map(|index| (format!("custom-{index}"), "0409:00000409")),
+            )
+            .unwrap()
+        };
+        let base = ConfigurationDocument::default();
+        let mut ours = base.clone();
+        ours.input_profiles = profiles(0..40);
+        let mut theirs = base.clone();
+        theirs.input_profiles = profiles(40..80);
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, ["input_profiles"]);
+        assert_eq!(merged.document.input_profiles, ours.input_profiles);
+        // Any part: the settings and the backend rules the same way.
+        let mut conflicts = Vec::new();
+        assert_eq!(
+            parsed_or_ours("settings", Err::<u8, ()>(()), &5, &mut conflicts),
+            5
+        );
+        assert_eq!(
+            parsed_or_ours("settings", Ok::<u8, ()>(7), &5, &mut conflicts),
+            7
+        );
+        assert_eq!(conflicts, ["settings"]);
     }
 
     #[test]
