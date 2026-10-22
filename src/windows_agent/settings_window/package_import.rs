@@ -16,6 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
 mod online;
 
+/// Holds the listing of the installed packages back this many milliseconds, so that the desktop
+/// acceptance acts while the refresh at opening still runs, as on a slow disk.
+#[cfg(test)]
+pub(super) static LISTING_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Coarse, path-free reason codes for a failed local package operation, so the
 /// status line can name the failing stage instead of a generic message.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -484,6 +490,10 @@ pub(super) fn wire(
         ui.set_package_import_ready(false);
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, || {
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(
+                LISTING_DELAY_MS.load(Ordering::Relaxed),
+            ));
             let snapshot = store()?
                 .load(&PackageTrust::release().map_err(|_| ImportFailure::Snapshot)?)
                 .map_err(|_| ImportFailure::Snapshot)?;

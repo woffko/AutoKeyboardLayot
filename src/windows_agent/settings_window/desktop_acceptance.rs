@@ -326,6 +326,10 @@ impl Element {
         }
     }
 
+    fn enabled(&self) -> bool {
+        unsafe { self.element.CurrentIsEnabled() }.is_ok_and(|enabled| enabled.as_bool())
+    }
+
     fn focus(&self) {
         unsafe {
             self.element
@@ -1657,6 +1661,121 @@ fn the_settings_window_on_the_desktop_lists_the_installed_packages_at_opening() 
         listed.is_some(),
         "the installed package is not listed at opening"
     );
+}
+
+/// The window in a managed profile, opened while its refresh of the installed packages at opening
+/// is held back for a minute, as on a slow disk; the refresh is seen running.
+fn open_during_the_refresh_at_opening(ui: &Automation) -> Window {
+    package_import::LISTING_DELAY_MS.store(60_000, std::sync::atomic::Ordering::Relaxed);
+    let window = Window::open(Profile::managed("en"));
+    show_page(ui, &window, &tr("nav.languages"));
+    let refresh = ui
+        .find(
+            window.handle,
+            UIA_ButtonControlTypeId,
+            &tr("remove.refresh"),
+        )
+        .expect("Refresh");
+    assert!(!refresh.enabled(), "the refresh at opening is not running");
+    window
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_cancels_during_the_package_refresh_at_opening() {
+    let ui = Automation::new();
+    let window = open_during_the_refresh_at_opening(&ui);
+    // The window's own Cancel, at the bottom; the reviews' Cancel buttons are hidden.
+    let cancel = ui
+        .elements(window.handle)
+        .into_iter()
+        .filter(|element| {
+            element.is(UIA_ButtonControlTypeId)
+                && element.name == tr("button.cancel")
+                && element.width() > 0
+        })
+        .max_by_key(|element| element.rect.bottom)
+        .expect("Cancel");
+    let enabled = cancel.enabled();
+    click(cancel.center());
+    let closed = window.closed_within(Duration::from_secs(10));
+    if !closed {
+        let _ = screenshot("settings-cancel-during-refresh.bmp");
+    }
+    eprintln!("cancel={:?} enabled={enabled} closed={closed}", cancel.rect);
+    assert!(enabled, "Cancel is disabled during the refresh at opening");
+    assert!(
+        closed,
+        "Cancel did not close the window during the refresh at opening"
+    );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_closes_on_request_during_the_package_refresh_at_opening() {
+    let ui = Automation::new();
+    let window = open_during_the_refresh_at_opening(&ui);
+    let advertised = graceful_close_advertised(window.handle);
+    // The installer's close, and the title bar's.
+    window.request_close();
+    let closed = window.closed_within(Duration::from_secs(10));
+    if !closed {
+        let _ = screenshot("settings-close-during-refresh.bmp");
+    }
+    eprintln!("advertised={advertised} closed={closed}");
+    assert!(
+        advertised,
+        "the graceful close is not advertised during the refresh at opening"
+    );
+    assert!(
+        closed,
+        "WM_CLOSE did not close the window during the refresh at opening"
+    );
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_advertises_the_graceful_close_only_while_it_would_close() {
+    let window = Window::open(Profile::legacy());
+    let ui = Automation::new();
+    let option = within(Duration::from_secs(10), || {
+        ui.choices(window.handle, &tr("general.conversion_sound"))
+            .into_iter()
+            .next()
+    })
+    .expect("the conversion sound option");
+    let advertised_at_first = graceful_close_advertised(window.handle);
+    click(option.center());
+    // An unsaved edit: the window would refuse the installer's close, so it does not offer it.
+    let withdrawn = within(Duration::from_secs(5), || {
+        (!graceful_close_advertised(window.handle)).then_some(())
+    })
+    .is_some();
+    window.request_close();
+    let refused = !window.closed_within(Duration::from_secs(3));
+    // Back to the saved value: the close is offered again and granted.
+    click(option.center());
+    let offered_again = within(Duration::from_secs(5), || {
+        graceful_close_advertised(window.handle).then_some(())
+    })
+    .is_some();
+    window.request_close();
+    let closed = window.closed_within(Duration::from_secs(30));
+    eprintln!(
+        "advertised at first={advertised_at_first} withdrawn={withdrawn} refused={refused} \
+         offered again={offered_again} closed={closed}"
+    );
+    assert!(advertised_at_first, "the graceful close is not advertised");
+    assert!(
+        withdrawn,
+        "the graceful close stays advertised while an unsaved edit would refuse it"
+    );
+    assert!(refused, "the window closed with an unsaved edit");
+    assert!(
+        offered_again,
+        "the graceful close is not advertised again once the edit is undone"
+    );
+    assert!(closed, "the window did not close");
 }
 
 #[test]
