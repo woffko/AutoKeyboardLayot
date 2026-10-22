@@ -92,8 +92,10 @@ pub struct MergedConfiguration {
     /// The configuration as it is now with the draft's changes; in a conflict, the draft's value.
     pub document: ConfigurationDocument,
     /// What both the draft and the configuration changed since the draft's base, differently:
-    /// setting keys, `ui_language`, `mode`, a profile's pack ID, a rule's executable, or
-    /// `user_dictionary, word_exclusions` when an entry ends up in both lists.
+    /// setting keys (`force_hotkey` for the hotkey), `ui_language`, `mode`, a profile's pack ID, a
+    /// rule's executable, a part that does not parse back (`settings`, `input_profiles`,
+    /// `backend_rules`), or `user_dictionary, word_exclusions` when an entry would end up in both
+    /// lists (it stays in the draft's).
     pub conflicts: Vec<String>,
 }
 
@@ -548,11 +550,24 @@ impl ConfigurationDocument {
             ),
             backend_rules,
         };
-        if document
+        let mut document = document;
+        let both: Vec<String> = document
             .word_exclusions
             .iter()
-            .any(|entry| document.user_dictionary.contains(entry))
-        {
+            .filter(|entry| document.user_dictionary.contains(entry))
+            .cloned()
+            .collect();
+        if !both.is_empty() {
+            // Still reported for the user to review; the entry stays in the list the draft put
+            // it in, so the window can save what it then shows. Both sides are valid, so only
+            // the draft holding it in one list and the configuration in the other ends here.
+            for entry in &both {
+                if ours.word_exclusions.contains(entry) {
+                    document.user_dictionary.retain(|word| word != entry);
+                } else {
+                    document.word_exclusions.retain(|word| word != entry);
+                }
+            }
             conflicts.push("user_dictionary, word_exclusions".to_owned());
         }
         MergedConfiguration {
@@ -1415,6 +1430,35 @@ mod tests {
             ConfigurationDocument::merge(&base, &ours, &theirs).conflicts,
             ["user_dictionary, word_exclusions"]
         );
+    }
+
+    #[test]
+    fn an_entry_both_sides_put_in_different_lists_stays_where_the_draft_put_it() {
+        let base = ConfigurationDocument::default();
+        let entry = "en-US: firefox".to_owned();
+        for draft_in_dictionary in [true, false] {
+            let (mut ours, mut theirs) = (base.clone(), base.clone());
+            if draft_in_dictionary {
+                ours.user_dictionary.push(entry.clone());
+                theirs.word_exclusions.push(entry.clone());
+            } else {
+                ours.word_exclusions.push(entry.clone());
+                theirs.user_dictionary.push(entry.clone());
+            }
+            let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+            // Still reported, so the user reviews it; the window can save what it shows.
+            assert_eq!(merged.conflicts, ["user_dictionary, word_exclusions"]);
+            let mut document = merged.document;
+            assert_eq!(
+                document.user_dictionary.contains(&entry),
+                draft_in_dictionary
+            );
+            assert_eq!(
+                document.word_exclusions.contains(&entry),
+                !draft_in_dictionary
+            );
+            assert!(document.canonicalize_and_validate().is_ok());
+        }
     }
 
     #[test]

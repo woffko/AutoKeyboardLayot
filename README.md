@@ -350,7 +350,9 @@ The hotkey (whether it is on, its key and its modifiers) is one value there: a k
 chosen in the window and modifiers changed outside never make a third shortcut, they
 are a conflict. A part that does not read back after the merge (more keyboard profiles
 or backend rules than allowed once both sides' additions meet) is reported the same
-way instead of silently keeping the window's.
+way instead of silently keeping the window's. A word put in the user dictionary on one
+side and in the word exclusions on the other is reported too and stays in the list the
+window put it in, so that Apply can save what the window then shows.
 The settings application itself is excluded from conversion.
 
 Dictionary and word-exclusion entries take the form `en-US: word`, `ru-RU: слово`,
