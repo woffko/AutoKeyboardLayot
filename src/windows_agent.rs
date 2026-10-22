@@ -4292,6 +4292,18 @@ fn refresh_tray_state() {
     update_tray(indicator, now);
 }
 
+/// Whether a changed status may go to the tray icon now: only to an icon that exists, so that
+/// an update that cannot happen (no icon yet, or one the shell refused) spends none of the
+/// throttle's budget and the icon added a moment later shows the status at once.
+fn tray_update_allowed(
+    has_icon: bool,
+    gate_active: bool,
+    throttle: &mut TrayThrottle,
+    now: Instant,
+) -> bool {
+    has_icon && throttle.allow(now, gate_active)
+}
+
 /// Shows the agent's current status with `indicator` in the tray icon when it changed, and
 /// announces a new conversion failure.
 fn update_tray(indicator: LayoutIndicator, now: Instant) {
@@ -4319,7 +4331,10 @@ fn update_tray(indicator: LayoutIndicator, now: Instant) {
         // thread: at most two updates per second and none while a gate holds keys. The status
         // stays different from the shown one, so a refused update is tried again on a later tick.
         let gate_active = state.correction_gate.active;
-        if !UI_GUARDS.with(|guards| guards.borrow_mut().tray.allow(now, gate_active)) {
+        let has_icon = state.tray.is_some();
+        if !UI_GUARDS.with(|guards| {
+            tray_update_allowed(has_icon, gate_active, &mut guards.borrow_mut().tray, now)
+        }) {
             return None;
         }
         let notify_failure = should_notify_conversion_failure(state.last_tray_status, status);
@@ -20976,6 +20991,28 @@ mod tests {
             .store(false, Ordering::Release);
         queue_periodic_refreshes(&mut state, foreground, false, now);
         assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+    }
+
+    #[test]
+    fn a_missing_tray_icon_spends_no_update_budget() {
+        let now = Instant::now();
+        let mut throttle = TrayThrottle::new();
+        // Before the icon exists (or while it cannot be added) nothing is shown...
+        assert!(!tray_update_allowed(false, false, &mut throttle, now));
+        // ...and the icon added a moment later shows the status at once.
+        assert!(tray_update_allowed(true, false, &mut throttle, now));
+        // The budget holds for an icon that exists: two updates per second.
+        assert!(!tray_update_allowed(true, false, &mut throttle, now));
+        assert!(tray_update_allowed(
+            true,
+            false,
+            &mut throttle,
+            now + TrayThrottle::MIN_INTERVAL
+        ));
+        // A gate holding keys refuses it without spending the budget, as before.
+        let later = now + TrayThrottle::MIN_INTERVAL * 2;
+        assert!(!tray_update_allowed(true, true, &mut throttle, later));
+        assert!(tray_update_allowed(true, false, &mut throttle, later));
     }
 
     #[test]

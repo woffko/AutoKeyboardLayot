@@ -636,7 +636,8 @@ A failed installation is retried with backoff (1 s up to 30 s) and reported afte
 the third failure. Tray updates are limited to two per second and wait while the
 correction gate holds keys, because the shell call can block on an unresponsive
 Explorer while the hooks need the UI thread; a skipped update is tried again on a
-later tick. The diagnostics log records `event=hooks` with the reason
+later tick, and while there is no icon yet (or the shell refused it) nothing counts
+against that limit, so the icon shows the status as soon as it is added. The diagnostics log records `event=hooks` with the reason
 (`silent-keyboard` or `silent-mouse` for the watchdog).
 
 ## Language packs
