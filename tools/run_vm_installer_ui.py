@@ -4,7 +4,9 @@ Usage: run_vm_installer_ui.py OUTPUT_DIRECTORY BUILD_DIRECTORY SCENARIO... < ide
 
 BUILD_DIRECTORY is an output of tools/build_experimental_installer.py, relative to the repository
 (its build.json names the setup and the program). Each SCENARIO is one of tools/test-installer-ui.ps1
-except probe, which needs a /DInstallerUiProbe build and runs directly in the session.
+except probe, which needs a /DInstallerUiProbe build and runs directly in the session;
+download-failure and cancel-restarts-agent need a setup built with a test build of the package
+helper that fails every download.
 Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment; AKL_VM_TEST_USER names
 the interactive user (see vm_config.py). The ssh identity path comes on standard input.
 """
@@ -17,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STAGE_NAME = 'akl-installer-ui'
 TASK = 'AklInstallerAcceptance'
 SCENARIOS = ('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
-             'startup-removal', 'fence-invalid', 'settings-open')
+             'startup-removal', 'fence-invalid', 'settings-open', 'download-failure', 'cancel-restarts-agent')
 
 
 def main():

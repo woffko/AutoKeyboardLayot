@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory=$true)][string]$InstalledAppHash,
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [ValidateSet('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
-                 'startup-removal', 'fence-invalid', 'no-selectable-row', 'probe', 'settings-open')]
+                 'startup-removal', 'fence-invalid', 'no-selectable-row', 'probe', 'settings-open',
+                 'download-failure', 'cancel-restarts-agent')]
     [string]$Scenario = 'retry',
     [string]$Language = 'Deutsch'
 )
@@ -33,6 +34,14 @@ param(
 #                           and the upgrade installs; with an unsaved edit the window stays open with the edit,
 #                           setup reports the program busy and replaces nothing; once the edit is saved, the
 #                           upgrade closes the window and installs
+#   download-failure        a language is checked and Next pressed, its download fails: the list is cleared, the
+#                           page says that Next continues with English only, the installation fence is free;
+#                           Back, then Next checks the catalog again; Cancel removes the profile folder that
+#                           Next created. Needs a setup whose package helper is a test build that fails every
+#                           download
+#   cancel-restarts-agent   with the program installed and running, a language is checked and Next pressed (the
+#                           program is closed), its download fails, and setup is cancelled: the program runs
+#                           again and the profile stays. Needs the same test build of the package helper
 # The language list comes from the published catalog (network). The script refuses to run when the user
 # already has a profile or an installation, and removes what it created.
 $ErrorActionPreference = 'Stop'
@@ -500,6 +509,46 @@ try {
             Check 'settings_closed_after_saving' ($settings.WaitForExit(5000) -and $settings.ExitCode -eq 0)
             Check 'installed_app_hash_after_saving' (Installed-Hash)
             Check 'saved_edit_kept' ([IO.File]::ReadAllText($config) -match '(?m)^conversion_sound=true\r?$')
+        }
+        'download-failure' {
+            $log = Join-Path $OutputDirectory 'setup.log'
+            $setup = Start-Owned $Executable ('/SP- /LANG=english /DIR="' + $installTarget + '" /LOG="' + $log + '"')
+            Check-Language (Reach-LanguageList)
+            Click (Next-Button)
+            Wait-Text '*Package operation failed*' 120
+            Start-Sleep -Seconds 1
+            Check 'english_only_said' ((Wizard-Text) -like '*Click Next to continue with English only*')
+            $rows = [SetupWindows]::Message((Package-List), 0x18B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+            Check 'no_language_left_chosen' ($rows -eq 0)
+            Check 'next_enabled_after_the_failure' ([SetupWindows]::IsWindowEnabled((Next-Button)))
+            Check 'fence_free_after_the_failure' (Fence-Free)
+            Check 'profile_initialized_by_next' (Test-Path -LiteralPath $profilePath)
+            # Back, then Next checks the catalog again.
+            Click (Find-Control '*Button*' '*Back')
+            Start-Sleep -Seconds 1
+            [void](Reach-LanguageList)
+            $session = Setup-Session-Directory $log
+            $commands = @(Get-ChildItem -LiteralPath $session -Filter 'request-*.json' | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).command.action })
+            $result.helper_commands = $commands
+            Check 'catalog_checked_again' (@($commands | Where-Object { $_ -eq 'check_catalog' }).Count -eq 2)
+            Cancel-Setup $setup
+            Check 'no_profile_left' (-not (Test-Path -LiteralPath $profilePath))
+            Check 'nothing_installed' (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $registration))
+        }
+        'cancel-restarts-agent' {
+            Check 'silent_install_exit' ((Silent-Setup '') -eq 0)
+            Check 'agent_running' (Start-Agent)
+            $setup = Start-Owned $Executable ('/SP- /LANG=english /DIR="' + $installTarget + '" /LOG="' + (Join-Path $OutputDirectory 'setup.log') + '"')
+            Check-Language (Reach-LanguageList)
+            Click (Next-Button)
+            Wait-Text '*Package operation failed*' 120
+            Check 'agent_closed_by_next' (@(Agent-Processes).Count -eq 0)
+            Cancel-Setup $setup
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while (@(Agent-Processes).Count -eq 0 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+            Check 'agent_running_again' (@(Agent-Processes).Count -ge 1)
+            Check 'profile_kept' (Test-Path -LiteralPath (Join-Path $profilePath 'config.ini'))
+            Check 'installed_app_hash' (Installed-Hash)
         }
         'missing-exe' {
             Check 'silent_install_exit' ((Silent-Setup '') -eq 0)
