@@ -118,9 +118,14 @@ for the session and exposes a technical failure counter in the tray status.
   interface language stays marked after several clicks; the online review shows each
   chosen package's license through its package picker, which stays clear of the
   preview; the Add language dialog shows its failures inside; in Arabic the language
-  rows are mirrored with their marks visible; Space starts a shortcut recording; the
+  rows are mirrored with their marks visible and a row without a profile picker toggles
+  from its left part; in Spanish at the window's least width the language names keep
+  their width, a long status wrapping below them; Space starts a shortcut recording; the
   migration review shows in a legacy profile without opening the tools; the installed
-  packages are listed at opening; file dialogs belong to the settings window and
+  packages are listed at opening, and while they are being read Cancel and a close
+  request close the window; the graceful-close property is withdrawn while an unsaved
+  edit would refuse the close; the package tools are unavailable while a removal awaits
+  its confirmation; file dialogs belong to the settings window and
   disable it; a maximized window stays maximized when Settings is opened again; while
   a recording runs, Shift with a letter and Ctrl+Alt with a letter are refused with
   their reasons and the recording goes on. The shortcut capture ignores injected input,
@@ -360,6 +365,12 @@ way instead of silently keeping the window's. A word put in the user dictionary 
 side and in the word exclusions on the other is reported too and stays in the list the
 window put it in, so that Apply can save what the window then shows.
 The settings application itself is excluded from conversion.
+Cancel, the title bar and an installer's close request close the window while it only
+reads the installed packages (as it does at opening); an import, removal, rollback or
+download in progress holds it, and unsaved edits hold a close that keeps them. The
+installer's graceful-close property is offered exactly while such a close would be
+accepted. While a prepared package change waits in its card for confirmation, Refresh,
+Choose package and Review removal are unavailable, so that the card is not lost.
 
 Dictionary and word-exclusion entries take the form `en-US: word`, `ru-RU: слово`,
 or `et-EE: tere`; the colon is required, as a first word would otherwise be taken
