@@ -395,8 +395,9 @@ component LanguageRow inherits Rectangle {
         VerticalLayout { alignment: center; LanguageMark { checked: root.checked; } }
     }
     TouchArea {
-        // Keep the profile picker area clickable; the row toggle covers the rest.
-        x: Localization.rtl ? root.picker-width + 24px : 0px;
+        // Keep the profile picker area clickable; the row toggle covers the rest, the whole row
+        // when it has no picker.
+        x: Localization.rtl && root.has-profile ? root.picker-width + 24px : 0px;
         width: parent.width - (root.has-profile ? root.picker-width + 24px : 0px);
         clicked => { row-focus.focus(); root.toggled(!root.checked); }
     }
