@@ -95,6 +95,16 @@ function Check([string]$Name, [bool]$Value) {
     $result[$Name] = $Value
     if (-not $Value) { throw "Check failed: $Name" }
 }
+# A check that lets the scenario go on, so that every one of them is recorded; Checks-Passed fails
+# the scenario at its end if one did not hold.
+$script:failedChecks = @()
+function Note([string]$Name, [bool]$Value) {
+    $result[$Name] = $Value
+    if (-not $Value) { $script:failedChecks += $Name }
+}
+function Checks-Passed {
+    if ($script:failedChecks.Count -gt 0) { throw ('Checks failed: ' + ($script:failedChecks -join ', ')) }
+}
 function Start-Owned([string]$File, [string]$Arguments) {
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $File; $info.Arguments = $Arguments; $info.UseShellExecute = $false
@@ -517,11 +527,11 @@ try {
             Click (Next-Button)
             Wait-Text '*Package operation failed*' 120
             Start-Sleep -Seconds 1
-            Check 'english_only_said' ((Wizard-Text) -like '*Click Next to continue with English only*')
+            Note 'english_only_said' ((Wizard-Text) -like '*Click Next to continue with English only*')
             $rows = [SetupWindows]::Message((Package-List), 0x18B, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
-            Check 'no_language_left_chosen' ($rows -eq 0)
-            Check 'next_enabled_after_the_failure' ([SetupWindows]::IsWindowEnabled((Next-Button)))
-            Check 'fence_free_after_the_failure' (Fence-Free)
+            Note 'no_language_left_chosen' ($rows -eq 0)
+            Note 'next_enabled_after_the_failure' ([SetupWindows]::IsWindowEnabled((Next-Button)))
+            Note 'fence_free_after_the_failure' (Fence-Free)
             Check 'profile_initialized_by_next' (Test-Path -LiteralPath $profilePath)
             # Back, then Next checks the catalog again.
             Click (Find-Control '*Button*' '*Back')
@@ -530,10 +540,11 @@ try {
             $session = Setup-Session-Directory $log
             $commands = @(Get-ChildItem -LiteralPath $session -Filter 'request-*.json' | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).command.action })
             $result.helper_commands = $commands
-            Check 'catalog_checked_again' (@($commands | Where-Object { $_ -eq 'check_catalog' }).Count -eq 2)
+            Note 'catalog_checked_again' (@($commands | Where-Object { $_ -eq 'check_catalog' }).Count -eq 2)
             Cancel-Setup $setup
-            Check 'no_profile_left' (-not (Test-Path -LiteralPath $profilePath))
-            Check 'nothing_installed' (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $registration))
+            Note 'no_profile_left' (-not (Test-Path -LiteralPath $profilePath))
+            Note 'nothing_installed' (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $registration))
+            Checks-Passed
         }
         'cancel-restarts-agent' {
             Check 'silent_install_exit' ((Silent-Setup '') -eq 0)
@@ -546,9 +557,10 @@ try {
             Cancel-Setup $setup
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             while (@(Agent-Processes).Count -eq 0 -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
-            Check 'agent_running_again' (@(Agent-Processes).Count -ge 1)
-            Check 'profile_kept' (Test-Path -LiteralPath (Join-Path $profilePath 'config.ini'))
-            Check 'installed_app_hash' (Installed-Hash)
+            Note 'agent_running_again' (@(Agent-Processes).Count -ge 1)
+            Note 'profile_kept' (Test-Path -LiteralPath (Join-Path $profilePath 'config.ini'))
+            Note 'installed_app_hash' (Installed-Hash)
+            Checks-Passed
         }
         'missing-exe' {
             Check 'silent_install_exit' ((Silent-Setup '') -eq 0)
