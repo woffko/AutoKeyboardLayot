@@ -354,16 +354,35 @@ fn populate_input_packs(
             return;
         }
     };
-    // Keep a deselected missing row visible for the remainder of this window,
-    // so the user can undo that choice before saving.
-    for mut previous in ui.get_input_packs().iter() {
+    keep_previous_rows(&mut rows, ui.get_input_packs().iter(), profiles);
+    ui.set_input_packs(std::rc::Rc::new(VecModel::from(rows)).into());
+}
+
+/// Keeps a deselected missing row visible for the remainder of this window, so the user can undo
+/// that choice before saving. Its profile is the one `profiles`, the configuration now shown,
+/// chooses (or the default): a choice removed outside and merged in leaves no unsaved change.
+fn keep_previous_rows(
+    rows: &mut Vec<InputPackRow>,
+    previous: impl Iterator<Item = InputPackRow>,
+    profiles: &autokeyboardlayot::input_profile_selection::InputProfileSelections,
+) {
+    for mut previous in previous {
         if !rows.iter().any(|row| row.id == previous.id) {
             previous.selected = false;
+            let chosen = profiles
+                .iter()
+                .find(|(id, _)| id.as_str() == previous.id.as_str())
+                .map(|(_, profile)| profile.to_string())
+                .unwrap_or_default();
+            previous.profile_index = previous
+                .profile_ids
+                .iter()
+                .position(|id| id.as_str() == chosen)
+                .unwrap_or(0) as i32;
             rows.push(previous);
         }
     }
     rows.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    ui.set_input_packs(std::rc::Rc::new(VecModel::from(rows)).into());
 }
 
 fn selected_input_packs(
@@ -1279,6 +1298,36 @@ mod tests {
             refused_hotkey_hint(&autokeyboardlayot::Settings::default()),
             None
         );
+    }
+
+    #[test]
+    fn a_kept_row_of_a_missing_package_takes_its_profile_from_the_saved_configuration() {
+        let previous = InputPackRow {
+            profile_ids: strings_model(["", "0409:00000409"]),
+            profile_names: strings_model(["Default", "US"]),
+            profile_index: 1,
+            id: "custom-x".into(),
+            name: "custom-x".into(),
+            selected: true,
+            status_key: "packs.missing".into(),
+            details: "".into(),
+        };
+        // The saved configuration (merged with a change made outside) no longer chooses one.
+        let mut rows = Vec::new();
+        let none = autokeyboardlayot::input_profile_selection::InputProfileSelections::default();
+        keep_previous_rows(&mut rows, [previous.clone()].into_iter(), &none);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].selected);
+        assert_eq!(rows[0].profile_index, 0);
+        // Or it still does.
+        let chosen = autokeyboardlayot::input_profile_selection::InputProfileSelections::parse([(
+            "custom-x",
+            "0409:00000409",
+        )])
+        .unwrap();
+        let mut rows = Vec::new();
+        keep_previous_rows(&mut rows, [previous].into_iter(), &chosen);
+        assert_eq!(rows[0].profile_index, 1);
     }
 
     #[test]
