@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [ValidateSet('retry', 'helper-failure', 'timer-exception', 'no-store', 'uninstall-confirmation', 'missing-exe',
                  'startup-removal', 'fence-invalid', 'no-selectable-row', 'probe', 'settings-open',
-                 'download-failure', 'cancel-restarts-agent')]
+                 'download-failure', 'cancel-restarts-agent', 'late-exception')]
     [string]$Scenario = 'retry',
     [string]$Language = 'Deutsch'
 )
@@ -42,6 +42,9 @@ param(
 #   cancel-restarts-agent   with the program installed and running, a language is checked and Next pressed (the
 #                           program is closed), its download fails, and setup is cancelled: the program runs
 #                           again and the profile stays. Needs the same test build of the package helper
+#   late-exception          the helper is ready, then its catalog reply cannot be trusted (a row of no size): the
+#                           page offers English only, and Back, then Next asks the helper again. Needs a setup whose
+#                           package helper is a test build that reports every row with no size
 # The language list comes from the published catalog (network). The script refuses to run when the user
 # already has a profile or an installation, and removes what it created.
 $ErrorActionPreference = 'Stop'
@@ -562,6 +565,33 @@ try {
             Note 'agent_running_again' (@(Agent-Processes).Count -ge 1)
             Note 'profile_kept' (Test-Path -LiteralPath (Join-Path $profilePath 'config.ini'))
             Note 'installed_app_hash' (Installed-Hash)
+            Checks-Passed
+        }
+        'late-exception' {
+            $log = Join-Path $OutputDirectory 'setup.log'
+            $setup = Start-Owned $Executable ('/SP- /LANG=english /DIR="' + $installTarget + '" /LOG="' + $log + '"')
+            $deadline = [DateTime]::UtcNow.AddSeconds(60)
+            while ((Wizard-Text) -notlike '*Check package catalog*' -and [DateTime]::UtcNow -lt $deadline) {
+                $next = Next-Button
+                if ($next -ne [IntPtr]::Zero -and [SetupWindows]::IsWindowEnabled($next)) { Click $next }
+                Start-Sleep -Milliseconds 300
+            }
+            Wait-Text '*Package operation failed*Click Next to continue with English only*' 90
+            $result.failure_text = $true
+            $session = Setup-Session-Directory $log
+            Check 'helper_was_ready' (Test-Path -LiteralPath (Join-Path $session 'reply-0.ini'))
+            # Back, then Next.
+            Click (Find-Control '*Button*' '*Back')
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            while ((Wizard-Text) -like '*Check package catalog*' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }
+            Click (Next-Button)
+            Start-Sleep -Seconds 8
+            $commands = @(Get-ChildItem -LiteralPath $session -Filter 'request-*.json' | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).command.action })
+            $result.helper_commands = $commands
+            Note 'catalog_checked_again' (@($commands | Where-Object { $_ -eq 'check_catalog' }).Count -ge 2)
+            Note 'english_only_said_again' ((Wizard-Text) -like '*Click Next to continue with English only*')
+            Cancel-Setup $setup
+            Note 'nothing_installed' (-not (Test-Path -LiteralPath $installedExe) -and -not (Test-Path -LiteralPath $registration))
             Checks-Passed
         }
         'missing-exe' {
