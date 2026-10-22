@@ -277,6 +277,13 @@ fn unchanged_draft(ui: &SettingsWindow, original: &ConfigurationDocument) -> boo
     document_from_ui(ui, original.clone()).is_ok_and(|draft| &draft == original)
 }
 
+/// Whether a package tool (Refresh, Choose package, Review removal, Roll back) may start: in a
+/// managed profile, with no package work running and no prepared change waiting for its
+/// confirmation, which starting another would discard.
+fn tool_may_start(allowed: bool, busy: bool, running: bool, prepared: bool) -> bool {
+    allowed && !busy && !running && !prepared
+}
+
 fn start(
     ui: &SettingsWindow,
     state: &mut State,
@@ -358,11 +365,12 @@ pub(super) fn wire(
             return;
         };
         let mut state = rollback_state.borrow_mut();
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || state.receiver.is_some()
-            || state.pending.is_some()
-        {
+        if !tool_may_start(
+            ui.get_package_import_allowed(),
+            ui.get_package_import_busy(),
+            state.receiver.is_some(),
+            state.pending.is_some(),
+        ) {
             return;
         }
         let Some(id) = usize::try_from(ui.get_installed_package_index())
@@ -480,10 +488,12 @@ pub(super) fn wire(
             return;
         };
         let mut state = list_state.borrow_mut();
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || state.receiver.is_some()
-        {
+        if !tool_may_start(
+            ui.get_package_import_allowed(),
+            ui.get_package_import_busy(),
+            state.receiver.is_some(),
+            state.pending.is_some(),
+        ) {
             return;
         }
         state.pending = None;
@@ -510,10 +520,12 @@ pub(super) fn wire(
             return;
         };
         let mut state = remove_state.borrow_mut();
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || state.receiver.is_some()
-        {
+        if !tool_may_start(
+            ui.get_package_import_allowed(),
+            ui.get_package_import_busy(),
+            state.receiver.is_some(),
+            state.pending.is_some(),
+        ) {
             return;
         }
         let Some(id) = usize::try_from(ui.get_installed_package_index())
@@ -553,10 +565,16 @@ pub(super) fn wire(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || inspect_state.borrow().receiver.is_some()
-        {
+        let blocked = {
+            let state = inspect_state.borrow();
+            !tool_may_start(
+                ui.get_package_import_allowed(),
+                ui.get_package_import_busy(),
+                state.receiver.is_some(),
+                state.pending.is_some(),
+            )
+        };
+        if blocked {
             return;
         }
         hotkey_capture::stop();
@@ -1046,6 +1064,16 @@ fn decode_selected_files(file: &[u16], multiple: bool) -> Option<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prepared_change_holds_the_package_tools() {
+        assert!(tool_may_start(true, false, false, false));
+        // A prepared change waits for its confirmation: another tool would discard it.
+        assert!(!tool_may_start(true, false, false, true));
+        assert!(!tool_may_start(false, false, false, false));
+        assert!(!tool_may_start(true, true, false, false));
+        assert!(!tool_may_start(true, false, true, false));
+    }
 
     #[test]
     fn an_expired_catalog_has_its_own_status_and_other_errors_keep_their_code() {

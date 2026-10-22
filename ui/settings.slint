@@ -777,7 +777,8 @@ export component SettingsWindow inherits Window {
                                     first-text: Localization.text("languages.add_button", Localization.revision);
                                     first-enabled: root.package-import-allowed && !root.package-import-busy;
                                     second-text: Localization.text("remove.refresh", Localization.revision);
-                                    second-enabled: !root.package-import-busy;
+                                    // Refreshing would discard a prepared change waiting for its confirmation.
+                                    second-enabled: root.package-import-allowed && !root.package-import-busy && !root.package-import-ready;
                                     first-clicked => {
                                         // The dialog shows the messages of what happens in it.
                                         root.status-text = "";
@@ -847,12 +848,12 @@ export component SettingsWindow inherits Window {
                                             UiText { text: Localization.text("languages.advanced_hint", Localization.revision); color: Palette.foreground; opacity: 0.7; font-size: 12px; wrap: word-wrap; }
                                             if root.package-import-allowed: Button {
                                                 text: Localization.text("import.choose", Localization.revision);
-                                                enabled: root.package-import-allowed && !root.package-import-busy;
+                                                enabled: root.package-import-allowed && !root.package-import-busy && !root.package-import-ready;
                                                 clicked => { root.inspect-package(); }
                                             }
                                             if root.package-import-busy: UiText { text: Localization.text("import.busy", Localization.revision); color: Palette.foreground; }
                                             if root.package-import-allowed: ComboBox { model: root.installed-package-names; current-index <=> root.installed-package-index; enabled: !root.package-import-busy && !root.package-import-ready; }
-                                            if root.package-import-allowed: Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
+                                            if root.package-import-allowed: Button { text: Localization.text("remove.choose", Localization.revision); enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-ids.length > 0; clicked => { root.prepare-package-removal(); } }
                                             if root.package-import-allowed: Button {
                                                 text: Localization.text("rollback.choose", Localization.revision);
                                                 enabled: !root.package-import-busy && !root.package-import-ready && root.installed-package-index >= 0 && root.installed-package-index < root.installed-package-rollback.length && root.installed-package-rollback[root.installed-package-index];
