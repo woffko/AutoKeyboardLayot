@@ -364,7 +364,10 @@ present in both lists, naming the page and the editor line of an entry it cannot
 read; after saving it says when an entry's language is not installed. Words are
 limited to 64 characters after lowercasing. Program exclusions are normalized to
 executable names; a name that starts with `#` or is in square brackets is refused,
-as it would read back as a comment or a section. Every save checks that the file
+as it would read back as a comment or a section, and so is a program name or a backend
+rule path with a character no Windows file name holds (`"` inside it, `<`, `>`, `|`,
+`?`, `*` or a control character), named with its page and line before anything is
+saved. Quotes around a name and spaces inside them are dropped. Every save checks that the file
 reads back unchanged. A setting given twice is refused with its line, and a byte
 order mark at the start of a file is accepted.
 The whole configuration is bounded to 1 MiB, loaded once into in-memory sets and

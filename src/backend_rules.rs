@@ -165,11 +165,7 @@ fn normalize_rule_pattern(pattern: &str) -> Option<String> {
 
 fn normalize_process_path(path_or_name: &str) -> Option<String> {
     let value = path_or_name.trim().trim_matches('"');
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '*' | '?'))
-    {
+    if value.is_empty() || value.chars().any(crate::privacy::forbidden_in_windows_path) {
         return None;
     }
     // Unicode lowercasing, as for program exclusions: a path with non-ASCII letters (a user
@@ -197,6 +193,27 @@ mod tests {
             rules.resolve("unknown-editor.exe"),
             BackendStrategy::CapabilityProbe
         );
+    }
+
+    #[test]
+    fn a_quoted_path_loses_its_inner_spaces_and_characters_windows_forbids_are_refused() {
+        let rules =
+            BackendRules::from_lines([r#"" C:\Tools\app.exe " = physical-replay"#]).unwrap();
+        assert_eq!(
+            rules.resolve(r"C:\Tools\app.exe"),
+            BackendStrategy::PhysicalReplay
+        );
+        let text = rules.to_text();
+        assert_eq!(BackendRules::from_lines(text.lines()).unwrap(), rules);
+        for line in [
+            r"C:\a|b.exe = observe-only",
+            r"C:\a<b.exe = observe-only",
+            r"C:\a>b.exe = observe-only",
+            r#"C:\a"b.exe = observe-only"#,
+        ] {
+            let error = BackendRules::from_lines(["ok.exe = observe-only", line]).unwrap_err();
+            assert_eq!(error.line, 2, "{line}");
+        }
     }
 
     #[test]

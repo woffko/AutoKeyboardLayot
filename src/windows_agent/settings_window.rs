@@ -1240,6 +1240,18 @@ mod tests {
             .unwrap();
         assert_eq!(error.page, Some(PROCESS_EXCLUSIONS_PAGE));
         assert!(error.message.contains(", line 3: "), "{}", error.message);
+        // A program name with a character Windows forbids, named at its line before saving.
+        let error = editor_lists(
+            "",
+            "",
+            "private.exe
+va|ult.exe
+",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.page, Some(PROCESS_EXCLUSIONS_PAGE));
+        assert!(error.message.contains(", line 2: "), "{}", error.message);
         // An entry in both lists is named at its line in the exclusions.
         let error = editor_lists("en-US: firefox\n", "\nru-RU: x\nen-US: Firefox\n", "")
             .err()

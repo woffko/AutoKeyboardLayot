@@ -1285,14 +1285,15 @@ mod tests {
 
     #[test]
     fn a_document_that_would_not_read_back_unchanged_is_not_written() {
-        // A line break inside a name would read back as two names.
+        // A line break inside a name would read back as two names: such a name is refused before
+        // anything is written, and the read-back check stays behind that.
         let document = ConfigurationDocument {
             process_exclusions: vec!["evil\nname.exe".to_owned()],
             ..ConfigurationDocument::default()
         };
         assert_eq!(
             document.to_text().unwrap_err().message,
-            "the configuration would not read back unchanged; it was not saved"
+            "expected one executable name or path"
         );
     }
 
@@ -1521,6 +1522,22 @@ mod tests {
             7
         );
         assert_eq!(conflicts, ["settings"]);
+    }
+
+    #[test]
+    fn a_program_exclusion_windows_could_not_name_is_refused_at_its_line() {
+        let error =
+            ConfigurationDocument::process_editor_entries("vault.exe\n\nva|ult.exe\n").unwrap_err();
+        assert_eq!(error.line, Some(3));
+        // A quoted name with spaces inside its quotes is stored without them and reads back.
+        let entries = ConfigurationDocument::process_editor_entries("\" Vault.exe \"\n").unwrap();
+        assert_eq!(entries[0].entry, "vault.exe");
+        let mut document = ConfigurationDocument {
+            process_exclusions: vec!["\" Vault.exe \"".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        document.canonicalize_and_validate().unwrap();
+        assert!(document.to_text().is_ok());
     }
 
     #[test]
