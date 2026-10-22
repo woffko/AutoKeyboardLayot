@@ -1223,6 +1223,59 @@ fn the_settings_window_on_the_desktop_mirrors_the_language_rows_in_arabic() {
 }
 
 /// The vertical extent of the accent-colored pixels of `area` on `screen`, if there are any.
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_toggles_an_arabic_row_without_a_profile_from_its_left_part() {
+    // German is selected but not installed: its row has no profile picker.
+    let profile = Profile::new(
+        "schema_version=4\n\n[packages]\nmode=managed\n\n[settings]\nui_language=ar\n\
+         enabled_input_packs=en-US,de-DE\n",
+        true,
+    );
+    install_published(&profile, &["ar-SA"]);
+    let window = Window::open(profile);
+    let ui = Automation::new();
+    assert!(
+        super::super::ui_localization::is_rtl(),
+        "the interface is not right-to-left"
+    );
+    show_page(&ui, &window, &tr("nav.languages"));
+    let german = || ui.find(window.handle, UIA_CheckBoxControlTypeId, "Deutsch");
+    let row = within(Duration::from_secs(10), german).expect("the German row");
+    let picker = ui.elements(window.handle).into_iter().find(|element| {
+        element.is(UIA_ComboBoxControlTypeId)
+            && element.rect.top >= row.rect.top - 2
+            && element.rect.bottom <= row.rect.bottom + 2
+    });
+    let before = row.checked();
+    // The row's left part: in a right-to-left row, where a profile picker would be.
+    click(POINT {
+        x: row.rect.left + 40,
+        y: (row.rect.top + row.rect.bottom) / 2,
+    });
+    let after = within(Duration::from_secs(5), || {
+        german()
+            .and_then(|row| row.checked())
+            .filter(|checked| Some(*checked) != before)
+    });
+    if after.is_none() {
+        let _ = screenshot("settings-arabic-row-left.bmp");
+    }
+    eprintln!(
+        "row={:?} picker={:?} before={before:?} after={after:?}",
+        row.rect,
+        picker.as_ref().map(|picker| picker.rect)
+    );
+    window.request_close();
+    assert!(picker.is_none(), "the German row has a profile picker");
+    assert_eq!(before, Some(true), "German is not selected at opening");
+    assert_eq!(
+        after,
+        Some(false),
+        "a click on the left part of the row did not toggle it"
+    );
+}
+
 fn accent_rows(screen: &(Vec<u32>, i32), accent: u32, area: &RECT) -> Option<(i32, i32)> {
     let rows: Vec<i32> = (area.top..area.bottom)
         .filter(|y| {
