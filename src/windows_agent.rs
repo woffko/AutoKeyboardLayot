@@ -8723,15 +8723,17 @@ impl InputProcessor {
                     self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
                 let printable = self.printable_character(event);
-                // Only a key the offline tables cannot place needs its readings in the target
-                // layouts, such as the Estonian "ü" typed as "[" in the English layout.
+                // A letter the offline tables place needs no readings. Any other key is judged by
+                // what it prints in the target layouts, such as the Estonian "ü" typed as "[" in
+                // the English layout, or the keypad's "." that prints "," in Russian where the
+                // offline table reads the main row's "." as "ю".
                 let readings = match (
                     printable,
                     language,
                     replay_key_from_event(event, self.modifiers),
                 ) {
                     (Some(character), Some(language), Some(key))
-                        if !self.detector.can_extend_word(character, language) =>
+                        if !self.letter_extends_word(character, language) =>
                     {
                         self.key_readings(key, language, &mut self.key_mapper())
                     }
@@ -9044,6 +9046,13 @@ impl InputProcessor {
             );
         }
         translate_printable(event, self.modifiers)
+    }
+
+    /// A letter that continues a word by the offline tables alone. Another character, even one
+    /// those tables read as a letter of a target layout ("." as "ю"), is judged by what its key
+    /// prints there (`key_readings`): the keypad's "." prints "," in Russian.
+    fn letter_extends_word(&self, character: char, language: Language) -> bool {
+        character.is_alphabetic() && self.detector.can_extend_word(character, language)
     }
 
     /// What `key` prints in the layout of each enabled automatic target of `language`, from the
@@ -12804,7 +12813,7 @@ mod tests {
     /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
     /// punctuation key prints nothing here.
     pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
-        const KEYS: [(u16, [char; 3]); 44] = [
+        const KEYS: [(u16, [char; 3]); 45] = [
             (0x02, ['1', '1', '1']),
             (0x03, ['2', '2', '2']),
             (0x04, ['3', '3', '3']),
@@ -12849,6 +12858,8 @@ mod tests {
             (0x34, ['.', 'ю', '.']),
             (0x35, ['/', '.', '-']),
             (0x39, [' ', ' ', ' ']),
+            // The keypad's decimal key, with Num Lock on.
+            (0x53, ['.', ',', ',']),
         ];
         let column = match layout {
             0x0409 => 0,
@@ -16952,6 +16963,37 @@ mod tests {
         assert_eq!(pending.transaction.original, ",skj");
         assert_eq!(pending.transaction.replacement, "было");
         assert_eq!(pending.transaction.target_language, Language::Russian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_keypad_period_ends_the_word_where_the_target_layouts_print_a_comma() {
+        // The offline table reads "." as the Russian "ю", the key of the main row. The keypad's
+        // "." prints "," in the Russian and Estonian layouts: after "ghbdtn" it ends the word
+        // instead of joining it, where the word's Russian reading would be "привет,".
+        for (scan_code, virtual_key, continues) in
+            // VK_OEM_PERIOD, then the keypad's VK_DECIMAL.
+            [(0x34, VIRTUAL_KEY(0xbe), true), (0x53, VK_DECIMAL, false)]
+        {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            type_keys(
+                &mut processor,
+                foreground,
+                &[0x22, 0x23, 0x30, 0x20, 0x14, 0x31],
+            );
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                foreground,
+                ..test_raw_key(WM_KEYDOWN, virtual_key, 7, 0)
+            });
+            let typed = if continues { 7 } else { 0 };
+            assert_eq!(
+                processor.session.buffered_character_count(),
+                typed,
+                "{scan_code:#x}"
+            );
+            assert_eq!(processor.replay_keys.len(), typed, "{scan_code:#x}");
+        }
     }
 
     #[cfg(feature = "legacy-bundled-input")]

@@ -175,7 +175,9 @@ physical typing.
 
 The EN/RU detector now keeps physical punctuation keys inside a pending token
 when those keys represent letters in the other layout. This covers words such
-as `hf,jnftn` → `работает` and `gthtrk.xtybt` → `переключение`. A valid word in
+as `hf,jnftn` → `работает` and `gthtrk.xtybt` → `переключение`. Whether a
+punctuation key is such a letter is read from the key itself in the other
+layouts: the keypad's `.` prints `,` in Russian, so it ends the word. A valid word in
 the current layout is a hard veto; automatic correction does not override it
 even when another pack also contains a plausible word.
 
