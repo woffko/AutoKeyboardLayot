@@ -19,8 +19,9 @@ For every layout reading of the typed keys the model combines:
 - whether it is the typed layout and whether it equals the typed text;
 - the languages of up to four previous words (only their language, never
   their text; a word counts as its target language only once its conversion
-  was applied, and the list is cleared when the focused window or field
-  changes).
+  was applied, and as typed again once that conversion is undone; a token
+  kept only for Pause, such as digits or text after a shortcut, does not
+  count; the list is cleared when the focused window or field changes).
 
 A small neural network (about one million parameters, 1.3 MB) scores every
 reading and a softmax gives the probability of each layout. The word is

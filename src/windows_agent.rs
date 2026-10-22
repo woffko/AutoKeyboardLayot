@@ -8988,7 +8988,9 @@ impl InputProcessor {
                 self.remember_word_language(detection.source_language);
                 transaction
             } else {
-                if !replay_keys.is_empty()
+                // A suppressed token (digits, text after a shortcut) is no word of a language.
+                if !suppressed
+                    && !replay_keys.is_empty()
                     && let Some(language) = language
                 {
                     self.remember_word_language(language);
@@ -10510,19 +10512,7 @@ impl InputProcessor {
             }
         }
 
-        self.commit_confirmed_layout(record.source_layout);
-        self.session.clear();
-        self.transpose_cycle = None;
-        self.last_boundary = record.transaction.delimiter.map(|delimiter| LastBoundary {
-            replay_keys: record.replay_keys.clone(),
-            delimiter: Some(delimiter),
-            foreground: ForegroundContext {
-                layout: record.source_layout,
-                ..record.foreground
-            },
-            epoch: self.last_input_epoch,
-            profile_generation: record.profile_generation,
-        });
+        self.finish_applied_undo(&record);
         self.request_sound(SoundCue::Undone);
         self.diagnostic(
             "undo",
@@ -10543,6 +10533,31 @@ impl InputProcessor {
                 record.transaction.original,
             );
         }
+    }
+
+    /// The bookkeeping of an undo whose edit was applied: the word is back as typed, in the
+    /// layout it was typed in, and may be converted again with Pause.
+    fn finish_applied_undo(&mut self, record: &UndoRecord) {
+        // The applied conversion made the word count as the target language for the following
+        // words (finish_applied_conversion); undone, it counts as typed again.
+        if let Some(last) = self.recent_languages.last_mut()
+            && *last == record.transaction.target_language
+        {
+            *last = record.transaction.source_language;
+        }
+        self.commit_confirmed_layout(record.source_layout);
+        self.session.clear();
+        self.transpose_cycle = None;
+        self.last_boundary = record.transaction.delimiter.map(|delimiter| LastBoundary {
+            replay_keys: record.replay_keys.clone(),
+            delimiter: Some(delimiter),
+            foreground: ForegroundContext {
+                layout: record.source_layout,
+                ..record.foreground
+            },
+            epoch: self.last_input_epoch,
+            profile_generation: record.profile_generation,
+        });
     }
 
     fn set_lexicon_offer(&self, target: LexiconOfferTarget, language: Language, word: String) {
@@ -17946,6 +17961,70 @@ mod tests {
                 assert_eq!(processor.recent_languages, [expected], "forced={forced}");
             }
         }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn an_undone_automatic_conversion_counts_as_typed_again() {
+        // "ghbdtn" converted to Russian by itself, then undone with Pause: the following words
+        // see an English word again.
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        processor.remember_word_language(Language::Estonian);
+        type_wrong_layout_word(&mut processor);
+        let (transaction, replay_keys) = processor
+            .handle_boundary(Some(Language::English), Some(' '), false)
+            .expect("a conversion");
+        processor.finish_applied_conversion(
+            PendingConversion {
+                transaction,
+                foreground: test_foreground(),
+                source_layout: 0x0409,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 1,
+                replay_keys,
+                forced: false,
+                cycle_order: Vec::new(),
+            },
+            1,
+            HKL(0x0419 as *mut c_void),
+            EditStrategy::ProtectedPaste,
+        );
+        assert_eq!(
+            processor.recent_languages,
+            [Language::Estonian, Language::Russian]
+        );
+        let record = processor.undo_record.take().expect("an undo");
+        processor.finish_applied_undo(&record);
+        assert_eq!(
+            processor.recent_languages,
+            [Language::Estonian, Language::English]
+        );
+        // A last entry in another language than the conversion's target is another word's.
+        processor.remember_word_language(Language::Estonian);
+        processor.finish_applied_undo(&record);
+        assert_eq!(
+            processor.recent_languages,
+            [Language::Estonian, Language::English, Language::Estonian]
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_suppressed_token_leaves_the_recent_word_languages_alone() {
+        // "123" is a token for Pause only: no language of a word follows from it.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys(&mut processor, foreground, &[0x02, 0x03, 0x04]);
+        assert!(processor.session.is_suppressed());
+        assert_eq!(processor.replay_keys.len(), 3);
+        processor.process_key(space_key(foreground, 4, 0));
+        assert!(processor.recent_languages.is_empty());
+        // A word that is not converted does count as typed.
+        type_keys(&mut processor, foreground, &[0x23, 0x12, 0x26, 0x26, 0x18]);
+        processor.process_key(space_key(foreground, 10, 0));
+        assert_eq!(processor.recent_languages, [Language::English]);
     }
 
     #[cfg(feature = "legacy-bundled-input")]
