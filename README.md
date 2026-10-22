@@ -341,7 +341,9 @@ an error in one of them names that file. The pre-migration backup is written to 
 temporary file and appears whole or not at all.
 GUI and tray writes share a cross-process named Windows mutex; a word added from
 the tray is saved on a thread of its own, so the keyboard hook never waits for the
-lock or the disk. When the configuration has changed since the window was opened
+lock or the disk. A word the tray adds to the user dictionary leaves the word
+exclusions, and one it adds to the exclusions leaves the dictionary, so the save is
+never refused for a word in both lists. When the configuration has changed since the window was opened
 (a word added from the tray, a hand edit), Apply merges the draft into it: what the
 window changed wins, everything else is kept, and list entries added on either
 side stay. A value changed differently in both places is reported; the window then

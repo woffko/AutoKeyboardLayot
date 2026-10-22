@@ -7165,10 +7165,18 @@ fn persist_lexicon_candidate(
 ) -> std::io::Result<()> {
     let _guard = ConfigurationWriteGuard::acquire()?;
     let mut document = autokeyboardlayot::configuration::load_configuration_directory(directory)?;
-    let entries = match candidate.target {
-        LexiconOfferTarget::UserDictionary => &mut document.user_dictionary,
-        LexiconOfferTarget::WordExclusions => &mut document.word_exclusions,
+    let (entries, other) = match candidate.target {
+        LexiconOfferTarget::UserDictionary => {
+            (&mut document.user_dictionary, &mut document.word_exclusions)
+        }
+        LexiconOfferTarget::WordExclusions => {
+            (&mut document.word_exclusions, &mut document.user_dictionary)
+        }
     };
+    // A word is in one list only: the offer moves it out of the other.
+    other.retain(|line| {
+        !UserLexicon::from_lines([line.as_str()]).contains(candidate.language, &candidate.word)
+    });
     let existing = entries.join("\n");
     let merged = merge_lexicon_entry(&existing, candidate).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid exclusion word")
@@ -22588,6 +22596,33 @@ mod tests {
         let saved = saved_document(folder.path());
         assert_eq!(saved.user_dictionary, ["en-US: firefox"]);
         assert!(saved.process_exclusions.is_empty());
+    }
+
+    #[test]
+    fn a_tray_offer_moves_its_word_out_of_the_other_list() {
+        let exclusion_offer = |word: &str| VolatileLexiconCandidate {
+            target: LexiconOfferTarget::WordExclusions,
+            ..dictionary_offer(word)
+        };
+        for (offer, dictionary, exclusions) in [
+            (dictionary_offer("firefox"), true, false),
+            (exclusion_offer("firefox"), false, true),
+        ] {
+            let folder = configuration_folder();
+            let mut document = saved_document(folder.path());
+            // The word is in the list the offer does not add to.
+            if dictionary {
+                document.word_exclusions.push("en-US: firefox".to_owned());
+            } else {
+                document.user_dictionary.push("en-US: Firefox".to_owned());
+            }
+            write_configuration_document(folder.path(), &document).unwrap();
+            persist_lexicon_candidate(folder.path(), &offer).unwrap();
+            let saved = saved_document(folder.path());
+            let entry = "en-US: firefox".to_owned();
+            assert_eq!(saved.user_dictionary.contains(&entry), dictionary);
+            assert_eq!(saved.word_exclusions.contains(&entry), exclusions);
+        }
     }
 
     #[test]
