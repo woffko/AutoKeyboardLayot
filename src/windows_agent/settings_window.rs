@@ -1486,6 +1486,30 @@ va|ult.exe
     }
 
     #[test]
+    fn the_editors_of_a_conflict_over_a_word_in_both_lists_pass_the_windows_check() {
+        // A word added to the exclusions from the tray while the window put it in the dictionary.
+        let base = ConfigurationDocument::default();
+        let mut ours = base.clone();
+        ours.user_dictionary.push("en-US: firefox".to_owned());
+        let mut theirs = base.clone();
+        theirs.word_exclusions.push("en-US: firefox".to_owned());
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert!(!merged.conflicts.is_empty());
+        // What the window then shows in its editors, read back as Apply reads it.
+        let document = merged.document;
+        let lists = editor_lists(
+            &lines_to_editor(&document.user_dictionary),
+            &lines_to_editor(&document.word_exclusions),
+            &lines_to_editor(&document.process_exclusions),
+        );
+        assert!(
+            lists.is_ok(),
+            "{:?}",
+            lists.err().map(|error| error.message)
+        );
+    }
+
+    #[test]
     fn a_value_changed_in_the_window_and_outside_it_is_not_saved_over() {
         let base = ConfigurationDocument::default();
         let mut outside = base.clone();
