@@ -184,12 +184,14 @@ begin
       PackageFailed;
       if PackagePhase = 'idle' then begin
         // The check or the download failed and the helper starts over: nothing is chosen any
-        // more, Next continues with English only, and Back, then Next checks again.
+        // more, Next continues with English only, and Back, then Next checks again. A download
+        // that failed after Next closed the program frees its leases and the fence.
         PackageList.Items.Clear;
         SetArrayLength(PackageIds, 0);
         SetArrayLength(PackageBytes, 0);
         PackageStatus.Caption := PackageStatus.Caption + ' ' + CustomMessage('AkPackageEnglishNext');
         PackageRetry := True;
+        ReleaseLeases;
       end;
     end;
     PackageControls;

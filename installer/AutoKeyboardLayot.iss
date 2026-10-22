@@ -91,6 +91,8 @@ const
   NotModularBase = 23;
 var
   AgentLease, SettingsLease, InstallationFence: THandle;
+  // What setup undoes when it ends without installing (RestoreAfterAbandonedSetup).
+  DataFolderExisted, AgentClosedBySetup, SetupInstalled: Boolean;
 
 function NativeCreateMutex(Attributes, InitialOwner: LongWord; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -108,6 +110,7 @@ function NativeFenceAttributes(Name: String): LongWord;
   external 'GetFileAttributesW@kernel32.dll stdcall';
 
 function PrepareToInstall(var NeedsRestart: Boolean): String; forward;
+procedure ReleaseLeases; forward;
 #include "package-pages.iss"
 
 procedure ReleaseLeases;
@@ -176,6 +179,7 @@ end;
 function StopAndLease(Helper: String): String;
 var
   ExitCode: Integer;
+  AgentRunning: Boolean;
 begin
   Result := '';
   if (AgentLease <> 0) and (SettingsLease <> 0) and (InstallationFence <> 0) then
@@ -185,6 +189,7 @@ begin
   // can run from it, so there is nothing to close; the leases and the fence below still
   // keep a program from elsewhere and other setups out.
   if FileExists(Helper) then begin
+    AgentRunning := CheckForMutexes(AgentMutexName);
     if not Exec(Helper, '--prepare-upgrade "' + ExpandConstant('{app}') + '"',
         '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
       Result := CustomMessage('AkCloseHelperFailed');
@@ -194,6 +199,9 @@ begin
       Result := FmtMessage(CustomMessage('AkCloseBusy'), [IntToStr(ExitCode)]);
       Exit;
     end;
+    // The agent of this session ran and is closed now: setup starts it again if it ends
+    // without installing.
+    if AgentRunning then AgentClosedBySetup := True;
   end else
     Log('The installed program is missing; no running instance needs to be closed.');
   if not AcquireLease(AgentMutexName, AgentLease) then begin
@@ -250,20 +258,68 @@ begin
     ReleaseLeases;
 end;
 
+function InitializeSetup: Boolean;
+begin
+  DataFolderExisted := DirExists(ExpandConstant('{localappdata}\AutoKeyboardLayot'));
+  Result := True;
+end;
+
 // The files are in place: from here on the new shortcuts must be able to start the
 // program, also while the Finished page is still open.
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then begin
+    SetupInstalled := True;
     StopPackageHelper;
     ReleaseLeases;
   end;
+end;
+
+// Only what profile initialization and the package store create.
+function OnlyInitializedProfile(Folder: String): Boolean;
+var
+  Find: TFindRec;
+  Name: String;
+begin
+  Result := True;
+  if not FindFirst(Folder + '\*', Find) then
+    Exit;
+  try
+    repeat
+      Name := Lowercase(Find.Name);
+      if (Name <> '.') and (Name <> '..') and (Name <> 'config.ini') and (Name <> 'packages') then
+        Result := False;
+    until not Result or not FindNext(Find);
+  finally
+    FindClose(Find);
+  end;
+end;
+
+// Setup ends without installing (cancelled, or failed before the files were replaced): the
+// languages chosen with Next may already have initialized the profile and closed the program.
+// A profile folder that did not exist when setup started and holds only what initialization
+// created goes; the agent of this session that setup closed starts again.
+procedure RestoreAfterAbandonedSetup;
+var
+  Folder: String;
+  ExitCode: Integer;
+begin
+  Folder := ExpandConstant('{localappdata}\AutoKeyboardLayot');
+  if not DataFolderExisted and DirExists(Folder) and OnlyInitializedProfile(Folder) then
+    if not DelTree(Folder, True, True, True) then
+      Log('The profile folder setup created could not be removed.');
+  if AgentClosedBySetup then
+    if FileExists(ExpandConstant('{app}\AutoKeyboardLayot.exe')) then
+      if not Exec(ExpandConstant('{app}\AutoKeyboardLayot.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ExitCode) then
+        Log('The program setup closed could not be started again.');
 end;
 
 procedure DeinitializeSetup;
 begin
   StopPackageHelper;
   ReleaseLeases;
+  if not SetupInstalled then
+    RestoreAfterAbandonedSetup;
 end;
 
 // Close the program only once the user has confirmed the removal: declining must leave
