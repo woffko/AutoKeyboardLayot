@@ -970,7 +970,8 @@ export component SettingsWindow inherits Window {
                 height: 40px;
                 spacing: 10px;
                 cancel-button := Button {
-                    enabled: !root.package-import-busy;
+                    // Only reading the installed packages does not hold the window (close_refusal).
+                    enabled: !root.package-import-busy || root.package-import-read-only;
                     text: Localization.text("button.cancel", Localization.revision);
                     width: self.preferred-width; height: parent.height;
                     x: Localization.rtl ? apply-button.x + apply-button.width + parent.spacing : apply-button.x - parent.spacing - self.width;
