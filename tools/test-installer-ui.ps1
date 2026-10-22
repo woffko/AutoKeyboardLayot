@@ -31,9 +31,9 @@ param(
 #                           language is refused and can be repeated, the helper never receives a download or
 #                           install command, Cancel ends it, and no profile is created
 #   settings-open           a silent upgrade while the settings window is open: without edits the window closes
-#                           and the upgrade installs; with an unsaved edit the window stays open with the edit,
-#                           setup reports the program busy and replaces nothing; once the edit is saved, the
-#                           upgrade closes the window and installs
+#                           and the upgrade installs; with an unsaved edit the window stays open with the edit
+#                           and offers no graceful close, setup reports the program busy without asking it and
+#                           replaces nothing; once the edit is saved, the upgrade closes the window and installs
 #   download-failure        a language is checked and Next pressed, its download fails: the list is cleared, the
 #                           page says that Next continues with English only, the installation fence is free;
 #                           Back, then Next checks the catalog again; Cancel removes the profile folder that
@@ -510,7 +510,9 @@ try {
             Check 'nothing_replaced' ($logText -notlike '*-- File entry --*' -and $after.CreationTimeUtc -eq $before.CreationTimeUtc -and $after.LastWriteTimeUtc -eq $before.LastWriteTimeUtc)
             Check 'settings_still_open' (-not $settings.HasExited -and (Settings-Window) -eq $window)
             Check 'edit_kept' (Sound-On $window)
-            Check 'unsaved_notice_shown' ($null -ne (Settings-Element $window ([Windows.Automation.ControlType]::Text) 'Settings contain unsaved or invalid changes. Save them before closing, or choose Cancel to explicitly discard them.'))
+            # A window that would refuse the close offers no graceful close, so setup asked it nothing.
+            Check 'graceful_close_withdrawn_while_unsaved' ([SetupWindows]::GetProp($window, 'AutoKeyboardLayot.GracefulClose.v1') -ne [IntPtr]1)
+            Check 'no_close_request_notice' ($null -eq (Settings-Element $window ([Windows.Automation.ControlType]::Text) 'Settings contain unsaved or invalid changes. Save them before closing, or choose Cancel to explicitly discard them.'))
             (Settings-Element $window ([Windows.Automation.ControlType]::Button) 'Apply').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             while ([IO.File]::ReadAllText($config) -notmatch '(?m)^conversion_sound=true\r?$' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 300 }

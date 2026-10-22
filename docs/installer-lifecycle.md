@@ -281,8 +281,9 @@ catalog whose packages all need a newer package API (or a test build of the pack
 helper that reports every row unavailable), `probe` for a `/DInstallerUiProbe`
 build, and `settings-open` (a silent upgrade while the settings window is open:
 without edits the window closes and the upgrade installs; with an unsaved edit the
-window stays open with the edit, setup reports the program busy with helper code 12
-and replaces nothing; after Apply the upgrade closes the window and installs).
+window stays open with the edit and offers no graceful close, setup reports the
+program busy with helper code 12 without asking it and replaces nothing; after Apply
+the upgrade closes the window and installs).
 `download-failure` (the list cleared, English only said, the fence free, the
 catalog checked again after Back and Next, the profile folder Next created removed
 by Cancel) and `cancel-restarts-agent` (the program Next closed runs again after
