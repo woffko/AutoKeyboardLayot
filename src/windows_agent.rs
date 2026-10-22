@@ -7807,11 +7807,12 @@ impl InputProcessor {
     }
 
     /// The source layout is the field's layout when the edit starts: after a manual switch Pause
-    /// replaces a word typed in another layout, so it need not be the source language's own. Any
-    /// change of the profiles since the edit was planned changes the generation.
+    /// replaces a word typed in another layout, so it need not be the source language's own, nor
+    /// any enabled language's. An automatic conversion starts from the layout the word was typed
+    /// in. Any change of the profiles since the edit was planned changes the generation.
     fn pending_profiles_match(&self, pending: &PendingConversion) -> bool {
         pending.profile_generation == self.input_profiles.generation()
-            && self.language_for_layout(pending.source_layout).is_some()
+            && (pending.forced || self.language_for_layout(pending.source_layout).is_some())
             && self
                 .find_layout(pending.transaction.target_language)
                 .is_some()
@@ -8487,14 +8488,17 @@ impl InputProcessor {
                     }),
                     _ => self.last_boundary.take(),
                 };
+                // A Pause cycle goes on from the layout the field shows now; the next key that
+                // types ends it as usual.
+                let cycle = self.transpose_cycle.take();
                 self.invalidate_conversion_state();
-                self.transpose_cycle = None;
                 self.handle_switching_rule(
                     InputEvent::LayoutChanged,
                     language,
                     self.settings.suppress_after_manual_layout_change,
                 );
                 self.last_boundary = kept;
+                self.transpose_cycle = cycle;
                 self.last_layout = Some(event.foreground.layout);
             }
         } else if self
@@ -13087,6 +13091,11 @@ mod tests {
         pending.profile_generation = processor.input_profiles.generation();
         pending.source_layout = 0xf0020409;
         assert!(!processor.pending_profiles_match(&pending));
+        // Pause starts from whatever layout the field shows after a manual switch, also one of
+        // no enabled language.
+        pending.forced = true;
+        assert!(processor.pending_profiles_match(&pending));
+        pending.forced = false;
         pending.source_layout = 0x0409;
         pending.transaction.target_language = Language::Japanese;
         assert!(!processor.pending_profiles_match(&pending));
@@ -23483,8 +23492,9 @@ mod tests {
         processor.process_key(space_key(foreground, scan_codes.len() as u64 + 1, 0));
     }
 
-    /// Presses Pause in the processor's field and returns the diagnostics written meanwhile. A
-    /// press that converts leaves the field in the target layout, as Windows would.
+    /// Presses Pause in the processor's field, through `process_key` as the worker takes it, and
+    /// returns the diagnostics written meanwhile. A press that converts leaves the field in the
+    /// target layout, as Windows would.
     #[cfg(feature = "legacy-bundled-input")]
     fn press_pause(
         processor: &mut InputProcessor,
@@ -23497,13 +23507,16 @@ mod tests {
             .metrics
             .active_gate_token
             .store(sequence, Ordering::Release);
-        let event = RawKeyEvent {
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(sequence, Ordering::Release);
+        processor.settings.pause_break_undo = true;
+        processor.process_key(RawKeyEvent {
             foreground,
             hotkey_trigger: true,
             ..test_raw_key(WM_KEYDOWN, VK_PAUSE, sequence, 0)
-        };
-        let language = processor.language_for_layout(foreground.layout);
-        processor.execute_forced_conversion(event, language);
+        });
         if let Some(cycle) = &processor.transpose_cycle {
             let layout = processor
                 .find_layout(cycle.language)
@@ -23575,6 +23588,53 @@ mod tests {
         let cycle = processor.transpose_cycle.as_ref().expect("converted again");
         assert_ne!(cycle.language, Language::Russian, "{lines:?}");
         assert_eq!(cycle.text, "ghbdtn");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_manual_layout_switch_between_two_pause_presses_keeps_the_cycle() {
+        // "ghbdtn" without a Space: the first press converts the keys before the caret; then
+        // Alt+Shift shows the Estonian layout, and the second press walks the cycle on.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor.transpose_cycle.as_ref().expect("converted");
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "привет");
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0425,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 42);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("the cycle was lost: {lines:?}"));
+        assert_ne!(cycle.language, Language::Russian, "{lines:?}");
+        assert_eq!(cycle.text, "ghbdtn");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_after_a_manual_switch_to_a_layout_of_no_enabled_language() {
+        // English and Russian enabled; Alt+Shift shows the Estonian layout, loaded in Windows but
+        // not enabled here. The word typed in English is still converted to Russian.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        processor
+            .settings
+            .set_pack_enabled(autokeyboardlayot::PackId::parse("et-EE").unwrap(), false);
+        type_word_and_space(&mut processor, &GHBDTN);
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0425,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("not converted: {lines:?}"));
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "привет");
     }
 
     #[cfg(feature = "legacy-bundled-input")]

@@ -220,7 +220,8 @@ and key-up are swallowed so the hotkey cannot leak into the target editor. A
 manual layout switch (Alt+Shift, Ctrl+Shift or Win+Space) ends automatic
 conversion of the word but not Pause: the word typed so far, or else the last
 completed word, can still be converted; it is read in the layout it was typed in
-and replaced from the layout the field shows now. Text typed right after a manual
+and replaced from the layout the field shows now, even one of no language enabled
+here. A switch between two presses keeps their cycle going. Text typed right after a manual
 switch is kept for Pause like text typed after a shortcut. Digits typed on the numeric
 keypad can be part of such a word; they are typed back as keypad keys, because a
 keypad scan code sent alone arrives as the navigation key that shares it (keypad
