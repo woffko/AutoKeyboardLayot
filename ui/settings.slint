@@ -341,7 +341,11 @@ component LanguageRow inherits Rectangle {
     callback profile-selected(int);
     private property <bool> has-profile: root.profile-names.length > 1;
     private property <length> picker-width: 180px;
-    height: 40px;
+    // The side of the row the profile picker takes, when there is one.
+    private property <length> picker-side: root.has-profile ? root.picker-width + 24px : 12px;
+    // A long status, as in most interface languages but English, makes the row taller instead
+    // of squeezing the name.
+    height: max(40px, content.preferred-height);
     background: checked ? Palette.alternate-background : Palette.background;
     horizontal-stretch: 1;
     vertical-stretch: 0;
@@ -353,46 +357,32 @@ component LanguageRow inherits Rectangle {
     accessible-action-default => { root.toggled(!root.checked); }
 
     // A right-to-left interface mirrors the row: the mark at the right edge, the profile picker
-    // at the left one, where it would otherwise cover the mark.
-    if !Localization.rtl: HorizontalLayout {
-        padding-left: 12px;
-        padding-right: root.has-profile ? root.picker-width + 24px : 12px;
+    // at the left one, where it would otherwise cover the mark. The name has the texts' whole
+    // width, the status wraps below it. The layout is a plain child: a conditional one would
+    // measure the wrapped status at a width it does not have.
+    content := HorizontalLayout {
+        padding-left: Localization.rtl ? root.picker-side : 12px;
+        padding-right: Localization.rtl ? 12px : root.picker-side;
+        padding-top: 6px;
+        padding-bottom: 6px;
         spacing: 10px;
         // The row's layout puts a child of fixed height at its top; the column centers the mark.
-        VerticalLayout { alignment: center; LanguageMark { checked: root.checked; } }
-        UiText {
-            text: root.name;
-            color: Palette.foreground;
-            horizontal-stretch: 1;
-            vertical-alignment: center;
+        if !Localization.rtl: VerticalLayout { alignment: center; LanguageMark { checked: root.checked; } }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            UiText {
+                text: root.name;
+                color: Palette.foreground;
+            }
+            UiText {
+                text: root.status;
+                color: Palette.foreground;
+                opacity: 0.6;
+                font-size: 12px;
+            }
         }
-        UiText {
-            text: root.status;
-            color: Palette.foreground;
-            opacity: 0.6;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-    }
-    if Localization.rtl: HorizontalLayout {
-        padding-left: root.has-profile ? root.picker-width + 24px : 12px;
-        padding-right: 12px;
-        spacing: 10px;
-        UiText {
-            text: root.status;
-            color: Palette.foreground;
-            opacity: 0.6;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-        UiText {
-            text: root.name;
-            color: Palette.foreground;
-            horizontal-stretch: 1;
-            vertical-alignment: center;
-        }
-        // The row's layout puts a child of fixed height at its top; the column centers the mark.
-        VerticalLayout { alignment: center; LanguageMark { checked: root.checked; } }
+        if Localization.rtl: VerticalLayout { alignment: center; LanguageMark { checked: root.checked; } }
     }
     TouchArea {
         // Keep the profile picker area clickable; the row toggle covers the rest, the whole row
