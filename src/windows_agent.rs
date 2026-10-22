@@ -8776,6 +8776,11 @@ impl InputProcessor {
                         InputEvent::UnsupportedInput
                     }
                 });
+                // Before the reset below is overwritten: a token may start with a digit right
+                // after a shortcut or a manual layout switch.
+                let buffered_before = self.session.buffered_character_count();
+                let token_keys =
+                    self.take_manual_token_keys(input_event, printable.is_some(), buffered_before);
                 if input_event == InputEvent::UnsupportedInput {
                     self.last_word_reset = "unsupported";
                     self.diagnostic(
@@ -8797,9 +8802,6 @@ impl InputProcessor {
                     self.last_word_reset = "boundary";
                     self.recovered_mid_word = false;
                 }
-                let buffered_before = self.session.buffered_character_count();
-                let token_keys =
-                    self.take_manual_token_keys(input_event, printable.is_some(), buffered_before);
                 if matches!(input_event, InputEvent::Printable(_)) && buffered_before == 0 {
                     // Bind the manual-only mark to the word being started. Resets
                     // such as focus, mouse or layout changes discard the previous
@@ -23691,6 +23693,33 @@ mod tests {
             .unwrap_or_else(|| panic!("the cycle was lost: {lines:?}"));
         assert_ne!(cycle.language, Language::Russian, "{lines:?}");
         assert_eq!(cycle.text, "ghbdtn");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_token_that_starts_with_a_digit_after_a_manual_switch_is_kept_for_pause() {
+        // Alt+Shift from Russian to English, then "6ghbdtn": the digit first, typed right after
+        // the switch, starts the token Pause converts.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0419);
+        let english = ForegroundContext {
+            layout: 0x0409,
+            ..foreground
+        };
+        processor.foreground_override = Some(english);
+        switch_layout_by_hand(&mut processor, 0x0409);
+        type_keys(
+            &mut processor,
+            english,
+            &[0x07, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31],
+        );
+        assert_eq!(processor.replay_keys.len(), 7);
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("not converted: {lines:?}"));
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "6привет");
     }
 
     #[cfg(feature = "legacy-bundled-input")]
