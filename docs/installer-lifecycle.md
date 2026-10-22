@@ -113,9 +113,13 @@ automatic conversion on. Existing profiles remain byte-for-byte unchanged; malfo
 configuration and partial/unrelated stores fail without reset. Exit `20` means
 missing lease/path/writer lock; `21` means profile initialization failed.
 
-Initialization precedes binary installation in the current prototype. If a
-later installer step fails or is cancelled, the new valid English-only profile
-may remain; it is not recursively removed or claimed to be a completed install.
+Initialization precedes binary installation in the current prototype. When setup
+then ends without installing (cancelled, or failed before the files were replaced),
+it removes the profile folder if that folder did not exist when setup started and
+holds only `config.ini` and `packages` (what initialization and the package store
+create); any other file keeps it. It also starts again the agent of this session
+that it closed (the owner's decision of 2026-10-22): setup still starts nothing
+after an installation.
 
 ## Language page and startup task
 
@@ -130,11 +134,15 @@ again. The package helper lives as long as setup does, however long the user
 stays on the page.
 
 Setup continues with English only, without a selection, when the helper cannot
-start or fails (its replies stop or cannot be trusted; Back and Next start a new
-one), when the catalog offers no language this setup can install, and when an
-existing profile from an earlier version keeps no package store (the helper
-answers `reason=store_missing`). While a reply is pending, Cancel asks the helper
-to cancel first; a failed reply never leaves the page waiting for one.
+start or fails (its replies stop or cannot be trusted), when the catalog check or
+the download fails, when the catalog offers no language this setup can install,
+and when an existing profile from an earlier version keeps no package store (the
+helper answers `reason=store_missing`). After a failed check or download the list
+is cleared and the page says that Next continues with English only; a download
+that failed after Next frees the leases and the fence again. Back, then Next
+checks the catalog again (with the same helper, or a new one after a helper
+failure). While a reply is pending, Cancel asks the helper to cancel first; a
+failed reply never leaves the page waiting for one.
 
 The startup task writes `HKCU\...\Run\AutoKeyboardLayot`; leaving it unchecked
 on a reinstall or upgrade deletes that value, and uninstall removes it.
@@ -274,7 +282,12 @@ helper that reports every row unavailable), `probe` for a `/DInstallerUiProbe`
 build, and `settings-open` (a silent upgrade while the settings window is open:
 without edits the window closes and the upgrade installs; with an unsaved edit the
 window stays open with the edit, setup reports the program busy with helper code 12
-and replaces nothing; after Apply the upgrade closes the window and installs). The
+and replaces nothing; after Apply the upgrade closes the window and installs).
+`download-failure` (the list cleared, English only said, the fence free, the
+catalog checked again after Back and Next, the profile folder Next created removed
+by Cancel) and `cancel-restarts-agent` (the program Next closed runs again after
+Cancel) need a setup built with a test build of the package helper that fails every
+download. The
 language list comes from the published catalog, so the VM needs network
 access. The script refuses to run when the user already has a profile or an
 installation, and removes what it created.
