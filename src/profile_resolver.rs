@@ -63,8 +63,22 @@ pub const PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// The wait before the next refresh after a failed one.
 pub const PROFILE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Worker-owned freshness boundary. Unchanged successful refreshes preserve a
-/// word/transaction generation; loss of evidence or changed bindings invalidate it.
+/// What a refresh of the keyboard profiles changed for their consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileUpdate {
+    /// The same snapshot, still usable.
+    Unchanged,
+    /// The snapshot aged out, or came back with the bindings it had: consumers stop or resume
+    /// using it, and keep what they hold under the generation, which did not change.
+    Availability,
+    /// The bindings changed, or the provider is gone: a new generation, and whatever was
+    /// planned under the old one is stale.
+    Bindings,
+}
+
+/// Worker-owned freshness boundary. Unchanged successful refreshes, and a snapshot that ages out
+/// and comes back with the same bindings, preserve a word/transaction generation; changed
+/// bindings or a provider that is gone invalidate it.
 #[derive(Debug, Default)]
 pub struct ProfileSnapshotCache {
     snapshot: Option<ResolvedKeyboardProfiles>,
@@ -82,20 +96,27 @@ impl ProfileSnapshotCache {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
-    pub fn invalidate(&mut self) -> bool {
+    /// The evidence is gone for good (the provider is): a new generation.
+    pub fn invalidate(&mut self) -> ProfileUpdate {
         self.confirmed_at = None;
         if self.snapshot.take().is_some() {
             self.generation = self.generation.wrapping_add(1);
-            true
+            ProfileUpdate::Bindings
         } else {
-            false
+            ProfileUpdate::Unchanged
         }
     }
-    pub fn expire(&mut self, now: Instant, max_age: Duration) -> bool {
-        if self.current(now, max_age).is_none() {
-            self.invalidate()
+    /// A snapshot too old to use goes, the generation stays: the same bindings coming back
+    /// change nothing planned under them, and other ones make a new generation then.
+    pub fn expire(&mut self, now: Instant, max_age: Duration) -> ProfileUpdate {
+        if self.current(now, max_age).is_some() {
+            return ProfileUpdate::Unchanged;
+        }
+        self.confirmed_at = None;
+        if self.snapshot.take().is_some() {
+            ProfileUpdate::Availability
         } else {
-            false
+            ProfileUpdate::Unchanged
         }
     }
     pub fn accept(
@@ -103,12 +124,12 @@ impl ProfileSnapshotCache {
         snapshot: ResolvedKeyboardProfiles,
         now: Instant,
         _max_age: Duration,
-    ) -> bool {
+    ) -> ProfileUpdate {
         // Only a real binding change invalidates buffered input. Re-accepting an
         // identical snapshot after the age limit, or after an expiry made it
         // unavailable, must not churn the generation, otherwise periodic refreshes
-        // keep clearing the current word. A snapshot available again is still a
-        // change for the consumers, who must take it up.
+        // keep clearing the current word. A snapshot available again is still news
+        // for the consumers, who must take it up.
         let changed = self.last_known.as_ref() != Some(&snapshot);
         if changed {
             self.generation = self.generation.wrapping_add(1);
@@ -117,7 +138,13 @@ impl ProfileSnapshotCache {
         self.last_known = Some(snapshot.clone());
         self.snapshot = Some(snapshot);
         self.confirmed_at = Some(now);
-        changed || available_again
+        if changed {
+            ProfileUpdate::Bindings
+        } else if available_again {
+            ProfileUpdate::Availability
+        } else {
+            ProfileUpdate::Unchanged
+        }
     }
 }
 
@@ -560,40 +587,72 @@ mod tests {
     }
 
     #[test]
-    fn cache_refresh_preserves_generation_but_loss_and_change_invalidate_it() {
+    fn cache_refresh_and_expiry_preserve_generation_but_change_and_loss_invalidate_it() {
+        use ProfileUpdate::{Availability, Bindings, Unchanged};
         let now = Instant::now();
         let ttl = Duration::from_secs(2);
         let snapshot = resolve_keyboard_profiles(&mut Fake::default()).unwrap();
         let mut cache = ProfileSnapshotCache::default();
         assert!(cache.current(now, ttl).is_none());
-        assert!(!cache.invalidate());
-        assert!(cache.accept(snapshot.clone(), now, ttl));
+        assert_eq!(cache.invalidate(), Unchanged);
+        assert_eq!(cache.accept(snapshot.clone(), now, ttl), Bindings);
         let generation = cache.generation();
-        assert!(!cache.accept(snapshot.clone(), now + Duration::from_secs(1), ttl));
+        assert_eq!(
+            cache.accept(snapshot.clone(), now + Duration::from_secs(1), ttl),
+            Unchanged
+        );
         assert_eq!(cache.generation(), generation);
         assert!(cache.current(now, ttl).is_none()); // Never accept future-dated evidence.
         assert!(cache.current(now + Duration::from_secs(2), ttl).is_some());
-        assert!(cache.expire(now + Duration::from_secs(3), ttl));
-        assert_eq!(cache.generation(), generation + 1);
-        assert!(!cache.expire(now + Duration::from_secs(4), ttl));
-        // The same bindings back after the expiry: available again (a change for the
-        // consumers) in the same generation, so words kept under it stay valid.
-        assert!(cache.accept(snapshot.clone(), now + Duration::from_secs(4), ttl));
-        assert_eq!(cache.generation(), generation + 1);
+        // Aged out, as under a tray menu left open: unavailable, in the same generation.
+        assert_eq!(
+            cache.expire(now + Duration::from_secs(3), ttl),
+            Availability
+        );
+        assert_eq!(cache.generation(), generation);
+        assert!(cache.current(now + Duration::from_secs(3), ttl).is_none());
+        assert_eq!(cache.expire(now + Duration::from_secs(4), ttl), Unchanged);
+        // The same bindings back after the expiry: available again in the same generation, so
+        // words kept under it stay valid.
+        assert_eq!(
+            cache.accept(snapshot.clone(), now + Duration::from_secs(4), ttl),
+            Availability
+        );
+        assert_eq!(cache.generation(), generation);
         assert!(cache.current(now + Duration::from_secs(4), ttl).is_some());
         let mut changed = snapshot;
         changed.profiles.remove(&VARIANT);
-        assert!(cache.accept(changed.clone(), now + Duration::from_secs(4), ttl));
+        assert_eq!(
+            cache.accept(changed.clone(), now + Duration::from_secs(4), ttl),
+            Bindings
+        );
+        assert_eq!(cache.generation(), generation + 1);
+        // Other bindings after an expiry are a change too.
+        assert_eq!(
+            cache.expire(now + Duration::from_secs(7), ttl),
+            Availability
+        );
+        let mut other = changed.clone();
+        other.profiles.remove(&US);
+        assert_eq!(
+            cache.accept(other, now + Duration::from_secs(7), ttl),
+            Bindings
+        );
         assert_eq!(cache.generation(), generation + 2);
-        assert!(cache.invalidate());
+        assert_eq!(cache.invalidate(), Bindings);
         assert_eq!(cache.generation(), generation + 3);
-        assert!(cache.current(now + Duration::from_secs(4), ttl).is_none());
-        assert!(cache.accept(changed.clone(), now + Duration::from_secs(5), ttl));
-        assert_eq!(cache.generation(), generation + 3);
+        assert!(cache.current(now + Duration::from_secs(7), ttl).is_none());
+        assert_eq!(
+            cache.accept(changed.clone(), now + Duration::from_secs(8), ttl),
+            Bindings
+        );
         let generation = cache.generation();
         // An identical refresh after the age limit must not churn the generation,
         // otherwise periodic refreshes keep clearing the current word.
-        assert!(!cache.accept(changed, now + Duration::from_secs(7), ttl));
+        assert_eq!(
+            cache.accept(changed, now + Duration::from_secs(11), ttl),
+            Unchanged
+        );
         assert_eq!(cache.generation(), generation);
     }
 

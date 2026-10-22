@@ -19,7 +19,7 @@ use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
 use autokeyboardlayot::conversion_sound::{self, SoundCue};
 use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
 use autokeyboardlayot::panic_guard::{BusyGuard, FaultWindow, WorkerExit, guarded, run_contained};
-use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
+use autokeyboardlayot::profile_resolver::{ProfileUpdate, ResolvedKeyboardProfiles};
 use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
 use autokeyboardlayot::ui_guard::{
@@ -4188,8 +4188,22 @@ fn queue_periodic_refreshes(
     }
 }
 
+/// While the tray menu is open the agent's own window is in front and the menu runs its own loop:
+/// only the keyboard profiles are refreshed, so that they do not age out (PROFILE_MAX_AGE) under
+/// a menu left open. True when the menu is open.
+fn queue_refreshes_under_menu(state: &mut AppState) -> bool {
+    if state.menu_open {
+        state.enqueue(RawInputEvent::ProfileRefresh);
+    }
+    state.menu_open
+}
+
 fn refresh_tray_state() {
-    if APP_STATE.with(|slot| slot.borrow().as_ref().is_some_and(|state| state.menu_open)) {
+    if APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(queue_refreshes_under_menu)
+    }) {
         return;
     }
     let Some(context) = current_foreground_context() else {
@@ -7740,29 +7754,36 @@ impl InputProcessor {
         if self.profile_override.is_some() {
             return;
         }
-        let changed = self.input_profiles.poll();
-        self.apply_profile_refresh(changed);
+        let update = self.input_profiles.poll();
+        self.apply_profile_refresh(update);
     }
 
-    fn apply_profile_refresh(&mut self, changed: bool) {
-        if changed {
-            let snapshot = self.resolved_profiles().cloned();
-            self.detector.set_resolved_profiles(snapshot.as_ref());
+    /// Takes up a refreshed profile snapshot. Only changed bindings make what was planned under
+    /// the old ones stale (the word, its boundary, a Pause cycle, the remembered words); a
+    /// snapshot that aged out, as under a tray menu left open, and came back with the same
+    /// bindings keeps them.
+    fn apply_profile_refresh(&mut self, update: ProfileUpdate) {
+        if update == ProfileUpdate::Unchanged {
+            return;
+        }
+        let snapshot = self.resolved_profiles().cloned();
+        self.detector.set_resolved_profiles(snapshot.as_ref());
+        if update == ProfileUpdate::Bindings {
             self.invalidate_conversion_state();
             if self.session.buffered_character_count() != 0 {
                 self.suppress_session();
             }
             self.replay_keys.clear();
             self.layout_switch_in_flight = None;
-            self.diagnostic(
-                "input_profiles",
-                format!(
-                    "generation={} available={}",
-                    self.input_profiles.generation(),
-                    snapshot.is_some()
-                ),
-            );
         }
+        self.diagnostic(
+            "input_profiles",
+            format!(
+                "generation={} available={}",
+                self.input_profiles.generation(),
+                snapshot.is_some()
+            ),
+        );
     }
 
     fn language_for_layout(&self, layout: usize) -> Option<Language> {
@@ -12929,7 +12950,7 @@ mod tests {
                 profile_generation: processor.input_profiles.generation(),
                 order: Vec::new(),
             });
-            processor.apply_profile_refresh(false);
+            processor.apply_profile_refresh(ProfileUpdate::Unchanged);
             assert!(processor.last_boundary.is_some());
             assert!(processor.transpose_cycle.is_some());
             match reset {
@@ -12941,6 +12962,46 @@ mod tests {
             assert!(processor.last_boundary.is_none());
             assert!(processor.transpose_cycle.is_none());
         }
+    }
+
+    #[test]
+    fn a_profile_snapshot_that_aged_out_and_came_back_keeps_the_words() {
+        // A tray menu left open for more than PROFILE_MAX_AGE let the snapshot age out; it comes
+        // back with the same bindings.
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
+        processor.last_boundary = Some(LastBoundary {
+            replay_keys: Vec::new(),
+            delimiter: Some(' '),
+            foreground,
+            epoch: 0,
+            profile_generation: processor.input_profiles.generation(),
+        });
+        for character in "hello".chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+        }
+        processor.replay_keys = vec![
+            ReplayKey {
+                scan_code: 0x23,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            };
+            5
+        ];
+        processor.apply_profile_refresh(ProfileUpdate::Availability);
+        assert!(processor.last_boundary.is_some());
+        assert_eq!(processor.session.buffered_character_count(), 5);
+        assert_eq!(processor.replay_keys.len(), 5);
+        // Changed bindings make them stale.
+        processor.apply_profile_refresh(ProfileUpdate::Bindings);
+        assert!(processor.last_boundary.is_none());
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert!(processor.replay_keys.is_empty());
     }
 
     #[test]
@@ -12965,7 +13026,7 @@ mod tests {
     #[test]
     fn profile_refresh_preserves_unchanged_words_and_suppresses_only_an_invalidated_tail() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.apply_profile_refresh(true);
+        processor.apply_profile_refresh(ProfileUpdate::Bindings);
         for character in "hello".chars() {
             processor.session.handle(
                 InputEvent::Printable(character),
@@ -12974,9 +13035,9 @@ mod tests {
             );
         }
         assert_eq!(processor.session.buffered_character_count(), 5);
-        processor.apply_profile_refresh(false);
+        processor.apply_profile_refresh(ProfileUpdate::Unchanged);
         assert_eq!(processor.session.buffered_character_count(), 5);
-        processor.apply_profile_refresh(true);
+        processor.apply_profile_refresh(ProfileUpdate::Bindings);
         assert_eq!(processor.session.buffered_character_count(), 0);
         for character in "tail".chars() {
             processor.session.handle(
@@ -20776,6 +20837,16 @@ mod tests {
     }
 
     #[test]
+    fn the_keyboard_profiles_are_refreshed_under_an_open_tray_menu() {
+        let (mut state, receiver) = test_gate_state(8);
+        assert!(!queue_refreshes_under_menu(&mut state));
+        assert!(queued_refreshes(&receiver).is_empty());
+        state.menu_open = true;
+        assert!(queue_refreshes_under_menu(&mut state));
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+    }
+
+    #[test]
     fn a_profile_refresh_waits_once_in_the_queue_and_a_full_queue_only_drops_it() {
         let (state, receiver) = test_gate_state(1);
         assert!(state.enqueue(RawInputEvent::ProfileRefresh));
@@ -20830,6 +20901,72 @@ mod tests {
         assert_eq!(processor.input_profiles.generation(), 1);
         assert!(asked.load(Ordering::Acquire) >= 1);
         assert_eq!(processor.resolved_profiles(), Some(&test_profiles()));
+    }
+
+    #[test]
+    fn a_word_remembered_before_the_profiles_aged_out_is_not_stale_when_they_come_back() {
+        // Before this, an open tray menu stopped the refreshes: after six seconds the snapshot
+        // aged out, the same bindings came back in a new generation and the word remembered when
+        // the tray was clicked was dropped as stale.
+        use autokeyboardlayot::profile_resolver::{PROFILE_MAX_AGE, ProfileResolutionError};
+        let mut processor = processor_at_the_test_target();
+        processor.profile_override = None;
+        let answering = Arc::new(AtomicBool::new(true));
+        let provider = Arc::clone(&answering);
+        processor.input_profiles = KeyboardProfileCache::with_resolver(
+            BoundedProbe::spawn("test-profiles", move || {
+                move |()| {
+                    if provider.load(Ordering::Acquire) {
+                        Ok(test_profiles())
+                    } else {
+                        Err(ProfileResolutionError::Unavailable)
+                    }
+                }
+            })
+            .unwrap(),
+        );
+        let refresh_until = |processor: &mut InputProcessor, available: bool| {
+            let deadline = Instant::now() + PROFILE_MAX_AGE + Duration::from_secs(5);
+            while processor.resolved_profiles().is_some() != available {
+                assert!(Instant::now() < deadline, "available={available}");
+                processor.refresh_input_profiles();
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        refresh_until(&mut processor, true);
+        let generation = processor.input_profiles.generation();
+        let target = recent_ok_foreground();
+        processor.last_boundary = Some(LastBoundary {
+            replay_keys: vec![
+                ReplayKey {
+                    scan_code: 0x23,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                };
+                5
+            ],
+            delimiter: Some(' '),
+            foreground: target,
+            epoch: 0,
+            profile_generation: generation,
+        });
+        processor.remember_word(target, None, Instant::now());
+        processor.last_boundary = None;
+        // No refresh succeeds for longer than the snapshot lives, then the same bindings return.
+        answering.store(false, Ordering::Release);
+        refresh_until(&mut processor, false);
+        answering.store(true, Ordering::Release);
+        refresh_until(&mut processor, true);
+        assert_eq!(processor.input_profiles.generation(), generation);
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        assert!(
+            processor
+                .restore_remembered_word(target, Instant::now())
+                .is_some(),
+            "the remembered word is stale"
+        );
+        assert!(processor.last_boundary.is_some());
     }
 
     #[test]

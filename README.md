@@ -240,7 +240,9 @@ field check before it no longer cancels the conversion. After you switch to anot
 back, or click, Pause can still convert the last word of that window for two
 minutes: the word is used only if it is still exactly before the caret, and
 nothing is typed otherwise (`event=hotkey source=remembered`). Applying settings or
-switching the automatic mode in between keeps it; changed keyboard layouts drop it
+switching the automatic mode in between keeps it, and so does a tray menu left open
+(the keyboard layouts are still checked under it, and the same layouts found again after
+a pause in the checks change nothing); changed keyboard layouts drop it
 (`source=remembered result=stale`). A paste the field
 did not confirm ends with `event=conversion result=cancelled`, and its selection
 line says what the field showed (`confirm=` and `attempts=`).
