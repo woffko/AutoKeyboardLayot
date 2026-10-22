@@ -2143,6 +2143,72 @@ fn the_settings_window_on_the_desktop_shows_the_whole_tools_section_in_spanish_a
 
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_keeps_the_language_names_in_spanish_at_the_least_width() {
+    // The Spanish status of an active language is about 90 characters long.
+    let profile = Profile::managed("es");
+    install_published(&profile, &["es-ES"]);
+    let window = Window::open(profile);
+    window.place(900, 640);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let row = ui
+        .wait(
+            window.handle,
+            UIA_CheckBoxControlTypeId,
+            "English",
+            Duration::from_secs(10),
+        )
+        .expect("the English row");
+    // The row's texts: those that begin inside its band.
+    let texts: Vec<Element> = ui
+        .texts(window.handle)
+        .into_iter()
+        .filter(|text| {
+            text.rect.top >= row.rect.top - 2
+                && text.rect.top < row.rect.bottom
+                && text.rect.left < row.rect.right
+                && text.rect.right > row.rect.left
+        })
+        .collect();
+    let name = texts.iter().find(|text| text.name == "English");
+    let status = texts
+        .iter()
+        .filter(|text| text.name != "English")
+        .max_by_key(|text| text.name.len());
+    let _ = screenshot("settings-spanish-rows.bmp");
+    eprintln!(
+        "row={:?} name={:?} status={:?}",
+        row.rect,
+        name.map(|name| name.rect),
+        status.map(|status| (status.rect, status.name.clone()))
+    );
+    window.request_close();
+    let name = name.expect("the English row's name");
+    let status = status.expect("the English row's status");
+    assert!(
+        status.name.chars().count() > 60,
+        "the status is not a long one"
+    );
+    // "English" is about 50 px wide on its own line.
+    assert!(
+        name.width() >= 40,
+        "the name is squeezed to {} px",
+        name.width()
+    );
+    // Both stay inside the row: the row grows with the wrapped status.
+    for text in [name, status] {
+        assert!(
+            text.rect.bottom <= row.rect.bottom + 1,
+            "{:?} runs out of its row ({} > {})",
+            text.name,
+            text.rect.bottom,
+            row.rect.bottom
+        );
+    }
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_keeps_the_running_applications_below_their_buttons_when_narrow()
  {
     let window = Window::open(Profile::legacy());
