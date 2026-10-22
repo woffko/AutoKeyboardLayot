@@ -128,23 +128,8 @@ pub(super) fn run() -> Result<(), String> {
     ui.global::<Localization>()
         .set_rtl(super::ui_localization::is_rtl());
     populate_ui(&ui, &document, &packages.dictionaries);
-    let _import_timer = wire_callbacks(&ui, document, packages.dictionaries);
+    let _timers = wire_callbacks(&ui, document, packages.dictionaries);
     ui.show().map_err(|error| error.to_string())?;
-    // winit creates the native window only once the event loop runs: the installer's graceful
-    // close is advertised on one of its first ticks.
-    let advertiser = std::rc::Rc::new(slint::Timer::default());
-    let done = std::rc::Rc::downgrade(&advertiser);
-    advertiser.start(
-        slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(20),
-        move || {
-            if advertise_graceful_close()
-                && let Some(timer) = done.upgrade()
-            {
-                timer.stop();
-            }
-        },
-    );
     let result = ui.run().map_err(|error| error.to_string());
     retract_graceful_close();
     hotkey_capture::stop();
@@ -443,7 +428,7 @@ fn wire_callbacks(
     ui: &SettingsWindow,
     document: ConfigurationDocument,
     registry: Arc<autokeyboardlayot::DictionaryRegistry>,
-) -> slint::Timer {
+) -> [slint::Timer; 2] {
     let document = std::rc::Rc::new(std::cell::RefCell::new(document));
     let close_document = std::rc::Rc::clone(&document);
     let weak = ui.as_weak();
@@ -451,21 +436,40 @@ fn wire_callbacks(
         let Some(ui) = weak.upgrade() else {
             return slint::CloseRequestResponse::HideWindow;
         };
-        if ui.get_package_import_busy() {
-            ui.set_status_error(false);
-            ui.set_status_text(tr("lifecycle.settings_busy").into());
-            return slint::CloseRequestResponse::KeepWindowShown;
-        }
         let original = close_document.borrow();
-        if !settings_edits_are_saved(document_from_ui(&ui, original.clone()), &original) {
+        let saved = settings_edits_are_saved(document_from_ui(&ui, original.clone()), &original);
+        if let Some(refusal) = close_refusal(package_work(&ui), saved, false) {
             ui.set_status_error(false);
-            ui.set_status_text(tr("lifecycle.settings_unsaved").into());
+            ui.set_status_text(tr(refusal).into());
             return slint::CloseRequestResponse::KeepWindowShown;
         }
         hotkey_capture::stop();
         retract_graceful_close();
         slint::CloseRequestResponse::HideWindow
     });
+    // winit creates the native window only once the event loop runs: the installer's graceful
+    // close is advertised on one of its first ticks, and from then on exactly while a close would
+    // be accepted (close_refusal), so that the installer never asks a window that would refuse.
+    let advertiser = slint::Timer::default();
+    let weak = ui.as_weak();
+    let advertised_document = std::rc::Rc::clone(&document);
+    advertiser.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let original = advertised_document.borrow();
+            let saved =
+                settings_edits_are_saved(document_from_ui(&ui, original.clone()), &original);
+            if close_refusal(package_work(&ui), saved, false).is_none() {
+                advertise_graceful_close();
+            } else {
+                retract_graceful_close();
+            }
+        },
+    );
     let registry = std::rc::Rc::new(std::cell::RefCell::new(registry));
     let import_timer = package_import::wire(ui, document.clone(), registry.clone());
 
@@ -657,7 +661,7 @@ fn wire_callbacks(
     ui.on_cancel_requested(move || {
         if weak
             .upgrade()
-            .is_some_and(|ui| ui.get_package_import_busy())
+            .is_some_and(|ui| close_refusal(package_work(&ui), true, true).is_some())
         {
             return;
         }
@@ -724,7 +728,45 @@ fn wire_callbacks(
             }
         }
     });
-    import_timer
+    [import_timer, advertiser]
+}
+
+/// The package operation running now, as closing the window sees it: the read-only refresh of
+/// the installed packages (the one at opening) or one that changes the store (an import, a
+/// removal, a rollback, a download).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageWork {
+    Idle,
+    ReadOnly,
+    Changing,
+}
+
+fn package_work(ui: &SettingsWindow) -> PackageWork {
+    if !ui.get_package_import_busy() {
+        PackageWork::Idle
+    } else if ui.get_package_import_read_only() {
+        PackageWork::ReadOnly
+    } else {
+        PackageWork::Changing
+    }
+}
+
+/// Why the window may not close now, if it may not (the message key): an operation that changes
+/// the package store, or unsaved edits unless the close discards them (Cancel). X, `WM_CLOSE`
+/// and the installer's graceful close keep edits; the graceful close is advertised exactly while
+/// this allows a close.
+fn close_refusal(
+    work: PackageWork,
+    edits_saved: bool,
+    discards_edits: bool,
+) -> Option<&'static str> {
+    if work == PackageWork::Changing {
+        return Some("lifecycle.settings_busy");
+    }
+    if !discards_edits && !edits_saved {
+        return Some("lifecycle.settings_unsaved");
+    }
+    None
 }
 
 fn settings_edits_are_saved(
@@ -1540,6 +1582,24 @@ va|ult.exe
             save_or_merge(folder.path(), &document, &current).unwrap(),
             Saved::AsDrafted
         );
+    }
+
+    #[test]
+    fn a_read_only_package_refresh_does_not_hold_the_window_open() {
+        use PackageWork::{Changing, Idle, ReadOnly};
+        let busy = Some("lifecycle.settings_busy");
+        let unsaved = Some("lifecycle.settings_unsaved");
+        // The refresh at opening only reads the installed packages: X, WM_CLOSE and Cancel close.
+        assert_eq!(close_refusal(ReadOnly, true, false), None);
+        assert_eq!(close_refusal(ReadOnly, true, true), None);
+        // An operation that changes the store holds the window, whatever the edits.
+        assert_eq!(close_refusal(Changing, true, false), busy);
+        assert_eq!(close_refusal(Changing, true, true), busy);
+        // Unsaved edits hold it for a close that keeps them, not for Cancel.
+        assert_eq!(close_refusal(Idle, false, false), unsaved);
+        assert_eq!(close_refusal(ReadOnly, false, false), unsaved);
+        assert_eq!(close_refusal(Idle, false, true), None);
+        assert_eq!(close_refusal(Idle, true, false), None);
     }
 
     #[test]

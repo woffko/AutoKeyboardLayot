@@ -48,9 +48,12 @@ executable path against `<directory>/AutoKeyboardLayot.exe`, and rechecks the
 window PID. It also requires the versioned `AutoKeyboardLayot.GracefulClose.v1`
 window property advertised by the guarded agent/settings code. The settings
 window sets it on one of the first ticks of its event loop, once the native window
-exists, and removes it while the window still exists, before the loop ends; a close
-it refuses (unsaved edits, a package operation in progress) keeps it, so a later
-setup can ask again. Older versions
+exists, and from then on exactly while it would accept a close: it takes the
+property away while there are unsaved edits or a package operation that changes the
+store, and sets it again once there are none (checked every 100 ms), so the helper
+never asks a window that would refuse. The read-only refresh of the installed
+packages at opening does not hold the window. It removes the property while the
+window still exists, before the loop ends. Older versions
 without that capability require manual closure; no `WM_CLOSE` is sent to them.
 A portable instance from another directory is not closed. A request
 waits at most 15 seconds per process. A missing window with a live singleton is
@@ -133,8 +136,10 @@ on a reinstall or upgrade deletes that value, and uninstall removes it.
 
 ## Remaining work
 
-The settings window refuses normal close while a package operation or file
-picker is active. It also refuses if the current editor values are invalid or
+The settings window refuses normal close while a package operation that changes
+the store (import, removal, rollback, download) or a file picker is active; the
+read-only refresh of the installed packages at opening does not hold X, Cancel or
+`WM_CLOSE`. It also refuses if the current editor values are invalid or
 different from the last saved document. Apply/OK saves explicitly; Cancel is
 the explicit discard action. This guard is shared by native window close and
 an externally delivered normal close request. It does not save on the user's

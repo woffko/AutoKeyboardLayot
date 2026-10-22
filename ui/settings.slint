@@ -495,6 +495,8 @@ export component SettingsWindow inherits Window {
     in property <[InputPackRow]> input-packs;
     in property <bool> package-import-allowed: false;
     in property <bool> package-import-busy: false;
+    // The operation behind package-import-busy only reads the installed packages.
+    in property <bool> package-import-read-only: false;
     in property <bool> package-import-ready: false;
     in property <string> package-import-preview;
     in-out property <bool> add-language-visible: false;

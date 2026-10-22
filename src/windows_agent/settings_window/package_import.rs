@@ -285,6 +285,7 @@ fn start(
         Ok(_) => {
             state.receiver = Some(receive);
             ui.set_package_import_busy(true);
+            ui.set_package_import_read_only(false);
         }
         Err(_) => failure(ui, ImportFailure::Thread),
     }
@@ -488,6 +489,8 @@ pub(super) fn wire(
                 .map_err(|_| ImportFailure::Snapshot)?;
             Ok(Completed::Listing(listing(&snapshot)))
         });
+        // Only reading the installed packages, it does not hold the window open.
+        ui.set_package_import_read_only(true);
     });
 
     let weak = ui.as_weak();
@@ -742,6 +745,7 @@ pub(super) fn wire(
             let was_uncertain_inspection = state.inspecting_uncertain;
             state.inspecting_uncertain = false;
             ui.set_package_import_busy(false);
+            ui.set_package_import_read_only(false);
             let was_network = ui.get_download_active();
             let cancelled = state
                 .cancel
