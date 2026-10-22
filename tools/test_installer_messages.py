@@ -97,6 +97,25 @@ class InstallerMessageTests(unittest.TestCase):
         self.assertIn('expired', english['AkCatalogExpired'])
         self.assertIn('clock', english['AkCatalogExpired'])
 
+    def test_the_package_page_intro_asks_for_next_in_every_language(self):
+        # Next installs the chosen languages at once (AkPackageCloses): the intro asks for that one
+        # step, as en.isl does, and promises no later confirmation. Each locale names its Next
+        # button as its own AkPackageEnglishNext does.
+        next_buttons = {
+            'en': 'Next', 'ru': '«Далее»', 'de': '„Weiter“', 'es': '«Siguiente»', 'fr': '« Suivant »',
+            'pt-BR': '“Avançar”', 'ja': '[次へ]', 'ar': '«التالي»', 'zh-CN': '“下一步”', 'id': 'Maju',
+            'ur': '«اگلا»', 'et': '„Edasi“', 'hi': '«आगे बढो»', 'bn': '«পরবর্তী»',
+        }
+        root = Path(__file__).resolve().parents[1] / 'installer/messages'
+        files = sorted(root.glob('*.isl'))
+        self.assertEqual({file.stem for file in files}, set(next_buttons))
+        for file in files:
+            pairs = dict(line.split('=', 1) for line in file.read_text(encoding='utf-8').splitlines()
+                         if line.startswith('Ak'))
+            with self.subTest(locale=file.stem):
+                self.assertIn(next_buttons[file.stem], pairs['AkPackageEnglishNext'])
+                self.assertIn(next_buttons[file.stem], pairs['AkPackageIntro'])
+
     def test_locale_keys_and_placeholders_match_english_fallback(self):
         root = Path(__file__).resolve().parents[1] / 'installer'
         def catalog(name):
