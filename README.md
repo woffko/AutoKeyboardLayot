@@ -182,7 +182,11 @@ an explicit tray action. Selecting a hotkey with modifiers does not inject
 corrections until those modifiers have been released. Recording a shortcut in the
 settings refuses chords that are typing, which the agent would otherwise swallow
 everywhere: Shift with a letter or digit (a capital or a symbol) and Ctrl+Alt with a
-letter or digit (AltGr on many layouts, without Win). It warns before Alt+F4 and
+letter or digit (AltGr on many layouts, without Win). The configuration refuses them
+too: a configuration file that names one (allowed by earlier versions) still loads,
+with the hotkey turned off, and the settings window says which shortcut it was.
+Recording starts only on the hotkey's page with the hotkey on, also when it waited
+for the key that selected it to be released. It warns before Alt+F4 and
 Ctrl+C, V, X, Z, A and S, which Windows and programs use. Selected-text conversion
 is planned separately and is not implemented.
 

@@ -66,7 +66,34 @@ impl Hotkey {
                 "letter and number hotkeys require at least one modifier".to_owned(),
             ));
         }
+        if Self::types_text(virtual_key, modifiers) {
+            return Err(HotkeyError(
+                "a letter or number with Shift alone or with Ctrl+Alt types text".to_owned(),
+            ));
+        }
         Ok(Self {
+            virtual_key,
+            modifiers,
+        })
+    }
+
+    /// Whether `modifiers` with the letter or digit `virtual_key` type a character instead: Shift
+    /// alone types a capital letter or a symbol, and Ctrl+Alt without Win is AltGr on many layouts
+    /// (€ on E, @ on 2). Taken as the hotkey, such a chord would swallow typing everywhere.
+    pub const fn types_text(virtual_key: u16, modifiers: u8) -> bool {
+        let letter_or_digit = matches!(virtual_key, 0x30..=0x39 | 0x41..=0x5a);
+        let ctrl_alt = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT;
+        letter_or_digit
+            && (modifiers == HOTKEY_MOD_SHIFT
+                || (modifiers & HOTKEY_MOD_WIN == 0 && modifiers & ctrl_alt == ctrl_alt))
+    }
+
+    /// The chord `key` with `modifiers` spell when it is a letter or digit shortcut that types
+    /// text (see `types_text`), to name it to the user; never a usable hotkey.
+    pub fn typing_chord(key: &str, modifiers: &str) -> Option<Self> {
+        let virtual_key = parse_key(key)?;
+        let modifiers = parse_modifiers(modifiers).ok()?;
+        Self::types_text(virtual_key, modifiers).then_some(Self {
             virtual_key,
             modifiers,
         })
@@ -229,8 +256,45 @@ mod tests {
     #[test]
     fn ordinary_keys_require_a_modifier() {
         assert!(Hotkey::from_parts("K", "").is_err());
-        assert!(Hotkey::from_parts("K", "Ctrl+Alt").is_ok());
+        assert!(Hotkey::from_parts("K", "Ctrl+Win").is_ok());
         assert!(Hotkey::from_parts("Escape", "Ctrl").is_err());
+    }
+
+    #[test]
+    fn a_letter_or_digit_shortcut_that_types_text_is_refused() {
+        let ctrl_alt = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT;
+        // Shift alone types capitals and symbols; Ctrl+Alt is AltGr on many layouts, with Shift too.
+        for (key, modifiers) in [
+            (b'A', HOTKEY_MOD_SHIFT),
+            (b'7', HOTKEY_MOD_SHIFT),
+            (b'E', ctrl_alt),
+            (b'2', ctrl_alt | HOTKEY_MOD_SHIFT),
+        ] {
+            assert!(Hotkey::types_text(u16::from(key), modifiers));
+            assert!(Hotkey::new(u16::from(key), modifiers).is_err());
+        }
+        // With Win there is no AltGr; Ctrl, Alt or Win make a letter a shortcut, Shift may join;
+        // the function keys and Pause take Shift alone.
+        for (key, modifiers) in [
+            (u16::from(b'E'), ctrl_alt | HOTKEY_MOD_WIN),
+            (u16::from(b'Q'), HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
+            (u16::from(b'Q'), HOTKEY_MOD_ALT | HOTKEY_MOD_SHIFT),
+            (u16::from(b'Q'), HOTKEY_MOD_ALT),
+            (0x74, HOTKEY_MOD_SHIFT),
+            (VK_PAUSE, HOTKEY_MOD_SHIFT),
+        ] {
+            assert!(!Hotkey::types_text(key, modifiers));
+            assert!(Hotkey::new(key, modifiers).is_ok());
+        }
+        // The spelling of such a chord is still read, to tell the user what was turned off.
+        assert_eq!(
+            Hotkey::typing_chord("A", "Shift")
+                .map(Hotkey::display_name)
+                .as_deref(),
+            Some("Shift+A")
+        );
+        assert_eq!(Hotkey::typing_chord("A", "Ctrl"), None);
+        assert_eq!(Hotkey::typing_chord("bad", "Shift"), None);
     }
 
     #[test]

@@ -148,6 +148,7 @@
     "hotkey.modifier_required": "使用字母或数字时，请同时按住 Ctrl、Alt 或 Win。Pause/Break 和 F1–F24 也可单独使用。",
     "hotkey.shift_only": "Shift 加字母或数字会输入大写字母或符号，不能用作快捷键。请加上 Ctrl、Alt 或 Win。",
     "hotkey.altgr": "在许多键盘布局中，Ctrl+Alt 加字母或数字会输入字符（AltGr），不能用作快捷键。请选择其他组合。",
+    "hotkey.refused_loaded": "配置中的快捷键 {hotkey} 会输入文字，因此已关闭热键。请录制其他快捷键，打开热键，然后选择“应用”。",
     "hotkey.selected_common": "已选择 {hotkey}。Windows 和许多程序都使用此快捷键；分配期间，主程序会接管它。松开按键，然后选择“应用”，或录制其他组合。",
     "recovery.repeat_warning": "部分保留的输入可能已经发送到应用。重复发送可能导致文本或快捷键重复。仍要准备恢复吗？",
     "recovery.ready_title": "输入恢复已准备就绪",

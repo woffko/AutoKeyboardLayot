@@ -144,6 +144,7 @@
     "hotkey.modifier_required": "Halten Sie für Buchstaben oder Ziffern Strg, Alt oder Win gedrückt. Pause/Break und F1–F24 funktionieren auch allein.",
     "hotkey.shift_only": "Umschalt mit einem Buchstaben oder einer Ziffer schreibt einen Großbuchstaben oder ein Zeichen und kann daher kein Kürzel sein. Nehmen Sie Strg, Alt oder Win hinzu.",
     "hotkey.altgr": "Strg+Alt mit einem Buchstaben oder einer Ziffer schreibt auf vielen Layouts Zeichen (AltGr) und kann daher kein Kürzel sein. Wählen Sie ein anderes.",
+    "hotkey.refused_loaded": "Das Tastenkürzel {hotkey} aus der Konfiguration tippt Text, daher wurde die Kurztaste ausgeschaltet. Nehmen Sie ein anderes Kürzel auf, schalten Sie die Kurztaste ein und wählen Sie Übernehmen.",
     "hotkey.selected_common": "{hotkey} ausgewählt. Windows und viele Programme verwenden dieses Kürzel; solange es zugewiesen ist, übernimmt es der Agent. Lassen Sie die Tasten los und wählen Sie Übernehmen, oder nehmen Sie ein anderes auf.",
     "recovery.repeat_warning": "Ein Teil der zurückgehaltenen Eingabe könnte die Anwendung bereits erreicht haben. Erneutes Senden kann Text oder Tastenkürzel duplizieren. Wiederherstellung trotzdem vorbereiten?",
     "recovery.ready_title": "Eingabewiederherstellung vorbereitet",

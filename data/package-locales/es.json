@@ -144,6 +144,7 @@
     "hotkey.modifier_required": "Mantenga Ctrl, Alt o Win con una letra o un dígito. Pause/Break y F1–F24 también funcionan solas.",
     "hotkey.shift_only": "Shift con una letra o un dígito escribe una mayúscula o un símbolo, así que no puede ser el atajo. Añada Ctrl, Alt o Win.",
     "hotkey.altgr": "Ctrl+Alt con una letra o un dígito escribe caracteres en muchas distribuciones (AltGr), así que no puede ser el atajo. Elija otro.",
+    "hotkey.refused_loaded": "El atajo {hotkey} de la configuración escribe texto, así que se desactivó la tecla de acceso rápido. Grabe otro atajo, active la tecla y seleccione Aplicar.",
     "hotkey.selected_common": "Se ha seleccionado {hotkey}. Windows y muchos programas usan este atajo; mientras esté asignado, el agente lo toma para sí. Suelte las teclas y seleccione Aplicar, o grabe otro.",
     "recovery.repeat_warning": "Es posible que parte de la entrada retenida ya haya llegado a la aplicación. Repetirla puede duplicar texto o atajos. ¿Preparar la recuperación de todos modos?",
     "recovery.ready_title": "Recuperación de entrada preparada",

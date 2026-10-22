@@ -144,6 +144,7 @@
     "hotkey.modifier_required": "Mantenha Ctrl, Alt ou Win pressionado com uma letra ou um dígito. Pause/Break e F1–F24 também funcionam sozinhas.",
     "hotkey.shift_only": "Shift com uma letra ou um dígito digita uma maiúscula ou um símbolo, por isso não pode ser o atalho. Acrescente Ctrl, Alt ou Win.",
     "hotkey.altgr": "Ctrl+Alt com uma letra ou um dígito digita caracteres em muitos layouts (AltGr), por isso não pode ser o atalho. Escolha outro.",
+    "hotkey.refused_loaded": "O atalho {hotkey} da configuração digita texto, por isso a tecla de atalho foi desativada. Grave outro atalho, ative a tecla de atalho e selecione Aplicar.",
     "hotkey.selected_common": "{hotkey} selecionado. O Windows e muitos programas usam este atalho; enquanto estiver atribuído, o agente fica com ele. Solte as teclas e selecione Aplicar, ou grave outro.",
     "recovery.repeat_warning": "Parte da entrada retida pode já ter chegado ao aplicativo. Repeti-la pode duplicar texto ou atalhos. Preparar a recuperação mesmo assim?",
     "recovery.ready_title": "Recuperação de entrada preparada",

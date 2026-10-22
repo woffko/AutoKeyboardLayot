@@ -1541,6 +1541,20 @@ mod tests {
     }
 
     #[test]
+    fn a_configuration_whose_hotkey_types_text_still_loads_and_saves() {
+        let text = "schema_version=4\n[packages]\nmode=legacy\n[settings]\nforce_hotkey_key=E\nforce_hotkey_modifiers=Ctrl+Alt\n[process_exclusions]\nprivate.exe\n";
+        let document = ConfigurationDocument::from_text(text).unwrap();
+        assert!(!document.settings.pause_break_undo);
+        assert_eq!(
+            document.settings.refused_force_hotkey.chord(),
+            Some("Ctrl+Alt+E")
+        );
+        assert_eq!(document.process_exclusions, ["private.exe"]);
+        let saved = document.to_text().unwrap();
+        assert_eq!(ConfigurationDocument::from_text(&saved).unwrap(), document);
+    }
+
+    #[test]
     fn rejects_unknown_or_future_schema() {
         assert!(ConfigurationDocument::from_text("[settings]\n").is_err());
         assert!(ConfigurationDocument::from_text("schema_version=4\n[settings]\n").is_err());

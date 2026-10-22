@@ -241,7 +241,17 @@ fn populate_ui(
 
     let hotkey = settings.force_hotkey();
     set_ui_hotkey(ui, hotkey);
+    if let Some(hint) = refused_hotkey_hint(settings) {
+        ui.set_hotkey_capture_hint(hint.into());
+    }
     ui.set_running_processes(strings_model(std::iter::empty::<&str>()));
+}
+
+/// What the window says about a hotkey the configuration names that types text: it was turned
+/// off at loading (see `RefusedHotkey`).
+fn refused_hotkey_hint(settings: &autokeyboardlayot::Settings) -> Option<String> {
+    let chord = settings.refused_force_hotkey.chord()?;
+    Some(tr_format("hotkey.refused_loaded", &[("hotkey", chord)]))
 }
 
 fn populate_ui_language(ui: &SettingsWindow, preference: &UiLanguagePreference) {
@@ -1214,6 +1224,20 @@ mod tests {
             .find(|row| row.id == "en-us")
             .unwrap()
             .selected
+        );
+    }
+
+    #[test]
+    fn the_window_says_which_configured_hotkey_was_turned_off_for_typing_text() {
+        let settings = autokeyboardlayot::Settings::try_from_text(
+            "force_hotkey_key=A\nforce_hotkey_modifiers=Shift\n",
+        )
+        .unwrap();
+        let hint = refused_hotkey_hint(&settings).expect("a hint");
+        assert!(hint.contains("Shift+A"), "{hint}");
+        assert_eq!(
+            refused_hotkey_hint(&autokeyboardlayot::Settings::default()),
+            None
         );
     }
 

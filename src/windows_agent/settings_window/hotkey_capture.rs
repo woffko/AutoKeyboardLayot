@@ -4,7 +4,7 @@
 use super::super::ui_localization::{tr, tr_format};
 use super::super::{current_foreground_context, hotkey_modifier_bit};
 use super::{Hotkey, SettingsWindow, set_ui_hotkey};
-use autokeyboardlayot::{HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN};
+use autokeyboardlayot::{HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT};
 use slint::ComponentHandle;
 use std::{
     cell::{Cell, RefCell},
@@ -35,16 +35,26 @@ const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 /// What starting a capture does now: begin with every key up, wait while a key is still down (the
 /// Space or Enter that selected the button fires on its key-down), give up after `RELEASE_WAIT`
-/// or when another program is in the foreground.
+/// or when another program is in the foreground, and cancel once the window is not `in_place`
+/// (another page, or the hotkey switched off), also while waiting, so no hook is installed there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartStep {
     Begin,
     Wait,
     GiveUp,
+    /// The window left the hotkey's page or the hotkey was switched off.
+    Cancel,
 }
 
-fn start_step(owns_foreground: bool, released: bool, waited: Duration) -> StartStep {
-    if !owns_foreground {
+fn start_step(
+    owns_foreground: bool,
+    in_place: bool,
+    released: bool,
+    waited: Duration,
+) -> StartStep {
+    if !in_place {
+        StartStep::Cancel
+    } else if !owns_foreground {
         StartStep::GiveUp
     } else if released {
         StartStep::Begin
@@ -97,21 +107,21 @@ enum Refusal {
     AltGr,
 }
 
-/// What the capture makes of a shortcut the hotkey rules allow: refused when it is typing, else
-/// accepted, and true when Windows and many programs use it themselves.
-fn verdict(hotkey: Hotkey) -> Result<bool, Refusal> {
-    let letter_or_digit = matches!(hotkey.virtual_key, 0x30..=0x39 | 0x41..=0x5a);
-    let ctrl_alt = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT;
-    if letter_or_digit && hotkey.modifiers == HOTKEY_MOD_SHIFT {
-        return Err(Refusal::ShiftOnly);
+/// What the capture makes of a chord: refused, with the reason, when it types text (the hotkey
+/// rules refuse it too, see `Hotkey::types_text`), else accepted, and true when Windows and many
+/// programs use it themselves.
+fn verdict(virtual_key: u16, modifiers: u8) -> Result<bool, Refusal> {
+    if Hotkey::types_text(virtual_key, modifiers) {
+        return Err(if modifiers == HOTKEY_MOD_SHIFT {
+            Refusal::ShiftOnly
+        } else {
+            Refusal::AltGr
+        });
     }
-    if letter_or_digit
-        && hotkey.modifiers & HOTKEY_MOD_WIN == 0
-        && hotkey.modifiers & ctrl_alt == ctrl_alt
-    {
-        return Err(Refusal::AltGr);
-    }
-    Ok(is_common_shortcut(hotkey))
+    Ok(is_common_shortcut(Hotkey {
+        virtual_key,
+        modifiers,
+    }))
 }
 
 /// Alt+F4 closes the window; Ctrl+C, V, X, Z, A and S copy, paste, cut, undo, select all and save.
@@ -124,7 +134,7 @@ fn is_common_shortcut(hotkey: Hotkey) -> bool {
 
 /// The hint once `hotkey` is chosen, warning about a shortcut that Windows and programs use.
 fn chosen_hint(hotkey: Hotkey) -> String {
-    let key = if verdict(hotkey) == Ok(true) {
+    let key = if verdict(hotkey.virtual_key, hotkey.modifiers) == Ok(true) {
         "hotkey.selected_common"
     } else {
         "hotkey.selected"
@@ -186,15 +196,22 @@ impl CaptureKeys {
             .iter()
             .filter_map(|key| hotkey_modifier_bit(*key))
             .fold(0, |all, bit| all | bit);
-        match Hotkey::new(key, modifiers).map(|hotkey| (hotkey, verdict(hotkey))) {
-            Ok((hotkey, Ok(_))) => {
+        if let Err(refusal) = verdict(key, modifiers) {
+            return Update::Refused(refusal);
+        }
+        match Hotkey::new(key, modifiers) {
+            Ok(hotkey) => {
                 self.chosen = Some(hotkey);
                 Update::Chosen(hotkey, self.pressed.is_empty())
             }
-            Ok((_, Err(refusal))) => Update::Refused(refusal),
             Err(_) => Update::Invalid,
         }
     }
+}
+
+/// Whether recording belongs on the window as it is: the hotkey's page, with the hotkey on.
+fn recording_in_place(ui: &SettingsWindow) -> bool {
+    ui.get_current_page() == 0 && ui.get_hotkey_enabled()
 }
 
 fn owns_foreground() -> bool {
@@ -209,9 +226,15 @@ fn keyboard_released() -> bool {
 pub(super) fn start(ui: &SettingsWindow) {
     stop();
     ABORT_CAPTURE.with(|flag| flag.set(false));
-    match start_step(owns_foreground(), keyboard_released(), Duration::ZERO) {
+    match start_step(
+        owns_foreground(),
+        recording_in_place(ui),
+        keyboard_released(),
+        Duration::ZERO,
+    ) {
         StartStep::Begin => begin(ui),
         StartStep::GiveUp => ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into()),
+        StartStep::Cancel => ui.set_hotkey_capture_hint(tr("hotkey.cancelled").into()),
         StartStep::Wait => {
             let began = Instant::now();
             let weak = ui.as_weak();
@@ -220,18 +243,28 @@ pub(super) fn start(ui: &SettingsWindow) {
                 slint::TimerMode::Repeated,
                 Duration::from_millis(25),
                 move || {
-                    let step = start_step(owns_foreground(), keyboard_released(), began.elapsed());
+                    let Some(ui) = weak.upgrade() else {
+                        WAITING.with(|slot| slot.borrow_mut().take());
+                        return;
+                    };
+                    let step = start_step(
+                        owns_foreground(),
+                        recording_in_place(&ui),
+                        keyboard_released(),
+                        began.elapsed(),
+                    );
                     if step == StartStep::Wait {
                         return;
                     }
                     WAITING.with(|slot| slot.borrow_mut().take());
-                    let Some(ui) = weak.upgrade() else {
-                        return;
-                    };
-                    if step == StartStep::Begin {
-                        begin(&ui);
-                    } else {
-                        ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into());
+                    match step {
+                        StartStep::Begin => begin(&ui),
+                        StartStep::Cancel => {
+                            ui.set_hotkey_capture_hint(tr("hotkey.cancelled").into());
+                        }
+                        StartStep::Wait | StartStep::GiveUp => {
+                            ui.set_hotkey_capture_hint(tr("hotkey.release_retry").into());
+                        }
                     }
                 },
             );
@@ -451,36 +484,38 @@ mod tests {
     fn a_shortcut_that_types_is_refused_and_a_common_one_is_flagged() {
         use autokeyboardlayot::{HOTKEY_MOD_ALT, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN};
         let hotkey = |key: u8, modifiers| Hotkey::new(u16::from(key), modifiers).unwrap();
+        let chord = |key: u8, modifiers| (u16::from(key), modifiers);
         let ctrl_alt = HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT;
-        for (shortcut, expected) in [
+        let pause = Hotkey::default();
+        for ((key, modifiers), expected) in [
             // Shift types capitals and symbols; Ctrl+Alt is AltGr (€ on E, @ on 2), with Shift too.
-            (hotkey(b'Q', HOTKEY_MOD_SHIFT), Err(Refusal::ShiftOnly)),
-            (hotkey(b'7', HOTKEY_MOD_SHIFT), Err(Refusal::ShiftOnly)),
-            (hotkey(b'E', ctrl_alt), Err(Refusal::AltGr)),
+            (chord(b'Q', HOTKEY_MOD_SHIFT), Err(Refusal::ShiftOnly)),
+            (chord(b'7', HOTKEY_MOD_SHIFT), Err(Refusal::ShiftOnly)),
+            (chord(b'E', ctrl_alt), Err(Refusal::AltGr)),
             (
-                hotkey(b'2', ctrl_alt | HOTKEY_MOD_SHIFT),
+                chord(b'2', ctrl_alt | HOTKEY_MOD_SHIFT),
                 Err(Refusal::AltGr),
             ),
             // With Win it is no AltGr; Ctrl, Alt or Win make a letter a shortcut, Shift may join.
-            (hotkey(b'E', ctrl_alt | HOTKEY_MOD_WIN), Ok(false)),
+            (chord(b'E', ctrl_alt | HOTKEY_MOD_WIN), Ok(false)),
             (
-                hotkey(b'Q', HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
+                chord(b'Q', HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
                 Ok(false),
             ),
-            (hotkey(b'Q', HOTKEY_MOD_ALT), Ok(false)),
-            (hotkey(0x74, HOTKEY_MOD_SHIFT), Ok(false)),
-            (Hotkey::default(), Ok(false)),
+            (chord(b'Q', HOTKEY_MOD_ALT), Ok(false)),
+            (chord(0x74, HOTKEY_MOD_SHIFT), Ok(false)),
+            ((pause.virtual_key, pause.modifiers), Ok(false)),
             // Shortcuts Windows and programs use: accepted with a warning.
-            (hotkey(0x73, HOTKEY_MOD_ALT), Ok(true)),
-            (hotkey(b'C', HOTKEY_MOD_CONTROL), Ok(true)),
-            (hotkey(b'S', HOTKEY_MOD_CONTROL), Ok(true)),
-            (hotkey(b'Z', HOTKEY_MOD_CONTROL), Ok(true)),
+            (chord(0x73, HOTKEY_MOD_ALT), Ok(true)),
+            (chord(b'C', HOTKEY_MOD_CONTROL), Ok(true)),
+            (chord(b'S', HOTKEY_MOD_CONTROL), Ok(true)),
+            (chord(b'Z', HOTKEY_MOD_CONTROL), Ok(true)),
             (
-                hotkey(b'C', HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
+                chord(b'C', HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT),
                 Ok(false),
             ),
         ] {
-            assert_eq!(verdict(shortcut), expected, "{}", shortcut.display_name());
+            assert_eq!(verdict(key, modifiers), expected, "{key:#x} {modifiers:#x}");
         }
         // A refused chord leaves the capture open for another one.
         let mut keys = CaptureKeys::default();
@@ -506,15 +541,25 @@ mod tests {
     fn recording_selected_from_the_keyboard_waits_for_that_key_to_be_released() {
         use StartStep::{Begin, GiveUp, Wait};
         let moment = Duration::from_millis(100);
-        assert_eq!(start_step(true, true, Duration::ZERO), Begin);
+        assert_eq!(start_step(true, true, true, Duration::ZERO), Begin);
         // Space or Enter selected the button and is still down: wait for its release.
-        assert_eq!(start_step(true, false, Duration::ZERO), Wait);
-        assert_eq!(start_step(true, false, RELEASE_WAIT - moment), Wait);
-        assert_eq!(start_step(true, true, RELEASE_WAIT - moment), Begin);
+        assert_eq!(start_step(true, true, false, Duration::ZERO), Wait);
+        assert_eq!(start_step(true, true, false, RELEASE_WAIT - moment), Wait);
+        assert_eq!(start_step(true, true, true, RELEASE_WAIT - moment), Begin);
         // A key held longer, or another program in the foreground, ends it.
-        assert_eq!(start_step(true, false, RELEASE_WAIT), GiveUp);
-        assert_eq!(start_step(false, true, Duration::ZERO), GiveUp);
-        assert_eq!(start_step(false, false, moment), GiveUp);
+        assert_eq!(start_step(true, true, false, RELEASE_WAIT), GiveUp);
+        assert_eq!(start_step(false, true, true, Duration::ZERO), GiveUp);
+        assert_eq!(start_step(false, true, false, moment), GiveUp);
+    }
+
+    #[test]
+    fn recording_never_begins_away_from_the_hotkey_or_with_it_off() {
+        use StartStep::Cancel;
+        let moment = Duration::from_millis(100);
+        // Another page, or the hotkey switched off, before or while waiting for the release.
+        assert_eq!(start_step(true, false, true, Duration::ZERO), Cancel);
+        assert_eq!(start_step(true, false, false, moment), Cancel);
+        assert_eq!(start_step(true, false, true, moment), Cancel);
     }
 
     #[test]

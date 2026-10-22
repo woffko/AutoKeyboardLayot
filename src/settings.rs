@@ -47,7 +47,30 @@ pub struct Settings {
     pub suppress_after_manual_layout_change: bool,
     /// Selected IDs survive disabled/missing data and unsupported input adapters.
     pub enabled_input_packs: BTreeSet<PackId>,
+    /// A hotkey the configuration names that types text (Shift+A): see `RefusedHotkey`.
+    pub refused_force_hotkey: RefusedHotkey,
 }
+
+/// A hotkey the configuration names that types text (Shift+A, Ctrl+Alt+E): it is not used, the
+/// hotkey loads turned off, and the settings window says which it was. The note takes no part in
+/// comparisons or in what is written: the next save writes the hotkey in force.
+#[derive(Debug, Clone, Default)]
+pub struct RefusedHotkey(Option<String>);
+
+impl RefusedHotkey {
+    /// How the configuration spelled the refused chord.
+    pub fn chord(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl PartialEq for RefusedHotkey {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RefusedHotkey {}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -78,6 +101,7 @@ impl Default for Settings {
                 .map(|id| PackId::parse(id).expect("built-in ID is valid"))
                 .into_iter()
                 .collect(),
+            refused_force_hotkey: RefusedHotkey::default(),
         }
     }
 }
@@ -225,6 +249,11 @@ impl Settings {
             if let Ok(hotkey) = crate::Hotkey::from_parts(&key, &modifiers) {
                 settings.force_hotkey_virtual_key = hotkey.virtual_key;
                 settings.force_hotkey_modifiers = hotkey.modifiers;
+            } else if let Some(chord) = crate::Hotkey::typing_chord(&key, &modifiers) {
+                // A shortcut that types text (allowed by earlier versions) does not make the whole
+                // configuration unreadable: the hotkey is turned off and the window says why.
+                settings.pause_break_undo = false;
+                settings.refused_force_hotkey = RefusedHotkey(Some(chord.display_name()));
             } else if strict {
                 return Err(SettingsError {
                     line: hotkey_line,
@@ -363,6 +392,24 @@ fn parse_pack_selection(value: &str) -> Result<BTreeSet<PackId>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_shortcut_that_types_text_is_loaded_turned_off_and_noted() {
+        let text = "pause_break_undo=true\nforce_hotkey_key=A\nforce_hotkey_modifiers=Shift\nlayout_model=true\n";
+        let settings = Settings::try_from_text(text).unwrap();
+        assert!(!settings.pause_break_undo);
+        assert_eq!(settings.force_hotkey(), crate::Hotkey::default());
+        assert_eq!(settings.refused_force_hotkey.chord(), Some("Shift+A"));
+        assert!(settings.layout_model, "the rest of the settings stands");
+        // The note takes no part in comparisons; what is saved reads back equal, without it.
+        let reread = Settings::try_from_text(&settings.to_text()).unwrap();
+        assert_eq!(reread, settings);
+        assert_eq!(reread.refused_force_hotkey.chord(), None);
+        // Any other bad hotkey is still an error at its line.
+        let error =
+            Settings::try_from_text("force_hotkey_key=A\nforce_hotkey_modifiers=\n").unwrap_err();
+        assert_eq!(error.line, 2);
+    }
 
     #[test]
     fn a_known_key_given_twice_is_an_error_with_its_line_in_strict_mode() {

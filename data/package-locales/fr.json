@@ -144,6 +144,7 @@
     "hotkey.modifier_required": "Maintenez Ctrl, Alt ou Win avec une lettre ou un chiffre. Pause/Break et F1–F24 fonctionnent aussi seules.",
     "hotkey.shift_only": "Maj avec une lettre ou un chiffre tape une majuscule ou un symbole : ce ne peut pas être le raccourci. Ajoutez Ctrl, Alt ou Win.",
     "hotkey.altgr": "Ctrl+Alt avec une lettre ou un chiffre tape des caractères sur de nombreuses dispositions (AltGr) : ce ne peut pas être le raccourci. Choisissez-en un autre.",
+    "hotkey.refused_loaded": "Le raccourci {hotkey} de la configuration saisit du texte, le raccourci a donc été désactivé. Enregistrez un autre raccourci, activez-le et sélectionnez Appliquer.",
     "hotkey.selected_common": "{hotkey} sélectionné. Windows et de nombreux programmes utilisent ce raccourci ; tant qu’il est attribué, l’agent le prend pour lui. Relâchez les touches, puis sélectionnez Appliquer, ou enregistrez-en un autre.",
     "recovery.repeat_warning": "Une partie de la saisie conservée a peut-être déjà atteint l’application. La répéter peut dupliquer du texte ou des raccourcis. Préparer tout de même la récupération ?",
     "recovery.ready_title": "Récupération de la saisie préparée",

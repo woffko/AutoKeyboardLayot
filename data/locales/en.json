@@ -156,6 +156,7 @@
     "hotkey.modifier_required": "Hold Ctrl, Alt or Win with a letter or digit. Pause/Break and F1–F24 also work alone.",
     "hotkey.shift_only": "Shift with a letter or digit types a capital letter or a symbol, so it cannot be the shortcut. Add Ctrl, Alt or Win.",
     "hotkey.altgr": "Ctrl+Alt with a letter or digit types characters on many layouts (AltGr), so it cannot be the shortcut. Choose another one.",
+    "hotkey.refused_loaded": "The configuration's shortcut {hotkey} types text, so the hotkey was turned off. Record another shortcut, turn the hotkey on and select Apply.",
     "hotkey.selected_common": "Selected {hotkey}. Windows and many programs use this shortcut; while it is assigned, the agent takes it over. Release the keys, then select Apply, or record another one.",
     "recovery.repeat_warning": "Some retained input may already have reached the application. Repeating it may duplicate text or shortcuts. Prepare recovery anyway?",
     "recovery.ready_title": "Input recovery prepared",

@@ -141,6 +141,7 @@
     "hotkey.modifier_required": "Tähe või numbri juures hoia all Ctrl, Alt või Win. Pause/Break ja F1–F24 sobivad ka üksi.",
     "hotkey.shift_only": "Shift koos tähe või numbriga kirjutab suurtähe või sümboli, seega ei saa see olla kiirklahv. Lisa Ctrl, Alt või Win.",
     "hotkey.altgr": "Ctrl+Alt koos tähe või numbriga kirjutab paljudes paigutustes märke (AltGr), seega ei saa see olla kiirklahv. Vali muu.",
+    "hotkey.refused_loaded": "Seadistuse kiirklahv {hotkey} sisestab teksti, seepärast lülitati kiirklahv välja. Salvestage uus kiirklahv, lülitage see sisse ja valige Rakenda.",
     "hotkey.selected_common": "Valitud: {hotkey}. Windows ja paljud programmid kasutavad seda kombinatsiooni; kuni see on määratud, võtab agent selle üle. Vabasta klahvid ja vajuta „Rakenda” või salvesta muu.",
     "recovery.repeat_warning": "Osa säilitatud sisestusest võis juba rakendusse jõuda. Kordamine võib teksti või kiirklahvitoiminguid dubleerida. Kas valmistada taastamine siiski ette?",
     "recovery.ready_title": "Sisestuse taastamine on ette valmistatud",
