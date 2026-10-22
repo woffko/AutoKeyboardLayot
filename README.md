@@ -617,8 +617,9 @@ watchdog on the 250 ms timer also reinstalls them when a hook misses input it mu
 for more than 3 seconds while the user gives input (within the last 400 ms): the mouse
 hook while the pointer keeps moving (on two ticks in a row, so a program placing the
 pointer does not count), the keyboard hook when input comes while the pointer stands
-still and the mouse hook saw none of it either (a click or a scroll it saw is no
-typing). Each hook has its own record of callbacks, so typing no longer hides a mouse
+still and the mouse hook saw none of it either: input newer than the mouse hook's last
+callback by more than 400 ms (a click or a scroll it saw is no typing, and a click a
+second before typing no longer hides a dead keyboard hook). Each hook has its own record of callbacks, so typing no longer hides a mouse
 hook that Windows removed. It does
 not act on the lock screen or the UAC desktop, when the foreground window has no
 known or a higher integrity level (its input may legitimately never reach the

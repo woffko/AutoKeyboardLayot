@@ -47,8 +47,8 @@ pub enum ForegroundPrivilege {
 /// A hook that missed input it must have seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SilentHook {
-    /// Input came while the pointer stood still, and neither hook saw any: typing, or a click or
-    /// a scroll that the mouse hook missed as well.
+    /// Input came while the pointer stood still, after the mouse hook's last callback, and the
+    /// keyboard hook saw none: typing, or a click or a scroll that the mouse hook missed as well.
     Keyboard,
     /// The pointer kept moving, and the mouse hook saw none of it.
     Mouse,
@@ -64,8 +64,10 @@ pub struct HookSilence {
 /// Which hook looks dead while the user gives input, if one does. Each hook is judged by input
 /// that it must see, so one hook's callbacks never hide the other's silence: the mouse hook by a
 /// moving pointer, the keyboard hook by input without pointer movement that the mouse hook did
-/// not see either (a click or a scroll it saw is no typing). The Windows adapter checks this
-/// cheap condition first and gathers the other facts only when it holds.
+/// not see either. A click or a scroll the mouse hook saw is no typing, so that input must be
+/// newer than the mouse hook's last callback by more than INPUT_RECENT; a click a second before
+/// the typing does not hide a dead keyboard hook. The Windows adapter checks this cheap condition
+/// first and gathers the other facts only when it holds.
 pub fn silent_hook(
     input_idle: Duration,
     silence: HookSilence,
@@ -77,7 +79,8 @@ pub fn silent_hook(
     if pointer_moving {
         return (silence.mouse > HOOK_SILENT).then_some(SilentHook::Mouse);
     }
-    (silence.keyboard > HOOK_SILENT && silence.mouse > HOOK_SILENT).then_some(SilentHook::Keyboard)
+    let unseen_by_the_mouse_hook = silence.mouse > input_idle + INPUT_RECENT;
+    (silence.keyboard > HOOK_SILENT && unseen_by_the_mouse_hook).then_some(SilentHook::Keyboard)
 }
 
 /// Follows the pointer from one timer tick to the next. It counts as moving after moves on two
@@ -327,8 +330,25 @@ mod tests {
             silent_hook(input, silence(long, long), false),
             Some(SilentHook::Keyboard)
         );
+        // Typing a second after a click into the field, or a scroll: the mouse hook's last call
+        // is older than the input, which it did not see.
+        for mouse in [Duration::from_millis(1200), Duration::from_millis(2500)] {
+            assert_eq!(
+                silent_hook(input, silence(long, mouse), false),
+                Some(SilentHook::Keyboard),
+                "{mouse:?}"
+            );
+        }
         // A click or a scroll that the mouse hook saw is no typing.
         assert_eq!(silent_hook(input, silence(long, recent), false), None);
+        assert_eq!(
+            silent_hook(
+                Duration::from_millis(300),
+                silence(long, Duration::from_millis(290)),
+                false
+            ),
+            None
+        );
         // Typing that the keyboard hook saw.
         assert_eq!(silent_hook(input, silence(recent, long), false), None);
         // No input lately: nothing to judge by.
