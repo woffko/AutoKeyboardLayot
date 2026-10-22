@@ -20,7 +20,9 @@ var
   // PackageFault: the helper failed or its replies cannot be trusted, so this session
   // installs no languages; setup continues with English only (Back and Next retry).
   // PackageEnglishOnly: the profile keeps no package store, so there is nothing to install.
-  PackageAnySelectable, PackageEnglishOnly: Boolean;
+  // PackageRetry: the catalog check or the download failed, or the helper did: coming back to
+  // the page (Back, then Next) checks the catalog again.
+  PackageAnySelectable, PackageEnglishOnly, PackageRetry: Boolean;
 
 function PackageSetTimer(Wnd: HWND; Event: UINT_PTR; Elapse: UINT; Callback: LongWord): UINT_PTR;
   external 'SetTimer@user32.dll stdcall';
@@ -136,6 +138,7 @@ end;
 procedure PackageHelperFailed;
 begin
   PackageFault := True;
+  PackageRetry := True;
   PackageFailed;
   PackageStatus.Caption := PackageStatus.Caption + ' ' + CustomMessage('AkPackageEnglishNext');
   PackageControls;
@@ -177,8 +180,18 @@ begin
       PackageEnglishOnly := True;
       PackageAfterSelect := False;
       PackageStatus.Caption := CustomMessage('AkPackageNoStore');
-    end else
+    end else begin
       PackageFailed;
+      if PackagePhase = 'idle' then begin
+        // The check or the download failed and the helper starts over: nothing is chosen any
+        // more, Next continues with English only, and Back, then Next checks again.
+        PackageList.Items.Clear;
+        SetArrayLength(PackageIds, 0);
+        SetArrayLength(PackageBytes, 0);
+        PackageStatus.Caption := PackageStatus.Caption + ' ' + CustomMessage('AkPackageEnglishNext');
+        PackageRetry := True;
+      end;
+    end;
     PackageControls;
     Exit;
   end;
@@ -299,8 +312,9 @@ begin
     PackageAwaiting := -1;
     PackageBusy := False;
     PackageCancelRequested := False;
-    // Before the helper is ready its first reply would only fail again on every tick.
-    if not PackageReady then PackageStarted := False;
+    // Its replies would only fail again on every tick. Back, then Next starts again: a new
+    // helper, or this one asked again once it is ready.
+    PackageStarted := False;
     PackageHelperFailed;
    end;
   finally
@@ -314,9 +328,14 @@ begin
   PackageComplete := False;
   PackageFault := False;
   PackageEnglishOnly := False;
+  PackageRetry := False;
   PackageReason := '';
   SetArrayLength(PackageReviewFiles, 0); SetArrayLength(PackageSeen, 0);
-  if PackageReady then begin PackageSend(Command, 'check'); Exit; end;
+  if PackageReady then begin
+    PackageStarted := True;
+    if not PackageSend(Command, 'check') then PackageHelperFailed;
+    Exit;
+  end;
   Inc(PackageSerial);
   PackageDir := ExpandConstant('{tmp}') + '\package-session-' + IntToStr(PackageSerial);
   PackageIdentity := Copy(GetSHA256OfString(PackageDir), 1, 32);
@@ -436,10 +455,11 @@ begin Result := (PageID = PackageReviewPage.ID) or (WizardSilent and (PageID = P
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID <> PackagePage.ID then Exit;
-  if PackageStarted then
-    PackageControls
+  // Coming back after a failed check or download, or a failed helper, checks the catalog again.
+  if not PackageStarted or (PackageRetry and not PackageBusy and (PackageAwaiting < 0)) then
+    PackageStart('{"action":"check_catalog"}')
   else
-    PackageStart('{"action":"check_catalog"}');
+    PackageControls;
 end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
