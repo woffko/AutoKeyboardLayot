@@ -1725,6 +1725,18 @@ fn the_settings_window_on_the_desktop_holds_the_package_tools_while_a_removal_aw
     let window = Window::open(profile);
     let ui = Automation::new();
     show_page(&ui, &window, &tr("nav.languages"));
+    // Left of the first language row is the padding of its card: the wheel there scrolls the page.
+    let beside = ui
+        .wait(
+            window.handle,
+            UIA_CheckBoxControlTypeId,
+            "English",
+            Duration::from_secs(10),
+        )
+        .expect("the English row")
+        .rect
+        .left
+        - 10;
     let tools = ui
         .choices(window.handle, &tr("languages.advanced"))
         .into_iter()
@@ -1738,17 +1750,31 @@ fn the_settings_window_on_the_desktop_holds_the_package_tools_while_a_removal_aw
     })
     .expect("Review removal is not available")
     .invoke();
-    let card = within(Duration::from_secs(20), || button("remove.confirm"));
-    let tools = ["remove.refresh", "import.choose", "remove.choose"]
-        .map(|key| (key, button(key).map(|button| button.enabled())));
+    // The card opens above the tools with its preview, named after its confirmation. UI
+    // Automation shows only what the page shows: the tools below are found by scrolling to them.
+    let card = within(Duration::from_secs(20), || {
+        ui.find(window.handle, UIA_EditControlTypeId, &tr("remove.confirm"))
+    });
+    let refresh = button("remove.refresh").map(|button| button.enabled());
+    let tools = ["import.choose", "remove.choose"].map(|key| {
+        let found = scroll_until(
+            &ui,
+            &window,
+            beside,
+            UIA_ButtonControlTypeId,
+            &tr(key),
+            Duration::from_secs(10),
+        );
+        (key, found.map(|button| button.enabled()))
+    });
     let _ = screenshot("settings-removal-card.bmp");
     eprintln!(
-        "card={:?} tools={tools:?}",
+        "card={:?} refresh={refresh:?} tools={tools:?}",
         card.as_ref().map(|card| card.rect)
     );
     window.request_close();
     assert!(card.is_some(), "the removal card did not open");
-    for (key, enabled) in tools {
+    for (key, enabled) in [("remove.refresh", refresh)].into_iter().chain(tools) {
         assert_eq!(
             enabled,
             Some(false),
