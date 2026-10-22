@@ -914,6 +914,11 @@ impl VolatileLexiconCandidate {
     fn is_valid_at(&self, now: Instant) -> bool {
         now <= self.expires_at
     }
+
+    /// The same word for the same list, whenever it was offered.
+    fn same_offer(&self, other: &Self) -> bool {
+        self.target == other.target && self.language == other.language && self.word == other.word
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3993,13 +3998,48 @@ fn expire_lexicon_candidate() {
 struct LexiconSaves {
     sender: SyncSender<(VolatileLexiconCandidate, std::io::Result<()>)>,
     finished: Receiver<(VolatileLexiconCandidate, std::io::Result<()>)>,
+    /// The offers being saved now.
+    in_flight: Vec<VolatileLexiconCandidate>,
 }
 
 impl LexiconSaves {
     fn new() -> Self {
         let (sender, finished) = sync_channel(8);
-        Self { sender, finished }
+        Self {
+            sender,
+            finished,
+            in_flight: Vec::new(),
+        }
     }
+
+    /// Whether a save of `candidate` may start: not while the same offer, chosen twice in the
+    /// tray, is being saved, which would put two writers on the configuration.
+    fn begin(&mut self, candidate: &VolatileLexiconCandidate) -> bool {
+        if self
+            .in_flight
+            .iter()
+            .any(|saving| saving.same_offer(candidate))
+        {
+            return false;
+        }
+        self.in_flight.push(candidate.clone());
+        true
+    }
+
+    /// A save of `candidate` finished (or never started).
+    fn end(&mut self, candidate: &VolatileLexiconCandidate) {
+        self.in_flight
+            .retain(|saving| !saving.same_offer(candidate));
+    }
+}
+
+/// Messages the window ignores once the agent shuts down: a finished word save would reload the
+/// configuration on a thread of its own during the teardown.
+fn ignored_while_shutting_down(message: u32) -> bool {
+    matches!(
+        message,
+        WM_COMMAND | TRAY_CALLBACK_MESSAGE | SETTINGS_APPLIED_MESSAGE | LEXICON_SAVED_MESSAGE
+    )
 }
 
 /// Saves the word a tray offer names. Reading, merging and writing the configuration waits for
@@ -4010,9 +4050,12 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
         return;
     };
     let Some(sender) = APP_STATE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|state| state.lexicon_saves.sender.clone())
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        state
+            .lexicon_saves
+            .begin(&candidate)
+            .then(|| state.lexicon_saves.sender.clone())
     }) else {
         return;
     };
@@ -4039,6 +4082,11 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
             )
         });
     if let Err(error) = started {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.lexicon_saves.end(&candidate);
+            }
+        });
         report_lexicon_save(hwnd, &candidate, Err(error));
     }
 }
@@ -4059,13 +4107,19 @@ fn save_lexicon_candidate_in_background(
         .map(drop)
 }
 
-/// Reports the tray "add word" saves that finished.
+/// Reports the tray "add word" saves that finished; polled on the timer too, in case their
+/// message could not be posted.
 fn finish_lexicon_saves(hwnd: HWND) {
     let finished: Vec<_> = APP_STATE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|state| state.lexicon_saves.finished.try_iter().collect())
-            .unwrap_or_default()
+        let mut borrowed = slot.borrow_mut();
+        let Some(state) = borrowed.as_mut() else {
+            return Vec::new();
+        };
+        let finished: Vec<_> = state.lexicon_saves.finished.try_iter().collect();
+        for (candidate, _) in &finished {
+            state.lexicon_saves.end(candidate);
+        }
+        finished
     });
     for (candidate, result) in finished {
         report_lexicon_save(hwnd, &candidate, result);
@@ -4095,11 +4149,9 @@ fn report_lexicon_save(
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow().as_ref()
             && let Ok(mut stored) = state.lexicon_candidate.lock()
-            && stored.as_ref().is_some_and(|offer| {
-                offer.target == candidate.target
-                    && offer.language == candidate.language
-                    && offer.word == candidate.word
-            })
+            && stored
+                .as_ref()
+                .is_some_and(|offer| offer.same_offer(candidate))
         {
             stored.take();
         }
@@ -4747,14 +4799,13 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if matches!(
-        message,
-        WM_COMMAND | TRAY_CALLBACK_MESSAGE | SETTINGS_APPLIED_MESSAGE
-    ) && APP_STATE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|state| state.shutdown.load(Ordering::Acquire))
-    }) {
+    if ignored_while_shutting_down(message)
+        && APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|state| state.shutdown.load(Ordering::Acquire))
+        })
+    {
         return LRESULT(0);
     }
     match message {
@@ -4770,6 +4821,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // Publishing first frees the slot for a configuration loaded meanwhile.
             finish_configuration_reload(hwnd);
             finish_configuration_load(hwnd);
+            finish_lexicon_saves(hwnd);
             expire_correction_gate();
             expire_retained_input(hwnd, Instant::now());
             announce_clipboard_failures(hwnd);
@@ -20924,6 +20976,34 @@ mod tests {
             .store(false, Ordering::Release);
         queue_periodic_refreshes(&mut state, foreground, false, now);
         assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+    }
+
+    #[test]
+    fn a_tray_offer_chosen_twice_is_saved_once() {
+        let now = Instant::now();
+        let word = |word: &str| {
+            VolatileLexiconCandidate::new(
+                LexiconOfferTarget::UserDictionary,
+                Language::English,
+                word.to_owned(),
+                now,
+            )
+        };
+        let mut saves = LexiconSaves::new();
+        assert!(saves.begin(&word("teh")));
+        // Chosen again while the first save waits for the disk: no second writer.
+        assert!(!saves.begin(&word("teh")));
+        assert!(saves.begin(&word("adn")));
+        saves.end(&word("teh"));
+        assert!(saves.begin(&word("teh")));
+    }
+
+    #[test]
+    fn a_word_save_finished_during_shutdown_starts_nothing() {
+        // Its report reloads the configuration on a thread of its own.
+        assert!(ignored_while_shutting_down(LEXICON_SAVED_MESSAGE));
+        assert!(ignored_while_shutting_down(WM_COMMAND));
+        assert!(!ignored_while_shutting_down(WM_TIMER));
     }
 
     #[test]

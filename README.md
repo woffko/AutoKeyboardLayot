@@ -359,7 +359,9 @@ an error in one of them names that file. The pre-migration backup is written to 
 temporary file and appears whole or not at all.
 GUI and tray writes share a cross-process named Windows mutex; a word added from
 the tray is saved on a thread of its own, so the keyboard hook never waits for the
-lock or the disk. A word the tray adds to the user dictionary leaves the word
+lock or the disk; the same offer chosen twice meanwhile is saved once, a finished save is
+taken up on the next timer tick even if its message is lost, and none is reported (or
+reloads the configuration) once the agent exits. A word the tray adds to the user dictionary leaves the word
 exclusions, and one it adds to the exclusions leaves the dictionary, so the save is
 never refused for a word in both lists. When the configuration has changed since the window was opened
 (a word added from the tray, a hand edit), Apply merges the draft into it: what the
