@@ -1716,6 +1716,47 @@ fn the_settings_window_on_the_desktop_lists_the_installed_packages_at_opening() 
     );
 }
 
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_holds_the_package_tools_while_a_removal_awaits_confirmation()
+{
+    let profile = Profile::managed("en");
+    install_published(&profile, &["ur-PK"]);
+    let window = Window::open(profile);
+    let ui = Automation::new();
+    show_page(&ui, &window, &tr("nav.languages"));
+    let tools = ui
+        .choices(window.handle, &tr("languages.advanced"))
+        .into_iter()
+        .next()
+        .expect("the tools box");
+    click(tools.center());
+    let button = |key: &str| ui.find(window.handle, UIA_ButtonControlTypeId, &tr(key));
+    // Once the installed packages are listed, the removal of the one chosen can be reviewed.
+    within(Duration::from_secs(20), || {
+        button("remove.choose").filter(Element::enabled)
+    })
+    .expect("Review removal is not available")
+    .invoke();
+    let card = within(Duration::from_secs(20), || button("remove.confirm"));
+    let tools = ["remove.refresh", "import.choose", "remove.choose"]
+        .map(|key| (key, button(key).map(|button| button.enabled())));
+    let _ = screenshot("settings-removal-card.bmp");
+    eprintln!(
+        "card={:?} tools={tools:?}",
+        card.as_ref().map(|card| card.rect)
+    );
+    window.request_close();
+    assert!(card.is_some(), "the removal card did not open");
+    for (key, enabled) in tools {
+        assert_eq!(
+            enabled,
+            Some(false),
+            "{key} is available while the removal awaits confirmation"
+        );
+    }
+}
+
 /// The window in a managed profile, opened while its refresh of the installed packages at opening
 /// is held back for a minute, as on a slow disk; the refresh is seen running.
 fn open_during_the_refresh_at_opening(ui: &Automation) -> Window {
