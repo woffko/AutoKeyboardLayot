@@ -858,6 +858,45 @@ fn the_settings_window_on_the_desktop_shows_a_refused_save_in_full() {
 
 #[test]
 #[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
+fn the_settings_window_on_the_desktop_closes_on_ok_with_an_entry_kept_for_a_removed_language() {
+    // German was removed; its dictionary entry is kept, without effect until German is back.
+    let profile = Profile::new(
+        &format!("{LEGACY}\n[user_dictionary]\nde-DE: moin\n"),
+        false,
+    );
+    let window = Window::open(profile);
+    window.place(900, 740);
+    let ui = Automation::new();
+    ui.wait(
+        window.handle,
+        UIA_ButtonControlTypeId,
+        &tr("button.ok"),
+        Duration::from_secs(5),
+    )
+    .expect("OK")
+    .invoke();
+    let closed = window.closed_within(Duration::from_secs(15));
+    if !closed {
+        let template = tr("settings.saved_unknown_language");
+        let prefix = template.split("{page}").next().unwrap_or_default();
+        let note = ui
+            .texts(window.handle)
+            .into_iter()
+            .find(|text| text.name.starts_with(prefix))
+            .map(|text| text.name);
+        eprintln!("still open after OK: note={note:?}");
+        let _ = screenshot("settings-ok-kept-entry.bmp");
+        if let Some(cancel) = ui.find(window.handle, UIA_ButtonControlTypeId, &tr("button.cancel"))
+        {
+            cancel.invoke();
+        }
+        let _ = window.closed_within(Duration::from_secs(15));
+    }
+    assert!(closed, "OK did not close the window");
+}
+
+#[test]
+#[ignore = "drives the settings window on the desktop: run it alone in an interactive session on the test VM"]
 fn the_settings_window_on_the_desktop_keeps_one_interface_language_marked() {
     let window = Window::open(Profile::legacy());
     let ui = Automation::new();
