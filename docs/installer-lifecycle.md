@@ -69,7 +69,12 @@ user's `AutoKeyboardLayot.exe` processes in other sessions and refuses with `12`
 when one runs the install target. Another signed-in user's processes are never
 inspected: the list carries no SID for them, this user cannot open them, and they
 run that user's own copy, so they cannot block this user's setup or uninstall.
-`11` remains for this user's own process whose path cannot be read. A first
+Each of this user's processes is opened only for its limited information, which
+Windows grants also for an elevated one: its image path is compared first, and only
+a process of the target image is asked whether it still runs (its exit code). A copy
+whose path does not resolve in this session (a deleted folder, a drive letter of
+another session) is not the target, which exists, and is passed over. `11` remains
+for this user's own process whose path cannot be read at all. A first
 installation, with no executable at the target yet, has nothing to compare.
 
 After exit code 0, the installer must atomically create and hold both exact

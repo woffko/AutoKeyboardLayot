@@ -5,7 +5,7 @@ use windows::{
     Win32::{
         Foundation::{
             ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, HWND, LPARAM,
-            WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+            STILL_ACTIVE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
         },
         Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
         System::{
@@ -14,10 +14,10 @@ use windows::{
                 WTSEnumerateProcessesW, WTSFreeMemory,
             },
             Threading::{
-                CreateMutexW, GetCurrentProcess, MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess,
-                OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ReleaseMutex,
-                SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+                CreateMutexW, GetCurrentProcess, GetExitCodeProcess, MUTEX_MODIFY_STATE,
+                OpenMutexW, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+                ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
             },
         },
         UI::WindowsAndMessaging::{
@@ -153,24 +153,20 @@ fn require_no_foreign_session_target(executable: &Path) -> Result<(), i32> {
         if !needs_inspection(own_pid, own_session, &process) {
             continue;
         }
-        let handle = match unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                false,
-                row.ProcessId,
-            )
-        } {
-            Ok(handle) => ProcessHandle(handle),
-            // The process ended after the list was taken.
-            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
-            Err(_) => return Err(11),
-        };
-        match unsafe { WaitForSingleObject(handle.0, 0) } {
-            WAIT_OBJECT_0 => continue,
-            WAIT_TIMEOUT => {}
-            _ => return Err(11),
-        }
-        if same_image_path(&expected, &canonical_image(&handle)?) {
+        // Only the limited information: Windows grants it to this user also for an elevated
+        // process, which SYNCHRONIZE is not; a copy of another image is never asked for more.
+        let handle =
+            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, row.ProcessId) } {
+                Ok(handle) => ProcessHandle(handle),
+                // The process ended after the list was taken.
+                Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
+                Err(_) => return Err(11),
+            };
+        if runs_target(
+            &expected,
+            || canonical_existing(&image_path(&handle)?),
+            || still_running(&handle),
+        )? {
             return Err(12);
         }
     }
@@ -259,7 +255,41 @@ fn current_token_user() -> Result<Vec<usize>, i32> {
     }
 }
 
-fn canonical_image(process: &ProcessHandle) -> Result<PathBuf, i32> {
+/// Whether one of this user's processes in another session runs the install target. `image`
+/// gives its executable's canonical path (None when that path does not resolve here), `running`
+/// whether it still runs.
+fn runs_target(
+    expected: &Path,
+    image: impl FnOnce() -> Result<Option<PathBuf>, i32>,
+    running: impl FnOnce() -> Result<bool, i32>,
+) -> Result<bool, i32> {
+    let Some(actual) = image()? else {
+        // The target exists (installed_target), so a path that does not resolve is another copy.
+        return Ok(false);
+    };
+    if !same_image_path(expected, &actual) {
+        return Ok(false);
+    }
+    running()
+}
+
+/// The canonical form of a process's image path; None when it does not resolve here.
+fn canonical_existing(image: &str) -> Result<Option<PathBuf>, i32> {
+    match PathBuf::from(image).canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(11),
+    }
+}
+
+/// Whether a process opened for its limited information still runs.
+fn still_running(process: &ProcessHandle) -> Result<bool, i32> {
+    let mut code = 0;
+    unsafe { GetExitCodeProcess(process.0, &mut code) }.map_err(|_| 11)?;
+    Ok(code == STILL_ACTIVE.0 as u32)
+}
+
+fn image_path(process: &ProcessHandle) -> Result<String, i32> {
     let mut buffer = vec![0u16; 32768];
     let mut length = buffer.len() as u32;
     unsafe {
@@ -271,8 +301,7 @@ fn canonical_image(process: &ProcessHandle) -> Result<PathBuf, i32> {
         )
     }
     .map_err(|_| 11)?;
-    let image = String::from_utf16(&buffer[..length as usize]).map_err(|_| 11)?;
-    PathBuf::from(image).canonicalize().map_err(|_| 11)
+    String::from_utf16(&buffer[..length as usize]).map_err(|_| 11)
 }
 
 fn close_instance(class: PCWSTR, mutex: PCWSTR, executable: &Path) -> Result<(), i32> {
@@ -292,7 +321,7 @@ fn close_instance(class: PCWSTR, mutex: PCWSTR, executable: &Path) -> Result<(),
         )
         .map_err(|_| 11)?
     });
-    let actual = canonical_image(&process)?;
+    let actual = canonical_existing(&image_path(&process)?)?.ok_or(11)?;
     let expected = executable.canonicalize().map_err(|_| 11)?;
     if !same_image_path(&expected, &actual) {
         // A portable/debug copy or unproven window is outside the install scope.
@@ -357,6 +386,47 @@ mod tests {
         ] {
             assert_eq!(needs_inspection(40, 1, &row), inspected, "{}", row.id);
         }
+    }
+
+    #[test]
+    fn only_a_running_process_of_the_target_image_blocks_setup() {
+        let target = Path::new(
+            "C:\\Users\\u\\AppData\\Local\\Programs\\AutoKeyboardLayot\\AutoKeyboardLayot.exe",
+        );
+        let refused = || -> Result<bool, i32> { Err(11) };
+        // A copy whose path does not resolve in this session (a deleted folder, another
+        // session's drive letter) is not the target, which exists; whether it runs is not asked.
+        assert_eq!(runs_target(target, || Ok(None), refused), Ok(false));
+        // Another copy is never opened for more than its image path.
+        let portable = PathBuf::from("D:\\tools\\AutoKeyboardLayot.exe");
+        assert_eq!(
+            runs_target(target, || Ok(Some(portable.clone())), refused),
+            Ok(false)
+        );
+        // The target itself blocks while it runs.
+        assert_eq!(
+            runs_target(target, || Ok(Some(target.to_path_buf())), || Ok(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            runs_target(target, || Ok(Some(target.to_path_buf())), || Ok(false)),
+            Ok(false)
+        );
+        // An image path that cannot be read at all still fails closed.
+        assert_eq!(runs_target(target, || Err(11), || Ok(true)), Err(11));
+    }
+
+    #[test]
+    fn an_image_path_that_does_not_resolve_is_no_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let gone = directory.path().join("gone").join("AutoKeyboardLayot.exe");
+        assert_eq!(canonical_existing(gone.to_str().unwrap()), Ok(None));
+        let here = directory.path().join("AutoKeyboardLayot.exe");
+        std::fs::write(&here, b"").unwrap();
+        assert_eq!(
+            canonical_existing(here.to_str().unwrap()),
+            Ok(Some(here.canonicalize().unwrap()))
+        );
     }
 
     #[test]
