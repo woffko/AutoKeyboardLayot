@@ -297,6 +297,9 @@ impl Detector {
             return None;
         }
         let typed = model.index_of(current_language)?;
+        // As in the dictionary stage, only layouts Windows has, each for one package, take part:
+        // without them (no snapshot, a layout missing or claimed twice) no reading is left.
+        let candidates = self.resolve_candidates(word, current_language, candidates);
         let texts: Vec<Option<&str>> = model
             .languages()
             .iter()
@@ -941,6 +944,66 @@ mod tests {
             assert_eq!(detection.replacement, expected);
             assert_eq!(detection.target_language, Language::Estonian);
         }
+    }
+
+    /// What Windows reports with the US (0x0409), Russian (0x0419) and Estonian (0x0425) layouts
+    /// of `layouts` loaded.
+    fn windows_profiles(layouts: &[usize]) -> crate::profile_resolver::ResolvedKeyboardProfiles {
+        use crate::profile_resolver::{KeyboardProfileProbe, resolve_keyboard_profiles};
+        struct Fixture(Vec<usize>, usize);
+        impl KeyboardProfileProbe for Fixture {
+            fn loaded_layouts(&mut self) -> Option<Vec<usize>> {
+                Some(self.0.clone())
+            }
+            fn current_layout(&mut self) -> Option<usize> {
+                Some(self.1)
+            }
+            fn is_ime(&mut self, _: usize) -> bool {
+                false
+            }
+            fn activate_layout(&mut self, layout: usize) -> Option<usize> {
+                Some(std::mem::replace(&mut self.1, layout))
+            }
+            fn current_layout_name(&mut self) -> Option<[u16; 9]> {
+                let name = format!("{:08x}", self.1);
+                let mut result = [0; 9];
+                for (slot, value) in result.iter_mut().zip(name.encode_utf16()) {
+                    *slot = value;
+                }
+                Some(result)
+            }
+        }
+        resolve_keyboard_profiles(&mut Fixture(layouts.to_vec(), layouts[0])).expect("profiles")
+    }
+
+    #[test]
+    fn the_layout_model_converts_only_between_layouts_windows_has() {
+        let mut detector = model_detector();
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду"),
+            (Language::Estonian, "küsimusele"),
+        ]);
+        let converted = |detector: &Detector| {
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &[Language::English],
+                )
+                .map(|detection| detection.target_language)
+        };
+        detector.set_resolved_profiles(Some(&windows_profiles(&[0x0409, 0x0419, 0x0425])));
+        assert_eq!(converted(&detector), Some(Language::Estonian));
+        // No profile snapshot: the model converts nothing, as the dictionary stage does not.
+        detector.set_resolved_profiles(None);
+        assert_eq!(converted(&detector), None);
+        // No Estonian layout: the model may not choose Estonian.
+        detector.set_resolved_profiles(Some(&windows_profiles(&[0x0409, 0x0419])));
+        assert_ne!(converted(&detector), Some(Language::Estonian));
+        // No English layout: the typed word belongs to no layout Windows has.
+        detector.set_resolved_profiles(Some(&windows_profiles(&[0x0419, 0x0425])));
+        assert_eq!(converted(&detector), None);
     }
 
     #[test]

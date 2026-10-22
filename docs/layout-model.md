@@ -42,7 +42,11 @@ converted only when all of the following hold:
    outside the typed alphabet as a capital letter, which inside a word comes
    from Shift between letters (`LANGID:KLID` would read as `LANGIDÖKLID`);
 6. the model is at least 90% sure of another layout (97% for three-letter
-   words).
+   words);
+7. as for the dictionary detector, the typed and the target layout are both
+   loaded in Windows, each for one language package: without a profile snapshot,
+   or with a layout missing or claimed twice, the model sees no other reading. A
+   reading the platform does not give falls back to the offline key table.
 
 Typed text is processed in memory only: it is never written to disk, logged or
 sent anywhere. Diagnostics record only `stage=model` or `stage=dictionary` next
@@ -78,6 +82,8 @@ after the rules for code-shaped tokens (rules 4 and 5). Before them the model
 corrected 95.26% of the realistic words (Estonian 90.58%), 87.45% with the
 default settings and 90.61% of the rare ones; the generated typing has no
 code, so here the rules only cost (0.04 points realistic, 0.20 points rare).
+Rule 7 (2026-10-22) leaves every output of these measurements byte for byte the
+same: the test cases give the reading of every layout and load all three.
 
 Before rule 4 and the dictionary veto on punctuation after a known word (see
 [Limits](#limits)), the dictionary detector corrected 86.5% and the model
