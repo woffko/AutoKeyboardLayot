@@ -365,7 +365,10 @@ Dictionary and word-exclusion entries take the form `en-US: word`, `ru-RU: сл�
 or `et-EE: tere`; the colon is required, as a first word would otherwise be taken
 for a language. The GUI validates, normalizes, deduplicates, and rejects a word
 present in both lists, naming the page and the editor line of an entry it cannot
-read; after saving it says when an entry's language is not installed. Words are
+read; after saving it says when an entry's language is not installed. That is a note
+for an entry kept when its language was removed, and OK closes the window all the
+same; an entry typed since the last save is shown on its page as an error after Apply,
+so that a typo in the language is found. Words are
 limited to 64 characters after lowercasing. Program exclusions are normalized to
 executable names; a name that starts with `#` or is in square brackets is refused,
 as it would read back as a comment or a section, and so is a program name or a backend

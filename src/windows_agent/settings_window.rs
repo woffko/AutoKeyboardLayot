@@ -622,29 +622,13 @@ fn wire_callbacks(
         *save_document.borrow_mut() = document;
         refresh_ui_language(&ui, &preference, &registry.borrow());
         let notified = notify_agent();
-        if let Some(unknown) = unknown {
-            ui.set_current_page(unknown.page);
-            ui.set_status_error(true);
-            ui.set_status_text(
-                tr_format(
-                    "settings.saved_unknown_language",
-                    &[
-                        ("page", &tr(unknown.page_name)),
-                        ("line", &unknown.line.to_string()),
-                        ("id", &unknown.id),
-                    ],
-                )
-                .into(),
-            );
-            return;
+        let after = after_save(unknown.as_ref(), &original, notified, close_after_save);
+        if let Some(page) = after.page {
+            ui.set_current_page(page);
         }
-        ui.set_status_error(false);
-        ui.set_status_text(if notified {
-            tr("settings.saved_notified").into()
-        } else {
-            tr("settings.saved_agent_unavailable").into()
-        });
-        if close_after_save {
+        ui.set_status_error(after.error);
+        ui.set_status_text(after.status.into());
+        if after.close {
             retract_graceful_close();
             let _ = slint::quit_event_loop();
         }
@@ -817,6 +801,8 @@ struct UnknownLanguage {
     page_name: &'static str,
     line: usize,
     id: String,
+    /// The entry as stored.
+    entry: String,
 }
 
 fn unknown_language_entry(
@@ -851,11 +837,65 @@ fn unknown_language_entry(
                     page_name,
                     line: entry.line,
                     id: id.to_owned(),
+                    entry: entry.entry.clone(),
                 });
             }
         }
     }
     None
+}
+
+/// What the window does once a save succeeded: the status it shows (an error or not), the page it
+/// turns to, and whether it closes.
+#[derive(Debug, PartialEq, Eq)]
+struct AfterSave {
+    status: String,
+    error: bool,
+    page: Option<i32>,
+    close: bool,
+}
+
+/// After a successful save: `unknown` is an entry for a language that is not installed, and
+/// `original` the configuration the window saved over. OK always closes the window then (the
+/// owner's question Q6). An entry kept when its language was removed is only noted; one the user
+/// typed since the last save turns its page to it as an error, so that Apply shows the typo.
+fn after_save(
+    unknown: Option<&UnknownLanguage>,
+    original: &ConfigurationDocument,
+    notified: bool,
+    close_after_save: bool,
+) -> AfterSave {
+    if let Some(unknown) = unknown {
+        let kept = if unknown.page == DICTIONARY_PAGE {
+            &original.user_dictionary
+        } else {
+            &original.word_exclusions
+        };
+        let typed = !kept.contains(&unknown.entry);
+        return AfterSave {
+            status: tr_format(
+                "settings.saved_unknown_language",
+                &[
+                    ("page", &tr(unknown.page_name)),
+                    ("line", &unknown.line.to_string()),
+                    ("id", &unknown.id),
+                ],
+            ),
+            error: typed,
+            page: typed.then_some(unknown.page),
+            close: close_after_save,
+        };
+    }
+    AfterSave {
+        status: if notified {
+            tr("settings.saved_notified")
+        } else {
+            tr("settings.saved_agent_unavailable")
+        },
+        error: false,
+        page: None,
+        close: close_after_save,
+    }
 }
 
 /// What came of saving the window's draft.
@@ -1310,12 +1350,46 @@ va|ult.exe
                 page_name: "nav.dictionary",
                 line: 3,
                 id: "de".to_owned(),
+                entry: "de: hallo".to_owned(),
             })
         );
         assert_eq!(
             unknown_language_entry(&document, "de: Hallo\n", "", |_| true),
             None
         );
+    }
+
+    #[test]
+    fn ok_closes_after_a_save_and_an_entry_kept_for_a_removed_language_is_only_noted() {
+        let unknown = UnknownLanguage {
+            page: DICTIONARY_PAGE,
+            page_name: "nav.dictionary",
+            line: 1,
+            id: "de-DE".to_owned(),
+            entry: "de-DE: moin".to_owned(),
+        };
+        // The entry was kept when German was removed: noted, no page turned, no error.
+        let kept = ConfigurationDocument {
+            user_dictionary: vec!["de-DE: moin".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        for close_after_save in [false, true] {
+            let after = after_save(Some(&unknown), &kept, true, close_after_save);
+            assert!(!after.error);
+            assert_eq!(after.page, None);
+            assert_eq!(after.close, close_after_save);
+            assert!(after.status.contains("de-DE"), "{}", after.status);
+        }
+        // Typed in this session: Apply turns to it as an error, OK still closes.
+        let typed = ConfigurationDocument::default();
+        let apply = after_save(Some(&unknown), &typed, true, false);
+        assert!(apply.error);
+        assert_eq!(apply.page, Some(DICTIONARY_PAGE));
+        assert!(!apply.close);
+        assert!(after_save(Some(&unknown), &typed, true, true).close);
+        // Nothing to say: OK closes, Apply stays.
+        assert!(after_save(None, &typed, true, true).close);
+        assert!(!after_save(None, &typed, false, false).close);
     }
 
     /// A configuration folder holding `document`.
