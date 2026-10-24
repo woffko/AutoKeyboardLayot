@@ -266,9 +266,11 @@ const PRIVACY_ALLOWED: u8 = 0;
 // Worker-only wait: the low-level hook never waits for UI Automation.
 // Give ordinary delayed replies more headroom before failing closed.
 const PRIVACY_PROBE_WAIT_MS: u64 = 300;
-/// How long a failed field check may lean on the last good one for the same input target. The
-/// provider of a busy terminal answers a check late now and then; see `settle_probe_outcome`.
-const PRIVACY_RECENT_OK_MS: u64 = 2_000;
+/// How long a failed field check may lean on the last good one for the same input target, or on
+/// the last conversion made in it. The provider of a busy terminal answers a check late now and
+/// then, and fails them for seconds after an edit; see `settle_probe_outcome` (the owner's
+/// decision of 2026-10-24: five seconds, two before).
+const PRIVACY_RECENT_OK_MS: u64 = 5_000;
 /// Periodic field checks run every half second while they are fast. A slow one spaces the next
 /// by twenty times its own length, so that periodic checks fill at most a twentieth of the
 /// worker's time, and never more than five seconds apart.
@@ -10064,7 +10066,7 @@ impl InputProcessor {
     /// Only the provider's own field-inspection failure is softened. A password field, an
     /// excluded or unreadable process, a changed context and every transport failure stand, and a
     /// failure never renews the good check, so a window that keeps failing counts as failing
-    /// after two seconds.
+    /// after five seconds.
     fn settle_probe_outcome(
         &mut self,
         reason: Option<PrivacyBlockReason>,
@@ -10102,6 +10104,21 @@ impl InputProcessor {
             reason,
             source,
             recent_ok_age: None,
+        }
+    }
+
+    /// An edit was just made in `foreground`. When the last good field check was of that same
+    /// target in this input epoch (anything since that could move the focus would have cleared
+    /// it), it counts from now: a program busy with the edit fails checks for a while after it
+    /// (Windows Terminal for seconds), and the recent-good rule should not run out meanwhile (the
+    /// owner's decision of 2026-10-24). A record of another target, or none, is left as it is.
+    fn renew_recent_privacy_ok(&mut self, foreground: ForegroundContext) {
+        let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        if let Some(recent) = self.recent_privacy_ok.as_mut()
+            && same_input_target(recent.foreground, foreground)
+            && recent.epoch == epoch
+        {
+            recent.at = Instant::now();
         }
     }
 
@@ -10401,6 +10418,7 @@ impl InputProcessor {
         }
         self.commit_confirmed_layout(target_layout.0 as usize);
         self.session.clear();
+        self.renew_recent_privacy_ok(pending.foreground);
         if let Some(delimiter) = pending.transaction.delimiter {
             self.last_boundary = Some(LastBoundary {
                 replay_keys: pending.replay_keys.clone(),
@@ -18752,13 +18770,13 @@ mod tests {
     }
 
     #[test]
-    fn a_late_provider_answer_keeps_a_good_verdict_for_two_seconds() {
+    fn a_late_provider_answer_keeps_a_good_verdict_for_five_seconds() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
         let start = Instant::now();
         let good = settle(&mut processor, None, "provider", start);
         assert_eq!((good.reason, good.source), (None, "provider"));
         assert_eq!(good.recent_ok_age, None);
-        for milliseconds in [0, 120, 400, 1_999] {
+        for milliseconds in [0, 120, 400, 1_999, 4_999] {
             let age = Duration::from_millis(milliseconds);
             let verdict = settle(&mut processor, FIELD_FAILURE, "provider", start + age);
             assert_eq!(verdict.reason, None, "{milliseconds} ms after a good check");
@@ -18779,20 +18797,109 @@ mod tests {
             (FIELD_FAILURE, "provider")
         );
         settle(&mut processor, None, "provider", at(10));
-        // Two seconds after the good check the window is over.
-        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", at(2_010));
+        // Five seconds after the good check the window is over.
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", at(5_010));
         assert_eq!(verdict.reason, FIELD_FAILURE);
         assert_eq!(verdict.recent_ok_age, None);
-        // A failure never renews the good check: leaning on it for 1.5 s must not extend it.
-        settle(&mut processor, None, "provider", at(3_000));
+        // A failure never renews the good check: leaning on it for 3 s must not extend it.
+        settle(&mut processor, None, "provider", at(6_000));
         assert_eq!(
-            settle(&mut processor, FIELD_FAILURE, "provider", at(4_500)).reason,
+            settle(&mut processor, FIELD_FAILURE, "provider", at(9_000)).reason,
             None
         );
         assert_eq!(
-            settle(&mut processor, FIELD_FAILURE, "provider", at(5_100)).reason,
+            settle(&mut processor, FIELD_FAILURE, "provider", at(11_100)).reason,
             FIELD_FAILURE
         );
+    }
+
+    #[test]
+    fn a_conversion_in_the_same_field_counts_the_good_check_from_then() {
+        let foreground = recent_ok_foreground();
+        let processor_with_old_check = || {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            processor.metrics.input_epoch.store(5, Ordering::Release);
+            let long_ago = Instant::now() - Duration::from_millis(PRIVACY_RECENT_OK_MS + 1_000);
+            settle(&mut processor, None, "provider", long_ago);
+            processor
+        };
+        // The good check is too old: a failure now stands.
+        let mut processor = processor_with_old_check();
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", Instant::now());
+        assert_eq!(verdict.reason, FIELD_FAILURE);
+        // An edit in the same field since: the failure leans on it.
+        let mut processor = processor_with_old_check();
+        processor.renew_recent_privacy_ok(ForegroundContext {
+            layout: foreground.layout + 1,
+            ..foreground
+        });
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", Instant::now());
+        assert_eq!((verdict.reason, verdict.source), (None, "recent-ok"));
+        // An edit elsewhere, or in another input epoch, renews nothing; nor does an edit create a
+        // good check where none was.
+        for (edited, epoch) in [
+            (
+                ForegroundContext {
+                    focus: foreground.focus + 1,
+                    ..foreground
+                },
+                5,
+            ),
+            (foreground, 6),
+        ] {
+            let mut processor = processor_with_old_check();
+            processor
+                .metrics
+                .input_epoch
+                .store(epoch, Ordering::Release);
+            processor.renew_recent_privacy_ok(edited);
+            processor.metrics.input_epoch.store(5, Ordering::Release);
+            let verdict = settle(&mut processor, FIELD_FAILURE, "provider", Instant::now());
+            assert_eq!(verdict.reason, FIELD_FAILURE, "{edited:?} epoch {epoch}");
+        }
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.metrics.input_epoch.store(5, Ordering::Release);
+        processor.renew_recent_privacy_ok(foreground);
+        assert!(processor.recent_privacy_ok.is_none());
+    }
+
+    #[test]
+    fn an_applied_conversion_renews_the_good_check_of_its_field() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        processor.metrics.input_epoch.store(5, Ordering::Release);
+        let long_ago = Instant::now() - Duration::from_millis(PRIVACY_RECENT_OK_MS + 1_000);
+        settle(&mut processor, None, "provider", long_ago);
+        let edit = |erase_characters, insert_text: &str| autokeyboardlayot::conversion::TextEdit {
+            erase_characters,
+            insert_text: insert_text.to_owned(),
+        };
+        processor.finish_applied_conversion(
+            PendingConversion {
+                transaction: ConversionTransaction {
+                    source_language: Language::English,
+                    target_language: Language::Russian,
+                    original: "ghbdtn".to_owned(),
+                    replacement: "привет".to_owned(),
+                    delimiter: Some(' '),
+                    forward: edit(7, "привет "),
+                    undo: edit(7, "ghbdtn "),
+                },
+                foreground: recent_ok_foreground(),
+                source_layout: 0x0409,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 1,
+                replay_keys: Vec::new(),
+                forced: false,
+                cycle_order: Vec::new(),
+            },
+            1,
+            HKL(0x0419 as *mut c_void),
+            EditStrategy::PhysicalReplay,
+        );
+        let renewed = processor.recent_privacy_ok.expect("the good check");
+        assert!(renewed.at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
