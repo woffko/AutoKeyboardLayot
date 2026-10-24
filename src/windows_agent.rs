@@ -9268,10 +9268,12 @@ impl InputProcessor {
             }
         } else {
             if had_word {
-                let result = if manual_only {
-                    "manual-only"
-                } else {
-                    "privacy"
+                // Why a word is manual-only: a field check that did not pass while it was typed,
+                // or a word resumed by erasing its delimiter.
+                let result = match (manual_only, self.manual_only_inspection) {
+                    (true, true) => "manual-only cause=field-check",
+                    (true, false) => "manual-only cause=resumed",
+                    (false, _) => "privacy",
                 };
                 self.diagnostic("word", format!("result={result}"));
             }
@@ -19162,19 +19164,29 @@ mod tests {
         apply(&mut processor, None, true);
         assert!(processor.manual_only_word);
         processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = word_lines(&receiver);
         assert!(
-            word_lines(&receiver)
+            lines
                 .iter()
-                .any(|line| line.contains("result=manual-only"))
+                .any(|line| line.contains("result=manual-only cause=resumed")),
+            "{lines:?}"
         );
         // A failure the recent-good rule softens is no check of the field.
-        let (mut processor, _receiver) = processor_with_diagnostics();
+        let (mut processor, receiver) = processor_with_diagnostics();
         apply(&mut processor, None, true);
         processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
         type_letters(&mut processor, "hello");
         apply(&mut processor, FIELD_FAILURE, true);
         assert!(processor.privacy_reason.is_none());
         assert!(processor.manual_only_word);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = word_lines(&receiver);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("result=manual-only cause=field-check")),
+            "{lines:?}"
+        );
     }
 
     #[test]
