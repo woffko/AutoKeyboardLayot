@@ -323,7 +323,14 @@ A clipboard that cannot be taken in time (it belongs to a window that does not
 answer) leaves the word alone: an automatic conversion waits 0.2 seconds for it,
 Pause 0.5 seconds, and neither counts it as a failed edit; a broker that took too
 long does not put the replacement there any more, no new paste starts while it
-still runs, and how it ended is logged (`phase=broker_end`).
+still runs, and how it ended is logged (`phase=broker_end`). Clipboard listeners
+(Explorer, the clipboard history service, many programs) open the clipboard for a
+few milliseconds after every change: when another program holds it open, or the copy
+fails, the broker tries the copy and the installation again, at most three times
+15 ms apart, within the same wait. A clipboard that was not taken is logged with the
+reason, the attempts and the program holding the clipboard open then
+(`phase=clipboard_prepare result=NotInstalled reason=Open attempts=3 holder=…`); an
+excluded program is never named (`holder=excluded`).
 
 The replacement's text is rendered only when a program asks for it, so the broker
 knows which process read it. The user's clipboard is put back once the field
@@ -581,7 +588,12 @@ for an answer no longer than the barrier's deadline, at most 150 ms per read, a 
 behind changes nothing in the field, the barrier report then names `stage=Provider`, and a
 provider that keeps the queue busy for 2 seconds is replaced, at most three times. Each
 check reads the field afresh: the late answer of a read left behind describes the field as
-it was then and never answers a later check, even of the same word.
+it was then and never answers a later check, even of the same word. After a paste, a field
+that does not answer within those 150 ms is busy, typically with the paste itself (Viber
+answers UI Automation only once it has handled it): the check goes on reading it for up to
+400 ms more, as far as the gate's time allows after the steps that follow, because a paste
+counted as failed pauses automatic conversion. A field that answers without the
+replacement is not waited for longer.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
 keys typed meanwhile. This is deliberate (audit finding E-new-3, kept as it is): if a

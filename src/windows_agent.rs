@@ -198,6 +198,11 @@ const REMEMBERED_WORD_WINDOWS: usize = 8;
 const NOTEPAD_REPLAY_STEP_DELAY_MS: u64 = 3;
 const NOTEPAD_REPLAY_GATE_MARGIN_MS: u64 = 200;
 const CLIPBOARD_OPEN_RETRIES: usize = 10;
+/// How often a broker copies the user's clipboard and installs the replacement when another
+/// program held the clipboard open, and how long it waits between the attempts. The worker's
+/// installation timeout ends the attempts before that.
+const CLIPBOARD_INSTALL_ATTEMPTS: u32 = 3;
+const CLIPBOARD_INSTALL_RETRY_MS: u64 = 15;
 /// Putting the user's clipboard back is worth a longer wait than installing the temporary text
 /// (30 x 2 ms instead of 10 x 2 ms): a clipboard manager may hold the clipboard open for a moment.
 const CLIPBOARD_RESTORE_OPEN_RETRIES: usize = 30;
@@ -218,10 +223,19 @@ const TARGET_READ_GRACE_MS: u64 = 500;
 const PASTE_MIN_INSTALL_MS: u64 = 50;
 /// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
 /// the user's clipboard, the layout switch, the second commit and the UI Automation calls between.
-const PASTE_AFTER_SUBMIT_MS: u64 = 2 * NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
-    + CLIPBOARD_RESTORE_WAIT_MS
+const PASTE_AFTER_SUBMIT_MS: u64 = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_COMMIT_MS;
+/// What a protected paste needs after the commit of the replacement: the restore of the user's
+/// clipboard, the layout switch, the second commit and the UI Automation calls between.
+const PASTE_AFTER_COMMIT_MS: u64 = CLIPBOARD_RESTORE_WAIT_MS
     + LAYOUT_SWITCH_TIMEOUT_MS
-    + 100;
+    + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    + PASTE_UIA_MARGIN_MS;
+/// The UI Automation calls between the steps of a protected paste.
+const PASTE_UIA_MARGIN_MS: u64 = 100;
+/// How long past its poll a paste's commit check still waits for the field to answer its last
+/// read: a program busy with the paste (Viber) answers UI Automation only once it has handled
+/// it, and a paste counted as failed turns automatic conversion off.
+const PASTE_COMMIT_LATE_ANSWER_MS: u64 = 400;
 /// An automatic conversion waits this long for a busy clipboard, then leaves the word alone.
 const CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS: u64 = 200;
 const VK_V_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -1186,7 +1200,44 @@ enum BrokerWait {
 enum ClipboardBrokerResponse {
     Installed { sequence: u32, owner: usize },
     Finished(bool),
-    Failed,
+    Failed(BrokerRefusal),
+}
+
+/// Why a clipboard broker did not put the replacement on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerFailure {
+    /// OLE or the broker's window could not be set up.
+    Setup,
+    /// The user's clipboard could not be copied whole.
+    Snapshot,
+    /// Another program held the clipboard open.
+    Open,
+    /// The clipboard changed after the copy was taken.
+    Changed,
+    /// The worker stopped waiting.
+    Cancelled,
+    /// The replacement could not be prepared, or the clipboard could not be emptied.
+    Prepare,
+    /// The clipboard was emptied and the replacement could not be put there whole; the user's
+    /// clipboard was put back.
+    Emptied,
+}
+
+impl BrokerFailure {
+    /// A program that holds the clipboard open lets go in a moment, and a copy fails while it
+    /// does: worth another attempt while the worker waits.
+    const fn is_transient(self) -> bool {
+        matches!(self, Self::Open | Self::Snapshot)
+    }
+}
+
+/// A broker's failure as the worker logs it: why, after how many attempts, and the process that
+/// held the clipboard open then (0 when none did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrokerRefusal {
+    reason: BrokerFailure,
+    attempts: u32,
+    holder: u32,
 }
 
 /// How a clipboard broker ended; logged for a broker the worker stopped waiting for.
@@ -1284,7 +1335,7 @@ impl ClipboardBrokers {
 enum InstallOutcome {
     /// Nothing changed: the clipboard could not be opened, it changed since the copy was taken,
     /// the worker stopped waiting, or the data could not be prepared.
-    Untouched,
+    Untouched(BrokerFailure),
     /// The clipboard was emptied, but the replacement could not be put there whole.
     Emptied {
         sequence: u32,
@@ -1322,6 +1373,8 @@ trait ClipboardSystem {
     /// Whether `process`, whose Ctrl+V was sent at `submitted_at`, has read the replacement since
     /// it was put on the clipboard (see replacement_read_by).
     fn read_by(&self, process: u32, submitted_at: Instant) -> bool;
+    /// The process holding the clipboard open with a window, 0 when none does.
+    fn holder(&self) -> u32;
 }
 
 /// The broker's work: copy the user's clipboard, put the replacement there, report it, and on
@@ -1335,29 +1388,46 @@ fn run_clipboard_broker<S: ClipboardSystem>(
     commands: &Receiver<ClipboardBrokerCommand>,
     responses: &SyncSender<ClipboardBrokerResponse>,
 ) {
-    let before = system.sequence();
-    let Some(mut snapshot) = system.snapshot() else {
+    let mut attempts = 1;
+    let (mut snapshot, sequence) = loop {
+        let before = system.sequence();
+        let reason = match system.snapshot() {
+            None => BrokerFailure::Snapshot,
+            Some(mut snapshot) => match system.install(text, before, &shared.cancelled) {
+                InstallOutcome::Installed { sequence } => break (snapshot, sequence),
+                InstallOutcome::Untouched(reason) => reason,
+                InstallOutcome::Emptied { sequence } => {
+                    let end = if system.restore(Some(sequence), &mut snapshot) {
+                        BrokerEnd::Restored
+                    } else {
+                        BrokerEnd::NotRestored
+                    };
+                    shared.finish(end);
+                    let _ = responses.send(ClipboardBrokerResponse::Failed(BrokerRefusal {
+                        reason: BrokerFailure::Emptied,
+                        attempts,
+                        holder: 0,
+                    }));
+                    return;
+                }
+            },
+        };
+        // Clipboard listeners open the clipboard after every change, for some milliseconds each.
+        if reason.is_transient()
+            && attempts < CLIPBOARD_INSTALL_ATTEMPTS
+            && !shared.cancelled.load(Ordering::Acquire)
+        {
+            attempts += 1;
+            thread::sleep(Duration::from_millis(CLIPBOARD_INSTALL_RETRY_MS));
+            continue;
+        }
         shared.finish(BrokerEnd::Untouched);
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
+        let _ = responses.send(ClipboardBrokerResponse::Failed(BrokerRefusal {
+            reason,
+            attempts,
+            holder: system.holder(),
+        }));
         return;
-    };
-    let sequence = match system.install(text, before, &shared.cancelled) {
-        InstallOutcome::Installed { sequence } => sequence,
-        InstallOutcome::Untouched => {
-            shared.finish(BrokerEnd::Untouched);
-            let _ = responses.send(ClipboardBrokerResponse::Failed);
-            return;
-        }
-        InstallOutcome::Emptied { sequence } => {
-            let end = if system.restore(Some(sequence), &mut snapshot) {
-                BrokerEnd::Restored
-            } else {
-                BrokerEnd::NotRestored
-            };
-            shared.finish(end);
-            let _ = responses.send(ClipboardBrokerResponse::Failed);
-            return;
-        }
     };
     // A worker that stopped waiting has already sent its command; it is read below.
     let _ = responses.send(ClipboardBrokerResponse::Installed {
@@ -1471,7 +1541,11 @@ where
     thread::spawn(move || {
         let Some(mut system) = make() else {
             shared.finish(BrokerEnd::Untouched);
-            let _ = responses.send(ClipboardBrokerResponse::Failed);
+            let _ = responses.send(ClipboardBrokerResponse::Failed(BrokerRefusal {
+                reason: BrokerFailure::Setup,
+                attempts: 1,
+                holder: 0,
+            }));
             return;
         };
         run_clipboard_broker(&mut system, &text, &shared, &commands, &responses);
@@ -1484,8 +1558,9 @@ enum ClipboardBeginFailure {
     /// A broker the worker stopped waiting for still runs.
     Busy,
     /// The replacement was not on the clipboard in time. The broker does not put it there any
-    /// more, and puts the user's clipboard back if it already had.
-    NotInstalled,
+    /// more, and puts the user's clipboard back if it already had. With the broker's own refusal,
+    /// or none when it did not answer in time.
+    NotInstalled(Option<BrokerRefusal>),
 }
 
 /// The replacement on the clipboard for one paste. The user's clipboard is put back (`restore`)
@@ -1576,11 +1651,14 @@ impl<'a> ProtectedClipboard<'a> {
                 submitted_at: None,
                 lingering: false,
             }),
-            _ => {
+            answer => {
                 shared.cancelled.store(true, Ordering::Release);
                 let _ = command_sender.try_send(ClipboardBrokerCommand::Restore);
                 brokers.linger(worker, shared);
-                Err(ClipboardBeginFailure::NotInstalled)
+                Err(ClipboardBeginFailure::NotInstalled(match answer {
+                    Ok(ClipboardBrokerResponse::Failed(refusal)) => Some(refusal),
+                    _ => None,
+                }))
             }
         }
     }
@@ -1906,6 +1984,16 @@ impl ClipboardSystem for SystemClipboard {
                 .is_some_and(|render| replacement_read_by(&render.readers, process, submitted_at))
         })
     }
+
+    fn holder(&self) -> u32 {
+        let mut process = 0;
+        if let Ok(window) = unsafe { GetOpenClipboardWindow() } {
+            unsafe {
+                GetWindowThreadProcessId(window, Some(&mut process));
+            }
+        }
+        process
+    }
 }
 
 /// Whether the paste's target, `process`, has read the replacement among `readers`. A reader that
@@ -1981,21 +2069,23 @@ fn install_protected_clipboard(
 ) -> InstallOutcome {
     let installed = {
         let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES) else {
-            return InstallOutcome::Untouched;
+            return InstallOutcome::Untouched(BrokerFailure::Open);
         };
         // Checked with the clipboard open, so that nothing can change it before it is emptied:
         // what another program put there after the copy was taken is never replaced.
-        if cancelled.load(Ordering::Acquire) || unsafe { GetClipboardSequenceNumber() } != expected
-        {
-            return InstallOutcome::Untouched;
+        if cancelled.load(Ordering::Acquire) {
+            return InstallOutcome::Untouched(BrokerFailure::Cancelled);
+        }
+        if unsafe { GetClipboardSequenceNumber() } != expected {
+            return InstallOutcome::Untouched(BrokerFailure::Changed);
         }
         let Some(opt_outs) = clipboard_opt_out_formats() else {
-            return InstallOutcome::Untouched;
+            return InstallOutcome::Untouched(BrokerFailure::Prepare);
         };
         let mut opt_out_data = Vec::with_capacity(opt_outs.len());
         for _ in opt_outs {
             let Some(data) = global_bytes(&0u32.to_ne_bytes()) else {
-                return InstallOutcome::Untouched;
+                return InstallOutcome::Untouched(BrokerFailure::Prepare);
             };
             opt_out_data.push(data);
         }
@@ -2008,7 +2098,7 @@ fn install_protected_clipboard(
             });
         });
         if unsafe { EmptyClipboard().is_err() } {
-            return InstallOutcome::Untouched;
+            return InstallOutcome::Untouched(BrokerFailure::Prepare);
         }
         // Emptying waits for the previous owner to let go, which a hung program delays: a worker
         // that stopped waiting meanwhile gets the user's clipboard back instead of the replacement.
@@ -6877,21 +6967,19 @@ struct BarrierRead {
 type BarrierProbe = BoundedProbe<BarrierRead, (TextBarrierStatus, TextBarrierReport)>;
 
 /// The answer to `read` from `probe` by `deadline`, or `Unavailable` at the stage `Provider` when
-/// the provider is busy with an earlier read, stuck or late. The barrier only reads, so a read
-/// left behind at the deadline changes nothing in the field.
+/// the provider is busy with an earlier read, stuck or late; an answer to `read` given more than
+/// `max_age` after the read began counts as late. The barrier only reads, so a read left behind
+/// at the deadline changes nothing in the field.
 fn barrier_answer(
     probe: &mut BarrierProbe,
     read: BarrierRead,
     deadline: Instant,
+    max_age: Duration,
 ) -> (TextBarrierStatus, TextBarrierReport) {
     let expected_chars = read.text.chars().count();
     let wait = deadline.saturating_duration_since(Instant::now());
     probe
-        .query_result(
-            read,
-            wait,
-            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-        )
+        .query_result(read, wait, max_age)
         .unwrap_or_else(|_| unanswered_barrier(expected_chars))
 }
 
@@ -7694,19 +7782,62 @@ impl InputProcessor {
         expected_text: &str,
         deadline: Instant,
     ) -> TextBarrierStatus {
+        let read = self.next_barrier_read(process_id, expected_text);
+        self.answer_barrier_read(
+            read,
+            deadline,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+        )
+    }
+
+    /// A new barrier check of `expected_text` before the caret of `process_id`'s field.
+    fn next_barrier_read(&self, process_id: u32, expected_text: &str) -> BarrierRead {
         self.barrier_checks
             .set(self.barrier_checks.get().wrapping_add(1));
-        let read = BarrierRead {
+        BarrierRead {
             process_id,
             text: expected_text.to_owned(),
             check: self.barrier_checks.get(),
-        };
+        }
+    }
+
+    /// Asks the provider `read` by `deadline` (see barrier_answer) and keeps the report.
+    fn answer_barrier_read(
+        &self,
+        read: BarrierRead,
+        deadline: Instant,
+        max_age: Duration,
+    ) -> TextBarrierStatus {
+        let expected_chars = read.text.chars().count();
         let (status, report) = match self.barrier_probe.borrow_mut().as_mut() {
-            Some(probe) => barrier_answer(probe, read, deadline),
-            None => unanswered_barrier(expected_text.chars().count()),
+            Some(probe) => barrier_answer(probe, read, deadline, max_age),
+            None => unanswered_barrier(expected_chars),
         };
         self.privacy_guard.last_barrier_report.set(report);
         status
+    }
+
+    /// Whether the provider answered the last barrier read, Match or not.
+    fn barrier_answered(&self) -> bool {
+        self.privacy_guard.last_barrier_report().stage != TextBarrierStage::Provider
+    }
+
+    /// One read of a paste's commit check, answered by `until`: its status and whether the field
+    /// answered at all. A read waits behind one still under way in a busy field, so its answer
+    /// counts up to `PASTE_COMMIT_LATE_ANSWER_MS` later than a poll's.
+    fn commit_read(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        until: Instant,
+    ) -> (TextBarrierStatus, bool) {
+        let read = self.next_barrier_read(process_id, expected_text);
+        let status = self.answer_barrier_read(
+            read,
+            until,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_COMMIT_LATE_ANSWER_MS),
+        );
+        (status, self.barrier_answered())
     }
 
     /// The image path and the integrity level of `process_id`. Tests describe the process.
@@ -7777,12 +7908,19 @@ impl InputProcessor {
         input_sequence: u64,
         expected_layout: usize,
         expected_text: &str,
+        late_until: Instant,
     ) -> ReplayAttempt {
         #[cfg(test)]
         if let Some(seam) = &self.paste_seam {
             return seam.borrow_mut().commit();
         }
-        self.wait_for_text_commit(foreground, input_sequence, expected_layout, expected_text)
+        self.wait_for_text_commit(
+            foreground,
+            input_sequence,
+            expected_layout,
+            expected_text,
+            late_until,
+        )
     }
 
     /// Switches the layout after a paste. Tests script it.
@@ -10400,36 +10538,37 @@ impl InputProcessor {
         }
     }
 
+    /// Waits for the field to show a paste's `expected_text` (poll_text_commit), until
+    /// `late_until` when the field does not answer.
     fn wait_for_text_commit(
         &self,
         foreground: ForegroundContext,
         input_sequence: u64,
         expected_layout: usize,
         expected_text: &str,
+        late_until: Instant,
     ) -> ReplayAttempt {
         let deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
-        while Instant::now() < deadline {
-            if !self.edit_guard_is_current(foreground, input_sequence) {
-                self.diagnostic(
-                    "paste_guard",
-                    format!("sequence={input_sequence} reason=input-or-focus-changed"),
-                );
-                return ReplayAttempt::Cancelled;
-            }
-            let current = current_foreground_context();
-            if current.is_none_or(|current| current.layout != expected_layout) {
-                self.diagnostic("paste_guard", format!("sequence={input_sequence} reason=layout-changed expected={expected_layout:x} actual={:x}", current.map_or(0, |context| context.layout)));
-                return ReplayAttempt::Failed;
-            }
-            if matches!(
-                self.barrier_text_status(foreground.process_id, expected_text, deadline),
-                TextBarrierStatus::Match
-            ) {
-                return ReplayAttempt::Applied;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        ReplayAttempt::Failed
+        poll_text_commit(
+            deadline,
+            late_until,
+            || {
+                if !self.edit_guard_is_current(foreground, input_sequence) {
+                    self.diagnostic(
+                        "paste_guard",
+                        format!("sequence={input_sequence} reason=input-or-focus-changed"),
+                    );
+                    return Some(ReplayAttempt::Cancelled);
+                }
+                let current = current_foreground_context();
+                if current.is_none_or(|current| current.layout != expected_layout) {
+                    self.diagnostic("paste_guard", format!("sequence={input_sequence} reason=layout-changed expected={expected_layout:x} actual={:x}", current.map_or(0, |context| context.layout)));
+                    return Some(ReplayAttempt::Failed);
+                }
+                None
+            },
+            |until| self.commit_read(foreground.process_id, expected_text, until),
+        )
     }
 
     fn wait_for_capability_text_barrier(
@@ -10693,30 +10832,28 @@ impl InputProcessor {
             self.note_paste_budget(input_sequence, "install", budget);
             return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         };
-        let mut clipboard = match self.paste_clipboard(
-            replacement,
-            install_timeout,
-            foreground.process_id,
-        ) {
-            Ok(clipboard) => clipboard,
-            Err(failure) => {
-                self.diagnostic(
-                        "paste",
-                        format!(
-                            "sequence={input_sequence} phase=clipboard_prepare result={failure:?} elapsed_ms={}",
-                            started.elapsed().as_millis()
-                        ),
-                    );
-                // Nothing was typed and the user's clipboard was not replaced: a busy
-                // clipboard is a word left alone, not a failed edit, so automatic conversion
-                // stays on.
-                return self.abandon_selection(
-                    foreground,
-                    input_sequence,
-                    TextEditAttempt::Cancelled,
+        let mut clipboard =
+            match self.paste_clipboard(replacement, install_timeout, foreground.process_id) {
+                Ok(clipboard) => clipboard,
+                Err(failure) => {
+                    self.diagnostic(
+                    "paste",
+                    format!(
+                        "sequence={input_sequence} phase=clipboard_prepare result={} elapsed_ms={}",
+                        self.clipboard_failure_text(failure),
+                        started.elapsed().as_millis()
+                    ),
                 );
-            }
-        };
+                    // Nothing was typed and the user's clipboard was not replaced: a busy
+                    // clipboard is a word left alone, not a failed edit, so automatic conversion
+                    // stays on.
+                    return self.abandon_selection(
+                        foreground,
+                        input_sequence,
+                        TextEditAttempt::Cancelled,
+                    );
+                }
+            };
         let clipboard_current = clipboard.is_current();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_prepare result=ready current={clipboard_current} elapsed_ms={}", started.elapsed().as_millis()));
         let submit_fits = budget.allows_submit(Instant::now());
@@ -10754,8 +10891,18 @@ impl InputProcessor {
             );
         }
 
-        let paste_commit =
-            self.paste_commit(foreground, input_sequence, source_layout, replacement);
+        // The steps after this commit still fit when the field answers it late.
+        let late_until = budget.commit_late_until(
+            Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+            Duration::from_millis(PASTE_AFTER_COMMIT_MS),
+        );
+        let paste_commit = self.paste_commit(
+            foreground,
+            input_sequence,
+            source_layout,
+            replacement,
+            late_until,
+        );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
         if clipboard_after_paste(paste_commit) == ClipboardAfterPaste::Defer {
@@ -10794,17 +10941,50 @@ impl InputProcessor {
                 return TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch);
             }
         }
+        let late_until = budget.commit_late_until(
+            Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+            Duration::from_millis(PASTE_UIA_MARGIN_MS),
+        );
         let target_commit = self.paste_commit(
             foreground,
             input_sequence,
             target_layout.0 as usize,
             replacement,
+            late_until,
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=target_commit result={target_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
         protected_paste_outcome(
             matches!(target_commit, ReplayAttempt::Applied),
             clipboard_restored,
+        )
+    }
+
+    /// A failed installation as the log shows it: the broker's reason, its attempts and the
+    /// program that held the clipboard open then. An excluded program is not named.
+    fn clipboard_failure_text(&self, failure: ClipboardBeginFailure) -> String {
+        let refusal = match failure {
+            ClipboardBeginFailure::Busy => return "Busy".to_owned(),
+            ClipboardBeginFailure::NotInstalled(None) => {
+                return "NotInstalled reason=timeout".to_owned();
+            }
+            ClipboardBeginFailure::NotInstalled(Some(refusal)) => refusal,
+        };
+        let holder = match refusal.holder {
+            0 => "none".to_owned(),
+            process => match self.process_facts(process).0 {
+                Some(path) if self.exclusion_policy.is_excluded(&path) => "excluded".to_owned(),
+                Some(path) => path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                None => "unavailable".to_owned(),
+            },
+        };
+        format!(
+            "NotInstalled reason={:?} attempts={} holder={holder}",
+            refusal.reason, refusal.attempts
         )
     }
 
@@ -12060,6 +12240,16 @@ impl PasteBudget {
         self.remaining(now)
             .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
     }
+
+    /// Until when a commit check whose poll ends at `poll_end` waits for the field's late answer:
+    /// `PASTE_COMMIT_LATE_ANSWER_MS` past the poll, and never into `reserve`, what the steps after
+    /// the check need before the gate lets the keys go.
+    fn commit_late_until(self, poll_end: Instant, reserve: Duration) -> Instant {
+        let late = poll_end + Duration::from_millis(PASTE_COMMIT_LATE_ANSWER_MS);
+        self.deadline
+            .and_then(|deadline| deadline.checked_sub(reserve))
+            .map_or(late, |limit| late.min(limit))
+    }
 }
 
 /// What becomes of the user's clipboard once the Ctrl+V was sent: put back at once after the
@@ -12069,6 +12259,34 @@ impl PasteBudget {
 enum ClipboardAfterPaste {
     Restore,
     Defer,
+}
+
+/// A paste's commit check. Until `deadline`, `stop` ends it when the input, the focus or the
+/// layout moved on, and `read` asks the field, by the time it is given, whether it shows the
+/// replacement: its status and whether the field answered at all. A field that does not answer
+/// is busy, perhaps with the paste itself, and answers once it has handled it: the check then
+/// goes on until `late_until`, since a paste counted as failed turns automatic conversion off.
+fn poll_text_commit(
+    deadline: Instant,
+    late_until: Instant,
+    mut stop: impl FnMut() -> Option<ReplayAttempt>,
+    mut read: impl FnMut(Instant) -> (TextBarrierStatus, bool),
+) -> ReplayAttempt {
+    let mut until = deadline;
+    while Instant::now() < until {
+        if let Some(stopped) = stop() {
+            return stopped;
+        }
+        let (status, answered) = read(until);
+        if status == TextBarrierStatus::Match {
+            return ReplayAttempt::Applied;
+        }
+        if !answered {
+            until = until.max(late_until);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    ReplayAttempt::Failed
 }
 
 const fn clipboard_after_paste(commit: ReplayAttempt) -> ClipboardAfterPaste {
@@ -16341,7 +16559,7 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         assert_eq!(
             install_protected_clipboard(owner, "akl-replacement", stale, &cancelled),
-            InstallOutcome::Untouched
+            InstallOutcome::Untouched(BrokerFailure::Changed)
         );
         assert_eq!(test_clipboard_unicode(window).as_deref(), Some("akl-newer"));
         // A worker that stopped waiting is not served either, whatever the sequence.
@@ -16349,7 +16567,7 @@ mod tests {
         let current = unsafe { GetClipboardSequenceNumber() };
         assert_eq!(
             install_protected_clipboard(owner, "akl-replacement", current, &cancelled),
-            InstallOutcome::Untouched
+            InstallOutcome::Untouched(BrokerFailure::Cancelled)
         );
         assert_eq!(test_clipboard_unicode(window).as_deref(), Some("akl-newer"));
         unsafe {
@@ -21532,9 +21750,10 @@ mod tests {
             text: text.to_owned(),
             check: 1,
         };
+        let age = Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
         // A read whose deadline has come does not wait at all, whatever the provider does.
         let started = Instant::now();
-        let (status, report) = barrier_answer(&mut probe, read("ghbdtn "), started);
+        let (status, report) = barrier_answer(&mut probe, read("ghbdtn "), started, age);
         assert_eq!(status, TextBarrierStatus::Unavailable);
         assert_eq!(report.stage, TextBarrierStage::Provider);
         assert_eq!(report.expected_chars, 7);
@@ -21548,8 +21767,12 @@ mod tests {
         hung.recv_timeout(Duration::from_secs(10))
             .expect("the provider took the read");
         let next = Instant::now();
-        let (status, _) =
-            barrier_answer(&mut probe, read("vbh "), next + Duration::from_millis(50));
+        let (status, _) = barrier_answer(
+            &mut probe,
+            read("vbh "),
+            next + Duration::from_millis(50),
+            age,
+        );
         assert_eq!(status, TextBarrierStatus::Unavailable);
         assert!(
             next.elapsed() < Duration::from_millis(400),
@@ -21558,8 +21781,12 @@ mod tests {
         );
         // With the queue full, a read is refused at once, however long it may wait.
         let refused = Instant::now();
-        let (status, report) =
-            barrier_answer(&mut probe, read("lf "), refused + Duration::from_secs(30));
+        let (status, report) = barrier_answer(
+            &mut probe,
+            read("lf "),
+            refused + Duration::from_secs(30),
+            age,
+        );
         assert_eq!(
             (status, report.stage),
             (TextBarrierStatus::Unavailable, TextBarrierStage::Provider)
@@ -21575,6 +21802,7 @@ mod tests {
             &mut probe,
             read("lf "),
             Instant::now() + Duration::from_secs(5),
+            age,
         );
         assert_eq!(
             (status, report.expected_chars),
@@ -21619,6 +21847,52 @@ mod tests {
             processor.privacy_guard.last_barrier_report().expected_chars,
             41
         );
+    }
+
+    #[test]
+    fn a_commit_read_behind_one_under_way_counts_past_the_age_of_a_poll_answer() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new(metrics, 0);
+        let (release, released) = sync_channel::<()>(1);
+        // The field is busy with the paste: the first read answers only once released; the
+        // provider answers the next one at once, with the replacement.
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-commit-late-test", move || {
+                move |read: BarrierRead| {
+                    if read.check == 1 {
+                        let _ = released.recv();
+                    }
+                    marked_barrier_answer(41)
+                }
+            })
+            .expect("barrier provider"),
+        );
+        assert_eq!(
+            processor.commit_read(7, "привет", Instant::now() + Duration::from_millis(30)),
+            (TextBarrierStatus::Unavailable, false)
+        );
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(220));
+            release.send(()).unwrap();
+        });
+        // The next read waits behind it and is answered 250 ms after it was asked: past the age
+        // of a poll's answer, and still counted.
+        let started = Instant::now();
+        assert_eq!(
+            processor.commit_read(7, "привет", Instant::now() + Duration::from_secs(2)),
+            (TextBarrierStatus::Match, true)
+        );
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().expected_chars,
+            41
+        );
+        assert!(
+            started.elapsed() > Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)
+                && started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
     }
 
     #[test]
@@ -22251,6 +22525,12 @@ mod tests {
         /// Another program puts this on the clipboard while the copy is taken.
         writer_during_snapshot: Option<String>,
         open_fails: bool,
+        /// How many of the next openings fail (another program holds the clipboard open).
+        open_failures: u32,
+        /// The copy fails this many more times.
+        snapshot_failures: u32,
+        /// The process holding the clipboard open.
+        holder: u32,
         install_fails_after_empty: bool,
         restore_fails: bool,
         /// Processes that read the replacement (0: without a window), and when.
@@ -22281,6 +22561,10 @@ mod tests {
             let delay = self.0.lock().unwrap().snapshot_delay;
             thread::sleep(delay);
             let mut state = self.0.lock().unwrap();
+            if state.snapshot_failures > 0 {
+                state.snapshot_failures -= 1;
+                return None;
+            }
             let copy = state.text.clone();
             if let Some(newer) = state.writer_during_snapshot.take() {
                 state.text = newer;
@@ -22292,8 +22576,15 @@ mod tests {
 
         fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome {
             let mut state = self.0.lock().unwrap();
-            if state.open_fails || cancelled.load(Ordering::Acquire) || state.sequence != expected {
-                return InstallOutcome::Untouched;
+            if state.open_fails || state.open_failures > 0 {
+                state.open_failures = state.open_failures.saturating_sub(1);
+                return InstallOutcome::Untouched(BrokerFailure::Open);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return InstallOutcome::Untouched(BrokerFailure::Cancelled);
+            }
+            if state.sequence != expected {
+                return InstallOutcome::Untouched(BrokerFailure::Changed);
             }
             state.empties += 1;
             state.text.clear();
@@ -22353,6 +22644,10 @@ mod tests {
 
         fn read_by(&self, process: u32, submitted_at: Instant) -> bool {
             replacement_read_by(&self.0.lock().unwrap().readers, process, submitted_at)
+        }
+
+        fn holder(&self) -> u32 {
+            self.0.lock().unwrap().holder
         }
     }
 
@@ -22663,15 +22958,103 @@ mod tests {
         let state = fake_clipboard("old");
         state.lock().unwrap().writer_during_snapshot = Some("newer".to_owned());
         let brokers = ClipboardBrokers::default();
+        // Not tried again: the copy would be of what the other program put there, which it may
+        // replace again.
         assert!(matches!(
             begin_fake(&state, &brokers, Duration::from_secs(2)),
-            Err(ClipboardBeginFailure::NotInstalled)
+            Err(ClipboardBeginFailure::NotInstalled(Some(BrokerRefusal {
+                reason: BrokerFailure::Changed,
+                attempts: 1,
+                ..
+            })))
         ));
         assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
         let state = state.lock().unwrap();
         assert_eq!(state.text, "newer");
         assert_eq!(state.empties, 0);
         assert_eq!(state.restores, 0);
+    }
+
+    #[test]
+    fn a_clipboard_another_program_holds_open_for_a_moment_is_tried_again() {
+        // Clipboard listeners open the clipboard for a moment after every change: the copy and
+        // the installation are tried again.
+        let brokers = ClipboardBrokers::default();
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().open_failures = CLIPBOARD_INSTALL_ATTEMPTS - 1;
+        let mut transaction =
+            begin_fake(&state, &brokers, Duration::from_secs(2)).expect("installed at the last");
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert!(transaction.restore());
+        drop(transaction);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        // A copy that failed for a moment is taken again too.
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().snapshot_failures = 1;
+        let mut transaction =
+            begin_fake(&state, &brokers, Duration::from_secs(2)).expect("installed again");
+        assert!(transaction.restore());
+        drop(transaction);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        // Held open for good: the broker gives up after its attempts and says who held it.
+        let state = fake_clipboard("user text");
+        {
+            let mut state = state.lock().unwrap();
+            state.open_fails = true;
+            state.holder = 4321;
+        }
+        assert_eq!(
+            begin_fake(&state, &brokers, Duration::from_secs(2)).err(),
+            Some(ClipboardBeginFailure::NotInstalled(Some(BrokerRefusal {
+                reason: BrokerFailure::Open,
+                attempts: CLIPBOARD_INSTALL_ATTEMPTS,
+                holder: 4321,
+            })))
+        );
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        assert_eq!(state.lock().unwrap().empties, 0);
+        assert_eq!(state.lock().unwrap().text, "user text");
+    }
+
+    #[test]
+    fn a_failed_installation_is_logged_with_its_reason_and_the_program_holding_the_clipboard() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(metrics, 0);
+        let refusal = |holder| {
+            ClipboardBeginFailure::NotInstalled(Some(BrokerRefusal {
+                reason: BrokerFailure::Open,
+                attempts: 3,
+                holder,
+            }))
+        };
+        processor.process_override = Some((Some(r"C:\Tools\ClipTool.exe".to_owned()), None));
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(4321)),
+            "NotInstalled reason=Open attempts=3 holder=ClipTool.exe"
+        );
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(0)),
+            "NotInstalled reason=Open attempts=3 holder=none"
+        );
+        // An excluded program, a password manager for one, is never named.
+        processor.process_override = Some((Some(r"C:\Tools\KeePass\KeePass.exe".to_owned()), None));
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(4321)),
+            "NotInstalled reason=Open attempts=3 holder=excluded"
+        );
+        processor.process_override = Some((None, None));
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(4321)),
+            "NotInstalled reason=Open attempts=3 holder=unavailable"
+        );
+        assert_eq!(
+            processor.clipboard_failure_text(ClipboardBeginFailure::NotInstalled(None)),
+            "NotInstalled reason=timeout"
+        );
+        assert_eq!(
+            processor.clipboard_failure_text(ClipboardBeginFailure::Busy),
+            "Busy"
+        );
     }
 
     #[test]
@@ -22699,7 +23082,7 @@ mod tests {
         let brokers = ClipboardBrokers::default();
         assert!(matches!(
             begin_fake(&state, &brokers, Duration::from_millis(20)),
-            Err(ClipboardBeginFailure::NotInstalled)
+            Err(ClipboardBeginFailure::NotInstalled(None))
         ));
         // One broker at a time: the next paste does not start while that one still runs.
         let other = fake_clipboard("other");
@@ -22801,6 +23184,134 @@ mod tests {
         // The Ctrl+V needs everything after it in hand.
         assert!(at(PASTE_AFTER_SUBMIT_MS).allows_submit(now));
         assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
+    }
+
+    #[test]
+    fn a_late_commit_answer_is_waited_for_only_within_what_the_gate_has_left() {
+        let now = Instant::now();
+        let poll_end = now + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        let late = poll_end + Duration::from_millis(PASTE_COMMIT_LATE_ANSWER_MS);
+        let after = Duration::from_millis(PASTE_AFTER_COMMIT_MS);
+        assert_eq!(PASTE_AFTER_COMMIT_MS, 600);
+        // Without a gate, or with time to spare, the whole late wait.
+        assert_eq!(
+            PasteBudget { deadline: None }.commit_late_until(poll_end, after),
+            late
+        );
+        let spare = PasteBudget {
+            deadline: Some(late + after + Duration::from_millis(1)),
+        };
+        assert_eq!(spare.commit_late_until(poll_end, after), late);
+        // Otherwise it ends where the steps after the commit need the rest.
+        let deadline = now + Duration::from_millis(1_000);
+        let tight = PasteBudget {
+            deadline: Some(deadline),
+        };
+        assert_eq!(tight.commit_late_until(poll_end, after), deadline - after);
+        // With nothing to spare it is over before it began.
+        let none = PasteBudget {
+            deadline: Some(poll_end + after - Duration::from_millis(50)),
+        };
+        assert!(none.commit_late_until(poll_end, after) < poll_end);
+    }
+
+    #[test]
+    fn a_paste_commit_check_goes_on_while_the_field_is_too_busy_to_answer() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(30);
+        let late_until = started + Duration::from_millis(400);
+        // The field does not answer before the poll ends; once it is free it first answers
+        // without the replacement (it handles the queued read before the paste), then with it.
+        let reads = Cell::new(0);
+        let busy_then_pasted = |until: Instant| {
+            reads.set(reads.get() + 1);
+            match reads.get() {
+                1 => {
+                    thread::sleep(until.saturating_duration_since(Instant::now()));
+                    (TextBarrierStatus::Unavailable, false)
+                }
+                2 => (TextBarrierStatus::Mismatch, true),
+                _ => (TextBarrierStatus::Match, true),
+            }
+        };
+        assert_eq!(
+            poll_text_commit(deadline, late_until, || None, busy_then_pasted),
+            ReplayAttempt::Applied
+        );
+        assert_eq!(reads.get(), 3);
+        assert!(started.elapsed() < Duration::from_millis(400));
+        // A field that answers without the replacement is not waited for past the poll.
+        let started = Instant::now();
+        assert_eq!(
+            poll_text_commit(
+                started + Duration::from_millis(30),
+                started + Duration::from_secs(5),
+                || None,
+                |_| (TextBarrierStatus::Mismatch, true)
+            ),
+            ReplayAttempt::Failed
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // Busy, it is waited for until the late limit, and no longer.
+        let started = Instant::now();
+        let late_until = started + Duration::from_millis(200);
+        assert_eq!(
+            poll_text_commit(
+                started + Duration::from_millis(30),
+                late_until,
+                || None,
+                |until: Instant| {
+                    thread::sleep(until.saturating_duration_since(Instant::now()));
+                    (TextBarrierStatus::Unavailable, false)
+                }
+            ),
+            ReplayAttempt::Failed
+        );
+        assert!(Instant::now() >= late_until);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // The user acts while the field is busy: the check stops.
+        let reads = Cell::new(0);
+        let started = Instant::now();
+        assert_eq!(
+            poll_text_commit(
+                started + Duration::from_millis(30),
+                started + Duration::from_secs(5),
+                || (reads.get() >= 2).then_some(ReplayAttempt::Cancelled),
+                |until: Instant| {
+                    reads.set(reads.get() + 1);
+                    thread::sleep(
+                        until
+                            .min(Instant::now() + Duration::from_millis(40))
+                            .saturating_duration_since(Instant::now()),
+                    );
+                    (TextBarrierStatus::Unavailable, false)
+                }
+            ),
+            ReplayAttempt::Cancelled
+        );
+        // Stopped at once, the field is not read.
+        let reads = Cell::new(0);
+        assert_eq!(
+            poll_text_commit(
+                Instant::now() + Duration::from_millis(30),
+                Instant::now() + Duration::from_secs(5),
+                || Some(ReplayAttempt::Failed),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    (TextBarrierStatus::Match, true)
+                }
+            ),
+            ReplayAttempt::Failed
+        );
+        assert_eq!(reads.get(), 0);
     }
 
     /// What the gate of `accepting_gate_window` has left when the worker prepares a handoff.
@@ -24754,6 +25265,11 @@ public class AklWindowlessReader : Form {
             );
             assert_eq!(text, "привет", "{case}");
             assert_eq!(clipboard.as_deref(), Some("akl-password"), "{case}");
+            // A field busy for less than the late wait answers in time: the paste is confirmed,
+            // not counted as failed (which would turn automatic conversion off).
+            if read_then_busy_ms == 0 && busy_ms <= 300 {
+                assert_eq!(attempt, TextEditAttempt::Applied, "{case}");
+            }
         }
     }
 
@@ -24810,6 +25326,8 @@ public class AklWindowlessReader : Form {
         drop(field);
         assert_eq!(text, "привет");
         assert_eq!(clipboard.as_deref(), Some("akl-password"));
+        // Busy while it pastes, the field answers once it has: the paste is confirmed.
+        assert_eq!(attempt, TextEditAttempt::Applied);
     }
 
     #[test]
@@ -24879,8 +25397,10 @@ public class AklWindowlessReader : Form {
         };
         let english = 0x0409_0409usize;
         let mut outcomes = Vec::new();
-        // A field that pastes at once, and one busy when the replacement arrives.
-        for busy_ms in [0usize, 300] {
+        // A field that pastes at once, one busy when the replacement arrives (it answers UI
+        // Automation only once it has handled the paste), and one that pastes at once again: the
+        // busy one turned nothing off.
+        for busy_ms in [0usize, 300, 0] {
             unsafe {
                 let _ = PostMessageW(
                     Some(HWND(field.context.hwnd as *mut c_void)),
