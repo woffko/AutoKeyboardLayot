@@ -25657,6 +25657,9 @@ public class AklWindowlessReader : Form {
         record(&|line| {
             line.contains("event=paste")
                 || line.contains("event=conversion")
+                || line.contains("event=word")
+                || line.contains("event=privacy_probe")
+                || line.contains("event=context")
                 || line.contains("phase=armed")
                 || line.contains("event=gate_ack")
         });
