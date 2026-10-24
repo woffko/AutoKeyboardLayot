@@ -86,10 +86,11 @@ use windows::{
         },
         UI::{
             Accessibility::{
-                CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationTextPattern,
-                IUIAutomationTextRange, TextPatternRangeEndpoint_End,
+                CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
+                IUIAutomationTextPattern, IUIAutomationTextRange, TextPatternRangeEndpoint_End,
                 TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_CONTROLTYPE_ID,
-                UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_TextPatternId,
+                UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_IsPasswordPropertyId,
+                UIA_ProcessIdPropertyId, UIA_TextPatternId,
             },
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState,
@@ -290,6 +291,12 @@ const HOOK_SLOW_DIAGNOSTIC_MS: u64 = 50;
 /// Timer ticks are 250 ms apart; a longer gap means the UI thread was blocked.
 const UI_STALL_DIAGNOSTIC_MS: u64 = 700;
 const UIA_PROVIDER_TIMEOUT_MS: u32 = 100;
+/// The UI Automation timeout of the privacy check, which asks the field once (its process and
+/// whether it is a password field, in one cached request): a program busy for a moment after a
+/// conversion or under fast typing still answers, and the one call fits the worker's wait
+/// (`PRIVACY_PROBE_WAIT_MS`). An unanswered check makes the word being typed manual-only.
+const UIA_PRIVACY_TIMEOUT_MS: u32 = 250;
+const _: () = assert!((UIA_PRIVACY_TIMEOUT_MS as u64) < PRIVACY_PROBE_WAIT_MS);
 const PRIVACY_PASSWORD: u8 = 1;
 const PRIVACY_EXCLUDED: u8 = 2;
 const PRIVACY_UNAVAILABLE: u8 = 3;
@@ -6087,17 +6094,25 @@ fn window_belongs_to_context(window: HWND, expected: ForegroundContext) -> bool 
 
 struct PrivacyGuard {
     automation: Option<IUIAutomation>,
+    /// The focused field's process and password property, fetched with the field in one call.
+    privacy_cache: Option<IUIAutomationCacheRequest>,
     com_initialized: bool,
     last_barrier_report: Cell<TextBarrierReport>,
 }
 
 impl PrivacyGuard {
     fn new() -> Self {
+        Self::with_timeout(UIA_PROVIDER_TIMEOUT_MS)
+    }
+
+    /// A guard whose UI Automation calls each give up after `timeout_ms`.
+    fn with_timeout(timeout_ms: u32) -> Self {
         unsafe {
             let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             if !initialized {
                 return Self {
                     automation: None,
+                    privacy_cache: None,
                     com_initialized: false,
                     last_barrier_report: Cell::new(TextBarrierReport::default()),
                 };
@@ -6108,22 +6123,32 @@ impl PrivacyGuard {
             let automation: Option<IUIAutomation> = (|| -> Result<IUIAutomation> {
                 let client: IUIAutomation2 =
                     CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
-                client.SetConnectionTimeout(UIA_PROVIDER_TIMEOUT_MS)?;
-                client.SetTransactionTimeout(UIA_PROVIDER_TIMEOUT_MS)?;
+                client.SetConnectionTimeout(timeout_ms)?;
+                client.SetTransactionTimeout(timeout_ms)?;
                 client.cast()
             })()
             .ok();
-            if automation.is_none() {
+            let Some(automation) = automation else {
                 CoUninitialize();
                 return Self {
                     automation: None,
+                    privacy_cache: None,
                     com_initialized: false,
                     last_barrier_report: Cell::new(TextBarrierReport::default()),
                 };
-            }
+            };
+            let privacy_cache = automation
+                .CreateCacheRequest()
+                .and_then(|request| {
+                    request.AddProperty(UIA_ProcessIdPropertyId)?;
+                    request.AddProperty(UIA_IsPasswordPropertyId)?;
+                    Ok(request)
+                })
+                .ok();
 
             Self {
-                automation,
+                automation: Some(automation),
+                privacy_cache,
                 com_initialized: true,
                 last_barrier_report: Cell::new(TextBarrierReport::default()),
             }
@@ -6131,20 +6156,21 @@ impl PrivacyGuard {
     }
 
     fn inspect(&self, expected_process_id: u32) -> Option<PrivacyBlockReason> {
-        let Some(automation) = &self.automation else {
+        let (Some(automation), Some(cache)) = (&self.automation, &self.privacy_cache) else {
             return Some(PrivacyBlockReason::InspectionUnavailable);
         };
         unsafe {
-            let Ok(element) = automation.GetFocusedElement() else {
+            // One call to the field's program: a second and a third would each wait for it again.
+            let Ok(element) = automation.GetFocusedElementBuildCache(cache) else {
                 return Some(PrivacyBlockReason::FieldInspectionUnavailable);
             };
-            let Ok(process_id) = element.CurrentProcessId() else {
+            let Ok(process_id) = element.CachedProcessId() else {
                 return Some(PrivacyBlockReason::InspectionUnavailable);
             };
             if process_id < 0 || process_id as u32 != expected_process_id {
                 return Some(PrivacyBlockReason::InspectionUnavailable);
             }
-            match element.CurrentIsPassword() {
+            match element.CachedIsPassword() {
                 Ok(value) if value.as_bool() => Some(PrivacyBlockReason::PasswordField),
                 Ok(_) => None,
                 Err(_) => Some(PrivacyBlockReason::FieldInspectionUnavailable),
@@ -6316,6 +6342,8 @@ impl PrivacyGuard {
 
 impl Drop for PrivacyGuard {
     fn drop(&mut self) {
+        // COM objects are released before COM is uninitialized on this thread.
+        self.privacy_cache.take();
         self.automation.take();
         if self.com_initialized {
             unsafe {
@@ -7530,11 +7558,16 @@ struct InputProcessor {
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
-    // Field-inspection fallback authorizes manual input only. Recovery of UIA
-    // must not promote a word captured under that exception to automatic input.
+    // Field-inspection fallback authorizes manual input only, until a check of the
+    // same field passes before the word ends (`manual_only_inspection`); the
+    // recent-good rule's softened failure is no such check.
     // A word resumed by erasing its delimiter is also manual-only, so erasing
     // and retyping a space never re-triggers automatic conversion.
     manual_only_word: bool,
+    // The manual-only mark comes from the field-inspection fallback, not from a resumed word:
+    // a check of the same field that passes before the word ends lifts it (the owner's decision
+    // of 2026-10-24; a focus change, a click, Tab or Enter ends the word first).
+    manual_only_inspection: bool,
     // Whether the active manual token began at a known word start. A token
     // typed after a shortcut has an unknown left context; erasing it must not
     // re-enable automatic conversion for the following text.
@@ -7670,7 +7703,7 @@ impl InputProcessor {
             privacy_probe: BoundedProbe::spawn_resilient(
                 "autokey-privacy",
                 || {
-                    let guard = PrivacyGuard::new();
+                    let guard = PrivacyGuard::with_timeout(UIA_PRIVACY_TIMEOUT_MS);
                     move |(foreground, _epoch, _generation): (ForegroundContext, u64, u64)| {
                         if !foreground_identity_matches(foreground) {
                             return Some(PrivacyBlockReason::InspectionUnavailable);
@@ -7718,6 +7751,7 @@ impl InputProcessor {
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
             manual_only_word: false,
+            manual_only_inspection: false,
             manual_token_start_known: false,
             last_word_reset: "none",
             recent_languages: Vec::new(),
@@ -9024,6 +9058,7 @@ impl InputProcessor {
                     // such as focus, mouse or layout changes discard the previous
                     // word without passing through a boundary or suppression.
                     self.manual_only_word = self.privacy_reason.is_some();
+                    self.manual_only_inspection = self.manual_only_word;
                 }
                 let action = self.session.handle_with_readings(
                     input_event,
@@ -9394,6 +9429,7 @@ impl InputProcessor {
         }
         self.replay_keys = last.replay_keys;
         self.manual_only_word = true;
+        self.manual_only_inspection = false;
         true
     }
 
@@ -9939,6 +9975,12 @@ impl InputProcessor {
         let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
             && self.manual_privacy_allows_reason(reason, foreground);
         self.set_privacy_reason_with_manual_exception(reason, manual_exception);
+        // The field that could not be checked when the word began has now passed a check of its
+        // own (a softened failure is no check): the word is no longer manual-only.
+        if reason.is_none() && source == "provider" && self.manual_only_inspection {
+            self.manual_only_word = false;
+            self.manual_only_inspection = false;
+        }
         // Logged under the new verdict, so a check that blocks the field leaves no line.
         if changed
             || verdict.recent_ok_age.is_some()
@@ -10126,6 +10168,7 @@ impl InputProcessor {
         if reason.is_some() {
             if manual_exception && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) {
                 self.manual_only_word = true;
+                self.manual_only_inspection = true;
                 self.pending_conversion = None;
                 self.deferred_drained_conversion = None;
                 self.clear_undo();
@@ -10140,6 +10183,7 @@ impl InputProcessor {
     fn suppress_session(&mut self) {
         self.replay_keys.clear();
         self.manual_only_word = false;
+        self.manual_only_inspection = false;
         self.session
             .handle(InputEvent::UnsupportedInput, None, &self.detector);
     }
@@ -18512,6 +18556,9 @@ mod tests {
         assert_eq!(processor.session.buffered_character_count(), 6);
         assert_eq!(processor.replay_keys.len(), 6);
         assert!(processor.manual_only_word);
+        // A check of the field that passes meanwhile does not make it automatic either.
+        apply(&mut processor, None, true);
+        assert!(processor.manual_only_word);
         // Retyping the delimiter does not re-trigger automatic conversion.
         assert!(
             processor
@@ -18969,6 +19016,58 @@ mod tests {
             Instant::now(),
             ProbeTrigger::Typing,
         );
+    }
+
+    #[test]
+    fn a_word_begun_while_the_field_could_not_be_checked_becomes_automatic_once_it_passes() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        // The terminal's field did not answer: the word is kept, for Pause only.
+        processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
+        type_letters(&mut processor, "hello");
+        assert!(processor.manual_only_word);
+        // A check of the same field passes before the word ends.
+        apply(&mut processor, None, true);
+        assert!(!processor.manual_only_word);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = word_lines(&receiver);
+        assert!(
+            !lines.iter().any(|line| line.contains("result=manual-only")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_passed_check_of_the_same_field_lifts_the_manual_only_mark() {
+        // The check was for another context: the word is not promoted (it is dropped).
+        let (mut processor, _receiver) = processor_with_diagnostics();
+        processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
+        type_letters(&mut processor, "hello");
+        apply(&mut processor, None, false);
+        assert!(
+            processor
+                .handle_boundary(Some(Language::English), Some(' '), false)
+                .is_none()
+        );
+        // A word resumed by erasing its delimiter stays manual-only whatever the checks say.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        type_letters(&mut processor, "hello");
+        processor.manual_only_word = true;
+        apply(&mut processor, None, true);
+        assert!(processor.manual_only_word);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        assert!(
+            word_lines(&receiver)
+                .iter()
+                .any(|line| line.contains("result=manual-only"))
+        );
+        // A failure the recent-good rule softens is no check of the field.
+        let (mut processor, _receiver) = processor_with_diagnostics();
+        apply(&mut processor, None, true);
+        processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
+        type_letters(&mut processor, "hello");
+        apply(&mut processor, FIELD_FAILURE, true);
+        assert!(processor.privacy_reason.is_none());
+        assert!(processor.manual_only_word);
     }
 
     #[test]
@@ -20737,6 +20836,37 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_word_begun_before_its_field_passed_a_check_is_automatic_again() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        processor.process_override = Some((
+            Some(r"C:\Program Files\WindowsApps\Terminal\WindowsTerminal.exe".to_owned()),
+            Some(0x2000),
+        ));
+        processor.settings.manual_terminal_uia_fallback = true;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        // The field does not answer the first check, and passes the next one.
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-terminal", move || {
+                move |_| (counted.fetch_add(1, Ordering::SeqCst) == 0).then_some(FIELD_FAILURE)?
+            })
+            .unwrap(),
+        );
+        // "ghbdtn": the first letter meets the unanswered check, and the word is kept for Pause
+        // only.
+        type_keys(&mut processor, foreground, &[0x22]);
+        assert!(processor.manual_only_word);
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        // A periodic check of the same field passes while the word is typed.
+        processor.privacy_needs_check = true;
+        type_keys(&mut processor, foreground, &[0x23, 0x30, 0x20, 0x14, 0x31]);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(processor.privacy_reason.is_none());
+        assert!(!processor.manual_only_word);
+        assert_eq!(processor.session.buffered_character_count(), 6);
+    }
+
+    #[test]
     fn typing_in_a_password_field_leaves_no_line_once_the_field_is_known() {
         let (mut processor, receiver) =
             processor_in_field(EDITOR, Some(PrivacyBlockReason::PasswordField));
@@ -22055,6 +22185,7 @@ mod tests {
     fn a_collapse_adds_its_result_to_the_report_without_overwriting_the_step() {
         let guard = PrivacyGuard {
             automation: None,
+            privacy_cache: None,
             com_initialized: false,
             last_barrier_report: Cell::new(TextBarrierReport {
                 stage: TextBarrierStage::TextCompared,
@@ -23826,6 +23957,7 @@ mod tests {
         let foreground = test_foreground();
         processor.privacy_guard = PrivacyGuard {
             automation: None,
+            privacy_cache: None,
             com_initialized: false,
             last_barrier_report: Cell::new(TextBarrierReport::default()),
         };

@@ -435,6 +435,11 @@ input epoch and target identity still have to succeed. A transport timeout,
 changed target, unreadable process or confirmed password field does not qualify.
 Routing an application to `physical-replay` alone never grants this permission.
 
+The field check asks the focused field's program once, for its process and its
+password property together, and waits for it up to 250 ms (other UI Automation
+calls give up after 100 ms): Viber, Windows Terminal and browsers are often busy
+longer than 100 ms right after a conversion or under fast typing.
+
 A field check that fails because the focused window answers late (Windows
 Terminal while you type quickly) does not by itself make the word being typed
 manual-only. When the same window, focus and input epoch passed a check less than
@@ -446,8 +451,11 @@ renews the good check, so a window that keeps failing counts as failing after tw
 seconds. A password field,
 an excluded or unreadable process, a changed context and every transport failure
 stand as before, and recovery of held keys and manual conversion always take a
-failure at face value. A word that did meet a standing failure stays manual-only
-even when the next check passes.
+failure at face value. A word that met a standing failure of the field check in
+a terminal (kept for Pause by `manual_terminal_uia_fallback`) becomes automatic
+again when a check of the same field passes before the word ends; a softened
+failure is no such check. A word resumed by erasing its delimiter stays
+manual-only whatever the checks say.
 
 Capability diagnostics expose only backend states such as `uia-paste`,
 `physical-replay`, `capability-probe`, `unsupported`, or `text-mismatch`; they
