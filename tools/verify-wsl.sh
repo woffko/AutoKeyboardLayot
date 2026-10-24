@@ -105,8 +105,8 @@ cd "$repo_root" || exit 2
 
 min_linux_lib=${AKL_MIN_LINUX_LIB_TESTS:-377}
 min_python=${AKL_MIN_PYTHON_TESTS:-125}
-min_windows=${AKL_MIN_WINDOWS_TESTS:-370}
-min_windows_all=${AKL_MIN_WINDOWS_ALL_TESTS:-1523}
+min_windows=${AKL_MIN_WINDOWS_TESTS:-377}
+min_windows_all=${AKL_MIN_WINDOWS_ALL_TESTS:-1535}
 
 # Step selection ---------------------------------------------------------------
 
