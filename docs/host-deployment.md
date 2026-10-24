@@ -19,8 +19,11 @@ sha256sum target/xwin-hotkeys/x86_64-pc-windows-msvc/release/AutoKeyboardLayot.e
 
 `tools/release_rustflags.py` adds path remapping to the flags in `.cargo/config.toml` (the static C
 runtime), so the executable records no path of the build machine: no account name, checkout or
-Cargo cache. The installer build (`tools/build_experimental_installer.py`) uses the same flags and
-refuses executables that still contain such a path.
+Cargo cache; the toolchain path is the resolved one the compiler opens, past any symlink. The
+installer build (`tools/build_experimental_installer.py`) uses the same flags and refuses executables
+that still contain such a path, as UTF-8 or as the UTF-16LE of Windows resources and wide strings;
+`tools/export_windows_test_artifacts.py` builds the base test executables with the same flags
+(`release_rustflags.cargo_env`).
 
 Commit first: the version shown in Settings contains the commit id, and a build from uncommitted
 changes shows `-dirty` after it.

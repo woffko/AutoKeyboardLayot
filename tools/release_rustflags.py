@@ -39,12 +39,21 @@ def machine_paths(root):
     """Cargo's home and the active toolchain's sysroot on this machine."""
     cargo_home = Path(os.environ.get('CARGO_HOME') or Path.home() / '.cargo').resolve()
     sysroot = subprocess.check_output(['rustc', '--print', 'sysroot'], cwd=root, text=True, timeout=60)
-    return cargo_home, Path(sysroot.strip())
+    # Resolved like the others: the compiler records the paths it opens, past any symlink.
+    return cargo_home, Path(sysroot.strip()).resolve()
+
+
+def cargo_env(root, environ=None):
+    """The environment for a release cargo run of the checkout at `root`: CARGO_ENCODED_RUSTFLAGS set."""
+    flags = release_rustflags(root, *machine_paths(root))
+    return dict(os.environ if environ is None else environ, CARGO_ENCODED_RUSTFLAGS=encoded(flags))
 
 
 def leaked_paths(data, paths):
-    """The machine paths whose text still occurs in an executable's bytes."""
-    return [path for path in paths if str(path).encode('utf-8') in data]
+    """The machine paths whose text still occurs in an executable's bytes, as UTF-8 or as the
+    UTF-16LE of Windows resources and wide strings."""
+    return [path for path in paths
+            if str(path).encode('utf-8') in data or str(path).encode('utf-16le') in data]
 
 
 if __name__ == '__main__':
