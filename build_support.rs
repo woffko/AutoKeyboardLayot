@@ -90,7 +90,8 @@ pub fn describe_checkout_with(directory: &Path, setup: &dyn Fn(&mut Command)) ->
 /// The files whose change moves `HEAD` of the checkout in `directory`, for
 /// `cargo:rerun-if-changed`: `HEAD`, the current branch's loose ref and `packed-refs`, each only
 /// when it exists, since Cargo re-runs a build script on every build for a path that does not.
-/// Without `packed-refs` the `refs/heads` directory stands in, where packing the branch shows.
+/// When the branch has no loose ref (packed, or not born yet) or nothing is packed yet, the
+/// `refs/heads` directory stands in: the next commit or pack writes the loose ref there.
 pub fn watched_git_paths(directory: &Path, setup: &dyn Fn(&mut Command)) -> Vec<PathBuf> {
     let path = |name: &str| {
         git_with(directory, &["rev-parse", "--git-path", name], setup)
@@ -100,18 +101,24 @@ pub fn watched_git_paths(directory: &Path, setup: &dyn Fn(&mut Command)) -> Vec<
     names.extend(git_with(directory, &["symbolic-ref", "-q", "HEAD"], setup));
     names.push("packed-refs".to_owned());
     let mut watched = Vec::new();
+    let mut watch_heads = false;
     for name in names {
         let Some(found) = path(&name) else {
             continue;
         };
         if found.exists() {
             watched.push(found);
-        } else if name == "packed-refs"
-            && let Some(heads) = path("refs/heads")
-            && heads.is_dir()
-        {
-            watched.push(heads);
+        } else if name != "HEAD" {
+            // The branch not loose (packed, or not born yet), or nothing packed yet: the next
+            // commit or pack writes its loose ref under refs/heads, touching no path above.
+            watch_heads = true;
         }
+    }
+    if watch_heads
+        && let Some(heads) = path("refs/heads")
+        && heads.is_dir()
+    {
+        watched.push(heads);
     }
     watched
 }

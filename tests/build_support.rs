@@ -202,13 +202,40 @@ fn the_build_script_watches_only_git_paths_that_exist() {
     ]);
     assert_eq!(canonical(&loose), expected_loose);
 
-    // Packed, the branch lives in packed-refs.
+    // Packed, the branch lives in packed-refs, and the next commit writes it as a loose ref again,
+    // changing neither HEAD nor packed-refs: the refs/heads directory is watched for it.
     git(&isolation, root, &["pack-refs", "--all"]);
+    assert!(!git_dir.join("refs/heads/trunk").exists());
     let packed = watched();
     assert!(packed.iter().all(|path| path.exists()), "{packed:?}");
     assert_eq!(
         canonical(&packed),
-        canonical(&[git_dir.join("HEAD"), git_dir.join("packed-refs")])
+        canonical(&[
+            git_dir.join("HEAD"),
+            git_dir.join("packed-refs"),
+            git_dir.join("refs/heads"),
+        ])
+    );
+    write(root, "src/lib.rs", "fn main() { committed(); }\n");
+    git(
+        &isolation,
+        root,
+        &["commit", "-q", "-a", "-m", "after packing"],
+    );
+    assert!(git_dir.join("refs/heads/trunk").exists());
+    assert!(
+        packed
+            .iter()
+            .any(|path| git_dir.join("refs/heads/trunk").starts_with(path)),
+        "the loose ref the commit wrote is not under a watched path: {packed:?}"
+    );
+    assert_eq!(
+        canonical(&watched()),
+        canonical(&[
+            git_dir.join("HEAD"),
+            git_dir.join("refs/heads/trunk"),
+            git_dir.join("packed-refs"),
+        ])
     );
 }
 
