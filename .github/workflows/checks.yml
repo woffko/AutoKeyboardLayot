@@ -24,6 +24,8 @@ jobs:
       - run: cargo test --locked -- --test-threads=1
       - run: cargo test --locked --no-default-features -- --test-threads=1
       - run: cargo clippy --locked --no-default-features --features installer-tools --all-targets -- -D warnings
+      - run: cargo clippy --locked --features signing-tools --all-targets -- -D warnings
+      - run: cargo test --locked --features signing-tools -- --test-threads=1
       - run: cargo run --locked --example validate_locales -- data/package-locales --require-complete
       - run: python -m unittest discover -s tools -p "test_*.py"
       - run: cargo build --locked --release --no-default-features --features installer-tools --bins
@@ -31,7 +33,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit
+          cargo audit --deny warnings
+      - name: Dependency licenses and sources
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny check licenses bans sources
       - name: Verify previously published packages with the new consumer
         if: runner.os == 'Linux'
         shell: bash

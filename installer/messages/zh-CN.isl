@@ -17,6 +17,7 @@ AkPackageCancel=取消下载
 AkPackageInstall=安装所选语言包
 AkPackageBusy=正在处理语言包…
 AkPackageFailed=语言包操作失败。不会自动重试；重试前请检查语言包的当前状态。
+AkCatalogExpired=已发布的语言包目录已过期，或此计算机的日期和时间不正确。请检查系统时钟，或稍后重试。
 AkPackageInput=包含词典和输入规则。
 AkPackageUnavailable=不可用：语言包 API 不兼容，或属于受保护的内置英语基础。
 AkPackageIntro=已包含英语。可选语言包仅在您确认后安装。

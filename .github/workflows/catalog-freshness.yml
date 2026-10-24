@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  issues: write
 jobs:
   expiry:
     runs-on: ubuntu-latest
@@ -13,11 +14,36 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup update stable --no-self-update
       - run: rustup default stable
-      - name: Verify signature and at least 72 hours of remaining validity
+      - name: Verify signature and at least 240 hours (10 days) of remaining validity
         shell: bash
         run: |
           set -euo pipefail
           directory=$(mktemp -d)
           trap 'rm -rf "$directory"' EXIT
           curl --fail --location --proto '=https' --proto-redir '=https' --max-time 120 --max-filesize 1048576 https://github.com/woffko/AutoKeyboardLayot/releases/latest/download/catalog.aklc --output "$directory/catalog.aklc"
-          cargo run --locked --no-default-features --example check_catalog_expiry -- "$directory/catalog.aklc"
+          cargo run --locked --no-default-features --example check_catalog_expiry -- "$directory/catalog.aklc" 240
+      - name: Open or update the alert issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title='Published catalog expires soon or has expired'
+          body=$(cat <<EOF
+          The daily check of the published catalog (catalog.aklc) failed on $(date -u +%F).
+
+          The catalog has less than 10 days of validity left, has expired, or could not be downloaded or verified. Online language installation stops working when it expires.
+
+          Failed run: $RUN_URL
+
+          Renewal: see "Renewing the catalog" in docs/package-release-catalog.md. A renewal needs a new, higher catalog revision and the release signing key.
+          EOF
+          )
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title --jq '[.[] | select(.title == "Published catalog expires soon or has expired")] | first | .number // empty')
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

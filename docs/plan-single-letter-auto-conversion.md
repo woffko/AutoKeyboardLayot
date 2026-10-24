@@ -11,7 +11,7 @@ checks for `b/c/d/r` now apply only with the setting off or with explicit Englis
 user-dictionary entries. An unlisted `q→й` pair remains useful for testing
 user-added single-letter evidence.
 
-Project: AutoKeyboardLayot (`/home/w0w/AutoKeyboardLayot`, branch `main`).
+Project: AutoKeyboardLayot (the repository root, branch `main`).
 Owner decisions recorded 2026-09-15.
 
 ## Decisions

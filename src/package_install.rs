@@ -31,6 +31,19 @@ pub enum InstallError {
     EmptySelection,
     Cancelled,
 }
+impl InstallError {
+    /// True when the signed catalog is outside its validity window: the published catalog has
+    /// expired, or the clock of this computer is wrong (the window is compared with the local
+    /// clock, so a clock far in the past or future fails the same way).
+    pub fn is_catalog_expired(&self) -> bool {
+        matches!(
+            self,
+            Self::Catalog(ReleaseError::NotCurrent)
+                | Self::Download(DownloadError::Verification(ReleaseError::NotCurrent))
+                | Self::Inventory(InventoryError::Plan(ReleaseError::NotCurrent))
+        )
+    }
+}
 impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "package_install_{self:?}")
@@ -425,6 +438,34 @@ fn read_local_artifact(directory: &Path, asset: &str) -> Result<Vec<u8>, Downloa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_catalog_outside_its_window_counts_as_expired() {
+        let expired = [
+            InstallError::Catalog(ReleaseError::NotCurrent),
+            InstallError::Download(DownloadError::Verification(ReleaseError::NotCurrent)),
+            InstallError::Inventory(InventoryError::Plan(ReleaseError::NotCurrent)),
+        ];
+        for error in expired {
+            assert!(error.is_catalog_expired(), "{error:?}");
+        }
+        let other = [
+            InstallError::Catalog(ReleaseError::Rollback),
+            InstallError::Catalog(ReleaseError::InvalidData),
+            InstallError::Download(DownloadError::Verification(ReleaseError::ArtifactMismatch)),
+            InstallError::Download(DownloadError::Clock),
+            InstallError::Download(DownloadError::Network(12007)),
+            InstallError::Download(DownloadError::HttpStatus(404)),
+            InstallError::Inventory(InventoryError::Plan(ReleaseError::Rollback)),
+            InstallError::Inventory(InventoryError::InvalidState),
+            InstallError::Store(StoreError::Busy),
+            InstallError::EmptySelection,
+            InstallError::Cancelled,
+        ];
+        for error in other {
+            assert!(!error.is_catalog_expired(), "{error:?}");
+        }
+    }
 
     #[test]
     fn local_artifact_reader_accepts_one_regular_bounded_file() {

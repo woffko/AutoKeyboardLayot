@@ -68,6 +68,9 @@ On a new profile, the alpha defaults to observation-only mode:
   injected correction, and opt-in dictionary additions after manual conversion;
 - configurable suppression after Backspace, Delete, each arrow, Home/End, and a
   manual layout change, plus selectable EN/RU/ET automatic packs;
+- an optional soft, quiet sound after each conversion and a lower one after an
+  undo (`conversion_sound`, off by default), played on a thread of its own so a
+  conversion never waits for audio;
 - no typed-text logging.
 
 Automatic replacement is off at process start by default. A user can explicitly
@@ -148,8 +151,33 @@ also re-arm the first word when its setting is enabled. An additional Backspace
 on an already empty line still invalidates the context because it joins the
 line with preceding text. Pause/Break is reserved when its setting is enabled:
 it triggers undo when available, otherwise it forces the current buffered word
-through the same replacement pipeline even when automatic mode is off. Repeats
-and key-up are swallowed so the hotkey cannot leak into the target editor.
+through the same replacement pipeline even when automatic mode is off. Repeated
+presses walk the word through every enabled layout: the first goes to the
+language in which the word reads best (a dictionary word first), the next ones to
+the remaining languages, and the last one back to the original; without a clear
+reading the configured order is used. Repeats
+and key-up are swallowed so the hotkey cannot leak into the target editor. A
+manual layout switch ends automatic conversion of the word but not Pause: the
+word typed so far, or else the last completed word, can still be converted and is
+read in the layout it was typed in, and text typed right after a manual switch is
+kept for Pause like text typed after a shortcut. Digits typed on the numeric
+keypad can be part of such a word; they are typed back as keypad keys, because a
+keypad scan code sent alone arrives as the navigation key that shares it (keypad
+2 is Down). Keys held after a Space are replayed the same way. When Pause cannot act, the diagnostics log
+names the reason (`event=hotkey result=ignored reason=` `no-word-before-caret`,
+`key-without-character`, `stale-word`, `privacy`, `unsupported-layout`,
+`single-layout` or `identical`).
+
+In applications on the protected-paste backend, whose edit checks the exact text
+before the caret before it replaces anything, Pause does more. It waits up to 100
+ms for the field to confirm the selection of the word and selects a second time
+when the field did not show it (automatic conversions keep 50 ms, which the
+correction gate's budget accounts for). After you switch to another window and
+back, or click, Pause can still convert the last word of that window for two
+minutes: the word is used only if it is still exactly before the caret, and
+nothing is typed otherwise (`event=hotkey source=remembered`). A paste the field
+did not confirm ends with `event=conversion result=cancelled`, and its selection
+line says what the field showed (`confirm=` and `attempts=`).
 Changing automatic mode clears stale queued state without suppressing the
 first new word; only a real queue overflow keeps suppression until a boundary.
 
@@ -158,12 +186,35 @@ focused input thread is tracked separately for HKL and focused-child routing.
 Ordinary focus changes and mouse clicks re-check privacy on the first printable
 key without suppressing that first word.
 
+The focused field of the foreground window is also checked periodically: every
+half second while checks are fast, and when a check is slow, after twenty times
+its length (at most five seconds), so that periodic checks fill at most a
+twentieth of the worker's time. A full-screen program whose check is slow, which
+is how most games answer, is checked once per input target and then left alone;
+a new input target, and a click or a change of field on the next typed key, are
+still checked. The log records `event=foreground full_screen=true|false` when
+that state changes.
+
 ## Privacy boundary
 
-The process retains at most the current word in volatile memory. It does not
-write typed text to logs, configuration, diagnostics, or network services.
-Unsupported input, editing, navigation, focus changes, layout changes, and
-queue overflow clear or suppress the current context.
+The process retains at most the current word in volatile memory, plus the
+physical keys of a word that is being converted by hand (at most 64 key scan
+codes, kept only until the next word boundary or reset), plus, for Pause, the
+physical keys of the last word of at most eight windows for at most two minutes
+after a window switch, a click or a shortcut ended tracking there. While the correction
+gate is armed after a Space, up to 256 key events are held in memory for at
+most 1.2 seconds and then replayed unchanged. If the gate gives up on its time
+limit, a full buffer, a full queue or a hook reinstall, the held keys are handed
+back to the same field unless the privacy check finds a password field or an
+excluded or elevated program; a field that merely cannot be inspected at that
+moment (a hung or busy window) does not keep them back. Held keys that are not
+handed back (the gate ended at a click, a focus change, injected input, a failed
+submission or an internal fault, or the hand-back was refused) wait in memory
+for an explicit recovery from the tray menu for at most one minute, or one
+minute from preparing that recovery, and are then deleted. None of this is
+written to logs, configuration, diagnostics, or network services. Unsupported
+input, editing, navigation, focus changes, layout changes, and queue overflow
+clear or suppress the current context.
 
 For the protected-paste backend, the replacement is placed on the global
 clipboard only for the bounded paste transaction. The item opts out of Windows
@@ -174,6 +225,9 @@ window, pumps OLE messages, and restores those handles only while the temporary
 sequence and owner are unchanged. This preserves delayed, private, GDI, and
 enterprise-protection formats instead of discarding them. Password, excluded,
 elevated, non-materializable clipboard, and ambiguous UIA contexts fail closed.
+A clipboard that cannot be taken in time (it belongs to a window that does not
+answer) leaves the word alone: an automatic conversion waits 0.2 seconds for it,
+Pause 0.5 seconds, and neither counts it as a failed edit.
 Third-party local clipboard readers remain outside the confidentiality
 guarantees of the Win32 clipboard.
 
@@ -219,16 +273,116 @@ input epoch and target identity still have to succeed. A transport timeout,
 changed target, unreadable process or confirmed password field does not qualify.
 Routing an application to `physical-replay` alone never grants this permission.
 
+A field check that fails because the focused window answers late (Windows
+Terminal while you type quickly) does not by itself make the word being typed
+manual-only. When the same window, focus and input epoch passed a check less than
+two seconds earlier, and nothing that can move the focus has happened since (Tab,
+Enter, a click, a shortcut, injected input or a focus change), one failed field
+check keeps that earlier verdict. The keyboard layout is not part of the target:
+the answer does not depend on it, and a conversion switches it. A failure never
+renews the good check, so a window that keeps failing counts as failing after two
+seconds. A password field,
+an excluded or unreadable process, a changed context and every transport failure
+stand as before, and recovery of held keys and manual conversion always take a
+failure at face value. A word that did meet a standing failure stays manual-only
+even when the next check passes.
+
 Capability diagnostics expose only backend states such as `uia-paste`,
 `physical-replay`, `capability-probe`, `unsupported`, or `text-mismatch`; they
 never include the typed source or replacement.
 
 `diagnostics_enabled` is off by default. When explicitly enabled, a dedicated
 bounded queue writes `%LOCALAPPDATA%\AutoKeyboardLayot\diagnostics.log`. The
-log contains timestamps, process basename/PID, backend stages, language IDs,
-character counts, gate results, and edit outcomes. It never records words,
-clipboard contents, window titles, URLs, or message text. The file rotates at
-1 MiB and has no network transport.
+log contains timestamps, process basename and PID, backend stages, language
+IDs, word lengths, gate results, edit outcomes, reset and discard categories,
+the reasons that blocked a shutdown, and one result for every typed word that was
+not converted (`event=word result=` `no-candidate`, `manual-only`, `privacy`,
+`suppressed` or `no-language`), never the word. A suppressed word also names what
+cancelled it (`reset=` `unsupported`, `layout`, `shortcut`, `mouse`, `focus`,
+`backspace`, `delete`, `navigation` or `external-input`), and an unsupported key is
+logged by class only (`class=no-character` for a key that prints nothing,
+`class=other-character` for a digit or symbol a word cannot contain). A shortcut
+that ends a word is logged by its editing command only (`reason=shortcut kind=`
+`erase-word`, `paste`, `copy`, `cut`, `undo`, `ctrl`, `alt`, `ctrl-alt` or `win`).
+Privacy
+check lines name what asked for them (`trigger=`) and say when a late answer kept
+an earlier verdict (`source=recent-ok age_ms=`). It never records key codes, scan
+codes, characters, words, clipboard contents, window titles, URLs, file names,
+or message text; the test `diagnostics_never_log_key_identity` checks every
+diagnostic format string. The file rotates at 1 MiB and has no network
+transport. Earlier builds logged the virtual-key code of unsupported keys
+(including digits) as `vk=`; delete `diagnostics*.log` files written by them.
+
+`crash.log` in the same folder is always written, independent of
+`diagnostics_enabled`: one line per panic with the time in Unix milliseconds,
+the thread name, the source location and the application version, for example
+`1700000000123 panic thread=unnamed at src/windows_agent.rs:123:9 version=0.1.0 (abc1234)`.
+It never contains the panic message, typed text or key codes. The file is
+capped at 256 KiB and rotates to `crash.1.log`.
+
+A panic in a keyboard or mouse hook callback, the window procedure or the input
+worker is contained. Typing is not affected: the event is passed on untouched,
+keys held by the correction gate are released unchanged, automatic conversion is
+paused and a tray notice points to `crash.log`. If the worker panics three times
+within a minute it stops, which is reported once and turned into a prompt when
+Exit is chosen. A tray Exit that is declined (an active correction gate,
+retained input, a busy worker, a pending configuration, a hotkey in progress)
+now asks whether to exit anyway and names those reasons; it warns that
+keystrokes held back for recovery are lost. Retained input deletes itself after
+its minute, so it does not block Exit for longer. A worker thread that has
+already finished never blocks Exit. Installer-driven closes never force an exit.
+
+A Space that arms the correction gate is always released once the worker has
+handled it, whichever path it took (stale input epoch, pending configuration,
+automatic conversion switched off, a pending conversion, a shortcut modifier),
+so held keys no longer wait for the 1.2 second deadline that aborts the gate.
+When a gate timeout does happen and its held keys are handed back in full,
+automatic conversion resumes by itself; so it does when held keys that nobody
+recovered are deleted after their minute, which a tray notice reports. Either
+way it resumes at most three times an hour. A failed or partial recovery waits
+for that minute; an explicit recovery or any other pause stays paused. The
+optional diagnostics log records `phase=armed`, `phase=release_forced`,
+`phase=recovery_discarded` (`reason=expired` after the minute),
+`phase=auto_resumed`, `event=ui_stall` (timer ticks more than 700 ms apart) and
+`event=hook_slow` (a hook callback over 50 ms).
+
+The protected-paste backend selects the word it is about to replace. If the
+selection cannot be confirmed to hold exactly that word, or the paste does not
+complete, the selection is collapsed to its end instead of being left behind to
+be typed over; a selection the user made is never touched. When the text edit is
+confirmed but the previous clipboard contents cannot be put back (restoring
+waits up to 60 ms for the clipboard), the conversion still counts as done:
+automatic conversion stays on and the diagnostics log records
+`clipboard_restored=false`.
+
+The privacy check asks Windows UI Automation about the focused field from a
+dedicated provider thread. If that provider stops answering (a call that never
+returns), every later check used to report "queue busy" and privacy stayed
+unavailable for good. A provider that keeps the queue busy for 5 seconds is now
+abandoned and replaced by a fresh one on a new thread, at most three times; the
+diagnostics log records `event=probe respawned=N`, and the hung thread is never
+joined.
+
+The keyboard and mouse hooks are kept alive. When Explorer restarts (`TaskbarCreated`)
+the tray icon is added again, and if Explorer is not ready yet the addition is
+retried with a growing delay. Unlocking the session, reconnecting and resuming
+from sleep reinstall both hooks (held keys are released unchanged first). A
+watchdog on the 250 ms timer also reinstalls them when the user types (input
+within the last 400 ms) but no hook callback ran for more than 3 seconds. It does
+not act on the lock screen or the UAC desktop, when the foreground window has no
+known or a higher integrity level (its input may legitimately never reach the
+hooks), or when nothing is in the foreground; it acts at most once per 15 seconds
+and four times an hour, after which a tray notice says the hooks are unstable. It
+also leaves the hooks alone while a full-screen program (most games), a VMware,
+VirtualBox or Hyper-V console or a Remote Desktop window is in the foreground:
+these take the keyboard with a hook of their own, so silence proves nothing there,
+and reinstalling only fought them. The hooks are judged again once another window
+is in the foreground.
+A failed installation is retried with backoff (1 s up to 30 s) and reported after
+the third failure. Tray updates are limited to two per second and wait while the
+correction gate holds keys, because the shell call can block on an unresponsive
+Explorer while the hooks need the UI thread; a skipped update is tried again on a
+later tick. The diagnostics log records `event=hooks` with the reason.
 
 ## Language packs
 
@@ -274,8 +428,8 @@ The in-development localization layer embeds English and selects translations
 using the Windows display language, independently of the keyboard layout.
 External UI catalogs are validated against the embedded messages; missing
 translations fall back to English. Thirteen external catalog drafts cover the
-planned language set with all 141 current message keys each, including the new
-input-package status messages. Strict completeness and placeholder validation
+planned language set with every current message key, including the input-package
+status messages. Strict completeness and placeholder validation
 pass. Chinese uses an explicit Simplified-script catalog with regional
 aliases; Arabic and Urdu require RTL layout acceptance. Linguistic/UI acceptance and
 the input-plugin manager are still in progress; see
@@ -290,16 +444,68 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo check --target x86_64-pc-windows-msvc
 ```
 
+From WSL, `tools/verify-wsl.sh` runs the whole local gate with one command:
+formatting, Clippy (default features, `installer-tools` without default
+features, the Windows target, the signing tools on both systems, and the Windows
+installer helper), tests in two feature configurations plus the signing tools,
+strict locale validation, the Python unit tests, and every Windows test executable
+(the agent's, the library's, the integration tests and the signing utility's, in
+the default and in the modular configuration), which are cross-built with
+`cargo-xwin` and executed on the Windows host with a temporary `LOCALAPPDATA`. Each step logs to
+`target/verify/<timestamp>/`, the run ends with a `summary.txt`, and the test
+counts may not fall below recorded floors. `--keep-going` runs every step after a
+failure; `--list` and `--only` show and select steps.
+
+The CI workflow (`.github/workflows/checks.yml`) runs the same checks on Linux
+and Windows. On Linux it also checks dependency advisories with
+`cargo audit --deny warnings` (the four accepted notices are listed with their
+reasons in `.cargo/audit.toml`) and dependency licenses and sources with
+`cargo deny check licenses bans sources` (policy in `deny.toml`). A new license
+type or a git dependency fails the check until someone decides on it.
+
+The settings window and About page show the version as `0.1.0 (abc1234)`, where
+`abc1234` is the source commit. A build whose tracked source files (`src`,
+`data`, `ui`, `assets`, `Cargo.toml`, `Cargo.lock`, `build.rs`) differ from that
+commit shows `abc1234-dirty`; builds outside a Git checkout can set
+`AKL_BUILD_COMMIT` and otherwise show `unknown`.
+
+`tools/deploy-host.ps1` installs a verified build over the per-user installation
+with a backup, a graceful close and a rollback on failure; `-WhatIf` only prints
+the plan. See [`docs/host-deployment.md`](docs/host-deployment.md).
+
 `tools/verify-windows.ps1` runs native format/tests/Clippy/release checks, using
 an isolated temporary profile for adapter tests. `tools/start-windows-build.ps1`
 launches that script independently of SSH through WMI and monitors its result.
 Each run requires a fresh log directory; per-stage logs and `result.json`
 remain there even if the monitoring connection is interrupted.
 
-## Third-party notices
+## Security
 
-Dictionary source information and redistribution notices are included in
-`data/language-packs/`. The layout model's data sources and license are in
-`data/layout-model/NOTICE.md`. The settings UI uses Slint. Dependency versions are pinned
-by `Cargo.lock`; upstream dependency licenses remain applicable. No project-wide
-license file has been selected for this initial source snapshot.
+Report a suspected vulnerability privately; [`SECURITY.md`](SECURITY.md) says how.
+[`docs/threat-model.md`](docs/threat-model.md) lists what the program defends against and what it
+does not (code running as the same Windows user is out of scope), and
+[`docs/repository-settings.md`](docs/repository-settings.md) lists the GitHub settings that the
+owner switches on.
+
+## License and third-party notices
+
+The project's own code, tools, documentation and translation drafts are released
+under the MIT License ([`LICENSE`](LICENSE)). Third-party material keeps its own
+terms:
+
+- Dictionary sources and their redistribution notices are in
+  `data/language-packs/*/LICENSE*`.
+- The layout model's data sources and its CC BY-SA 4.0 license are in
+  `data/layout-model/NOTICE.md`.
+- Dependency versions are pinned by `Cargo.lock`; upstream dependency licenses
+  remain applicable. `tools/collect_dependency_notices.py` gathers their texts,
+  together with the notices of the bundled English dictionary and the layout
+  model, into the installer's `THIRD-PARTY-NOTICES.txt`.
+- The settings UI uses Slint, declared by its crates as
+  `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`.
+  Which option applies to the distributed executable is an open item.
+
+Open licensing questions (the Estonian LGPL dictionary in signed packages, the
+ShareAlike model, Slint, the application icon) are listed in
+[`docs/licensing-notes.md`](docs/licensing-notes.md), which records facts and
+questions, not legal advice.

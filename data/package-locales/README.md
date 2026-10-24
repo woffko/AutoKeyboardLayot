@@ -4,7 +4,7 @@ These 13 source catalogs were imported from the local
 `AutoKeyboardLayot-language-packs/ui` working tree on 2026-09-12, following the
 decision to use the main AutoKeyboardLayot repository. The former source tree
 was left unchanged. Three lifecycle messages were added to each imported catalog.
-Each catalog now contains all 184 current English message IDs and passes the
+Each catalog contains every current English message ID and passes the
 runtime's strict coverage and placeholder validation.
 
 These remain translation drafts: linguistic review, native layout/RTL/fonts,

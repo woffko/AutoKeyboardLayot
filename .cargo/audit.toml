@@ -1,0 +1,28 @@
+# Policy for `cargo audit --deny warnings` (CI step "Dependency advisories").
+#
+# Exactly four notices are ignored. All four are "unmaintained" advisories for
+# transitive dependencies of the Slint UI toolkit: none is a vulnerability and
+# none has a patched version to move to. Any other advisory, or a new crate with
+# a notice, fails the check until it has been reviewed.
+#
+# Review these entries whenever Slint is upgraded, and delete each one as soon
+# as its crate leaves Cargo.lock. Add nothing here without a comment that names
+# the crate, how it gets into the build and why it cannot be avoided.
+#
+#   RUSTSEC-2025-0141  bincode 2.0.1      Listed in Cargo.lock only: an optional
+#                                         feature of typed-index-collections,
+#                                         which the Slint compiler uses. It is
+#                                         not compiled into anything we build.
+#   RUSTSEC-2024-0436  paste 1.0.15       Procedural macro of pulp and rav1e,
+#                                         reached only through the Slint compiler
+#                                         (image decoding at build time).
+#   RUSTSEC-2026-0206  rustybuzz 0.20.1   Text shaping in resvg/usvg, which
+#                                         Slint uses for SVG; part of the agent.
+#   RUSTSEC-2026-0192  ttf-parser 0.25.1  Font parsing in fontdb/usvg, same path.
+[advisories]
+ignore = [
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0206",
+    "RUSTSEC-2026-0192",
+]

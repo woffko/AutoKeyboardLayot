@@ -127,20 +127,29 @@ impl LayoutModel {
             return Err(LayoutModelError::Format);
         }
         let rows = buckets as usize;
+        let width = dim + dense_width(count);
+        // The rest of the file must be exactly the payload the header announces
+        // (scale and embedding row per bucket, then the dense layers). Checking
+        // that first keeps a corrupt or hostile header from making the parser
+        // reserve tables for data that is not there.
+        let payload = rows
+            .checked_mul(4 + dim)
+            .and_then(|table| table.checked_add((hidden * width + 2 * hidden + 1) * 4))
+            .ok_or(LayoutModelError::Format)?;
+        if bytes.len() - reader.offset != payload {
+            return Err(LayoutModelError::Format);
+        }
         let mut scales = Vec::with_capacity(rows);
         let mut embeddings = Vec::with_capacity(rows * dim);
         for _ in 0..rows {
             scales.push(reader.f32()?);
             embeddings.extend(reader.take(dim)?.iter().map(|&byte| byte as i8));
         }
-        let width = dim + dense_width(count);
         let hidden_weight = reader.f32s(hidden * width)?;
         let hidden_bias = reader.f32s(hidden)?;
         let output_weight = reader.f32s(hidden)?;
         let output_bias = reader.f32()?;
-        if reader.offset != bytes.len() {
-            return Err(LayoutModelError::Format);
-        }
+        debug_assert_eq!(reader.offset, bytes.len());
         Ok(Self {
             languages,
             buckets,

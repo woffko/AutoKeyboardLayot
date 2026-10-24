@@ -34,6 +34,8 @@ pub struct Settings {
     /// Explicitly permit manual conversion in verified terminals when only the
     /// focused field's UIA inspection is unavailable.
     pub manual_terminal_uia_fallback: bool,
+    /// A short, quiet sound after each conversion and a lower one after an undo.
+    pub conversion_sound: bool,
     pub diagnostics_enabled: bool,
     pub suppress_after_backspace: bool,
     pub suppress_after_delete: bool,
@@ -62,6 +64,7 @@ impl Default for Settings {
             single_letter_words: false,
             layout_model: false,
             manual_terminal_uia_fallback: false,
+            conversion_sound: false,
             diagnostics_enabled: false,
             suppress_after_backspace: true,
             suppress_after_delete: true,
@@ -182,6 +185,7 @@ impl Settings {
                 "single_letter_words" => &mut settings.single_letter_words,
                 "layout_model" => &mut settings.layout_model,
                 "manual_terminal_uia_fallback" => &mut settings.manual_terminal_uia_fallback,
+                "conversion_sound" => &mut settings.conversion_sound,
                 "diagnostics_enabled" => &mut settings.diagnostics_enabled,
                 "suppress_after_backspace" => &mut settings.suppress_after_backspace,
                 "suppress_after_delete" => &mut settings.suppress_after_delete,
@@ -235,6 +239,7 @@ impl Settings {
              single_letter_words={}\n\
              layout_model={}\n\
              manual_terminal_uia_fallback={}\n\
+             conversion_sound={}\n\
              diagnostics_enabled={}\n\
              suppress_after_backspace={}\n\
              suppress_after_delete={}\n\
@@ -256,6 +261,7 @@ impl Settings {
             self.single_letter_words,
             self.layout_model,
             self.manual_terminal_uia_fallback,
+            self.conversion_sound,
             self.diagnostics_enabled,
             self.suppress_after_backspace,
             self.suppress_after_delete,
@@ -508,5 +514,23 @@ mod tests {
         assert!(!parsed.suppress_after_manual_layout_change);
         assert!(!parsed.language_enabled(crate::Language::Estonian));
         assert_eq!(Settings::from_text(&parsed.to_text()), parsed);
+    }
+
+    #[test]
+    fn the_conversion_sound_is_off_by_default_and_round_trips() {
+        assert!(!Settings::default().conversion_sound);
+        assert!(
+            Settings::default()
+                .to_text()
+                .lines()
+                .any(|line| line == "conversion_sound=false")
+        );
+        let enabled = Settings::try_from_text("conversion_sound=on").unwrap();
+        assert!(enabled.conversion_sound);
+        assert_eq!(
+            Settings::try_from_text(&enabled.to_text()).unwrap(),
+            enabled
+        );
+        assert!(Settings::try_from_text("conversion_sound=loud").is_err());
     }
 }

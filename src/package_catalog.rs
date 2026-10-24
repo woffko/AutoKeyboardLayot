@@ -38,7 +38,7 @@ pub fn resolve_repository_source(
 }
 pub(crate) const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
-const MAX_LIFETIME_SECONDS: u64 = 31 * 24 * 60 * 60;
+pub(crate) const MAX_LIFETIME_SECONDS: u64 = 31 * 24 * 60 * 60;
 pub const MAX_SELECTED_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

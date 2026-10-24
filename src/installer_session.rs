@@ -4,7 +4,9 @@
 use crate::{
     installer_packages::InstallerPackageSelection,
     language_package::PackageTrust,
+    package_download::DownloadError,
     package_install::{InstallError, PreparedCatalog, PreparedOnlineInstall, SelectedDownload},
+    package_store::StoreError,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +31,29 @@ pub enum SessionError {
     WrongState,
     Exhausted,
     Install(InstallError),
+}
+
+impl SessionError {
+    /// Coarse, path-free failure code for an asynchronous worker result. It never includes
+    /// paths, URLs, secrets or raw error text. An expired catalog has its own code so that the
+    /// installer can tell the user to check the clock instead of showing a generic failure.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::WrongState => "state",
+            Self::Exhausted => "exhausted",
+            Self::Install(error) if error.is_catalog_expired() => "catalog_expired",
+            Self::Install(InstallError::Store(StoreError::Busy)) => "store_busy",
+            Self::Install(InstallError::Store(_)) => "store",
+            Self::Install(InstallError::Download(DownloadError::HttpStatus(_))) => "download_http",
+            Self::Install(InstallError::Download(DownloadError::LocalRead)) => "local_read",
+            Self::Install(InstallError::Download(DownloadError::Verification(_))) => "verification",
+            Self::Install(InstallError::Download(DownloadError::Cancelled)) => "download_cancelled",
+            Self::Install(InstallError::Download(_)) => "download",
+            Self::Install(InstallError::Catalog(_)) => "catalog",
+            Self::Install(InstallError::Inventory(_)) => "inventory",
+            Self::Install(_) => "install",
+        }
+    }
 }
 
 impl Default for InstallerSession {
@@ -219,5 +244,80 @@ impl InstallerSession {
         self.next()?;
         self.state = State::Empty;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+    use crate::{package_catalog::ReleaseError, package_inventory::InventoryError};
+
+    #[test]
+    fn failure_reasons_are_coarse_codes_and_an_expired_catalog_has_its_own() {
+        let install = SessionError::Install;
+        let cases = [
+            (SessionError::WrongState, "state"),
+            (SessionError::Exhausted, "exhausted"),
+            (
+                install(InstallError::Catalog(ReleaseError::NotCurrent)),
+                "catalog_expired",
+            ),
+            (
+                install(InstallError::Download(DownloadError::Verification(
+                    ReleaseError::NotCurrent,
+                ))),
+                "catalog_expired",
+            ),
+            (
+                install(InstallError::Inventory(InventoryError::Plan(
+                    ReleaseError::NotCurrent,
+                ))),
+                "catalog_expired",
+            ),
+            (
+                install(InstallError::Catalog(ReleaseError::Rollback)),
+                "catalog",
+            ),
+            (
+                install(InstallError::Download(DownloadError::Verification(
+                    ReleaseError::ArtifactMismatch,
+                ))),
+                "verification",
+            ),
+            (
+                install(InstallError::Download(DownloadError::HttpStatus(404))),
+                "download_http",
+            ),
+            (
+                install(InstallError::Download(DownloadError::LocalRead)),
+                "local_read",
+            ),
+            (
+                install(InstallError::Download(DownloadError::Cancelled)),
+                "download_cancelled",
+            ),
+            (
+                install(InstallError::Download(DownloadError::Network(12007))),
+                "download",
+            ),
+            (
+                install(InstallError::Download(DownloadError::Clock)),
+                "download",
+            ),
+            (install(InstallError::Store(StoreError::Busy)), "store_busy"),
+            (
+                install(InstallError::Store(StoreError::InvalidFile)),
+                "store",
+            ),
+            (
+                install(InstallError::Inventory(InventoryError::InvalidState)),
+                "inventory",
+            ),
+            (install(InstallError::EmptySelection), "install"),
+            (install(InstallError::Cancelled), "install"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.reason(), expected, "{error:?}");
+        }
     }
 }

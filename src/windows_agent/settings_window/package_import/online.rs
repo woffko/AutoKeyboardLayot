@@ -42,7 +42,8 @@ fn begin(
     ui.set_status_error(false);
     ui.set_status_text(tr("import.busy").into());
     start(ui, state, move || {
-        Ok(work(&cancel).unwrap_or_else(|error| Completed::OnlineFailure(error.to_string())))
+        Ok(work(&cancel)
+            .unwrap_or_else(|error| Completed::OnlineFailure(OnlineFailure::from_error(&error))))
     });
     if state.receiver.is_none() {
         state.cancel = None;

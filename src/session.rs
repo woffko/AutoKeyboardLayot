@@ -34,6 +34,27 @@ pub enum InputEvent {
     Injected,
 }
 
+impl InputEvent {
+    /// A label for diagnostics. It matches the variant name, except that a
+    /// printable event never reveals its character (unlike `Debug`).
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::Printable(_) => "Printable",
+            Self::Boundary => "Boundary",
+            Self::Backspace => "Backspace",
+            Self::Delete => "Delete",
+            Self::Navigation => "Navigation",
+            Self::Mouse => "Mouse",
+            Self::FocusChanged => "FocusChanged",
+            Self::LayoutChanged => "LayoutChanged",
+            Self::Shortcut => "Shortcut",
+            Self::UnsupportedInput => "UnsupportedInput",
+            Self::QueueOverflow => "QueueOverflow",
+            Self::Injected => "Injected",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionAction {
     None,
@@ -340,6 +361,31 @@ mod tests {
             );
         }
         session.handle(InputEvent::Boundary, Some(language), detector)
+    }
+
+    #[test]
+    fn input_event_category_matches_debug_names_and_hides_characters() {
+        let unit_events = [
+            InputEvent::Boundary,
+            InputEvent::Backspace,
+            InputEvent::Delete,
+            InputEvent::Navigation,
+            InputEvent::Mouse,
+            InputEvent::FocusChanged,
+            InputEvent::LayoutChanged,
+            InputEvent::Shortcut,
+            InputEvent::UnsupportedInput,
+            InputEvent::QueueOverflow,
+            InputEvent::Injected,
+        ];
+        for event in unit_events {
+            assert_eq!(event.category(), format!("{event:?}"));
+        }
+        for character in ['q', 'z', '7', 'ж', 'ö'] {
+            let category = InputEvent::Printable(character).category();
+            assert_eq!(category, "Printable");
+            assert!(!category.contains(character));
+        }
     }
 
     #[test]
