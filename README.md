@@ -591,9 +591,11 @@ check reads the field afresh: the late answer of a read left behind describes th
 it was then and never answers a later check, even of the same word. After a paste, a field
 that does not answer within those 150 ms is busy, typically with the paste itself (Viber
 answers UI Automation only once it has handled it): the check goes on reading it for up to
-400 ms more, as far as the gate's time allows after the steps that follow, because a paste
-counted as failed pauses automatic conversion. A field that answers without the
-replacement is not waited for longer.
+400 ms more, because a paste counted as failed pauses automatic conversion. It keeps back
+from the gate's time only what the steps after it need at the least (the layout switch, a
+50 ms second check and a margin): the restore of the user's clipboard then waits only for
+what is left and otherwise finishes on its own, and so does the second check. A field that
+answers without the replacement is not waited for longer.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
 keys typed meanwhile. This is deliberate (audit finding E-new-3, kept as it is): if a

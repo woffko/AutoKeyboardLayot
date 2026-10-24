@@ -232,6 +232,15 @@ const PASTE_AFTER_COMMIT_MS: u64 = CLIPBOARD_RESTORE_WAIT_MS
     + PASTE_UIA_MARGIN_MS;
 /// The UI Automation calls between the steps of a protected paste.
 const PASTE_UIA_MARGIN_MS: u64 = 100;
+/// The least time the second commit check of a protected paste gets: the field showed the
+/// replacement once already.
+const PASTE_TARGET_COMMIT_MIN_MS: u64 = 50;
+/// What a protected paste keeps back after the commit of the replacement for the steps that
+/// follow at the least: the layout switch, the second commit's least check and the UI Automation
+/// calls between. The restore waits only for what is left (one that takes longer finishes on its
+/// own), and so does the second commit check beyond its least.
+const PASTE_AFTER_LATE_COMMIT_MS: u64 =
+    LAYOUT_SWITCH_TIMEOUT_MS + PASTE_TARGET_COMMIT_MIN_MS + PASTE_UIA_MARGIN_MS;
 /// How long past its poll a paste's commit check still waits for the field to answer its last
 /// read: a program busy with the paste (Viber) answers UI Automation only once it has handled
 /// it, and a paste counted as failed turns automatic conversion off.
@@ -1677,15 +1686,20 @@ impl<'a> ProtectedClipboard<'a> {
     /// `CLIPBOARD_RESTORE_WAIT_MS` for the broker; a restore that takes longer finishes on its
     /// own and is logged and counted when it is over (`restore_pending`).
     fn restore(&mut self) -> bool {
+        self.restore_waiting(Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS))
+    }
+
+    /// `restore`, waiting at most `wait` for the broker.
+    fn restore_waiting(&mut self, wait: Duration) -> bool {
         if !self.active {
             return true;
         }
         self.active = false;
         if (self.probe)() == (self.temporary_sequence, self.owner) {
-            self.finish(ClipboardBrokerCommand::Restore)
+            self.finish(ClipboardBrokerCommand::Restore, wait)
         } else {
             // Another program replaced the replacement: theirs stays, and the broker ends now.
-            let _ = self.finish(ClipboardBrokerCommand::Abandon);
+            let _ = self.finish(ClipboardBrokerCommand::Abandon, wait);
             false
         }
     }
@@ -1716,11 +1730,9 @@ impl<'a> ProtectedClipboard<'a> {
 
     /// Sends the last command and waits for the broker's answer; a broker that does not answer in
     /// time is left to finish and logged later. True when the user's clipboard was put back.
-    fn finish(&mut self, command: ClipboardBrokerCommand) -> bool {
+    fn finish(&mut self, command: ClipboardBrokerCommand, wait: Duration) -> bool {
         let response = if self.command.send(command).is_ok() {
-            self.response
-                .recv_timeout(Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS))
-                .ok()
+            self.response.recv_timeout(wait).ok()
         } else {
             None
         };
@@ -7908,7 +7920,7 @@ impl InputProcessor {
         input_sequence: u64,
         expected_layout: usize,
         expected_text: &str,
-        late_until: Instant,
+        (deadline, late_until): (Instant, Instant),
     ) -> ReplayAttempt {
         #[cfg(test)]
         if let Some(seam) = &self.paste_seam {
@@ -7919,7 +7931,7 @@ impl InputProcessor {
             input_sequence,
             expected_layout,
             expected_text,
-            late_until,
+            (deadline, late_until),
         )
     }
 
@@ -10538,17 +10550,16 @@ impl InputProcessor {
         }
     }
 
-    /// Waits for the field to show a paste's `expected_text` (poll_text_commit), until
-    /// `late_until` when the field does not answer.
+    /// Waits until `deadline` for the field to show a paste's `expected_text`
+    /// (poll_text_commit), until `late_until` when the field does not answer.
     fn wait_for_text_commit(
         &self,
         foreground: ForegroundContext,
         input_sequence: u64,
         expected_layout: usize,
         expected_text: &str,
-        late_until: Instant,
+        (deadline, late_until): (Instant, Instant),
     ) -> ReplayAttempt {
-        let deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
         poll_text_commit(
             deadline,
             late_until,
@@ -10891,17 +10902,16 @@ impl InputProcessor {
             );
         }
 
-        // The steps after this commit still fit when the field answers it late.
-        let late_until = budget.commit_late_until(
-            Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-            Duration::from_millis(PASTE_AFTER_COMMIT_MS),
-        );
+        // A whole poll fits (allows_submit); a late answer gets what the steps after it leave.
+        let poll_end = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        let late_until =
+            budget.commit_late_until(poll_end, Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS));
         let paste_commit = self.paste_commit(
             foreground,
             input_sequence,
             source_layout,
             replacement,
-            late_until,
+            (poll_end, late_until),
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
@@ -10920,7 +10930,11 @@ impl InputProcessor {
             );
         }
         let owned_before_restore = clipboard.is_current();
-        let clipboard_restored = clipboard.restore();
+        let clipboard_restored = clipboard.restore_waiting(budget.wait_within(
+            Instant::now(),
+            Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS),
+            Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS),
+        ));
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
         if !clipboard_restored && !clipboard.restore_pending() {
             self.count_clipboard_not_restored();
@@ -10941,16 +10955,20 @@ impl InputProcessor {
                 return TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch);
             }
         }
-        let late_until = budget.commit_late_until(
-            Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-            Duration::from_millis(PASTE_UIA_MARGIN_MS),
-        );
+        let now = Instant::now();
+        let margin = Duration::from_millis(PASTE_UIA_MARGIN_MS);
+        let poll_end = now
+            + budget.wait_within(
+                now,
+                Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+                margin,
+            );
         let target_commit = self.paste_commit(
             foreground,
             input_sequence,
             target_layout.0 as usize,
             replacement,
-            late_until,
+            (poll_end, budget.commit_late_until(poll_end, margin)),
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=target_commit result={target_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
@@ -12239,6 +12257,14 @@ impl PasteBudget {
     fn allows_submit(self, now: Instant) -> bool {
         self.remaining(now)
             .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
+    }
+
+    /// How long a step may wait: `limit`, shortened so that `reserve`, what the steps after it
+    /// need, still fits before the gate lets the keys go.
+    fn wait_within(self, now: Instant, limit: Duration, reserve: Duration) -> Duration {
+        self.remaining(now).map_or(limit, |remaining| {
+            remaining.saturating_sub(reserve).min(limit)
+        })
     }
 
     /// Until when a commit check whose poll ends at `poll_end` waits for the field's late answer:
@@ -23017,6 +23043,26 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_waits_only_as_long_as_it_is_given_and_then_finishes_on_its_own() {
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().restore_delay = Duration::from_millis(400);
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard =
+            begin_fake(&state, &brokers, Duration::from_secs(2)).expect("installed");
+        let started = Instant::now();
+        assert!(!clipboard.restore_waiting(Duration::from_millis(20)));
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(clipboard.restore_pending());
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "user text");
+    }
+
+    #[test]
     fn a_failed_installation_is_logged_with_its_reason_and_the_program_holding_the_clipboard() {
         let metrics = Arc::new(ObserverMetrics::default());
         let mut processor = InputProcessor::new(metrics, 0);
@@ -23191,7 +23237,10 @@ mod tests {
         let now = Instant::now();
         let poll_end = now + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
         let late = poll_end + Duration::from_millis(PASTE_COMMIT_LATE_ANSWER_MS);
-        let after = Duration::from_millis(PASTE_AFTER_COMMIT_MS);
+        // The steps after the commit at the least: the layout switch, the second commit's least
+        // check and the margin; the restore and the rest of the second check take what is left.
+        let after = Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS);
+        assert_eq!(PASTE_AFTER_LATE_COMMIT_MS, 400);
         assert_eq!(PASTE_AFTER_COMMIT_MS, 600);
         // Without a gate, or with time to spare, the whole late wait.
         assert_eq!(
@@ -23203,7 +23252,7 @@ mod tests {
         };
         assert_eq!(spare.commit_late_until(poll_end, after), late);
         // Otherwise it ends where the steps after the commit need the rest.
-        let deadline = now + Duration::from_millis(1_000);
+        let deadline = now + Duration::from_millis(800);
         let tight = PasteBudget {
             deadline: Some(deadline),
         };
@@ -23213,6 +23262,33 @@ mod tests {
             deadline: Some(poll_end + after - Duration::from_millis(50)),
         };
         assert!(none.commit_late_until(poll_end, after) < poll_end);
+    }
+
+    #[test]
+    fn a_step_of_a_paste_waits_only_for_what_the_steps_after_it_leave() {
+        let now = Instant::now();
+        let limit = Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS);
+        let after = Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS);
+        let at = |ms: u64| PasteBudget {
+            deadline: Some(now + Duration::from_millis(ms)),
+        };
+        assert_eq!(
+            PasteBudget { deadline: None }.wait_within(now, limit, after),
+            limit
+        );
+        assert_eq!(
+            at(PASTE_AFTER_LATE_COMMIT_MS + CLIPBOARD_RESTORE_WAIT_MS + 1)
+                .wait_within(now, limit, after),
+            limit
+        );
+        assert_eq!(
+            at(PASTE_AFTER_LATE_COMMIT_MS + 30).wait_within(now, limit, after),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            at(PASTE_AFTER_LATE_COMMIT_MS - 10).wait_within(now, limit, after),
+            Duration::ZERO
+        );
     }
 
     #[test]
