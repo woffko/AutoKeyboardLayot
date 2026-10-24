@@ -90,6 +90,13 @@ impl BackendRules {
                 line: line_number,
                 message: "invalid executable name or path".to_owned(),
             })?;
+            // Written back without its quotes, such a rule would read as a comment.
+            if pattern.starts_with('#') {
+                return Err(BackendRuleError {
+                    line: line_number,
+                    message: "an executable name cannot start with #".to_owned(),
+                });
+            }
             let strategy = BackendStrategy::from_id(strategy).ok_or_else(|| BackendRuleError {
                 line: line_number,
                 message: "unknown backend; use capability-probe, protected-paste, physical-replay, or observe-only".to_owned(),
@@ -158,14 +165,12 @@ fn normalize_rule_pattern(pattern: &str) -> Option<String> {
 
 fn normalize_process_path(path_or_name: &str) -> Option<String> {
     let value = path_or_name.trim().trim_matches('"');
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '*' | '?'))
-    {
+    if value.is_empty() || value.chars().any(crate::privacy::forbidden_in_windows_path) {
         return None;
     }
-    Some(value.replace('/', "\\").to_ascii_lowercase())
+    // Unicode lowercasing, as for program exclusions: a path with non-ASCII letters (a user
+    // folder in Cyrillic) matches its rule whatever the case Windows reports.
+    Some(value.replace('/', "\\").to_lowercase())
 }
 
 #[cfg(test)]
@@ -191,6 +196,27 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_path_loses_its_inner_spaces_and_characters_windows_forbids_are_refused() {
+        let rules =
+            BackendRules::from_lines([r#"" C:\Tools\app.exe " = physical-replay"#]).unwrap();
+        assert_eq!(
+            rules.resolve(r"C:\Tools\app.exe"),
+            BackendStrategy::PhysicalReplay
+        );
+        let text = rules.to_text();
+        assert_eq!(BackendRules::from_lines(text.lines()).unwrap(), rules);
+        for line in [
+            r"C:\a|b.exe = observe-only",
+            r"C:\a<b.exe = observe-only",
+            r"C:\a>b.exe = observe-only",
+            r#"C:\a"b.exe = observe-only"#,
+        ] {
+            let error = BackendRules::from_lines(["ok.exe = observe-only", line]).unwrap_err();
+            assert_eq!(error.line, 2, "{line}");
+        }
+    }
+
+    #[test]
     fn full_path_rule_wins_before_basename_and_output_round_trips() {
         let rules = BackendRules::from_lines([
             "editor.exe = capability-probe",
@@ -210,6 +236,34 @@ mod tests {
         assert_eq!(
             BackendRules::from_lines(rules.to_text().lines()).unwrap(),
             rules
+        );
+    }
+
+    #[test]
+    fn a_rule_for_a_name_that_starts_with_a_hash_is_refused_and_a_comment_stays_one() {
+        let error =
+            BackendRules::from_lines(["notepad.exe = paste", "\"#app.exe\" = observe-only"])
+                .unwrap_err();
+        assert_eq!(error.line, 2);
+        assert_eq!(
+            BackendRules::from_lines(["#app.exe = observe-only"]).unwrap(),
+            BackendRules::from_lines(std::iter::empty::<&str>()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rule_matches_a_path_whatever_the_case_of_its_non_ascii_letters() {
+        let rules =
+            BackendRules::from_lines(["d:\\профили\\иван\\apps\\editor.exe = physical-replay"])
+                .unwrap();
+        assert_eq!(
+            rules.resolve("D:\\Профили\\Иван\\Apps\\editor.exe"),
+            BackendStrategy::PhysicalReplay
+        );
+        let rules = BackendRules::from_lines(["РЕДАКТОР.EXE = observe-only"]).unwrap();
+        assert_eq!(
+            rules.resolve("D:\\Tools\\редактор.exe"),
+            BackendStrategy::ObserveOnly
         );
     }
 

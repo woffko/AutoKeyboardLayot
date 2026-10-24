@@ -1,12 +1,13 @@
 //! Shared by `tests/dev_tokens.rs` and `examples/measure_token_false_positives.rs`
 //! so the ratchet test and the measuring tool count exactly the same thing.
 //!
-//! Every token of the corpus is a command, tool or package name typed correctly
-//! in the English layout. The question is how often the detector would wrongly
-//! rewrite it as the same physical keys read in another layout (Russian or
-//! Estonian), first with the dictionary detector alone and then with the layout
-//! model switched on. Each token is judged as the first word of a sentence
-//! (empty context), which is the least favorable case for the model.
+//! Every token of a corpus is typed correctly in the English layout: a command,
+//! tool or package name, or an English word with punctuation next to it. The
+//! question is how often the detector would wrongly rewrite it as the same
+//! physical keys read in another layout (Russian or Estonian), first with the
+//! dictionary detector alone and then with the layout model switched on. Each
+//! token is judged as the first word of a sentence (empty context), which is
+//! the least favorable case for the model.
 
 use autokeyboardlayot::{
     Detection, Detector, DetectorConfig, DictionaryRegistry, Language,
@@ -16,7 +17,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 /// The shipped corpus, see its header for the sources.
 pub const CORPUS: &str = include_str!("../fixtures/dev-tokens.txt");
-/// The US, Russian and Estonian layouts the corpus is read through.
+/// English words with punctuation next to them, see its header for the sources.
+pub const PUNCTUATED: &str = include_str!("../fixtures/punctuated-english.txt");
+/// Code paths, file names and identifiers, see its header for the sources.
+pub const TECHNICAL: &str = include_str!("../fixtures/technical-tokens.txt");
+/// The punctuation keys that print letters in the Russian or Estonian layout.
+pub const LETTER_PUNCTUATION: &str = "[];',.{}:\"<>";
+/// The US, Russian and Estonian layouts the corpora are read through.
 pub const LAYOUTS: &str = include_str!("../fixtures/layouts-en-ru-et.json");
 
 const MINIMUM_LETTERS: usize = 3;
@@ -30,6 +37,60 @@ const LOADED: [(usize, &str); 3] = [
 /// Lowercase tokens of `MINIMUM_LETTERS` or more letters, one per line, sorted
 /// and unique. Blank lines and lines that start with `#` are skipped.
 pub fn parse_tokens(text: &str) -> Result<Vec<String>, String> {
+    parse_sorted(
+        text,
+        |line| line.len() >= MINIMUM_LETTERS && line.bytes().all(|byte| byte.is_ascii_lowercase()),
+        &format!("a token of {MINIMUM_LETTERS} or more lowercase letters"),
+    )
+}
+
+/// Tokens of two or more lowercase letters and at least one key of
+/// `LETTER_PUNCTUATION`, one per line, sorted and unique, as `parse_tokens`.
+pub fn parse_punctuated_tokens(text: &str) -> Result<Vec<String>, String> {
+    let punctuation = |byte: &u8| LETTER_PUNCTUATION.as_bytes().contains(byte);
+    parse_sorted(
+        text,
+        |line| {
+            line.bytes().filter(u8::is_ascii_lowercase).count() >= 2
+                && line.bytes().any(|byte| punctuation(&byte))
+                && line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || punctuation(&byte))
+        },
+        "two or more lowercase letters with a punctuation key that prints a letter elsewhere",
+    )
+}
+
+/// Letters joined by `.`, `:` or `::`, two or more letters in every part, one
+/// per line, sorted and unique, as `parse_tokens`.
+pub fn parse_technical_tokens(text: &str) -> Result<Vec<String>, String> {
+    parse_sorted(
+        text,
+        |line| {
+            let parts: Vec<&str> = line
+                .split([':', '.'])
+                .filter(|part| !part.is_empty())
+                .collect();
+            parts.len() >= 2
+                && parts.iter().all(|part| {
+                    part.len() >= 2 && part.bytes().all(|byte| byte.is_ascii_alphabetic())
+                })
+                && !line.starts_with([':', '.'])
+                && !line.ends_with([':', '.'])
+                && !line.contains(".:")
+                && !line.contains(":.")
+                && !line.contains("..")
+                && !line.contains(":::")
+        },
+        "letters joined by \".\", \":\" or \"::\", two or more in every part",
+    )
+}
+
+fn parse_sorted(
+    text: &str,
+    valid: impl Fn(&str) -> bool,
+    expected: &str,
+) -> Result<Vec<String>, String> {
     let mut tokens: Vec<String> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim_end();
@@ -37,10 +98,8 @@ pub fn parse_tokens(text: &str) -> Result<Vec<String>, String> {
             continue;
         }
         let number = index + 1;
-        if line.len() < MINIMUM_LETTERS || !line.bytes().all(|byte| byte.is_ascii_lowercase()) {
-            return Err(format!(
-                "line {number}: {line:?} is not a token of {MINIMUM_LETTERS} or more lowercase letters"
-            ));
+        if !valid(line) {
+            return Err(format!("line {number}: {line:?} is not {expected}"));
         }
         if tokens
             .last()

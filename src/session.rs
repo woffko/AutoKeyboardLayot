@@ -100,6 +100,18 @@ impl InputSession {
         current_language: Option<Language>,
         detector: &Detector,
     ) -> SessionAction {
+        self.handle_with_readings(event, current_language, detector, &[])
+    }
+
+    /// As `handle`, given what the platform reports the key of a printable
+    /// event prints in target layouts (see `Detector::can_extend_word_with_readings`).
+    pub fn handle_with_readings(
+        &mut self,
+        event: InputEvent,
+        current_language: Option<Language>,
+        detector: &Detector,
+        readings: &[(Language, char)],
+    ) -> SessionAction {
         match event {
             InputEvent::Injected => SessionAction::None,
             InputEvent::Printable(character) => {
@@ -110,7 +122,7 @@ impl InputSession {
                 let Some(language) = current_language else {
                     return self.reset(ResetReason::UnsupportedInput, true);
                 };
-                if !detector.can_extend_word(character, language) {
+                if !detector.can_extend_word_with_readings(character, language, readings) {
                     return self.reset(ResetReason::UnsupportedInput, true);
                 }
                 if self.current_word.chars().count() >= self.max_word_characters {
@@ -145,18 +157,8 @@ impl InputSession {
     }
 
     /// Finish the current word using target strings mapped from the same
-    /// physical keys by a platform adapter.
-    pub fn finish_boundary_with_candidates(
-        &mut self,
-        current_language: Option<Language>,
-        detector: &Detector,
-        candidates: &[(Language, String)],
-    ) -> SessionAction {
-        self.finish_boundary(current_language, detector, Some((candidates, &[])))
-    }
-
-    /// As finish_boundary_with_candidates, also passing the languages (not
-    /// the text) of recent words to the optional layout model.
+    /// physical keys by a platform adapter, and the languages (not the text)
+    /// of recent words for the optional layout model.
     pub fn finish_boundary_in_context(
         &mut self,
         current_language: Option<Language>,
@@ -165,31 +167,6 @@ impl InputSession {
         previous: &[Language],
     ) -> SessionAction {
         self.finish_boundary(current_language, detector, Some((candidates, previous)))
-    }
-
-    /// Explicitly evaluate the word still under the caret without typing a
-    /// boundary. The buffer is consumed only when a target is selected.
-    pub fn force_current_word_with_candidates(
-        &mut self,
-        current_language: Option<Language>,
-        detector: &Detector,
-        candidates: &[(Language, String)],
-    ) -> SessionAction {
-        if self.suppressed_until_boundary || self.current_word.is_empty() {
-            return SessionAction::None;
-        }
-        let Some(language) = current_language else {
-            return SessionAction::None;
-        };
-        let Some(detection) =
-            detector.force_mapped_candidates(&self.current_word, language, candidates)
-        else {
-            return SessionAction::None;
-        };
-        self.current_word.clear();
-        self.backspace_remaining = None;
-        self.current_word_started_at_line_start = false;
-        SessionAction::Candidate(detection)
     }
 
     pub fn buffered_character_count(&self) -> usize {
@@ -527,41 +504,16 @@ mod tests {
                 SessionAction::None
             );
         }
-        let action = session.finish_boundary_with_candidates(
+        let action = session.finish_boundary_in_context(
             Some(Language::English),
             &detector,
             &[(Language::Estonian, "tere".to_owned())],
+            &[],
         );
         let SessionAction::Candidate(detection) = action else {
             panic!("expected Estonian candidate");
         };
         assert_eq!(detection.target_language, Language::Estonian);
-        assert_eq!(session.buffered_character_count(), 0);
-    }
-
-    #[test]
-    fn force_conversion_consumes_a_short_word_without_a_boundary() {
-        let detector = crate::test_support::detector();
-        let mut session = InputSession::default();
-        for character in "yt".chars() {
-            session.handle(
-                InputEvent::Printable(character),
-                Some(Language::English),
-                &detector,
-            );
-        }
-        let action = session.force_current_word_with_candidates(
-            Some(Language::English),
-            &detector,
-            &[
-                (Language::Russian, "не".to_owned()),
-                (Language::Estonian, "yt".to_owned()),
-            ],
-        );
-        let SessionAction::Candidate(detection) = action else {
-            panic!("expected forced short-word candidate");
-        };
-        assert_eq!(detection.replacement, "не");
         assert_eq!(session.buffered_character_count(), 0);
     }
 
@@ -644,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_word_can_be_forced_and_bounds_are_checked() {
+    fn restored_word_bounds_are_checked() {
         let detector = crate::test_support::detector();
         let mut session = InputSession::default();
         session.handle(InputEvent::UnsupportedInput, None, &detector);
@@ -840,5 +792,111 @@ mod tests {
             SessionAction::None
         );
         assert!(!session.is_suppressed());
+    }
+
+    /// Types `word`, giving each listed key what the platform reports it prints
+    /// in target layouts.
+    fn type_with_readings(
+        session: &mut InputSession,
+        word: &str,
+        language: Language,
+        detector: &Detector,
+        readings: &[(char, (Language, char))],
+    ) -> Vec<SessionAction> {
+        word.chars()
+            .map(|character| {
+                let reading: Vec<(Language, char)> = readings
+                    .iter()
+                    .filter(|(key, _)| *key == character)
+                    .map(|(_, reading)| *reading)
+                    .collect();
+                session.handle_with_readings(
+                    InputEvent::Printable(character),
+                    Some(language),
+                    detector,
+                    &reading,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_key_continues_the_word_where_a_target_layout_prints_a_letter() {
+        // English and Estonian without Russian: no offline key table covers
+        // the pair, so the platform's reading of "[" as "ü" decides.
+        let mut registry = crate::test_support::registry();
+        registry
+            .set_enabled([Language::English, Language::Estonian])
+            .unwrap();
+        let detector = Detector::with_registry(
+            crate::DetectorConfig::default(),
+            std::sync::Arc::new(registry),
+        );
+        let mut session = InputSession::default();
+        let readings = [('[', (Language::Estonian, 'ü'))];
+        let actions = type_with_readings(
+            &mut session,
+            "k[simus",
+            Language::English,
+            &detector,
+            &readings,
+        );
+        assert!(actions.iter().all(|action| *action == SessionAction::None));
+        let action = session.finish_boundary_in_context(
+            Some(Language::English),
+            &detector,
+            &[(Language::Estonian, "küsimus".to_owned())],
+            &[],
+        );
+        let SessionAction::Candidate(detection) = action else {
+            panic!("expected küsimus");
+        };
+        assert_eq!(detection.replacement, "küsimus");
+        // Without the reading, or with one for a language that is not enabled,
+        // the bracket cannot be part of a word.
+        for readings in [vec![], vec![('[', (Language::Russian, 'х'))]] {
+            let mut session = InputSession::default();
+            let actions =
+                type_with_readings(&mut session, "k[", Language::English, &detector, &readings);
+            assert_eq!(
+                actions[1],
+                SessionAction::Reset(ResetReason::UnsupportedInput)
+            );
+        }
+
+        // Russian typed with the Estonian layout active: the comma key is "б".
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        let readings = [
+            (',', (Language::Russian, 'б')),
+            (',', (Language::English, ',')),
+        ];
+        let actions = type_with_readings(
+            &mut session,
+            ",skj",
+            Language::Estonian,
+            &detector,
+            &readings,
+        );
+        assert!(actions.iter().all(|action| *action == SessionAction::None));
+        let action = session.finish_boundary_in_context(
+            Some(Language::Estonian),
+            &detector,
+            &[
+                (Language::English, ",skj".to_owned()),
+                (Language::Russian, "было".to_owned()),
+            ],
+            &[],
+        );
+        let SessionAction::Candidate(detection) = action else {
+            panic!("expected было");
+        };
+        assert_eq!(detection.replacement, "было");
+        let mut session = InputSession::default();
+        let actions = type_with_readings(&mut session, ",", Language::Estonian, &detector, &[]);
+        assert_eq!(
+            actions[0],
+            SessionAction::Reset(ResetReason::UnsupportedInput)
+        );
     }
 }

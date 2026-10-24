@@ -23,11 +23,23 @@ function FenceProbe {
     catch { return ($_.Exception.GetType().Name + ': ' + $_.Exception.Message) }
 }
 function FenceFree { return (FenceProbe) -eq 'free' }
+# Waits until the task has started (Running, or a result other than "has not yet run"), at most a
+# minute; $false when it never did.
+function Wait-TaskStart([string]$Name) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ((Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue).State -eq 'Running') { return $true }
+        if ((Get-ScheduledTaskInfo -TaskName $Name -ErrorAction SilentlyContinue).LastTaskResult -ne 267011) { return $true }
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
+# Waits until the started task is no longer running; $false when it still ran after $Seconds.
 function Wait-Task([string]$Name, [int]$Seconds) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ((Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue).State -ne 'Running') { return $true }
-        Start-Sleep -Milliseconds 300
+        Start-Sleep -Milliseconds 250
     }
     return $false
 }
@@ -35,7 +47,8 @@ function Drop-Task([string]$Name) { Unregister-ScheduledTask -TaskName $Name -Co
 
 $reader = $null
 try {
-    if ($env:COMPUTERNAME -ne $ExpectedComputer -or (Get-CimInstance Win32_ComputerSystem).Manufacturer -notlike '*VMware*') { throw 'Wrong guest' }
+    $manufacturer = (Get-CimInstance Win32_ComputerSystem).Manufacturer
+    if ($env:COMPUTERNAME -ne $ExpectedComputer -or ($manufacturer -notlike '*VMware*' -and $manufacturer -notlike '*QEMU*')) { throw 'Wrong guest' }
     if ((Hash $setup) -ne $SetupSha256) { throw 'Setup hash' }
     Drop-Task $installTask
     if ((& "$env:SystemRoot\System32\query.exe" user 2>&1 | Out-String) -notmatch 'console\s+1\s+Active') { throw 'No active console session' }
@@ -57,29 +70,29 @@ try {
     $installPrincipal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Interactive
     Register-ScheduledTask -TaskName $installTask -Action $installAction -Principal $installPrincipal -Force | Out-Null
     Start-ScheduledTask -TaskName $installTask
-    Start-Sleep -Seconds 1
-    $null = Wait-Task $installTask 180
+    if (-not (Wait-TaskStart $installTask)) { throw 'Setup did not start' }
+    $result.install_finished = Wait-Task $installTask 180
+    if (-not $result.install_finished) { throw 'Setup did not finish within three minutes' }
     $result.install_session = 1
     $result.installer_last_result = (Get-ScheduledTaskInfo -TaskName $installTask).LastTaskResult
     $logText = if (Test-Path -LiteralPath $log) { [IO.File]::ReadAllText($log) } else { '' }
-    $result.blocked_log_has_code12 = $logText -like '*Helper code: 12*'
+    # The fence has its own message (AkFenceBusy), distinct from a busy program's AkCloseBusy.
+    $result.blocked_log_reports_fence = $logText -like '*Another setup or uninstall of AutoKeyboardLayot is running*'
     $result.no_install_target = -not (Test-Path -LiteralPath (Join-Path $installTarget 'AutoKeyboardLayot.exe'))
     $result.reader_still_holds = -not (FenceFree)
-    if (-not ($result.blocked_log_has_code12 -and $result.no_install_target -and $result.reader_still_holds)) { throw 'Cross-session exclusion did not refuse the installer' }
+    if (-not ($result.blocked_log_reports_fence -and $result.no_install_target -and $result.reader_still_holds)) { throw 'Cross-session exclusion did not refuse the installer' }
     $result.phase = 'release'
     $reader.Dispose(); $reader = $null
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     $released = $false
     while ([DateTime]::UtcNow -lt $deadline) { if (FenceFree) { $released = $true; break }; Start-Sleep -Milliseconds 300 }
-    if (-not $released) {
-        $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'AutoKeyboardLayot*' -or $_.ProcessName -like 'setup*' -or $_.ProcessName -like 'is-*' })
-        $result.blocking_processes = @($procs | ForEach-Object { $_.Id.ToString() + ':' + $_.ProcessName + ':s' + $_.SessionId })
-        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 1000
-        $result.fence_free_after_kill = FenceFree
-    }
     $result.fence_released_after_reader_stop = $released
-    if (-not ($released -or $result.fence_free_after_kill -eq $true)) {
+    # The fence must come free by itself once the reader is gone; freeing it by stopping processes
+    # would hide the very hold this test looks for.
+    if (-not $released) {
+        $result.blocking_processes = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -like 'AutoKeyboardLayot*' -or $_.ProcessName -like 'setup*' -or $_.ProcessName -like 'is-*' } |
+            ForEach-Object { $_.Id.ToString() + ':' + $_.ProcessName + ':s' + $_.SessionId })
         $result.fence_probe = FenceProbe
         $result.lock_exists = Test-Path -LiteralPath $lock
         if ($result.lock_exists) { $result.lock_attributes = (Get-Item -LiteralPath $lock -Force).Attributes.ToString() }
@@ -92,6 +105,11 @@ try {
 } finally {
     if ($null -ne $reader) { $reader.Dispose() }
     Drop-Task $installTask
+    # Clean-up only: a setup left from this run (from the stage or its own is-*.tmp copy) must not
+    # hold the fence for the next one.
+    Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ($_.Path -like ($Stage.TrimEnd('\') + '\*') -or $_.Path -like '*\is-*.tmp\*') } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
     if (-not (Test-Path -LiteralPath $registration)) {
         Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue

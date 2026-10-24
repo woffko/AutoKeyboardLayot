@@ -77,9 +77,15 @@ impl ExclusionPolicy {
         }
     }
 
+    /// An entry without an extension ("Signal", "KeePass") names the program by its file stem:
+    /// a Windows image name always has an extension, so the entry alone would never match.
     pub fn is_excluded(&self, path_or_name: &str) -> bool {
-        normalize_executable_name(path_or_name)
-            .is_some_and(|name| self.executable_names.contains(&name))
+        normalize_executable_name(path_or_name).is_some_and(|name| {
+            self.executable_names.contains(&name)
+                || name.rsplit_once('.').is_some_and(|(stem, _)| {
+                    !stem.is_empty() && self.executable_names.contains(stem)
+                })
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -97,13 +103,45 @@ impl ExclusionPolicy {
 
 fn normalize_executable_name(path_or_name: &str) -> Option<String> {
     let trimmed = path_or_name.trim().trim_matches('"');
+    if trimmed.chars().any(forbidden_in_windows_path) {
+        return None;
+    }
     let name = trimmed.rsplit(['/', '\\']).next()?.trim();
     (!name.is_empty()).then(|| name.to_lowercase())
+}
+
+/// A character no Windows file name or path holds (`"`, `<`, `>`, `|`, `?`, `*` and control
+/// characters): a program entry with one could never match, and might not read back.
+pub(crate) fn forbidden_in_windows_path(character: char) -> bool {
+    character.is_control() || matches!(character, '"' | '<' | '>' | '|' | '?' | '*')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quoted_program_loses_its_inner_spaces_and_characters_windows_forbids_are_refused() {
+        assert_eq!(
+            ExclusionPolicy::normalize_entry(r#"" C:\Vault\Vault.exe ""#).as_deref(),
+            Some("vault.exe")
+        );
+        assert_eq!(
+            ExclusionPolicy::normalize_entry(r#"" Vault.exe ""#).as_deref(),
+            Some("vault.exe")
+        );
+        for entry in [
+            "va|ult.exe",
+            "va<ult.exe",
+            "va>ult.exe",
+            "va\"ult.exe",
+            "va?ult.exe",
+            "va*ult.exe",
+            "va\u{7}ult.exe",
+        ] {
+            assert_eq!(ExclusionPolicy::normalize_entry(entry), None, "{entry:?}");
+        }
+    }
 
     #[test]
     fn terminal_exception_never_authorizes_transport_or_process_failures() {
@@ -128,6 +166,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_entry_without_an_extension_matches_the_program_by_its_stem() {
+        let policy = ExclusionPolicy::from_lines(["Signal", "keepass.exe", "my.app"]);
+        assert!(policy.is_excluded(r"D:\Apps\signal-desktop\Signal.exe"));
+        assert!(policy.is_excluded("KeePass.exe"));
+        assert!(policy.is_excluded("my.app.exe"));
+        assert!(!policy.is_excluded("SignalR.exe"));
+        assert!(!policy.is_excluded("keepass"));
+        assert!(!policy.is_excluded(".exe"));
     }
 
     #[test]

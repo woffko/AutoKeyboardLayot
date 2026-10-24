@@ -32,7 +32,8 @@ Revision 5, SHA-256 `b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1
 `tests/fixtures/mutation-seed-catalog.aklc`.
 
 **The next renewal is due before about 2026-10-22**, when the daily check starts to
-report fewer than 10 days. Revision 8 is the next revision number.
+report fewer than 10 days — once its workflow is on `main` (see
+[When to renew](#when-to-renew)). Revision 8 is the next revision number.
 
 The window starts when the candidate is made, not when it is signed. Every day
 between the two shortens what the signed catalog is good for, so **make the
@@ -183,3 +184,20 @@ catalog, and check that the installer's language page lists Russian and Estonian
 10 days (240 hours) of validity are left. A 21-day window therefore gives about
 11 days of margin; renew as soon as the issue appears. Each renewal needs the key
 owner, so put the next date in a calendar when you publish.
+
+GitHub runs scheduled workflows from the default branch (`main`) only. The
+10-day threshold and the alert issue above come with PR #1
+(`audit-fixes-20260930`) and the branches built on it; until they reach `main`,
+the scheduled check runs `main`'s version, which fails only when fewer than 72
+hours are left and opens no issue: a red run in the Actions tab is then the only
+signal, about three days before the catalog expires. With revision 7 (valid
+until 2026-11-01 15:19 UTC) either of these keeps online installation working:
+
+- merge PR #1 (or at least its `catalog-freshness.yml`) into `main` before about
+  2026-10-22, so that the issue appears with 10 days left, then renew as above;
+- or sign and publish revision 8 by about 2026-10-22 with the steps above, and
+  keep the next date in a calendar, since `main` still gives only the late,
+  silent signal.
+
+Changing the workflow on a feature branch has no effect on the schedule; check
+the schedule's runs in the Actions tab, which name the branch they ran from.

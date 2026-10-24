@@ -11,10 +11,19 @@ for development installs from a checkout; the installer remains the way to insta
 From WSL, cross-build the modular base, which matches what the installer ships:
 
 ```sh
-cargo xwin build --release --target x86_64-pc-windows-msvc --no-default-features \
+CARGO_ENCODED_RUSTFLAGS="$(python3 tools/release_rustflags.py)" \
+  cargo xwin build --release --target x86_64-pc-windows-msvc --no-default-features \
   --bin AutoKeyboardLayot --target-dir target/xwin-hotkeys
 sha256sum target/xwin-hotkeys/x86_64-pc-windows-msvc/release/AutoKeyboardLayot.exe
 ```
+
+`tools/release_rustflags.py` adds path remapping to the flags in `.cargo/config.toml` (the static C
+runtime), so the executable records no path of the build machine: no account name, checkout or
+Cargo cache; the toolchain path is the resolved one the compiler opens, past any symlink. The
+installer build (`tools/build_experimental_installer.py`) uses the same flags and refuses executables
+that still contain such a path, as UTF-8 or as the UTF-16LE of Windows resources and wide strings;
+`tools/export_windows_test_artifacts.py` builds the base test executables with the same flags
+(`release_rustflags.cargo_env`).
 
 Commit first: the version shown in Settings contains the commit id, and a build from uncommitted
 changes shows `-dirty` after it.
@@ -31,7 +40,8 @@ powershell.exe -NoProfile -File tools\deploy-host.ps1 `
 
 ## Deploy
 
-Run the same command without `-WhatIf` (`-Confirm` asks first). `-BackupSuffix` names the backup
+Run the same command without `-WhatIf` (`-Confirm` asks once, before the first change; nothing after
+that asks again, so no answer can skip the backup or a step of the rollback). `-BackupSuffix` names the backup
 `AutoKeyboardLayot.exe.before-<BackupSuffix>` and must not exist yet. `-KeepBackups` (default 3) is how
 many `AutoKeyboardLayot.exe.before-*` files remain afterwards, counting the new one; older ones are
 deleted, newest first by creation time, and only regular files with that exact name pattern.
@@ -49,16 +59,32 @@ After the preflight it closes the agent with `WM_CLOSE` and waits at most 10 sec
 does not close in time keeps running and nothing is changed: the agent declines to exit while it holds
 typed input or is busy (with diagnostics on, its log says `event=gate phase=shutdown result=declined
 blockers=...`), and stopping it by force would lose that input. Run the script again later; held
-keys that nobody recovers are deleted after one minute.
+keys that nobody recovers are deleted after one minute. An agent that accepted the close but needs
+longer (it waits for its worker) is watched for `-CloseGraceSeconds` more (default 60): when it exits
+then, the script starts it again from the unchanged executable, replaces nothing and says so.
 
 Then it copies the backup, replaces the executable, verifies the installed hash, starts the new agent,
 waits five seconds and checks that exactly one agent process runs and its observer window exists. On
-any failure from the backup on, it stops the new agent and waits for it to exit (the executable stays
-locked until then), restores the backup when the executable was already replaced, and restarts the
-previous agent when one was running.
+any failure from the backup on, it stops the new agent (if it is still running) and waits for it to
+exit (the executable stays locked until then), restores the backup when the executable was already
+replaced, and restarts the previous agent when one was running. A restore that fails (a scanner holding
+the file, for example) is retried for about ten seconds and checked against the backup's hash; if it
+still fails, no agent is started and the error names the original failure and the backup to copy back
+by hand (see below).
 
 The last lines are a receipt: `DEPLOYED_PID`, `EXE_SHA256`, `BACKUP`, and the number of pruned and kept
 backups.
+
+## Acceptance on a test machine
+
+`tools/test-deploy-host.ps1 -Script <deploy-host.ps1> -OutputDirectory <new directory>` runs the script
+against stand-ins compiled on the spot (an agent with the real observer window and graceful-close
+property), each scenario in a LOCALAPPDATA of its own, so the machine's real installation is never
+touched: a successful deployment; the installed file held for six seconds (copying the candidate
+fails, the restore waits, the previous agent runs again); held for forty seconds (the error names the
+original failure and the backup, no agent is started); an agent that closes twenty seconds after
+`WM_CLOSE` (it runs again from the unchanged executable); `-Confirm` answered Yes and then No to
+anything else, and answered No. Run it on a test machine where no AutoKeyboardLayot process runs.
 
 ## Rolling back by hand
 

@@ -1,8 +1,8 @@
 //! Rules that keep the UI thread, which owns the low-level hooks, healthy.
 //!
 //! Windows silently removes a low-level hook whose thread is too slow, and some session changes
-//! leave a hook dead without any notice. The agent compares user input with hook callbacks to
-//! notice that, and limits the work that can block the thread. The decisions are pure so that
+//! leave a hook dead without any notice. The agent compares user input with each hook's callbacks
+//! to notice that, and limits the work that can block the thread. The decisions are pure so that
 //! every platform tests them; the Windows adapter supplies the facts.
 
 use std::{
@@ -10,9 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Input newer than this counts as "the user is typing right now".
+/// Input newer than this counts as "the user is giving input right now".
 pub const INPUT_RECENT: Duration = Duration::from_millis(400);
-/// No hook callback for longer than this while the user types means that the hooks are gone.
+/// No callback of a hook for longer than this while the user gives it input means that it is gone.
 pub const HOOK_SILENT: Duration = Duration::from_secs(3);
 /// Shortest time between two reinstallations triggered by the watchdog.
 pub const REINSTALL_MIN_INTERVAL: Duration = Duration::from_secs(15);
@@ -44,10 +44,69 @@ pub enum ForegroundPrivilege {
     Unknown,
 }
 
-/// Whether the hooks look silent while the user types. The Windows adapter checks this cheap
-/// condition first and gathers the other facts only when it holds.
-pub fn hooks_look_silent(input_idle: Duration, hook_silent: Duration) -> bool {
-    input_idle <= INPUT_RECENT && hook_silent > HOOK_SILENT
+/// A hook that missed input it must have seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilentHook {
+    /// Input came while the pointer stood still, after the mouse hook's last callback, and the
+    /// keyboard hook saw none: typing, or a click or a scroll that the mouse hook missed as well.
+    Keyboard,
+    /// The pointer kept moving, and the mouse hook saw none of it.
+    Mouse,
+}
+
+/// Each hook's time since its last callback or its installation.
+#[derive(Debug, Clone, Copy)]
+pub struct HookSilence {
+    pub keyboard: Duration,
+    pub mouse: Duration,
+}
+
+/// Which hook looks dead while the user gives input, if one does. Each hook is judged by input
+/// that it must see, so one hook's callbacks never hide the other's silence: the mouse hook by a
+/// moving pointer, the keyboard hook by input without pointer movement that the mouse hook did
+/// not see either. A click or a scroll the mouse hook saw is no typing, so that input must be
+/// newer than the mouse hook's last callback by more than INPUT_RECENT; a click a second before
+/// the typing does not hide a dead keyboard hook. The Windows adapter checks this cheap condition
+/// first and gathers the other facts only when it holds.
+pub fn silent_hook(
+    input_idle: Duration,
+    silence: HookSilence,
+    pointer_moving: bool,
+) -> Option<SilentHook> {
+    if input_idle > INPUT_RECENT {
+        return None;
+    }
+    if pointer_moving {
+        return (silence.mouse > HOOK_SILENT).then_some(SilentHook::Mouse);
+    }
+    let unseen_by_the_mouse_hook = silence.mouse > input_idle + INPUT_RECENT;
+    (silence.keyboard > HOOK_SILENT && unseen_by_the_mouse_hook).then_some(SilentHook::Keyboard)
+}
+
+/// Follows the pointer from one timer tick to the next. It counts as moving after moves on two
+/// ticks in a row: one jump, such as a program placing the pointer, is no movement by the user.
+#[derive(Debug, Default)]
+pub struct PointerMotion {
+    last: Option<(i32, i32)>,
+    moves: u32,
+}
+
+impl PointerMotion {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the pointer's position at this tick (`None`: unknown) and tells whether it moves.
+    pub fn observe(&mut self, position: Option<(i32, i32)>) -> bool {
+        let moved = position.is_some() && self.last.is_some() && position != self.last;
+        self.last = position;
+        self.moves = if moved {
+            self.moves.saturating_add(1)
+        } else {
+            0
+        };
+        self.moves >= 2
+    }
 }
 
 /// Whether the program at `image_path` (a full path or a file name) takes the keyboard itself.
@@ -75,8 +134,10 @@ impl ForegroundPrivilege {
 pub struct WatchdogFacts {
     /// Time since the last user input of the session.
     pub input_idle: Duration,
-    /// Time since the last hook callback or hook installation.
-    pub hook_silent: Duration,
+    /// Each hook's time since its last callback or installation.
+    pub silence: HookSilence,
+    /// The pointer kept moving over the last timer ticks (`PointerMotion`).
+    pub pointer_moving: bool,
     pub foreground: ForegroundPrivilege,
     /// False on the lock screen and the secure desktop, where typing never reaches the hooks.
     pub input_desktop_is_default: bool,
@@ -108,12 +169,12 @@ impl HookWatchdog {
         Self::default()
     }
 
-    /// Every condition must hold for the hooks to count as silent: the user is typing now, no hook
-    /// callback ran for a while, the input desktop is the default one, and the foreground window
-    /// is one whose input must reach the hooks: not a higher integrity level, and not a program
-    /// that takes the keyboard itself. An unknown privilege never triggers.
+    /// Every condition must hold for the hooks to count as silent: the user gives input now that a
+    /// hook missed for a while (`silent_hook`), the input desktop is the default one, and the
+    /// foreground window is one whose input must reach the hooks: not a higher integrity level,
+    /// and not a program that takes the keyboard itself. An unknown privilege never triggers.
     pub fn decide(&mut self, facts: &WatchdogFacts, now: Instant) -> WatchdogAction {
-        let silent = hooks_look_silent(facts.input_idle, facts.hook_silent)
+        let silent = silent_hook(facts.input_idle, facts.silence, facts.pointer_moving).is_some()
             && facts.input_desktop_is_default
             && facts.foreground == ForegroundPrivilege::NotHigher
             && !facts.foreground_captures_input;
@@ -187,10 +248,15 @@ pub fn retry_delay(failures: u32) -> Duration {
 mod tests {
     use super::*;
 
+    fn silence(keyboard: Duration, mouse: Duration) -> HookSilence {
+        HookSilence { keyboard, mouse }
+    }
+
     fn typing_with_silent_hooks() -> WatchdogFacts {
         WatchdogFacts {
             input_idle: Duration::from_millis(50),
-            hook_silent: Duration::from_secs(10),
+            silence: silence(Duration::from_secs(10), Duration::from_secs(10)),
+            pointer_moving: false,
             foreground: ForegroundPrivilege::NotHigher,
             input_desktop_is_default: true,
             foreground_captures_input: false,
@@ -216,18 +282,108 @@ mod tests {
         };
         assert_eq!(watchdog.decide(&idle, now), WatchdogAction::Nothing);
         let alive = WatchdogFacts {
-            hook_silent: Duration::from_millis(100),
+            silence: silence(Duration::from_millis(100), Duration::from_secs(10)),
             ..typing_with_silent_hooks()
         };
         assert_eq!(watchdog.decide(&alive, now), WatchdogAction::Nothing);
     }
 
     #[test]
+    fn a_dead_mouse_hook_is_noticed_while_the_keyboard_hook_is_called() {
+        // The user types and moves the mouse; Windows removed only the mouse hook. Keyboard
+        // callbacks used to keep one shared mark fresh and hid it.
+        let typing = Duration::from_millis(50);
+        let moving_without_mouse_callbacks =
+            silence(Duration::from_millis(20), Duration::from_secs(10));
+        assert_eq!(
+            silent_hook(typing, moving_without_mouse_callbacks, true),
+            Some(SilentHook::Mouse)
+        );
+        let mut watchdog = HookWatchdog::new();
+        let facts = WatchdogFacts {
+            silence: moving_without_mouse_callbacks,
+            pointer_moving: true,
+            ..typing_with_silent_hooks()
+        };
+        assert_eq!(
+            watchdog.decide(&facts, Instant::now()),
+            WatchdogAction::Reinstall
+        );
+        // A live mouse hook keeps up with the pointer.
+        assert_eq!(
+            silent_hook(
+                typing,
+                silence(Duration::from_secs(10), Duration::from_millis(20)),
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dead_keyboard_hook_is_noticed_by_input_that_no_hook_saw() {
+        let input = Duration::from_millis(50);
+        let long = Duration::from_secs(10);
+        let recent = Duration::from_millis(100);
+        // Typing while the pointer stands still, and neither hook called.
+        assert_eq!(
+            silent_hook(input, silence(long, long), false),
+            Some(SilentHook::Keyboard)
+        );
+        // Typing a second after a click into the field, or a scroll: the mouse hook's last call
+        // is older than the input, which it did not see.
+        for mouse in [Duration::from_millis(1200), Duration::from_millis(2500)] {
+            assert_eq!(
+                silent_hook(input, silence(long, mouse), false),
+                Some(SilentHook::Keyboard),
+                "{mouse:?}"
+            );
+        }
+        // A click or a scroll that the mouse hook saw is no typing.
+        assert_eq!(silent_hook(input, silence(long, recent), false), None);
+        assert_eq!(
+            silent_hook(
+                Duration::from_millis(300),
+                silence(long, Duration::from_millis(290)),
+                false
+            ),
+            None
+        );
+        // Typing that the keyboard hook saw.
+        assert_eq!(silent_hook(input, silence(recent, long), false), None);
+        // No input lately: nothing to judge by.
+        assert_eq!(
+            silent_hook(Duration::from_secs(5), silence(long, long), true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_pointer_moves_only_over_consecutive_ticks() {
+        let mut pointer = PointerMotion::new();
+        assert!(!pointer.observe(Some((10, 10))));
+        // One jump, such as a program placing the pointer, is no movement.
+        assert!(!pointer.observe(Some((400, 300))));
+        assert!(!pointer.observe(Some((400, 300))));
+        // Moves on two ticks in a row are.
+        assert!(!pointer.observe(Some((410, 300))));
+        assert!(pointer.observe(Some((420, 305))));
+        assert!(pointer.observe(Some((430, 310))));
+        // A stop, or a position that cannot be read (another desktop), ends it.
+        assert!(!pointer.observe(Some((430, 310))));
+        assert!(!pointer.observe(Some((440, 310))));
+        assert!(!pointer.observe(None));
+        assert!(!pointer.observe(Some((450, 310))));
+        assert!(!pointer.observe(Some((460, 310))));
+        assert!(pointer.observe(Some((470, 310))));
+    }
+
+    #[test]
     fn the_thresholds_are_exact() {
         let now = Instant::now();
-        let facts = |input_idle, hook_silent| WatchdogFacts {
+        let facts = |input_idle, quiet| WatchdogFacts {
             input_idle,
-            hook_silent,
+            silence: silence(quiet, quiet),
             ..typing_with_silent_hooks()
         };
         let mut watchdog = HookWatchdog::new();

@@ -1,10 +1,11 @@
 //! Fluent settings UI. It runs as a separate mode of the same executable so
 //! the keyboard-hook process never shares or blocks the UI event loop.
 
-use std::{collections::BTreeSet, fs::OpenOptions, mem::size_of, sync::Arc};
+use std::{collections::BTreeSet, fs::OpenOptions, mem::size_of, path::Path, sync::Arc};
 
+use autokeyboardlayot::configuration::{EditorEntry, load_configuration_directory};
 use autokeyboardlayot::localization::UiLanguagePreference;
-use autokeyboardlayot::{BackendRules, ConfigurationDocument, Hotkey};
+use autokeyboardlayot::{BackendRules, ConfigurationDocument, Hotkey, PackId};
 use i_slint_backend_winit::winit::platform::windows::WindowAttributesExtWindows;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use windows::{
@@ -25,7 +26,8 @@ use windows::{
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                FindWindowW, GA_ROOTOWNER, GetAncestor, PostMessageW, SW_RESTORE, SW_SHOWNORMAL,
+                FindWindowExW, FindWindowW, GA_ROOTOWNER, GetAncestor, GetWindowThreadProcessId,
+                IsIconic, PostMessageW, SHOW_WINDOW_CMD, SW_RESTORE, SW_SHOWNORMAL,
                 SetForegroundWindow, ShowWindow,
             },
         },
@@ -34,12 +36,14 @@ use windows::{
 };
 
 use super::{
-    SETTINGS_APPLIED_MESSAGE, WINDOW_CLASS, diagnostic_log_path, save_configuration_if_unchanged,
-    try_load_configuration_document,
+    SETTINGS_APPLIED_MESSAGE, WINDOW_CLASS, configuration_directory_or_error, diagnostic_log_path,
+    save_configuration_if_unchanged, try_load_configuration_document,
 };
 
 slint::include_modules!();
 use super::ui_localization::{tr, tr_format};
+#[cfg(test)]
+mod desktop_acceptance;
 mod hotkey_capture;
 mod package_import;
 
@@ -124,28 +128,54 @@ pub(super) fn run() -> Result<(), String> {
     ui.global::<Localization>()
         .set_rtl(super::ui_localization::is_rtl());
     populate_ui(&ui, &document, &packages.dictionaries);
-    let _import_timer = wire_callbacks(&ui, document, packages.dictionaries);
+    let _timers = wire_callbacks(&ui, document, packages.dictionaries);
     ui.show().map_err(|error| error.to_string())?;
-    let class = HSTRING::from(SETTINGS_WINDOW_CLASS);
-    let native_window = unsafe { FindWindowW(&class, None) }.ok().filter(|window| {
-        let mut process_id = 0;
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                *window,
-                Some(&mut process_id),
-            );
-        }
-        process_id == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() }
-    });
-    if let Some(window) = native_window {
-        super::installer_lifecycle::advertise_safe_close(window);
-    }
     let result = ui.run().map_err(|error| error.to_string());
-    if let Some(window) = native_window {
-        super::installer_lifecycle::remove_safe_close(window);
-    }
+    retract_graceful_close();
     hotkey_capture::stop();
     result
+}
+
+thread_local! {
+    /// The settings window while it advertises the installer's graceful close.
+    static GRACEFUL_CLOSE: std::cell::Cell<Option<HWND>> = const { std::cell::Cell::new(None) };
+}
+
+/// Advertises the installer's graceful close on this process's settings window once its native
+/// window exists; true when it is advertised.
+fn advertise_graceful_close() -> bool {
+    if GRACEFUL_CLOSE.get().is_some() {
+        return true;
+    }
+    let Some(window) = own_settings_window() else {
+        return false;
+    };
+    super::installer_lifecycle::advertise_safe_close(window);
+    GRACEFUL_CLOSE.set(Some(window));
+    true
+}
+
+/// Takes the graceful close back while the window still exists, before the event loop ends.
+fn retract_graceful_close() {
+    if let Some(window) = GRACEFUL_CLOSE.take() {
+        super::installer_lifecycle::remove_safe_close(window);
+    }
+}
+
+/// This process's settings window, once its native window exists.
+fn own_settings_window() -> Option<HWND> {
+    let class = HSTRING::from(SETTINGS_WINDOW_CLASS);
+    let own = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+    let mut previous = None;
+    while let Ok(window) = unsafe { FindWindowExW(None, previous, &class, None) } {
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+        if process_id == own {
+            return Some(window);
+        }
+        previous = Some(window);
+    }
+    None
 }
 
 fn set_ui_hotkey(ui: &SettingsWindow, hotkey: Hotkey) {
@@ -196,7 +226,17 @@ fn populate_ui(
 
     let hotkey = settings.force_hotkey();
     set_ui_hotkey(ui, hotkey);
+    if let Some(hint) = refused_hotkey_hint(settings) {
+        ui.set_hotkey_capture_hint(hint.into());
+    }
     ui.set_running_processes(strings_model(std::iter::empty::<&str>()));
+}
+
+/// What the window says about a hotkey the configuration names that types text: it was turned
+/// off at loading (see `RefusedHotkey`).
+fn refused_hotkey_hint(settings: &autokeyboardlayot::Settings) -> Option<String> {
+    let chord = settings.refused_force_hotkey.chord()?;
+    Some(tr_format("hotkey.refused_loaded", &[("hotkey", chord)]))
 }
 
 fn populate_ui_language(ui: &SettingsWindow, preference: &UiLanguagePreference) {
@@ -299,16 +339,35 @@ fn populate_input_packs(
             return;
         }
     };
-    // Keep a deselected missing row visible for the remainder of this window,
-    // so the user can undo that choice before saving.
-    for mut previous in ui.get_input_packs().iter() {
+    keep_previous_rows(&mut rows, ui.get_input_packs().iter(), profiles);
+    ui.set_input_packs(std::rc::Rc::new(VecModel::from(rows)).into());
+}
+
+/// Keeps a deselected missing row visible for the remainder of this window, so the user can undo
+/// that choice before saving. Its profile is the one `profiles`, the configuration now shown,
+/// chooses (or the default): a choice removed outside and merged in leaves no unsaved change.
+fn keep_previous_rows(
+    rows: &mut Vec<InputPackRow>,
+    previous: impl Iterator<Item = InputPackRow>,
+    profiles: &autokeyboardlayot::input_profile_selection::InputProfileSelections,
+) {
+    for mut previous in previous {
         if !rows.iter().any(|row| row.id == previous.id) {
             previous.selected = false;
+            let chosen = profiles
+                .iter()
+                .find(|(id, _)| id.as_str() == previous.id.as_str())
+                .map(|(_, profile)| profile.to_string())
+                .unwrap_or_default();
+            previous.profile_index = previous
+                .profile_ids
+                .iter()
+                .position(|id| id.as_str() == chosen)
+                .unwrap_or(0) as i32;
             rows.push(previous);
         }
     }
     rows.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    ui.set_input_packs(std::rc::Rc::new(VecModel::from(rows)).into());
 }
 
 fn selected_input_packs(
@@ -369,7 +428,7 @@ fn wire_callbacks(
     ui: &SettingsWindow,
     document: ConfigurationDocument,
     registry: Arc<autokeyboardlayot::DictionaryRegistry>,
-) -> slint::Timer {
+) -> [slint::Timer; 2] {
     let document = std::rc::Rc::new(std::cell::RefCell::new(document));
     let close_document = std::rc::Rc::clone(&document);
     let weak = ui.as_weak();
@@ -377,20 +436,40 @@ fn wire_callbacks(
         let Some(ui) = weak.upgrade() else {
             return slint::CloseRequestResponse::HideWindow;
         };
-        if ui.get_package_import_busy() {
-            ui.set_status_error(false);
-            ui.set_status_text(tr("lifecycle.settings_busy").into());
-            return slint::CloseRequestResponse::KeepWindowShown;
-        }
         let original = close_document.borrow();
-        if !settings_edits_are_saved(document_from_ui(&ui, original.clone()), &original) {
+        let saved = settings_edits_are_saved(document_from_ui(&ui, original.clone()), &original);
+        if let Some(refusal) = close_refusal(package_work(&ui), saved, false) {
             ui.set_status_error(false);
-            ui.set_status_text(tr("lifecycle.settings_unsaved").into());
+            ui.set_status_text(tr(refusal).into());
             return slint::CloseRequestResponse::KeepWindowShown;
         }
         hotkey_capture::stop();
+        retract_graceful_close();
         slint::CloseRequestResponse::HideWindow
     });
+    // winit creates the native window only once the event loop runs: the installer's graceful
+    // close is advertised on one of its first ticks, and from then on exactly while a close would
+    // be accepted (close_refusal), so that the installer never asks a window that would refuse.
+    let advertiser = slint::Timer::default();
+    let weak = ui.as_weak();
+    let advertised_document = std::rc::Rc::clone(&document);
+    advertiser.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let original = advertised_document.borrow();
+            let saved =
+                settings_edits_are_saved(document_from_ui(&ui, original.clone()), &original);
+            if close_refusal(package_work(&ui), saved, false).is_none() {
+                advertise_graceful_close();
+            } else {
+                retract_graceful_close();
+            }
+        },
+    );
     let registry = std::rc::Rc::new(std::cell::RefCell::new(registry));
     let import_timer = package_import::wire(ui, document.clone(), registry.clone());
 
@@ -505,33 +584,76 @@ fn wire_callbacks(
             return;
         }
         let original = save_document.borrow().clone();
-        match document_from_ui(&ui, original.clone()) {
-            Ok(document) => match save_configuration_if_unchanged(&document, &original) {
-                Ok(()) => {
-                    let preference = document.ui_language.clone();
-                    *save_document.borrow_mut() = document;
-                    refresh_ui_language(&ui, &preference, &registry.borrow());
-                    ui.set_status_error(false);
-                    ui.set_status_text(if notify_agent() {
-                        tr("settings.saved_notified").into()
-                    } else {
-                        tr("settings.saved_agent_unavailable").into()
-                    });
-                    if close_after_save {
-                        let _ = slint::quit_event_loop();
-                    }
+        let document = match document_from_ui(&ui, original.clone()) {
+            Ok(document) => document,
+            Err(error) => {
+                if let Some(page) = error.page {
+                    ui.set_current_page(page);
                 }
-                Err(error) => {
-                    ui.set_status_error(true);
-                    ui.set_status_text(
-                        tr_format("error.save_config", &[("error", &error.to_string())]).into(),
-                    );
-                }
-            },
+                ui.set_status_error(true);
+                ui.set_status_text(error.message.into());
+                return;
+            }
+        };
+        let saved = configuration_directory_or_error()
+            .and_then(|directory| save_or_merge(&directory, &document, &original));
+        let document = match saved {
+            Ok(Saved::AsDrafted) => document,
+            Ok(Saved::Merged(merged)) => {
+                // The window shows what was saved: the draft with the changes made meanwhile.
+                populate_ui(&ui, &merged, &registry.borrow());
+                merged
+            }
+            Ok(Saved::Conflict {
+                document,
+                current,
+                conflicts,
+            }) => {
+                // The next Apply saves the window's values over the configuration as it is now.
+                *save_document.borrow_mut() = *current;
+                populate_ui(&ui, &document, &registry.borrow());
+                ui.set_status_error(true);
+                ui.set_status_text(
+                    tr_format(
+                        "settings.merge_conflict",
+                        &[("fields", &conflicts.join(", "))],
+                    )
+                    .into(),
+                );
+                return;
+            }
             Err(error) => {
                 ui.set_status_error(true);
-                ui.set_status_text(error.into());
+                ui.set_status_text(
+                    tr_format("error.save_config", &[("error", &error.to_string())]).into(),
+                );
+                return;
             }
+        };
+        let preference = document.ui_language.clone();
+        let unknown = unknown_language_entry(
+            &document,
+            ui.get_user_dictionary_text().as_str(),
+            ui.get_word_exclusions_text().as_str(),
+            |id| {
+                registry
+                    .borrow()
+                    .installed_ids()
+                    .any(|installed| installed == id)
+            },
+        );
+        *save_document.borrow_mut() = document;
+        refresh_ui_language(&ui, &preference, &registry.borrow());
+        let notified = notify_agent();
+        let after = after_save(unknown.as_ref(), &original, notified, close_after_save);
+        if let Some(page) = after.page {
+            ui.set_current_page(page);
+        }
+        ui.set_status_error(after.error);
+        ui.set_status_text(after.status.into());
+        if after.close {
+            retract_graceful_close();
+            let _ = slint::quit_event_loop();
         }
     });
 
@@ -539,11 +661,12 @@ fn wire_callbacks(
     ui.on_cancel_requested(move || {
         if weak
             .upgrade()
-            .is_some_and(|ui| ui.get_package_import_busy())
+            .is_some_and(|ui| close_refusal(package_work(&ui), true, true).is_some())
         {
             return;
         }
         hotkey_capture::stop();
+        retract_graceful_close();
         let _ = slint::quit_event_loop();
     });
 
@@ -557,7 +680,7 @@ fn wire_callbacks(
             return;
         }
         ui.set_package_import_busy(true);
-        let selected = browse_for_executable();
+        let selected = browse_for_executable(own_settings_window());
         ui.set_package_import_busy(false);
         if let Some(path) = selected {
             ui.set_process_exclusions_text(
@@ -605,20 +728,293 @@ fn wire_callbacks(
             }
         }
     });
-    import_timer
+    [import_timer, advertiser]
+}
+
+/// The package operation running now, as closing the window sees it: the read-only refresh of
+/// the installed packages (the one at opening) or one that changes the store (an import, a
+/// removal, a rollback, a download).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageWork {
+    Idle,
+    ReadOnly,
+    Changing,
+}
+
+fn package_work(ui: &SettingsWindow) -> PackageWork {
+    if !ui.get_package_import_busy() {
+        PackageWork::Idle
+    } else if ui.get_package_import_read_only() {
+        PackageWork::ReadOnly
+    } else {
+        PackageWork::Changing
+    }
+}
+
+/// Why the window may not close now, if it may not (the message key): an operation that changes
+/// the package store, or unsaved edits unless the close discards them (Cancel). X, `WM_CLOSE`
+/// and the installer's graceful close keep edits; the graceful close is advertised exactly while
+/// this allows a close.
+fn close_refusal(
+    work: PackageWork,
+    edits_saved: bool,
+    discards_edits: bool,
+) -> Option<&'static str> {
+    if work == PackageWork::Changing {
+        return Some("lifecycle.settings_busy");
+    }
+    if !discards_edits && !edits_saved {
+        return Some("lifecycle.settings_unsaved");
+    }
+    None
 }
 
 fn settings_edits_are_saved(
-    candidate: Result<ConfigurationDocument, String>,
+    candidate: Result<ConfigurationDocument, DraftError>,
     original: &ConfigurationDocument,
 ) -> bool {
     candidate.is_ok_and(|document| document == *original)
 }
 
+const DICTIONARY_PAGE: i32 = 3;
+const WORD_EXCLUSIONS_PAGE: i32 = 4;
+const PROCESS_EXCLUSIONS_PAGE: i32 = 5;
+const BACKENDS_PAGE: i32 = 6;
+
+/// Why the window's draft cannot be saved, and the page that shows the problem.
+#[derive(Debug, PartialEq, Eq)]
+struct DraftError {
+    message: String,
+    page: Option<i32>,
+}
+
+impl From<String> for DraftError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            page: None,
+        }
+    }
+}
+
+/// A problem on a line of the editor on `page`, named `page_name` in the navigation.
+fn editor_error(page: i32, page_name: &str, line: usize, message: &str) -> DraftError {
+    DraftError {
+        message: tr_format(
+            "error.editor_line",
+            &[
+                ("page", &tr(page_name)),
+                ("line", &line.to_string()),
+                ("error", message),
+            ],
+        ),
+        page: Some(page),
+    }
+}
+
+/// The dictionary, word-exclusion and program-exclusion editors, each read on its own: a bad
+/// entry is named with its page and its line in that editor.
+struct EditorLists {
+    dictionary: Vec<EditorEntry>,
+    word_exclusions: Vec<EditorEntry>,
+    process_exclusions: Vec<EditorEntry>,
+}
+
+fn editor_lists(
+    dictionary: &str,
+    word_exclusions: &str,
+    process_exclusions: &str,
+) -> Result<EditorLists, DraftError> {
+    let in_editor = |page, page_name| {
+        move |error: autokeyboardlayot::ConfigurationError| {
+            editor_error(page, page_name, error.line.unwrap_or(1), &error.message)
+        }
+    };
+    let dictionary = ConfigurationDocument::lexicon_editor_entries(dictionary)
+        .map_err(in_editor(DICTIONARY_PAGE, "nav.dictionary"))?;
+    let word_exclusions = ConfigurationDocument::lexicon_editor_entries(word_exclusions)
+        .map_err(in_editor(WORD_EXCLUSIONS_PAGE, "nav.word_exclusions"))?;
+    if let Some(both) = word_exclusions
+        .iter()
+        .find(|word| dictionary.iter().any(|entry| entry.entry == word.entry))
+    {
+        return Err(editor_error(
+            WORD_EXCLUSIONS_PAGE,
+            "nav.word_exclusions",
+            both.line,
+            "this entry is also in the user dictionary",
+        ));
+    }
+    let process_exclusions = ConfigurationDocument::process_editor_entries(process_exclusions)
+        .map_err(in_editor(PROCESS_EXCLUSIONS_PAGE, "nav.process_exclusions"))?;
+    Ok(EditorLists {
+        dictionary,
+        word_exclusions,
+        process_exclusions,
+    })
+}
+
+/// A dictionary or word-exclusion entry whose language is not installed: saved, but without
+/// effect until the language is installed.
+#[derive(Debug, PartialEq, Eq)]
+struct UnknownLanguage {
+    page: i32,
+    page_name: &'static str,
+    line: usize,
+    id: String,
+    /// The entry as stored.
+    entry: String,
+}
+
+fn unknown_language_entry(
+    document: &ConfigurationDocument,
+    dictionary: &str,
+    word_exclusions: &str,
+    installed: impl Fn(&PackId) -> bool,
+) -> Option<UnknownLanguage> {
+    let lists = [
+        (
+            DICTIONARY_PAGE,
+            "nav.dictionary",
+            dictionary,
+            &document.user_dictionary,
+        ),
+        (
+            WORD_EXCLUSIONS_PAGE,
+            "nav.word_exclusions",
+            word_exclusions,
+            &document.word_exclusions,
+        ),
+    ];
+    for (page, page_name, editor, saved) in lists {
+        let entries = ConfigurationDocument::lexicon_editor_entries(editor).unwrap_or_default();
+        for entry in entries.iter().filter(|entry| saved.contains(&entry.entry)) {
+            let Some((id, _)) = entry.entry.split_once(':') else {
+                continue;
+            };
+            if PackId::parse(id).is_ok_and(|pack| !installed(&pack)) {
+                return Some(UnknownLanguage {
+                    page,
+                    page_name,
+                    line: entry.line,
+                    id: id.to_owned(),
+                    entry: entry.entry.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// What the window does once a save succeeded: the status it shows (an error or not), the page it
+/// turns to, and whether it closes.
+#[derive(Debug, PartialEq, Eq)]
+struct AfterSave {
+    status: String,
+    error: bool,
+    page: Option<i32>,
+    close: bool,
+}
+
+/// After a successful save: `unknown` is an entry for a language that is not installed, and
+/// `original` the configuration the window saved over. OK always closes the window then (the
+/// owner's question Q6). An entry kept when its language was removed is only noted; one the user
+/// typed since the last save turns its page to it as an error, so that Apply shows the typo.
+fn after_save(
+    unknown: Option<&UnknownLanguage>,
+    original: &ConfigurationDocument,
+    notified: bool,
+    close_after_save: bool,
+) -> AfterSave {
+    if let Some(unknown) = unknown {
+        let kept = if unknown.page == DICTIONARY_PAGE {
+            &original.user_dictionary
+        } else {
+            &original.word_exclusions
+        };
+        let typed = !kept.contains(&unknown.entry);
+        return AfterSave {
+            status: tr_format(
+                "settings.saved_unknown_language",
+                &[
+                    ("page", &tr(unknown.page_name)),
+                    ("line", &unknown.line.to_string()),
+                    ("id", &unknown.id),
+                ],
+            ),
+            error: typed,
+            page: typed.then_some(unknown.page),
+            close: close_after_save,
+        };
+    }
+    AfterSave {
+        status: if notified {
+            tr("settings.saved_notified")
+        } else {
+            tr("settings.saved_agent_unavailable")
+        },
+        error: false,
+        page: None,
+        close: close_after_save,
+    }
+}
+
+/// What came of saving the window's draft.
+#[derive(Debug, PartialEq, Eq)]
+enum Saved {
+    /// Saved as the window holds it.
+    AsDrafted,
+    /// The configuration changed since the window read it; the draft was merged into it and the
+    /// merge, as read back, saved.
+    Merged(ConfigurationDocument),
+    /// The configuration changed meanwhile in values the draft changed too: nothing was saved.
+    /// `document` is the merge with the draft's values, `current` the configuration now.
+    Conflict {
+        document: Box<ConfigurationDocument>,
+        current: Box<ConfigurationDocument>,
+        conflicts: Vec<String>,
+    },
+}
+
+/// Saves the draft (made from `original`) into the configuration in `directory`. When the
+/// configuration changed since the window read it (a word added from the tray, a hand edit),
+/// the draft is merged into it and that is saved; values both changed are a conflict.
+fn save_or_merge(
+    directory: &Path,
+    draft: &ConfigurationDocument,
+    original: &ConfigurationDocument,
+) -> std::io::Result<Saved> {
+    match save_configuration_if_unchanged(directory, draft, original) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        other => return other.map(|()| Saved::AsDrafted),
+    }
+    // Another writer may change it again between the read and the save.
+    for _ in 0..3 {
+        let current = load_configuration_directory(directory)?;
+        let merged = ConfigurationDocument::merge(original, draft, &current);
+        if !merged.conflicts.is_empty() {
+            return Ok(Saved::Conflict {
+                document: Box::new(merged.document),
+                current: Box::new(current),
+                conflicts: merged.conflicts,
+            });
+        }
+        match save_configuration_if_unchanged(directory, &merged.document, &current) {
+            Ok(()) => return load_configuration_directory(directory).map(Saved::Merged),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Configuration keeps changing outside this window; try applying again",
+    ))
+}
+
 fn document_from_ui(
     ui: &SettingsWindow,
     mut document: ConfigurationDocument,
-) -> Result<ConfigurationDocument, String> {
+) -> Result<ConfigurationDocument, DraftError> {
     let selected =
         usize::try_from(ui.get_ui_language_index()).map_err(|_| tr("error.ui_language"))?;
     let preference = ui
@@ -661,11 +1057,20 @@ fn document_from_ui(
     settings.force_hotkey_modifiers = hotkey.modifiers;
     document.settings = settings;
 
-    document.user_dictionary = editor_lines(ui.get_user_dictionary_text().as_str());
-    document.word_exclusions = editor_lines(ui.get_word_exclusions_text().as_str());
-    document.process_exclusions = editor_lines(ui.get_process_exclusions_text().as_str());
+    let lists = editor_lists(
+        ui.get_user_dictionary_text().as_str(),
+        ui.get_word_exclusions_text().as_str(),
+        ui.get_process_exclusions_text().as_str(),
+    )?;
+    let entries = |list: Vec<EditorEntry>| list.into_iter().map(|entry| entry.entry).collect();
+    document.user_dictionary = entries(lists.dictionary);
+    document.word_exclusions = entries(lists.word_exclusions);
+    document.process_exclusions = entries(lists.process_exclusions);
     document.backend_rules = BackendRules::from_lines(ui.get_backend_rules_text().lines())
-        .map_err(|error| tr_format("error.backend_rules", &[("error", &error.to_string())]))?;
+        .map_err(|error| DraftError {
+            message: tr_format("error.backend_rules", &[("error", &error.to_string())]),
+            page: Some(BACKENDS_PAGE),
+        })?;
     document
         .canonicalize_and_validate()
         .map_err(|error| tr_format("error.settings", &[("error", &error.to_string())]))?;
@@ -689,14 +1094,6 @@ fn lines_to_editor(lines: &[String]) -> SharedString {
     }
 }
 
-fn editor_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
-}
-
 fn append_unique_line(existing: &str, entry: &str) -> String {
     let entry = entry.trim();
     let mut lines: Vec<_> = existing
@@ -715,7 +1112,63 @@ fn append_unique_line(existing: &str, entry: &str) -> String {
     }
 }
 
-fn browse_for_executable() -> Option<String> {
+/// The open-file dialog's parameters. With the settings window as `owner` the dialog is modal: the
+/// window takes no input while it is open, so nothing queued replays after it closes.
+fn file_dialog(
+    owner: Option<HWND>,
+    filter: &[u16],
+    title: &[u16],
+    file: &mut [u16],
+    flags: windows::Win32::UI::Controls::Dialogs::OPEN_FILENAME_FLAGS,
+) -> Option<OPENFILENAMEW> {
+    Some(OPENFILENAMEW {
+        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).ok()?,
+        hwndOwner: owner.unwrap_or_default(),
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file.as_mut_ptr()),
+        nMaxFile: u32::try_from(file.len()).ok()?,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: flags,
+        ..Default::default()
+    })
+}
+
+/// Shows an open-file dialog and puts the process's current directory back afterwards. The dialog
+/// leaves the process in the folder the user chose (`OFN_NOCHANGEDIR` has no effect on Open
+/// dialogs), and Windows cannot remove a folder that is a process's current directory: a USB drive
+/// or network share chosen once could not be ejected while Settings stayed open.
+fn show_open_dialog(dialog: &mut OPENFILENAMEW) -> bool {
+    keeping_current_directory(
+        || std::env::current_dir().ok(),
+        |directory| std::env::set_current_dir(directory).is_ok(),
+        || {
+            std::env::current_exe()
+                .ok()
+                .and_then(|program| program.parent().map(Path::to_path_buf))
+        },
+        || unsafe { GetOpenFileNameW(dialog) }.as_bool(),
+    )
+}
+
+/// Runs `run`, then sets the current directory back to the one `current` gave before it, or to
+/// `fallback` when that one is unknown or gone.
+fn keeping_current_directory<T>(
+    current: impl Fn() -> Option<std::path::PathBuf>,
+    set: impl Fn(&Path) -> bool,
+    fallback: impl FnOnce() -> Option<std::path::PathBuf>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let before = current();
+    let result = run();
+    if !before.as_deref().is_some_and(&set)
+        && let Some(fallback) = fallback()
+    {
+        set(&fallback);
+    }
+    result
+}
+
+fn browse_for_executable(owner: Option<HWND>) -> Option<String> {
     let filter: Vec<u16> = format!(
         "{}\0*.exe\0{}\0*.*\0\0",
         tr("dialog.executables"),
@@ -728,16 +1181,14 @@ fn browse_for_executable() -> Option<String> {
         .chain([0])
         .collect();
     let mut file = vec![0u16; 32_768];
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).ok()?,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(file.as_mut_ptr()),
-        nMaxFile: u32::try_from(file.len()).ok()?,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
-        ..Default::default()
-    };
-    if !unsafe { GetOpenFileNameW(&raw mut dialog) }.as_bool() {
+    let mut dialog = file_dialog(
+        owner,
+        &filter,
+        &title,
+        &mut file,
+        OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+    )?;
+    if !show_open_dialog(&mut dialog) {
         return None;
     }
     let length = file.iter().position(|character| *character == 0)?;
@@ -826,9 +1277,17 @@ fn focus_existing_window() {
         // A native popup may share the backend class; focus its owning window.
         let owner = GetAncestor(window, GA_ROOTOWNER);
         let window = if owner.0.is_null() { window } else { owner };
-        let _ = ShowWindow(window, SW_RESTORE);
+        if let Some(command) = show_command_for_focus(IsIconic(window).as_bool()) {
+            let _ = ShowWindow(window, command);
+        }
         let _ = SetForegroundWindow(window);
     }
+}
+
+/// How a second start shows the open window: a minimized one is restored, any other keeps its
+/// placement, so a maximized window stays maximized.
+fn show_command_for_focus(minimized: bool) -> Option<SHOW_WINDOW_CMD> {
+    minimized.then_some(SW_RESTORE)
 }
 
 #[cfg(test)]
@@ -870,10 +1329,287 @@ mod tests {
     }
 
     #[test]
+    fn the_window_says_which_configured_hotkey_was_turned_off_for_typing_text() {
+        let settings = autokeyboardlayot::Settings::try_from_text(
+            "force_hotkey_key=A\nforce_hotkey_modifiers=Shift\n",
+        )
+        .unwrap();
+        let hint = refused_hotkey_hint(&settings).expect("a hint");
+        assert!(hint.contains("Shift+A"), "{hint}");
+        assert_eq!(
+            refused_hotkey_hint(&autokeyboardlayot::Settings::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_kept_row_of_a_missing_package_takes_its_profile_from_the_saved_configuration() {
+        let previous = InputPackRow {
+            profile_ids: strings_model(["", "0409:00000409"]),
+            profile_names: strings_model(["Default", "US"]),
+            profile_index: 1,
+            id: "custom-x".into(),
+            name: "custom-x".into(),
+            selected: true,
+            status_key: "packs.missing".into(),
+            details: "".into(),
+        };
+        // The saved configuration (merged with a change made outside) no longer chooses one.
+        let mut rows = Vec::new();
+        let none = autokeyboardlayot::input_profile_selection::InputProfileSelections::default();
+        keep_previous_rows(&mut rows, [previous.clone()].into_iter(), &none);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].selected);
+        assert_eq!(rows[0].profile_index, 0);
+        // Or it still does.
+        let chosen = autokeyboardlayot::input_profile_selection::InputProfileSelections::parse([(
+            "custom-x",
+            "0409:00000409",
+        )])
+        .unwrap();
+        let mut rows = Vec::new();
+        keep_previous_rows(&mut rows, [previous].into_iter(), &chosen);
+        assert_eq!(rows[0].profile_index, 1);
+    }
+
+    #[test]
+    fn a_bad_editor_line_names_its_page_and_its_line_in_that_editor() {
+        let dictionary = "# my words\nen-US: firefox\n\nen-US: two words\n";
+        let error = editor_lists(dictionary, "", "").err().unwrap();
+        assert_eq!(error.page, Some(DICTIONARY_PAGE));
+        assert!(
+            error.message.starts_with("User dictionary, line 4: "),
+            "{}",
+            error.message
+        );
+        // The same mistake in the word exclusions names that page.
+        let error = editor_lists("", dictionary, "").err().unwrap();
+        assert_eq!(error.page, Some(WORD_EXCLUSIONS_PAGE));
+        assert!(
+            error.message.starts_with("Word exclusions, line 4: "),
+            "{}",
+            error.message
+        );
+        let error = editor_lists("", "", "private.exe\n\n\"#vault.exe\"\n")
+            .err()
+            .unwrap();
+        assert_eq!(error.page, Some(PROCESS_EXCLUSIONS_PAGE));
+        assert!(error.message.contains(", line 3: "), "{}", error.message);
+        // A program name with a character Windows forbids, named at its line before saving.
+        let error = editor_lists(
+            "",
+            "",
+            "private.exe
+va|ult.exe
+",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.page, Some(PROCESS_EXCLUSIONS_PAGE));
+        assert!(error.message.contains(", line 2: "), "{}", error.message);
+        // An entry in both lists is named at its line in the exclusions.
+        let error = editor_lists("en-US: firefox\n", "\nru-RU: x\nen-US: Firefox\n", "")
+            .err()
+            .unwrap();
+        assert_eq!(error.page, Some(WORD_EXCLUSIONS_PAGE));
+        assert!(error.message.contains(", line 3: "), "{}", error.message);
+        let lists = editor_lists(
+            "en-US: Firefox\n",
+            "ru-RU: руддщ\n",
+            "C:\\Apps\\Vault.exe\n",
+        )
+        .unwrap();
+        assert_eq!(lists.dictionary[0].entry, "en-US: firefox");
+        assert_eq!(lists.process_exclusions[0].entry, "vault.exe");
+    }
+
+    #[test]
+    fn an_entry_for_a_language_that_is_not_installed_is_reported_after_saving() {
+        let document = ConfigurationDocument {
+            user_dictionary: vec!["de: hallo".to_owned(), "en-US: firefox".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        let english = PackId::parse("en-US").unwrap();
+        let unknown =
+            unknown_language_entry(&document, "en-US: firefox\n\nde: Hallo\n", "", |id| {
+                *id == english
+            });
+        assert_eq!(
+            unknown,
+            Some(UnknownLanguage {
+                page: DICTIONARY_PAGE,
+                page_name: "nav.dictionary",
+                line: 3,
+                id: "de".to_owned(),
+                entry: "de: hallo".to_owned(),
+            })
+        );
+        assert_eq!(
+            unknown_language_entry(&document, "de: Hallo\n", "", |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn ok_closes_after_a_save_and_an_entry_kept_for_a_removed_language_is_only_noted() {
+        let unknown = UnknownLanguage {
+            page: DICTIONARY_PAGE,
+            page_name: "nav.dictionary",
+            line: 1,
+            id: "de-DE".to_owned(),
+            entry: "de-DE: moin".to_owned(),
+        };
+        // The entry was kept when German was removed: noted, no page turned, no error.
+        let kept = ConfigurationDocument {
+            user_dictionary: vec!["de-DE: moin".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        for close_after_save in [false, true] {
+            let after = after_save(Some(&unknown), &kept, true, close_after_save);
+            assert!(!after.error);
+            assert_eq!(after.page, None);
+            assert_eq!(after.close, close_after_save);
+            assert!(after.status.contains("de-DE"), "{}", after.status);
+        }
+        // Typed in this session: Apply turns to it as an error, OK still closes.
+        let typed = ConfigurationDocument::default();
+        let apply = after_save(Some(&unknown), &typed, true, false);
+        assert!(apply.error);
+        assert_eq!(apply.page, Some(DICTIONARY_PAGE));
+        assert!(!apply.close);
+        assert!(after_save(Some(&unknown), &typed, true, true).close);
+        // Nothing to say: OK closes, Apply stays.
+        assert!(after_save(None, &typed, true, true).close);
+        assert!(!after_save(None, &typed, false, false).close);
+    }
+
+    /// A configuration folder holding `document`.
+    fn folder_with(document: &ConfigurationDocument) -> tempfile::TempDir {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("config.ini"),
+            document.to_text().unwrap(),
+        )
+        .unwrap();
+        folder
+    }
+
+    #[test]
+    fn a_draft_merges_with_a_word_added_from_the_tray_while_the_window_was_open() {
+        // The owner's case: the window is open, a word is added from the tray, then a box is
+        // unticked in the window and Apply is selected.
+        let base = ConfigurationDocument::default();
+        let folder = folder_with(&base);
+        let offer = super::super::VolatileLexiconCandidate::new(
+            super::super::LexiconOfferTarget::UserDictionary,
+            autokeyboardlayot::Language::English,
+            "firefox".to_owned(),
+            std::time::Instant::now(),
+        );
+        super::super::persist_lexicon_candidate(folder.path(), &offer).unwrap();
+        let mut draft = base.clone();
+        draft.settings.suppress_after_manual_layout_change =
+            !base.settings.suppress_after_manual_layout_change;
+        let saved = save_or_merge(folder.path(), &draft, &base).unwrap();
+        let on_disk = load_configuration_directory(folder.path()).unwrap();
+        assert_eq!(saved, Saved::Merged(on_disk.clone()));
+        assert_eq!(
+            on_disk.settings.suppress_after_manual_layout_change,
+            !base.settings.suppress_after_manual_layout_change
+        );
+        assert_eq!(on_disk.user_dictionary, ["en-US: firefox"]);
+        // Unchanged since, the next draft is saved as it is.
+        let mut next = on_disk.clone();
+        next.settings.layout_model = !next.settings.layout_model;
+        assert_eq!(
+            save_or_merge(folder.path(), &next, &on_disk).unwrap(),
+            Saved::AsDrafted
+        );
+    }
+
+    #[test]
+    fn the_editors_of_a_conflict_over_a_word_in_both_lists_pass_the_windows_check() {
+        // A word added to the exclusions from the tray while the window put it in the dictionary.
+        let base = ConfigurationDocument::default();
+        let mut ours = base.clone();
+        ours.user_dictionary.push("en-US: firefox".to_owned());
+        let mut theirs = base.clone();
+        theirs.word_exclusions.push("en-US: firefox".to_owned());
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert!(!merged.conflicts.is_empty());
+        // What the window then shows in its editors, read back as Apply reads it.
+        let document = merged.document;
+        let lists = editor_lists(
+            &lines_to_editor(&document.user_dictionary),
+            &lines_to_editor(&document.word_exclusions),
+            &lines_to_editor(&document.process_exclusions),
+        );
+        assert!(
+            lists.is_ok(),
+            "{:?}",
+            lists.err().map(|error| error.message)
+        );
+    }
+
+    #[test]
+    fn a_value_changed_in_the_window_and_outside_it_is_not_saved_over() {
+        let base = ConfigurationDocument::default();
+        let mut outside = base.clone();
+        outside.ui_language = UiLanguagePreference::from_config("et");
+        let folder = folder_with(&outside);
+        let mut draft = base.clone();
+        draft.ui_language = UiLanguagePreference::from_config("ru");
+        let Saved::Conflict {
+            document,
+            current,
+            conflicts,
+        } = save_or_merge(folder.path(), &draft, &base).unwrap()
+        else {
+            panic!("no conflict");
+        };
+        assert_eq!(conflicts, ["ui_language"]);
+        assert_eq!(document.ui_language.as_config(), "ru");
+        assert_eq!(current.ui_language.as_config(), "et");
+        assert_eq!(
+            load_configuration_directory(folder.path())
+                .unwrap()
+                .ui_language
+                .as_config(),
+            "et"
+        );
+        // With the configuration as it is now as the base, the window's values are saved.
+        assert_eq!(
+            save_or_merge(folder.path(), &document, &current).unwrap(),
+            Saved::AsDrafted
+        );
+    }
+
+    #[test]
+    fn a_read_only_package_refresh_does_not_hold_the_window_open() {
+        use PackageWork::{Changing, Idle, ReadOnly};
+        let busy = Some("lifecycle.settings_busy");
+        let unsaved = Some("lifecycle.settings_unsaved");
+        // The refresh at opening only reads the installed packages: X, WM_CLOSE and Cancel close.
+        assert_eq!(close_refusal(ReadOnly, true, false), None);
+        assert_eq!(close_refusal(ReadOnly, true, true), None);
+        // An operation that changes the store holds the window, whatever the edits.
+        assert_eq!(close_refusal(Changing, true, false), busy);
+        assert_eq!(close_refusal(Changing, true, true), busy);
+        // Unsaved edits hold it for a close that keeps them, not for Cancel.
+        assert_eq!(close_refusal(Idle, false, false), unsaved);
+        assert_eq!(close_refusal(ReadOnly, false, false), unsaved);
+        assert_eq!(close_refusal(Idle, false, true), None);
+        assert_eq!(close_refusal(Idle, true, false), None);
+    }
+
+    #[test]
     fn normal_close_requires_valid_unchanged_settings() {
         let original = ConfigurationDocument::default();
         assert!(settings_edits_are_saved(Ok(original.clone()), &original));
-        assert!(!settings_edits_are_saved(Err("invalid".into()), &original));
+        assert!(!settings_edits_are_saved(
+            Err(DraftError::from("invalid".to_owned())),
+            &original
+        ));
         let mut edited = original.clone();
         edited.settings.automatic_conversion_on_startup =
             !edited.settings.automatic_conversion_on_startup;
@@ -943,6 +1679,59 @@ mod tests {
             DestroyWindow(window).unwrap();
             UnregisterClassW(class, Some(instance)).unwrap();
         }
+    }
+
+    #[test]
+    fn file_dialogs_belong_to_the_settings_window() {
+        let owner = HWND(0x5a5a0 as *mut core::ffi::c_void);
+        let (filter, title) = ([0u16; 2], [0u16; 1]);
+        let mut file = [0u16; 16];
+        let dialog = file_dialog(Some(owner), &filter, &title, &mut file, OFN_EXPLORER).unwrap();
+        assert_eq!(dialog.hwndOwner, owner);
+        assert_eq!(dialog.nMaxFile, 16);
+        let dialog = file_dialog(None, &filter, &title, &mut file, OFN_EXPLORER).unwrap();
+        assert!(dialog.hwndOwner.0.is_null());
+    }
+
+    #[test]
+    fn the_current_directory_comes_back_after_a_file_dialog() {
+        use std::{cell::RefCell, path::PathBuf};
+        let directory = RefCell::new(Some(PathBuf::from(r"C:\Start")));
+        let gone = RefCell::new(Vec::<PathBuf>::new());
+        let current = || directory.borrow().clone();
+        let set = |path: &Path| {
+            let exists = !gone.borrow().iter().any(|removed| removed == path);
+            if exists {
+                *directory.borrow_mut() = Some(path.to_path_buf());
+            }
+            exists
+        };
+        let fallback = || Some(PathBuf::from(r"C:\Program"));
+        // The dialog moves the process into the chosen folder; it comes back to where it was.
+        let chosen = keeping_current_directory(current, set, fallback, || {
+            *directory.borrow_mut() = Some(PathBuf::from(r"E:\Packages"));
+            7
+        });
+        assert_eq!(chosen, 7);
+        assert_eq!(*directory.borrow(), Some(PathBuf::from(r"C:\Start")));
+        // A starting folder that is gone meanwhile gives way to the program's folder.
+        gone.borrow_mut().push(PathBuf::from(r"C:\Start"));
+        keeping_current_directory(current, set, fallback, || {
+            *directory.borrow_mut() = Some(PathBuf::from(r"E:\Packages"));
+        });
+        assert_eq!(*directory.borrow(), Some(PathBuf::from(r"C:\Program")));
+        // So does a current directory that could not be read before the dialog.
+        *directory.borrow_mut() = None;
+        keeping_current_directory(current, set, fallback, || {
+            *directory.borrow_mut() = Some(PathBuf::from(r"E:\Packages"));
+        });
+        assert_eq!(*directory.borrow(), Some(PathBuf::from(r"C:\Program")));
+    }
+
+    #[test]
+    fn a_second_start_restores_only_a_minimized_window() {
+        assert_eq!(show_command_for_focus(true), Some(SW_RESTORE));
+        assert_eq!(show_command_for_focus(false), None);
     }
 
     #[test]

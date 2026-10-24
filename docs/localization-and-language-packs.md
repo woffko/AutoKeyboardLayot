@@ -483,15 +483,22 @@ example). No native execution or physical acceptance was performed.
 
 The input worker now owns one persistent `KeyboardProfileCache`. It polls the
 provider with zero wait, refreshes after one second, and expires cached replies
-after two seconds. Transport replies themselves have a two-second age limit;
+after six seconds. Transport replies themselves have a six-second age limit;
 the cache lifetime starts at receipt, not at the earliest per-layout observation.
-Provider failures clear availability, retries are throttled to 250 ms, and a
-disconnected provider is not replaced with new threads. Hooks do not enumerate,
-activate or resolve layouts. No refresh request is started while an input gate
-is active; freshness checks can still reject an expired snapshot.
+A transient provider failure (an error answer, or a busy, timed-out or expired
+request) keeps the last snapshot until it is too old, and retries are throttled
+to 250 ms; only a disconnected provider clears availability, and it is not
+replaced with new threads. Hooks do not enumerate, activate or resolve layouts.
+No refresh request is started while an input gate is active; freshness checks
+can still reject an expired snapshot. The agent asks for a refresh on every
+250 ms timer tick whatever window is in the foreground: the desktop and File
+Explorer get no periodic field check, but their snapshot would age all the same,
+and the first key after a quiet minute there must not find it expired.
 
-An identical fresh snapshot preserves its generation and buffered word. Changed,
-failed or expired bindings invalidate pending conversion and undo state. A
+An identical fresh snapshot preserves its generation and buffered word, and the
+same bindings coming back after an expiry do not start another generation. Changed
+or expired bindings, and a disconnected provider, invalidate pending conversion
+and undo state; a transient failure alone does not. A
 partially typed word is suppressed until its boundary instead of treating its
 tail as a new word; an initial snapshot with no buffered word does not itself
 suppress the first word. Config reload rebinds the detector to current evidence.
@@ -560,8 +567,12 @@ requirements instead of comparing descriptors to embedded package identities.
 An arbitrary stable pack ID can use an approved exact profile and its scoring
 model. The offline US/Russian transposition table is selected through those exact
 profile bindings, so custom IDs work as both source and target; ET still requires
-native scan-code mapping. Neither a package ID nor a language match selects an
-unrelated keyboard variant.
+native scan-code mapping. While a word is typed, the agent reads every key the
+offline table cannot place in each enabled target layout with that native
+mapping (`Detector::can_extend_word_with_readings`), so `[` typed for the
+Estonian `ü` in the English layout, or the comma key typed for the Russian `б`
+in the Estonian layout, stays inside the word. Neither a package ID nor a
+language match selects an unrelated keyboard variant.
 
 All current bindings explicitly have `ConservativePhysicalKeys` scope. The ET
 binding preserves its physical subset only when the known full requirements are

@@ -70,37 +70,31 @@ impl UserLexicon {
     }
 }
 
+/// `id: word`, the only form: split at a space instead, any first word ("hello world",
+/// "firefox en-US") would be taken for a language and the entry would never match.
 fn parse_entry(line: &str) -> Option<(PackId, &str)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    let (language, word) = if let Some((language, word)) = line.split_once(':') {
-        (language.trim(), word.trim())
-    } else {
-        let mut parts = line.split_whitespace();
-        let language = parts.next()?;
-        let word = parts.next()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        (language, word)
-    };
-    Some((Language::from_id(language)?, word))
+    let (language, word) = line.split_once(':')?;
+    Some((Language::from_id(language.trim())?, word.trim()))
 }
 
+/// The stored form of a word: lowercased, at most 64 characters. The limit applies to the
+/// lowercased form, since some letters (`İ`) lowercase to two characters: a stored word then
+/// normalizes to itself.
 fn normalize_word(word: &str) -> Option<String> {
     let word = word.trim();
-    let character_count = word.chars().count();
-    if character_count == 0
-        || character_count > 64
+    if word.is_empty()
         || word
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
         return None;
     }
-    Some(word.to_lowercase())
+    let stored = word.to_lowercase();
+    (stored.chars().count() <= 64).then_some(stored)
 }
 
 #[cfg(test)]
@@ -108,17 +102,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_colon_tab_and_space_separated_entries() {
+    fn accepts_a_language_a_colon_and_a_word() {
         let lexicon = UserLexicon::from_lines([
             "en-US: RustDesk",
-            "ru\tруддщ",
-            "et-EE klaviatuur",
+            "ru:руддщ",
+            "et-EE :\tklaviatuur",
             "ja-JP: こんにちは",
         ]);
         assert!(lexicon.contains(Language::English, "rustdesk"));
         assert!(lexicon.contains(Language::Russian, "РУДДЩ"));
         assert!(lexicon.contains(Language::Estonian, "klaviatuur"));
         assert!(lexicon.contains(Language::Japanese, "こんにちは"));
+    }
+
+    #[test]
+    fn an_entry_without_the_colon_is_not_read_as_language_and_word() {
+        for line in [
+            "hello world",
+            "firefox en-US",
+            "ru\tруддщ",
+            "et-EE klaviatuur",
+        ] {
+            assert_eq!(UserLexicon::normalize_pack_entry(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_stored_word_normalizes_to_itself_also_when_lowercasing_lengthens_it() {
+        let dotted = |count: usize| "İ".repeat(count);
+        let latin = "a".repeat(60);
+        for (word, stored) in [
+            (dotted(32), true),
+            (dotted(33), false),
+            (dotted(64), false),
+            (format!("{latin}{}", dotted(2)), true),
+            (format!("{latin}{}", dotted(4)), false),
+            (format!("{latin}{}", dotted(5)), false),
+        ] {
+            let normalized = normalize_word(&word);
+            assert_eq!(normalized.is_some(), stored, "{word}");
+            if let Some(normalized) = normalized {
+                assert_eq!(normalized.chars().count(), 64);
+                assert_eq!(normalize_word(&normalized), Some(normalized.clone()));
+                assert!(UserLexicon::format_entry(Language::English, &normalized).is_some());
+            }
+        }
     }
 
     #[test]

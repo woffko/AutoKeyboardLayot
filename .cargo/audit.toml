@@ -1,6 +1,6 @@
 # Policy for `cargo audit --deny warnings` (CI step "Dependency advisories").
 #
-# Exactly four notices are ignored. All four are "unmaintained" advisories for
+# Exactly seven notices are ignored. All seven are "unmaintained" advisories for
 # transitive dependencies of the Slint UI toolkit: none is a vulnerability and
 # none has a patched version to move to. Any other advisory, or a new crate with
 # a notice, fails the check until it has been reviewed.
@@ -19,10 +19,19 @@
 #   RUSTSEC-2026-0206  rustybuzz 0.20.1   Text shaping in resvg/usvg, which
 #                                         Slint uses for SVG; part of the agent.
 #   RUSTSEC-2026-0192  ttf-parser 0.25.1  Font parsing in fontdb/usvg, same path.
+#   RUSTSEC-2026-0370  zvariant 5.15.0    D-Bus types of the Linux accessibility
+#   RUSTSEC-2026-0371  zbus_names 4.3.4   bridge (AT-SPI): accesskit_unix and
+#   RUSTSEC-2026-0372  zvariant_derive    atspi, reached through Slint's winit
+#                      5.15.0             backend (accesskit_winit). Built only
+#                                         for Linux targets, never into the
+#                                         Windows agent. Added 2026-10-24.
 [advisories]
 ignore = [
     "RUSTSEC-2025-0141",
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0206",
     "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]

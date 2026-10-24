@@ -16,9 +16,11 @@ Format (little endian), version 2:
   [hidden x (dim + 5 + 2N)] f32 row-major, hidden bias [hidden] f32, output
   weight [hidden] f32, output bias f32. Feature order: see train.py.
 """
+import hashlib
 import json
 import struct
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -49,6 +51,12 @@ def export(model_path, output):
     blob += hidden_w.astype("<f4").tobytes() + hidden_b.astype("<f4").tobytes()
     blob += out_w.astype("<f4").tobytes() + struct.pack("<f", out_b)
     open(output, "wb").write(bytes(blob))
+    # The training receipt travels with the exported model, with the export's own hash.
+    training = Path(f"{model_path}.json")
+    if training.is_file():
+        receipt = json.loads(training.read_text(encoding="utf-8"))
+        receipt["aklm_sha256"] = hashlib.sha256(bytes(blob)).hexdigest()
+        Path(f"{output}.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
     print(f"{output}: {len(blob)} bytes, layouts {layouts}")
 
 

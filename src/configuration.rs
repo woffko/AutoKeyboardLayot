@@ -1,6 +1,9 @@
 //! Versioned, human-readable configuration shared by the Windows agent and GUI.
 
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use crate::localization::UiLanguagePreference;
 use crate::{BackendRuleError, BackendRules, ExclusionPolicy, Hotkey, Settings, UserLexicon};
@@ -32,6 +35,8 @@ impl PackageMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigurationError {
+    /// The file the error is in when it is not `config.ini`: a file of an older version.
+    pub file: Option<&'static str>,
     pub line: Option<usize>,
     pub message: String,
 }
@@ -39,6 +44,7 @@ pub struct ConfigurationError {
 impl ConfigurationError {
     fn at(line: usize, message: impl Into<String>) -> Self {
         Self {
+            file: None,
             line: Some(line),
             message: message.into(),
         }
@@ -46,18 +52,28 @@ impl ConfigurationError {
 
     fn global(message: impl Into<String>) -> Self {
         Self {
+            file: None,
             line: None,
             message: message.into(),
+        }
+    }
+
+    /// The same error, placed in `file`.
+    fn in_file(self, file: &'static str) -> Self {
+        Self {
+            file: Some(file),
+            ..self
         }
     }
 }
 
 impl fmt::Display for ConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(line) = self.line {
-            write!(formatter, "line {line}: {}", self.message)
-        } else {
-            formatter.write_str(&self.message)
+        match (self.file, self.line) {
+            (Some(file), Some(line)) => write!(formatter, "{file}, line {line}: {}", self.message),
+            (Some(file), None) => write!(formatter, "{file}: {}", self.message),
+            (None, Some(line)) => write!(formatter, "line {line}: {}", self.message),
+            (None, None) => formatter.write_str(&self.message),
         }
     }
 }
@@ -66,11 +82,50 @@ impl std::error::Error for ConfigurationError {}
 
 impl From<BackendRuleError> for ConfigurationError {
     fn from(error: BackendRuleError) -> Self {
-        Self {
-            line: Some(error.line),
-            message: error.message,
+        Self::at(error.line, error.message)
+    }
+}
+
+/// What `ConfigurationDocument::merge` made of a draft and the configuration as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedConfiguration {
+    /// The configuration as it is now with the draft's changes; in a conflict, the draft's value.
+    pub document: ConfigurationDocument,
+    /// What both the draft and the configuration changed since the draft's base, differently:
+    /// setting keys (`force_hotkey` for the hotkey), `ui_language`, `mode`, a profile's pack ID, a
+    /// rule's executable, a part that does not parse back (`settings`, `input_profiles`,
+    /// `backend_rules`), or `user_dictionary, word_exclusions` when an entry would end up in both
+    /// lists (it stays in the draft's).
+    pub conflicts: Vec<String>,
+}
+
+/// One entry of a list as an editor holds it: its stored form and its 1-based line in the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorEntry {
+    pub line: usize,
+    pub entry: String,
+}
+
+fn editor_entries(
+    text: &str,
+    entry: impl Fn(usize, &str) -> Result<String, ConfigurationError>,
+) -> Result<Vec<EditorEntry>, ConfigurationError> {
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let stored = entry(index + 1, line)?;
+        if seen.insert(stored.clone()) {
+            entries.push(EditorEntry {
+                line: index + 1,
+                entry: stored,
+            });
         }
     }
+    Ok(entries)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,17 +151,25 @@ enum Section {
     BackendRules,
 }
 
+/// An editor may save a file with a byte order mark; one at the start is not part of the text.
+fn without_byte_order_mark(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 impl ConfigurationDocument {
     pub fn from_text(text: &str) -> Result<Self, ConfigurationError> {
+        let text = without_byte_order_mark(text);
         let mut schema_version = None;
         let mut section = None;
         let mut settings = String::new();
         let mut settings_lines = Vec::new();
         let mut ui_language = UiLanguagePreference::default();
+        let mut ui_language_seen = false;
         let mut user_dictionary = Vec::new();
         let mut word_exclusions = Vec::new();
         let mut process_exclusions = Vec::new();
         let mut backend_rules = Vec::new();
+        let mut backend_lines = Vec::new();
         let mut backend_section_seen = false;
         let mut profile_section_seen = false;
         let mut input_profiles = Vec::new();
@@ -222,6 +285,10 @@ impl ConfigurationDocument {
                     if let Some((key, value)) = line.split_once('=')
                         && key.trim().eq_ignore_ascii_case("ui_language")
                     {
+                        if ui_language_seen {
+                            return Err(ConfigurationError::at(line_number, "duplicate setting"));
+                        }
+                        ui_language_seen = true;
                         ui_language = UiLanguagePreference::from_config(value);
                     }
                     settings.push_str(line);
@@ -233,7 +300,10 @@ impl ConfigurationDocument {
                 Section::ProcessExclusions => {
                     process_exclusions.push((line_number, line.to_owned()));
                 }
-                Section::BackendRules => backend_rules.push(line.to_owned()),
+                Section::BackendRules => {
+                    backend_rules.push(line.to_owned());
+                    backend_lines.push(line_number);
+                }
             }
         }
 
@@ -277,7 +347,10 @@ impl ConfigurationDocument {
             word_exclusions: canonical_lexicon_entries(word_exclusions)?,
             process_exclusions: canonical_process_entries(process_exclusions)?,
             backend_rules: if backend_section_seen {
-                BackendRules::from_lines(backend_rules.iter().map(String::as_str))?
+                // The rules see only their own rows: the error is moved to the document's line.
+                BackendRules::from_lines(backend_rules.iter().map(String::as_str)).map_err(
+                    |error| ConfigurationError::at(backend_lines[error.line - 1], error.message),
+                )?
             } else {
                 BackendRules::default()
             },
@@ -297,16 +370,24 @@ impl ConfigurationDocument {
             settings,
             input_profiles: Default::default(),
             ui_language: UiLanguagePreference::default(),
-            user_dictionary: canonical_lexicon_entries_lossy(user_dictionary),
-            word_exclusions: canonical_lexicon_entries_lossy(word_exclusions),
-            process_exclusions: canonical_process_entries_lossy(process_exclusions),
+            user_dictionary: canonical_lexicon_entries_lossy(without_byte_order_mark(
+                user_dictionary,
+            )),
+            word_exclusions: canonical_lexicon_entries_lossy(without_byte_order_mark(
+                word_exclusions,
+            )),
+            process_exclusions: canonical_process_entries_lossy(without_byte_order_mark(
+                process_exclusions,
+            )),
             backend_rules: BackendRules::default(),
         };
         let _ = document.canonicalize_and_validate();
         document
     }
 
-    /// Migration input must not silently lose malformed dictionary/exclusion rows.
+    /// Migration input must not silently lose malformed dictionary/exclusion rows. The texts are
+    /// those of `user_dictionary.txt`, `word_exclusions.txt` and `exclusions.txt`; an error in a
+    /// row names its file.
     pub fn try_from_legacy(
         settings: Settings,
         user_dictionary: &str,
@@ -314,7 +395,8 @@ impl ConfigurationDocument {
         process_exclusions: &str,
     ) -> Result<Self, ConfigurationError> {
         fn rows(text: &str) -> Vec<(usize, String)> {
-            text.lines()
+            without_byte_order_mark(text)
+                .lines()
                 .enumerate()
                 .filter_map(|(index, line)| {
                     let line = line.trim();
@@ -328,9 +410,12 @@ impl ConfigurationDocument {
             settings,
             input_profiles: Default::default(),
             ui_language: UiLanguagePreference::default(),
-            user_dictionary: canonical_lexicon_entries(rows(user_dictionary))?,
-            word_exclusions: canonical_lexicon_entries(rows(word_exclusions))?,
-            process_exclusions: canonical_process_entries(rows(process_exclusions))?,
+            user_dictionary: canonical_lexicon_entries(rows(user_dictionary))
+                .map_err(|error| error.in_file("user_dictionary.txt"))?,
+            word_exclusions: canonical_lexicon_entries(rows(word_exclusions))
+                .map_err(|error| error.in_file("word_exclusions.txt"))?,
+            process_exclusions: canonical_process_entries(rows(process_exclusions))
+                .map_err(|error| error.in_file("exclusions.txt"))?,
             backend_rules: BackendRules::default(),
         };
         document.canonicalize_and_validate()?;
@@ -361,7 +446,134 @@ impl ConfigurationDocument {
         );
         output.push_str("[backend_rules]\n");
         output.push_str(&document.backend_rules.to_text());
+        // What is written must read back the same: a line taken as a comment or a section would
+        // drop an entry without a word.
+        if Self::from_text(&output).ok().as_ref() != Some(&document) {
+            return Err(ConfigurationError::global(
+                "the configuration would not read back unchanged; it was not saved",
+            ));
+        }
         Ok(output)
+    }
+
+    /// The dictionary or word-exclusion entries an editor holds: one per line, blank lines and
+    /// `#` comments skipped, each with its 1-based line in the editor, which an error names too.
+    /// A repeated entry keeps its first line.
+    pub fn lexicon_editor_entries(text: &str) -> Result<Vec<EditorEntry>, ConfigurationError> {
+        editor_entries(text, lexicon_entry)
+    }
+
+    /// The program exclusions an editor holds, read like `lexicon_editor_entries`.
+    pub fn process_editor_entries(text: &str) -> Result<Vec<EditorEntry>, ConfigurationError> {
+        editor_entries(text, process_entry)
+    }
+
+    /// Merges a draft (`ours`, made from `base`) into the configuration as it is now (`theirs`):
+    /// what the draft changed since `base` wins, everything else is taken from `theirs`. Settings,
+    /// profiles and rules are merged one by one and the lists entry by entry, so a word the draft
+    /// added and one added meanwhile both stay. A value both changed differently is a conflict;
+    /// the draft's value is kept for it.
+    pub fn merge(base: &Self, ours: &Self, theirs: &Self) -> MergedConfiguration {
+        let mut conflicts = Vec::new();
+        let package_mode = merge_value(
+            "mode",
+            &base.package_mode,
+            &ours.package_mode,
+            &theirs.package_mode,
+            &mut conflicts,
+        );
+        let ui_language = merge_value(
+            "ui_language",
+            &base.ui_language,
+            &ours.ui_language,
+            &theirs.ui_language,
+            &mut conflicts,
+        );
+        let settings_text = settings_text(&merge_map(
+            &settings_values(&base.settings),
+            &settings_values(&ours.settings),
+            &settings_values(&theirs.settings),
+            &mut conflicts,
+        ));
+        let profiles = merge_map(
+            &profile_values(&base.input_profiles),
+            &profile_values(&ours.input_profiles),
+            &profile_values(&theirs.input_profiles),
+            &mut conflicts,
+        );
+        let rules: String = merge_map(
+            &rule_values(&base.backend_rules),
+            &rule_values(&ours.backend_rules),
+            &rule_values(&theirs.backend_rules),
+            &mut conflicts,
+        )
+        .iter()
+        .map(|(pattern, strategy)| format!("{pattern} = {strategy}\n"))
+        .collect();
+        let settings = parsed_or_ours(
+            "settings",
+            Settings::try_from_text(&settings_text),
+            &ours.settings,
+            &mut conflicts,
+        );
+        let input_profiles = parsed_or_ours(
+            "input_profiles",
+            crate::input_profile_selection::InputProfileSelections::parse(profiles.iter()),
+            &ours.input_profiles,
+            &mut conflicts,
+        );
+        let backend_rules = parsed_or_ours(
+            "backend_rules",
+            BackendRules::from_lines(rules.lines()),
+            &ours.backend_rules,
+            &mut conflicts,
+        );
+        let document = Self {
+            package_mode,
+            settings,
+            input_profiles,
+            ui_language,
+            user_dictionary: merge_entries(
+                &base.user_dictionary,
+                &ours.user_dictionary,
+                &theirs.user_dictionary,
+            ),
+            word_exclusions: merge_entries(
+                &base.word_exclusions,
+                &ours.word_exclusions,
+                &theirs.word_exclusions,
+            ),
+            process_exclusions: merge_entries(
+                &base.process_exclusions,
+                &ours.process_exclusions,
+                &theirs.process_exclusions,
+            ),
+            backend_rules,
+        };
+        let mut document = document;
+        let both: Vec<String> = document
+            .word_exclusions
+            .iter()
+            .filter(|entry| document.user_dictionary.contains(entry))
+            .cloned()
+            .collect();
+        if !both.is_empty() {
+            // Still reported for the user to review; the entry stays in the list the draft put
+            // it in, so the window can save what it then shows. Both sides are valid, so only
+            // the draft holding it in one list and the configuration in the other ends here.
+            for entry in &both {
+                if ours.word_exclusions.contains(entry) {
+                    document.user_dictionary.retain(|word| word != entry);
+                } else {
+                    document.word_exclusions.retain(|word| word != entry);
+                }
+            }
+            conflicts.push("user_dictionary, word_exclusions".to_owned());
+        }
+        MergedConfiguration {
+            document,
+            conflicts,
+        }
     }
 
     /// Fresh installer document only; never use this to replace a user's config.
@@ -435,25 +647,161 @@ impl ConfigurationDocument {
     }
 }
 
+/// A part of the merge as parsed back. One that does not parse (more profiles or rules than
+/// allowed once both sides' additions meet) is a conflict that keeps the draft's part, never a
+/// silent choice of it that would drop the other side's changes unseen.
+fn parsed_or_ours<T: Clone, E>(
+    name: &str,
+    parsed: Result<T, E>,
+    ours: &T,
+    conflicts: &mut Vec<String>,
+) -> T {
+    parsed.unwrap_or_else(|_| {
+        conflicts.push(name.to_owned());
+        ours.clone()
+    })
+}
+
+/// A three-way merge of one value: the draft's change wins, otherwise the configuration's.
+fn merge_value<T: PartialEq + Clone>(
+    name: &str,
+    base: &T,
+    ours: &T,
+    theirs: &T,
+    conflicts: &mut Vec<String>,
+) -> T {
+    if ours == base {
+        theirs.clone()
+    } else {
+        if theirs != base && theirs != ours {
+            conflicts.push(name.to_owned());
+        }
+        ours.clone()
+    }
+}
+
+/// A three-way merge of named values, one by one; a missing name is a value too (removed).
+fn merge_map(
+    base: &BTreeMap<String, String>,
+    ours: &BTreeMap<String, String>,
+    theirs: &BTreeMap<String, String>,
+    conflicts: &mut Vec<String>,
+) -> BTreeMap<String, String> {
+    let names: BTreeSet<&String> = base
+        .keys()
+        .chain(ours.keys())
+        .chain(theirs.keys())
+        .collect();
+    let mut merged = BTreeMap::new();
+    for name in names {
+        if let Some(value) = merge_value(
+            name,
+            &base.get(name),
+            &ours.get(name),
+            &theirs.get(name),
+            conflicts,
+        ) {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    merged
+}
+
+/// A three-way merge of a list, entry by entry: an entry both keep stays, one either side added
+/// stays, one either side removed goes.
+fn merge_entries(base: &[String], ours: &[String], theirs: &[String]) -> Vec<String> {
+    let kept = |entry: &&String| !base.contains(entry);
+    ours.iter()
+        .filter(|entry| theirs.contains(entry) || kept(entry))
+        .chain(theirs.iter().filter(kept))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The settings keys of the hotkey: whether it is on, its key and its modifiers. They merge as one
+/// value (`HOTKEY_ENTRY`): a key chosen on one side and modifiers on the other would make a
+/// shortcut neither side chose (Shift+A, which swallows every capital A), and a hotkey both sides
+/// changed is a conflict.
+const HOTKEY_KEYS: [&str; 3] = [
+    "pause_break_undo",
+    "force_hotkey_key",
+    "force_hotkey_modifiers",
+];
+const HOTKEY_ENTRY: &str = "force_hotkey";
+
+fn settings_values(settings: &Settings) -> BTreeMap<String, String> {
+    let mut values: BTreeMap<String, String> = settings
+        .to_text()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    let hotkey: Vec<String> = HOTKEY_KEYS
+        .iter()
+        .map(|key| values.remove(*key).unwrap_or_default())
+        .collect();
+    values.insert(HOTKEY_ENTRY.to_owned(), hotkey.join("\n"));
+    values
+}
+
+/// The settings text of merged `values`, the hotkey back in its keys.
+fn settings_text(values: &BTreeMap<String, String>) -> String {
+    let mut text = String::new();
+    for (key, value) in values {
+        if key == HOTKEY_ENTRY {
+            for (key, value) in HOTKEY_KEYS.iter().zip(value.split('\n')) {
+                text.push_str(&format!("{key}={value}\n"));
+            }
+        } else {
+            text.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    text
+}
+
+fn profile_values(
+    profiles: &crate::input_profile_selection::InputProfileSelections,
+) -> BTreeMap<String, String> {
+    profiles
+        .iter()
+        .map(|(id, profile)| (id.to_string(), profile.to_string()))
+        .collect()
+}
+
+fn rule_values(rules: &BackendRules) -> BTreeMap<String, String> {
+    rules
+        .to_text()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(pattern, strategy)| (pattern.trim().to_owned(), strategy.trim().to_owned()))
+        .collect()
+}
+
 fn canonical_lexicon_entries(
     lines: Vec<(usize, String)>,
 ) -> Result<Vec<String>, ConfigurationError> {
     let mut entries = BTreeSet::new();
     for (line_number, line) in lines {
-        let Some((id, word)) = UserLexicon::normalize_pack_entry(&line) else {
-            return Err(ConfigurationError::at(
-                line_number,
-                "expected a valid language and one word, for example en-US: firefox",
-            ));
-        };
-        entries.insert(
-            UserLexicon::format_pack_entry(&id, &word)
-                .expect("normalized word")
-                .trim_end()
-                .to_owned(),
-        );
+        entries.insert(lexicon_entry(line_number, &line)?);
     }
     Ok(entries.into_iter().collect())
+}
+
+/// The stored form of one dictionary or word-exclusion row.
+fn lexicon_entry(line_number: usize, line: &str) -> Result<String, ConfigurationError> {
+    UserLexicon::normalize_pack_entry(line)
+        .and_then(|(id, word)| UserLexicon::format_pack_entry(&id, &word))
+        .map(|entry| entry.trim_end().to_owned())
+        .ok_or_else(|| {
+            ConfigurationError::at(
+                line_number,
+                "expected a language, a colon and one word, for example en-US: firefox",
+            )
+        })
 }
 
 fn canonical_process_entries(
@@ -461,15 +809,32 @@ fn canonical_process_entries(
 ) -> Result<Vec<String>, ConfigurationError> {
     let mut entries = BTreeSet::new();
     for (line_number, line) in lines {
-        let Some(name) = ExclusionPolicy::normalize_entry(&line) else {
-            return Err(ConfigurationError::at(
-                line_number,
-                "expected one executable name or path",
-            ));
-        };
-        entries.insert(name);
+        entries.insert(process_entry(line_number, &line)?);
     }
     Ok(entries.into_iter().collect())
+}
+
+/// The stored form of one program-exclusion row.
+fn process_entry(line_number: usize, line: &str) -> Result<String, ConfigurationError> {
+    let Some(name) = ExclusionPolicy::normalize_entry(line) else {
+        return Err(ConfigurationError::at(
+            line_number,
+            "expected one executable name or path",
+        ));
+    };
+    if !process_name_reads_back(&name) {
+        return Err(ConfigurationError::at(
+            line_number,
+            "a program name cannot start with # or be in square brackets",
+        ));
+    }
+    Ok(name)
+}
+
+/// Whether a program name, written on a line of its own, reads back as that name: a line that
+/// starts with `#` is a comment, and one in square brackets starts a section.
+fn process_name_reads_back(name: &str) -> bool {
+    !name.starts_with('#') && !(name.starts_with('[') && name.ends_with(']'))
 }
 
 fn canonical_lexicon_entries_lossy(text: &str) -> Vec<String> {
@@ -479,12 +844,8 @@ fn canonical_lexicon_entries_lossy(text: &str) -> Vec<String> {
             !line.is_empty() && !line.starts_with('#')
         })
         .filter_map(UserLexicon::normalize_pack_entry)
-        .map(|(id, word)| {
-            UserLexicon::format_pack_entry(&id, &word)
-                .expect("normalized word")
-                .trim_end()
-                .to_owned()
-        })
+        .filter_map(|(id, word)| UserLexicon::format_pack_entry(&id, &word))
+        .map(|entry| entry.trim_end().to_owned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -497,6 +858,7 @@ fn canonical_process_entries_lossy(text: &str) -> Vec<String> {
             !line.is_empty() && !line.starts_with('#')
         })
         .filter_map(ExclusionPolicy::normalize_entry)
+        .filter(|name| process_name_reads_back(name))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -516,7 +878,7 @@ fn append_section(output: &mut String, name: &str, entries: &[String]) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn package_mode_roundtrips_and_fresh_managed_base_does_not_enable_conversion() {
+    fn package_mode_roundtrips_and_a_fresh_managed_base_converts_automatically() {
         use super::{ConfigurationDocument, PackageMode};
         let document = ConfigurationDocument::english_only_managed();
         let serialized = document.to_text().unwrap();
@@ -798,6 +1160,398 @@ mod tests {
             .into_iter()
             .collect();
         assert!(one_language.to_text().is_ok());
+    }
+
+    #[test]
+    fn a_word_that_lowercasing_lengthens_past_the_limit_is_a_line_error_not_a_panic() {
+        let latin = "a".repeat(60);
+        for word in ["İ".repeat(64), format!("{latin}{}", "İ".repeat(4))] {
+            for section in ["user_dictionary", "word_exclusions"] {
+                let text = format!(
+                    "schema_version=4\n[packages]\nmode=legacy\n[{section}]\nen-US: {word}\n"
+                );
+                assert_eq!(
+                    ConfigurationDocument::from_text(&text).unwrap_err().line,
+                    Some(5)
+                );
+            }
+            let row = format!("en-US: {word}\n");
+            assert!(
+                ConfigurationDocument::try_from_legacy(Settings::default(), &row, "", "").is_err()
+            );
+            let lossy = ConfigurationDocument::from_legacy(Settings::default(), &row, &row, "");
+            assert!(lossy.user_dictionary.is_empty() && lossy.word_exclusions.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_byte_order_mark_at_the_start_of_a_file_is_ignored() {
+        let document = ConfigurationDocument {
+            user_dictionary: vec!["en-US: firefox".to_owned()],
+            process_exclusions: vec!["private.exe".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        let text = document.to_text().unwrap();
+        assert_eq!(
+            ConfigurationDocument::from_text(&format!("\u{feff}{text}")).unwrap(),
+            document
+        );
+        // Only one: a second one is text on the first line.
+        assert_eq!(
+            ConfigurationDocument::from_text(&format!("\u{feff}\u{feff}{text}"))
+                .unwrap_err()
+                .line,
+            Some(1)
+        );
+        let legacy = ConfigurationDocument::try_from_legacy(
+            Settings::default(),
+            "\u{feff}en-US: firefox\n",
+            "\u{feff}ru-RU: руддщ\n",
+            "\u{feff}private.exe\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.user_dictionary, ["en-US: firefox"]);
+        assert_eq!(legacy.word_exclusions, ["ru-RU: руддщ"]);
+        assert_eq!(legacy.process_exclusions, ["private.exe"]);
+        let lossy = ConfigurationDocument::from_legacy(
+            Settings::default(),
+            "\u{feff}en-US: firefox\n",
+            "",
+            "\u{feff}private.exe\n",
+        );
+        assert_eq!(lossy.user_dictionary, ["en-US: firefox"]);
+        assert_eq!(lossy.process_exclusions, ["private.exe"]);
+    }
+
+    #[test]
+    fn a_setting_given_twice_is_an_error_at_its_document_line() {
+        let head = "schema_version=4\n[packages]\nmode=legacy\n[settings]\n";
+        for (body, line) in [
+            ("layout_model=true\n\nlayout_model=false\n", 7),
+            (
+                "layout_model=true\n[user_dictionary]\n[settings]\nlayout_model=false\n",
+                8,
+            ),
+            ("ui_language=ru\nui_language=et\n", 6),
+        ] {
+            let error = ConfigurationDocument::from_text(&format!("{head}{body}")).unwrap_err();
+            assert_eq!(error.line, Some(line), "{body}");
+            assert_eq!(error.message, "duplicate setting");
+        }
+    }
+
+    #[test]
+    fn a_program_name_that_would_read_as_a_comment_or_a_section_is_refused() {
+        for name in [
+            "C:\\Tools\\#vault.exe",
+            "#vault.exe",
+            "[settings]",
+            "D:\\[x]",
+        ] {
+            let document = ConfigurationDocument {
+                process_exclusions: vec![name.to_owned()],
+                ..ConfigurationDocument::default()
+            };
+            assert!(document.to_text().is_err(), "{name}");
+            let text = format!(
+                "schema_version=4\n[packages]\nmode=legacy\n[process_exclusions]\n\"{name}\"\n"
+            );
+            assert_eq!(
+                ConfigurationDocument::from_text(&text).unwrap_err().line,
+                Some(5),
+                "{name}"
+            );
+            assert!(
+                ConfigurationDocument::from_legacy(Settings::default(), "", "", name)
+                    .process_exclusions
+                    .is_empty()
+            );
+        }
+        // Brackets or # inside a name read back as they are.
+        for name in ["[x].exe", "a#b.exe"] {
+            let document = ConfigurationDocument {
+                process_exclusions: vec![name.to_owned()],
+                ..ConfigurationDocument::default()
+            };
+            let text = document.to_text().unwrap();
+            assert_eq!(
+                ConfigurationDocument::from_text(&text)
+                    .unwrap()
+                    .process_exclusions,
+                [name]
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_that_would_not_read_back_unchanged_is_not_written() {
+        // A line break inside a name would read back as two names: such a name is refused before
+        // anything is written, and the read-back check stays behind that.
+        let document = ConfigurationDocument {
+            process_exclusions: vec!["evil\nname.exe".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        assert_eq!(
+            document.to_text().unwrap_err().message,
+            "expected one executable name or path"
+        );
+    }
+
+    #[test]
+    fn a_bad_backend_rule_is_reported_at_its_document_line() {
+        let text = "schema_version=4\n[packages]\nmode=legacy\n[backend_rules]\n# note\nnotepad.exe = protected-paste\n\nfirefox.exe = magic\n";
+        let error = ConfigurationDocument::from_text(text).unwrap_err();
+        assert_eq!(error.line, Some(8));
+        assert!(error.message.starts_with("unknown backend"));
+    }
+
+    #[test]
+    fn a_dictionary_row_without_the_colon_is_an_error_at_its_line() {
+        for row in ["hello world", "firefox en-US", "ru-RU привет"] {
+            let text = format!(
+                "schema_version=4\n[packages]\nmode=legacy\n[user_dictionary]\nen-US: firefox\n{row}\n"
+            );
+            assert_eq!(
+                ConfigurationDocument::from_text(&text).unwrap_err().line,
+                Some(6),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_editor_list_names_the_editor_line_of_a_bad_entry() {
+        let dictionary = "# my words\nen-US: Firefox\n\nen-US: two words\n";
+        let error = ConfigurationDocument::lexicon_editor_entries(dictionary).unwrap_err();
+        assert_eq!(error.line, Some(4));
+        let entries = ConfigurationDocument::lexicon_editor_entries(
+            "\nru-RU: Привет\nen-US: x\nru-RU: привет\n",
+        )
+        .unwrap();
+        assert_eq!(
+            entries,
+            [
+                EditorEntry {
+                    line: 2,
+                    entry: "ru-RU: привет".to_owned()
+                },
+                EditorEntry {
+                    line: 3,
+                    entry: "en-US: x".to_owned()
+                },
+            ]
+        );
+        let error = ConfigurationDocument::process_editor_entries(
+            "private.exe\n\n#a comment\n\"#vault.exe\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.line, Some(4));
+        assert_eq!(
+            ConfigurationDocument::process_editor_entries("C:\\Apps\\Vault.exe\n").unwrap()[0]
+                .entry,
+            "vault.exe"
+        );
+    }
+
+    impl ConfigurationDocument {
+        /// The document as it is stored: lists sorted and normalized.
+        fn canonical(mut self) -> Self {
+            self.canonicalize_and_validate().unwrap();
+            self
+        }
+    }
+
+    #[test]
+    fn a_draft_merges_into_a_configuration_changed_meanwhile() {
+        // The owner's case: a word added from the tray while the window was open, a box
+        // unticked and a word typed in the window.
+        let base = ConfigurationDocument {
+            user_dictionary: vec!["en-US: old".to_owned(), "en-US: gone".to_owned()],
+            process_exclusions: vec!["private.exe".to_owned()],
+            ..ConfigurationDocument::default()
+        }
+        .canonical();
+        let mut theirs = base.clone();
+        theirs.user_dictionary.push("en-US: firefox".to_owned());
+        theirs
+            .user_dictionary
+            .retain(|entry| entry != "en-US: gone");
+        theirs.settings.layout_model = !base.settings.layout_model;
+        let mut ours = base.clone();
+        ours.settings.suppress_after_manual_layout_change =
+            !base.settings.suppress_after_manual_layout_change;
+        ours.user_dictionary.push("ru-RU: привет".to_owned());
+        ours.process_exclusions.clear();
+        let merged = ConfigurationDocument::merge(&base, &ours.canonical(), &theirs.canonical());
+        assert!(merged.conflicts.is_empty(), "{:?}", merged.conflicts);
+        let document = merged.document;
+        assert_eq!(
+            document.settings.suppress_after_manual_layout_change,
+            !base.settings.suppress_after_manual_layout_change
+        );
+        assert_eq!(document.settings.layout_model, !base.settings.layout_model);
+        assert_eq!(
+            document.user_dictionary,
+            ["en-US: firefox", "en-US: old", "ru-RU: привет"]
+        );
+        assert!(document.process_exclusions.is_empty());
+        assert!(document.to_text().is_ok());
+    }
+
+    #[test]
+    fn a_value_both_sides_changed_differently_is_a_conflict_that_keeps_the_draft() {
+        let base = ConfigurationDocument::default();
+        let mut theirs = base.clone();
+        theirs.ui_language = UiLanguagePreference::from_config("et");
+        theirs.settings.layout_model = !base.settings.layout_model;
+        theirs.backend_rules = BackendRules::from_lines(["notepad.exe = observe-only"]).unwrap();
+        let mut ours = base.clone();
+        ours.ui_language = UiLanguagePreference::from_config("ru");
+        ours.settings.layout_model = !base.settings.layout_model;
+        ours.backend_rules = BackendRules::from_lines(["notepad.exe = physical-replay"]).unwrap();
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        // The same new value on both sides agrees; the rule for notepad.exe and the interface
+        // language do not. The catch-all rule, unchanged by the draft, is theirs.
+        assert_eq!(merged.conflicts, ["ui_language", "notepad.exe"]);
+        assert_eq!(merged.document.ui_language.as_config(), "ru");
+        assert_eq!(
+            merged.document.settings.layout_model,
+            !base.settings.layout_model
+        );
+        assert_eq!(
+            merged.document.backend_rules.resolve("notepad.exe"),
+            BackendStrategy::PhysicalReplay
+        );
+        // An entry that ends up in both lists.
+        let mut theirs = base.clone();
+        theirs.word_exclusions.push("en-US: firefox".to_owned());
+        let mut ours = base.clone();
+        ours.user_dictionary.push("en-US: firefox".to_owned());
+        assert_eq!(
+            ConfigurationDocument::merge(&base, &ours, &theirs).conflicts,
+            ["user_dictionary, word_exclusions"]
+        );
+    }
+
+    #[test]
+    fn an_entry_both_sides_put_in_different_lists_stays_where_the_draft_put_it() {
+        let base = ConfigurationDocument::default();
+        let entry = "en-US: firefox".to_owned();
+        for draft_in_dictionary in [true, false] {
+            let (mut ours, mut theirs) = (base.clone(), base.clone());
+            if draft_in_dictionary {
+                ours.user_dictionary.push(entry.clone());
+                theirs.word_exclusions.push(entry.clone());
+            } else {
+                ours.word_exclusions.push(entry.clone());
+                theirs.user_dictionary.push(entry.clone());
+            }
+            let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+            // Still reported, so the user reviews it; the window can save what it shows.
+            assert_eq!(merged.conflicts, ["user_dictionary, word_exclusions"]);
+            let mut document = merged.document;
+            assert_eq!(
+                document.user_dictionary.contains(&entry),
+                draft_in_dictionary
+            );
+            assert_eq!(
+                document.word_exclusions.contains(&entry),
+                !draft_in_dictionary
+            );
+            assert!(document.canonicalize_and_validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_hotkey_changed_on_both_sides_is_one_conflict_never_a_splice() {
+        use crate::hotkey::{HOTKEY_MOD_CONTROL, HOTKEY_MOD_SHIFT};
+        let mut base = ConfigurationDocument::default();
+        base.settings.force_hotkey_virtual_key = 0x7b;
+        base.settings.force_hotkey_modifiers = HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT;
+        // Ctrl+Shift+A in the window, Shift+F12 outside: never Shift+A.
+        let mut ours = base.clone();
+        ours.settings.force_hotkey_virtual_key = 0x41;
+        let mut theirs = base.clone();
+        theirs.settings.force_hotkey_modifiers = HOTKEY_MOD_SHIFT;
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, ["force_hotkey"]);
+        assert_eq!(
+            merged.document.settings.force_hotkey(),
+            Hotkey::new(0x41, HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT).unwrap()
+        );
+        // Switched off outside while another key is chosen in the window: the same one setting.
+        let mut theirs = base.clone();
+        theirs.settings.pause_break_undo = false;
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, ["force_hotkey"]);
+        assert!(merged.document.settings.pause_break_undo);
+        // Changed on one side only, it merges as before.
+        let merged = ConfigurationDocument::merge(&base, &ours, &base);
+        assert!(merged.conflicts.is_empty());
+        assert_eq!(merged.document.settings.force_hotkey_virtual_key, 0x41);
+        let merged = ConfigurationDocument::merge(&base, &base, &theirs);
+        assert!(merged.conflicts.is_empty());
+        assert!(!merged.document.settings.pause_break_undo);
+    }
+
+    #[test]
+    fn a_merge_that_does_not_parse_back_is_a_conflict_never_a_silent_choice() {
+        // More input profiles than allowed once both sides' additions meet.
+        let profiles = |range: std::ops::Range<usize>| {
+            crate::input_profile_selection::InputProfileSelections::parse(
+                range.map(|index| (format!("custom-{index}"), "0409:00000409")),
+            )
+            .unwrap()
+        };
+        let base = ConfigurationDocument::default();
+        let mut ours = base.clone();
+        ours.input_profiles = profiles(0..40);
+        let mut theirs = base.clone();
+        theirs.input_profiles = profiles(40..80);
+        let merged = ConfigurationDocument::merge(&base, &ours, &theirs);
+        assert_eq!(merged.conflicts, ["input_profiles"]);
+        assert_eq!(merged.document.input_profiles, ours.input_profiles);
+        // Any part: the settings and the backend rules the same way.
+        let mut conflicts = Vec::new();
+        assert_eq!(
+            parsed_or_ours("settings", Err::<u8, ()>(()), &5, &mut conflicts),
+            5
+        );
+        assert_eq!(
+            parsed_or_ours("settings", Ok::<u8, ()>(7), &5, &mut conflicts),
+            7
+        );
+        assert_eq!(conflicts, ["settings"]);
+    }
+
+    #[test]
+    fn a_program_exclusion_windows_could_not_name_is_refused_at_its_line() {
+        let error =
+            ConfigurationDocument::process_editor_entries("vault.exe\n\nva|ult.exe\n").unwrap_err();
+        assert_eq!(error.line, Some(3));
+        // A quoted name with spaces inside its quotes is stored without them and reads back.
+        let entries = ConfigurationDocument::process_editor_entries("\" Vault.exe \"\n").unwrap();
+        assert_eq!(entries[0].entry, "vault.exe");
+        let mut document = ConfigurationDocument {
+            process_exclusions: vec!["\" Vault.exe \"".to_owned()],
+            ..ConfigurationDocument::default()
+        };
+        document.canonicalize_and_validate().unwrap();
+        assert!(document.to_text().is_ok());
+    }
+
+    #[test]
+    fn a_configuration_whose_hotkey_types_text_still_loads_and_saves() {
+        let text = "schema_version=4\n[packages]\nmode=legacy\n[settings]\nforce_hotkey_key=E\nforce_hotkey_modifiers=Ctrl+Alt\n[process_exclusions]\nprivate.exe\n";
+        let document = ConfigurationDocument::from_text(text).unwrap();
+        assert!(!document.settings.pause_break_undo);
+        assert_eq!(
+            document.settings.refused_force_hotkey.chord(),
+            Some("Ctrl+Alt+E")
+        );
+        assert_eq!(document.process_exclusions, ["private.exe"]);
+        let saved = document.to_text().unwrap();
+        assert_eq!(ConfigurationDocument::from_text(&saved).unwrap(), document);
     }
 
     #[test]

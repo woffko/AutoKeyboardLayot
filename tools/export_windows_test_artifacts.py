@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import release_rustflags
+
 root = Path(__file__).resolve().parents[1]
 output = Path(sys.argv[1])
 if output.exists():
@@ -14,7 +16,9 @@ sources = {str(root / 'src/lib.rs'): 'core', str(root / 'src/main.rs'): 'adapter
 command = ['cargo', 'xwin', 'test', '--release', '--locked', '--offline', '--no-default-features',
            '--target', 'x86_64-pc-windows-msvc', '--target-dir', 'target/xwin-hotkeys', '--jobs', '2',
            '--no-run', '--message-format=json']
-result = subprocess.run(command, cwd=root, stdout=subprocess.PIPE, timeout=1200, check=True)
+# The same flags as the release executables, so that the tested binaries match them.
+result = subprocess.run(command, cwd=root, stdout=subprocess.PIPE, timeout=1200, check=True,
+                        env=release_rustflags.cargo_env(root))
 artifacts = {}
 compiled_packages = set()
 for line in result.stdout.splitlines():

@@ -1,8 +1,23 @@
 # Export the character produced by each physical key (scan code) for every
 # keyboard layout loaded in the current Windows session. Read-only: it never
 # loads, activates or unloads layouts. Dead keys are marked, not resolved.
+# Each layout carries its KLID, which tells layouts of one language apart
+# (US 00000409 and US-International 00020409 are both LANGID 0409).
 param([Parameter(Mandatory = $true)][string]$Output)
 $ErrorActionPreference = 'Stop'
+$layoutKeys = 'HKLM:\SYSTEM\CurrentControlSet\Control\Keyboard Layouts'
+# The KLID of an HKL: a high word below 0xF000 is the KLID's own number; 0xFnnn names the
+# "Layout Id" nnn of a variant, found in the registry.
+function Get-Klid([int64]$Hkl) {
+    $device = ($Hkl -shr 16) -band 0xffff
+    if (($device -band 0xf000) -ne 0xf000) { return ('{0:X8}' -f $device) }
+    $layoutId = '{0:x4}' -f ($device -band 0x0fff)
+    foreach ($key in Get-ChildItem -LiteralPath $layoutKeys) {
+        $id = (Get-ItemProperty -LiteralPath $key.PSPath -Name 'Layout Id' -ErrorAction SilentlyContinue).'Layout Id'
+        if ($id -and $id.ToLowerInvariant() -eq $layoutId) { return $key.PSChildName.ToUpperInvariant() }
+    }
+    throw ('No KLID has Layout Id ' + $layoutId + ' (HKL 0x{0:x})' -f $Hkl)
+}
 Add-Type @'
 using System;
 using System.Text;
@@ -48,6 +63,7 @@ foreach ($hkl in [LayoutExport]::Layouts()) {
     }
     $result.layouts += [ordered]@{
         hkl = ('0x{0:x}' -f $value)
+        klid = (Get-Klid $value)
         language_id = ('{0:x4}' -f ($value -band 0xffff))
         keys = $keys
     }

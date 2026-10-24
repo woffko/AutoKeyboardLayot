@@ -3,6 +3,12 @@
   "revision": "1ae7bf81dc0d2013235dfe4bb0b6f4e4a0b6b25c",
   "reference_version": "6.7.3",
   "normalization": "UTF-8 text with LF line endings; upstream comments retained",
+  "license": {
+    "name": "Inno Setup License",
+    "upstream_path": "license.txt",
+    "upstream_sha256": "2e5346868c2a18434489824e11d65c3031620f792fefc415d05f19cd441abf5c",
+    "note": "The license of the upstream repository at this revision. The message files name their translators but state no license of their own. The installed Inno Setup 6.7.3 compiler ships the same license.txt."
+  },
   "files": [
     {
       "file": "ChineseSimplified.isl",

@@ -67,6 +67,14 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(hook.SigningConfigurationError):
             hook.configuration(self.env(**{hook.TOOL: str(self.tool.parent / 'other.exe')}))
 
+    def test_a_signtool_name_without_a_file_is_refused(self):
+        # The name is right in both, so only the check for an existing file can refuse them.
+        folder = self.tool.parent / 'kit' / 'signtool.exe'
+        folder.mkdir(parents=True)
+        for value in (str(self.tool.parent / 'missing' / 'signtool.exe'), str(folder)):
+            with self.assertRaises(hook.SigningConfigurationError, msg=value):
+                hook.configuration(self.env(**{hook.TOOL: value}))
+
 
 class CommandTests(unittest.TestCase):
     def setUp(self):

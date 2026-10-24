@@ -1,5 +1,6 @@
 """Offline tests: no real requests, source installation or external writes."""
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -21,7 +22,35 @@ class Response(io.BytesIO):
         return self.url
 
 
+def reviewed(payload):
+    """REVIEWED as if every file had been reviewed with the content `payload`."""
+    digest = hashlib.sha256(payload).hexdigest()
+    return {source: {name: digest for name in files} for source, (_, _, files) in fetcher.SOURCES.items()}
+
+
 class FetchTests(unittest.TestCase):
+    def test_every_allowlisted_file_has_a_reviewed_hash(self):
+        for source, (_, _, files) in fetcher.SOURCES.items():
+            with self.subTest(source=source):
+                self.assertEqual(set(fetcher.REVIEWED[source]), set(files))
+                for digest in fetcher.REVIEWED[source].values():
+                    self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_a_file_that_differs_from_the_reviewed_one_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "new"
+
+            def request(req, timeout):
+                return Response(req.full_url, b"changed upstream")
+
+            with patch.object(fetcher.urllib.request, "build_opener") as opener, \
+                    patch.dict(fetcher.REVIEWED, reviewed(b"fixture")):
+                opener.return_value.open.side_effect = request
+                with self.assertRaisesRegex(ValueError, "differs from the reviewed file"):
+                    fetcher.fetch(destination)
+            self.assertFalse((destination / "FETCH-COMPLETE.json").exists())
+            self.assertEqual(list(destination.iterdir()), [])
+
     def test_both_fixed_allowlists_complete_and_refuse_overwrite(self):
         for source in fetcher.SOURCES:
             with self.subTest(source=source), tempfile.TemporaryDirectory() as temp:
@@ -33,7 +62,8 @@ class FetchTests(unittest.TestCase):
                     self.assertEqual(timeout, 25)
                     return Response(req.full_url, b"fixture")
 
-                with patch.object(fetcher.urllib.request, "build_opener") as opener:
+                with patch.object(fetcher.urllib.request, "build_opener") as opener, \
+                        patch.dict(fetcher.REVIEWED, reviewed(b"fixture")):
                     opener.return_value.open.side_effect = request
                     with contextlib.redirect_stdout(io.StringIO()):
                         fetcher.fetch(destination, source)

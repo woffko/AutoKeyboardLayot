@@ -8,12 +8,19 @@ use autokeyboardlayot::{
     package_install::{InstallError, PreparedCatalog, PreparedOnlineInstall},
     package_inventory::PackageInventory,
     package_store::{
-        PackageStore, PreparedImport, PreparedRollback, PreparedStoreInitialization, StoreSnapshot,
+        PackageStore, PreparedImport, PreparedRollback, PreparedStoreInitialization, StoreError,
+        StoreSnapshot,
     },
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
 mod online;
+
+/// Holds the listing of the installed packages back this many milliseconds, so that the desktop
+/// acceptance acts while the refresh at opening still runs, as on a slow disk.
+#[cfg(test)]
+pub(super) static LISTING_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Coarse, path-free reason codes for a failed local package operation, so the
 /// status line can name the failing stage instead of a generic message.
@@ -27,12 +34,25 @@ enum ImportFailure {
     Prepare,
     /// The chosen file is not a valid package.
     File,
+    /// The chosen file cannot be read.
+    Unreadable,
+    /// A newer revision of the package is or was installed.
+    Older,
+    /// The inventory holds the revision with other content, or the same components in another
+    /// package.
+    Conflict,
+    /// No more optional packages fit.
+    Capacity,
+    /// The English base is built in.
+    ProtectedBase,
     /// The settings changed outside this window; migration was aborted.
     Migration,
     /// The catalog state is gone or the selection is invalid.
     Catalog,
     /// A write may have happened; never advertise a safe automatic retry.
     OutcomeUnknown,
+    /// The store refused before the new state could become visible: nothing was installed.
+    NotInstalled,
     /// The worker could not be started (no work was submitted).
     Thread,
 }
@@ -44,9 +64,15 @@ impl ImportFailure {
             Self::Snapshot => "import.failure.snapshot",
             Self::Prepare => "import.failure.prepare",
             Self::File => "import.failure.file",
+            Self::Unreadable => "import.failure.unreadable",
+            Self::Older => "import.failure.older",
+            Self::Conflict => "import.failure.conflict",
+            Self::Capacity => "import.failure.capacity",
+            Self::ProtectedBase => "import.failure.protected",
             Self::Migration => "import.failure.migration",
             Self::Catalog => "import.failure.catalog",
             Self::OutcomeUnknown => "package.uncertain",
+            Self::NotInstalled => "package.not_installed",
             Self::Thread => "import.failure.thread",
         }
     }
@@ -76,6 +102,56 @@ impl OnlineFailure {
             Self::CatalogExpired => tr("download.catalog_expired"),
             Self::Code(code) => tr_format("download.failed", &[("code", code)]),
         }
+    }
+}
+
+/// Why a chosen package file cannot be installed: a file that fails verification is no valid
+/// package, and a refusal of the inventory says what it refuses.
+fn import_failure(error: &StoreError) -> ImportFailure {
+    use autokeyboardlayot::package_inventory::InventoryError;
+    match error {
+        StoreError::Io(_) => ImportFailure::Unreadable,
+        StoreError::Busy | StoreError::StaleSnapshot => ImportFailure::Snapshot,
+        StoreError::Inventory(InventoryError::Rollback) => ImportFailure::Older,
+        StoreError::Inventory(
+            InventoryError::RevisionConflict
+            | InventoryError::OwnershipConflict
+            | InventoryError::DuplicatePackage,
+        ) => ImportFailure::Conflict,
+        StoreError::Inventory(InventoryError::TooLarge) => ImportFailure::Capacity,
+        StoreError::Inventory(InventoryError::ProtectedBase) => ImportFailure::ProtectedBase,
+        StoreError::Inventory(_) => ImportFailure::Prepare,
+        _ => ImportFailure::File,
+    }
+}
+
+/// Prepares the installation of the package file at `path` into `store`.
+fn prepare_import(store: &PackageStore, path: &Path) -> Result<Completed, ImportFailure> {
+    let trust = PackageTrust::release().map_err(|_| ImportFailure::Prepare)?;
+    let snapshot = store.load(&trust).map_err(|_| ImportFailure::Snapshot)?;
+    PreparedImport::from_file(path, &snapshot, &trust)
+        .map(|prepared| Completed::Prepared(Box::new(prepared)))
+        .map_err(|error| import_failure(&error))
+}
+
+/// What the store's answer to a confirmation means for the window.
+enum Confirmation {
+    /// The change is in the store.
+    Done(Box<StoreSnapshot>),
+    /// The change may already be visible: reread the store, never confirm again.
+    Uncertain,
+    /// The store refused before the new state could become visible: nothing was installed, and
+    /// the change can be prepared again.
+    NotInstalled,
+}
+
+/// Only `CommitUncertain` comes after the store may have published the new state; every other
+/// error of a confirmation came before it.
+fn confirmation(result: Result<StoreSnapshot, StoreError>) -> Confirmation {
+    match result {
+        Ok(snapshot) => Confirmation::Done(Box::new(snapshot)),
+        Err(StoreError::CommitUncertain) => Confirmation::Uncertain,
+        Err(_) => Confirmation::NotInstalled,
     }
 }
 
@@ -201,6 +277,13 @@ fn unchanged_draft(ui: &SettingsWindow, original: &ConfigurationDocument) -> boo
     document_from_ui(ui, original.clone()).is_ok_and(|draft| &draft == original)
 }
 
+/// Whether a package tool (Refresh, Choose package, Review removal, Roll back) may start: in a
+/// managed profile, with no package work running and no prepared change waiting for its
+/// confirmation, which starting another would discard.
+fn tool_may_start(allowed: bool, busy: bool, running: bool, prepared: bool) -> bool {
+    allowed && !busy && !running && !prepared
+}
+
 fn start(
     ui: &SettingsWindow,
     state: &mut State,
@@ -215,6 +298,7 @@ fn start(
         Ok(_) => {
             state.receiver = Some(receive);
             ui.set_package_import_busy(true);
+            ui.set_package_import_read_only(false);
         }
         Err(_) => failure(ui, ImportFailure::Thread),
     }
@@ -281,11 +365,12 @@ pub(super) fn wire(
             return;
         };
         let mut state = rollback_state.borrow_mut();
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || state.receiver.is_some()
-            || state.pending.is_some()
-        {
+        if !tool_may_start(
+            ui.get_package_import_allowed(),
+            ui.get_package_import_busy(),
+            state.receiver.is_some(),
+            state.pending.is_some(),
+        ) {
             return;
         }
         let Some(id) = usize::try_from(ui.get_installed_package_index())
@@ -340,7 +425,7 @@ pub(super) fn wire(
             .collect();
         hotkey_capture::stop();
         ui.set_package_import_busy(true);
-        let paths = choose_files(true);
+        let paths = choose_files(true, own_settings_window());
         ui.set_package_import_busy(false);
         let Some(paths) = paths else {
             return;
@@ -403,21 +488,29 @@ pub(super) fn wire(
             return;
         };
         let mut state = list_state.borrow_mut();
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || state.receiver.is_some()
-        {
+        if !tool_may_start(
+            ui.get_package_import_allowed(),
+            ui.get_package_import_busy(),
+            state.receiver.is_some(),
+            state.pending.is_some(),
+        ) {
             return;
         }
         state.pending = None;
         ui.set_package_import_ready(false);
         ui.set_package_import_preview(SharedString::default());
         start(&ui, &mut state, || {
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(
+                LISTING_DELAY_MS.load(Ordering::Relaxed),
+            ));
             let snapshot = store()?
                 .load(&PackageTrust::release().map_err(|_| ImportFailure::Snapshot)?)
                 .map_err(|_| ImportFailure::Snapshot)?;
             Ok(Completed::Listing(listing(&snapshot)))
         });
+        // Only reading the installed packages, it does not hold the window open.
+        ui.set_package_import_read_only(true);
     });
 
     let weak = ui.as_weak();
@@ -427,10 +520,12 @@ pub(super) fn wire(
             return;
         };
         let mut state = remove_state.borrow_mut();
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || state.receiver.is_some()
-        {
+        if !tool_may_start(
+            ui.get_package_import_allowed(),
+            ui.get_package_import_busy(),
+            state.receiver.is_some(),
+            state.pending.is_some(),
+        ) {
             return;
         }
         let Some(id) = usize::try_from(ui.get_installed_package_index())
@@ -470,17 +565,23 @@ pub(super) fn wire(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        if !ui.get_package_import_allowed()
-            || ui.get_package_import_busy()
-            || inspect_state.borrow().receiver.is_some()
-        {
+        let blocked = {
+            let state = inspect_state.borrow();
+            !tool_may_start(
+                ui.get_package_import_allowed(),
+                ui.get_package_import_busy(),
+                state.receiver.is_some(),
+                state.pending.is_some(),
+            )
+        };
+        if blocked {
             return;
         }
         hotkey_capture::stop();
         // The native dialog pumps messages. Guard all import callbacks while
         // it is open, even though no worker receiver exists yet.
         ui.set_package_import_busy(true);
-        let path = choose_file();
+        let path = choose_file(own_settings_window());
         ui.set_package_import_busy(false);
         let Some(path) = path else {
             return;
@@ -489,14 +590,7 @@ pub(super) fn wire(
         state.pending = None;
         ui.set_package_import_ready(false);
         ui.set_package_import_preview(SharedString::default());
-        start(&ui, &mut state, move || {
-            let store = store()?;
-            let trust = PackageTrust::release().map_err(|_| ImportFailure::Prepare)?;
-            let snapshot = store.load(&trust).map_err(|_| ImportFailure::Snapshot)?;
-            PreparedImport::from_file(&path, &snapshot, &trust)
-                .map(|prepared| Completed::Prepared(Box::new(prepared)))
-                .map_err(|_| ImportFailure::File)
-        });
+        start(&ui, &mut state, move || prepare_import(&store()?, &path));
     });
 
     let weak = ui.as_weak();
@@ -596,11 +690,10 @@ pub(super) fn wire(
                     snapshot
                 }
             };
-            let (snapshot, uncertain) = match snapshot {
-                Ok(snapshot) => (snapshot, false),
-                Err(autokeyboardlayot::package_store::StoreError::CommitUncertain)
-                    if migration_documents.is_none() =>
-                {
+            let (snapshot, uncertain) = match confirmation(snapshot) {
+                Confirmation::Done(snapshot) => (*snapshot, false),
+                Confirmation::NotInstalled => return Err(ImportFailure::NotInstalled),
+                Confirmation::Uncertain if migration_documents.is_none() => {
                     // Refresh, never repeat a possibly committed operation.
                     // A migration must not activate config after this error.
                     notify_agent();
@@ -615,7 +708,7 @@ pub(super) fn wire(
                         true,
                     )
                 }
-                Err(_) => return Ok(inspect_uncertain_write(&trust)),
+                Confirmation::Uncertain => return Ok(inspect_uncertain_write(&trust)),
             };
             // Even if settings closes after confirmation, notify the agent of
             // the committed store; a missing receiver must not skip this step.
@@ -628,15 +721,15 @@ pub(super) fn wire(
             let migrated = if let Some((original, next)) = migration_documents {
                 // Saving mode last is the activation point. Failure leaves a
                 // prepared store ignored by the old legacy configuration.
-                let activation = super::super::configuration_directory()
-                    .and_then(|directory| PackageStore::open(&directory.join("packages")).ok())
-                    .is_some_and(|store| {
+                let activation = super::super::configuration_directory().is_some_and(|directory| {
+                    PackageStore::open(&directory.join("packages")).is_ok_and(|store| {
                         store
                             .with_current_snapshot(&snapshot, &trust, || {
-                                save_configuration_if_unchanged(&next, &original)
+                                save_configuration_if_unchanged(&directory, &next, &original)
                             })
                             .is_ok()
-                    });
+                    })
+                });
                 if !activation {
                     return Ok(inspect_uncertain_write(&trust));
                 }
@@ -680,6 +773,7 @@ pub(super) fn wire(
             let was_uncertain_inspection = state.inspecting_uncertain;
             state.inspecting_uncertain = false;
             ui.set_package_import_busy(false);
+            ui.set_package_import_read_only(false);
             let was_network = ui.get_download_active();
             let cancelled = state
                 .cancel
@@ -897,14 +991,19 @@ pub(super) fn wire(
             }
         },
     );
+    // The removal and rollback tools list the installed packages; read them once at opening
+    // instead of waiting for a refresh elsewhere.
+    if ui.get_package_import_allowed() {
+        ui.invoke_refresh_packages();
+    }
     timer
 }
 
-fn choose_file() -> Option<PathBuf> {
-    choose_files(false)?.into_iter().next()
+fn choose_file(owner: Option<HWND>) -> Option<PathBuf> {
+    choose_files(false, owner)?.into_iter().next()
 }
 
-fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
+fn choose_files(multiple: bool, owner: Option<HWND>) -> Option<Vec<PathBuf>> {
     let filter: Vec<u16> = "*.aklp\0*.aklp\0\0".encode_utf16().collect();
     let title: Vec<u16> = if multiple {
         tr("migration.choose")
@@ -919,16 +1018,8 @@ fn choose_files(multiple: bool) -> Option<Vec<PathBuf>> {
     if multiple {
         flags |= windows::Win32::UI::Controls::Dialogs::OFN_ALLOWMULTISELECT;
     }
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: u32::try_from(size_of::<OPENFILENAMEW>()).ok()?,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(file.as_mut_ptr()),
-        nMaxFile: u32::try_from(file.len()).ok()?,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: flags,
-        ..Default::default()
-    };
-    if !unsafe { GetOpenFileNameW(&raw mut dialog) }.as_bool() {
+    let mut dialog = file_dialog(owner, &filter, &title, &mut file, flags)?;
+    if !show_open_dialog(&mut dialog) {
         return None;
     }
     decode_selected_files(&file, multiple)
@@ -975,6 +1066,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_prepared_change_holds_the_package_tools() {
+        assert!(tool_may_start(true, false, false, false));
+        // A prepared change waits for its confirmation: another tool would discard it.
+        assert!(!tool_may_start(true, false, false, true));
+        assert!(!tool_may_start(false, false, false, false));
+        assert!(!tool_may_start(true, true, false, false));
+        assert!(!tool_may_start(true, false, true, false));
+    }
+
+    #[test]
     fn an_expired_catalog_has_its_own_status_and_other_errors_keep_their_code() {
         use autokeyboardlayot::{package_catalog::ReleaseError, package_download::DownloadError};
         for error in [
@@ -999,6 +1100,107 @@ mod tests {
         assert!(!expired.contains('{'), "{expired}");
         let generic = OnlineFailure::Code("package_install_Cancelled".into()).status_text();
         assert!(generic.contains("package_install_Cancelled"), "{generic}");
+    }
+
+    #[test]
+    fn a_package_the_inventory_refuses_says_why_and_is_no_invalid_file() {
+        use autokeyboardlayot::{
+            language_package::PackageError, package_inventory::InventoryError,
+        };
+        for (error, failure) in [
+            (
+                StoreError::Package(PackageError::InvalidSignature),
+                ImportFailure::File,
+            ),
+            (StoreError::InvalidFile, ImportFailure::File),
+            (
+                StoreError::Io(std::io::Error::other("locked")),
+                ImportFailure::Unreadable,
+            ),
+            (
+                StoreError::Inventory(InventoryError::Rollback),
+                ImportFailure::Older,
+            ),
+            (
+                StoreError::Inventory(InventoryError::RevisionConflict),
+                ImportFailure::Conflict,
+            ),
+            (
+                StoreError::Inventory(InventoryError::OwnershipConflict),
+                ImportFailure::Conflict,
+            ),
+            (
+                StoreError::Inventory(InventoryError::TooLarge),
+                ImportFailure::Capacity,
+            ),
+            (
+                StoreError::Inventory(InventoryError::ProtectedBase),
+                ImportFailure::ProtectedBase,
+            ),
+            (StoreError::Busy, ImportFailure::Snapshot),
+        ] {
+            let case = error.to_string();
+            assert_eq!(import_failure(&error), failure, "{case}");
+        }
+        // Each reason has a message of its own.
+        let messages: BTreeSet<_> = [
+            ImportFailure::File,
+            ImportFailure::Unreadable,
+            ImportFailure::Older,
+            ImportFailure::Conflict,
+            ImportFailure::Capacity,
+            ImportFailure::ProtectedBase,
+        ]
+        .into_iter()
+        .map(|failure| tr(failure.key()))
+        .collect();
+        assert_eq!(messages.len(), 6);
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("import.failure"))
+        );
+        // Preparing an import: a file that cannot be read, and one that is no package.
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+        let failure = |path: &Path| prepare_import(&store, path).err();
+        assert_eq!(
+            failure(&directory.path().join("missing.aklp")),
+            Some(ImportFailure::Unreadable)
+        );
+        let garbage = directory.path().join("garbage.aklp");
+        std::fs::write(&garbage, b"not a package").unwrap();
+        assert_eq!(failure(&garbage), Some(ImportFailure::File));
+    }
+
+    #[test]
+    fn only_an_uncertain_commit_is_reread_and_other_refusals_installed_nothing() {
+        use autokeyboardlayot::package_inventory::InventoryError;
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::initialize(&directory.path().join("packages")).unwrap();
+        let snapshot = store.load(&PackageTrust::release().unwrap()).unwrap();
+        assert!(matches!(confirmation(Ok(snapshot)), Confirmation::Done(_)));
+        assert!(matches!(
+            confirmation(Err(StoreError::CommitUncertain)),
+            Confirmation::Uncertain
+        ));
+        // Another writer, a held lock, damaged artifacts, an inventory refusal: before the pointer.
+        for error in [
+            StoreError::StaleSnapshot,
+            StoreError::Busy,
+            StoreError::Integrity,
+            StoreError::Inventory(InventoryError::Rollback),
+            StoreError::Io(std::io::Error::other("disk")),
+        ] {
+            let case = error.to_string();
+            assert!(
+                matches!(confirmation(Err(error)), Confirmation::NotInstalled),
+                "{case}"
+            );
+        }
+        let message = tr(ImportFailure::NotInstalled.key());
+        assert!(message.starts_with("Nothing was installed"), "{message}");
+        assert!(!message.contains("retry blindly"), "{message}");
     }
 
     #[test]

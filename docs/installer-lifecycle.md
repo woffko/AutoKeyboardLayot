@@ -46,7 +46,14 @@ files, or terminates a process forcibly. It handles settings before the agent.
 Before sending `WM_CLOSE`, it opens the window's process, checks its canonical
 executable path against `<directory>/AutoKeyboardLayot.exe`, and rechecks the
 window PID. It also requires the versioned `AutoKeyboardLayot.GracefulClose.v1`
-window property advertised by the guarded agent/settings code. Older versions
+window property advertised by the guarded agent/settings code. The settings
+window sets it on one of the first ticks of its event loop, once the native window
+exists, and from then on exactly while it would accept a close: it takes the
+property away while there are unsaved edits or a package operation that changes the
+store, and sets it again once there are none (checked every 100 ms), so the helper
+never asks a window that would refuse. The read-only refresh of the installed
+packages at opening does not hold the window. It removes the property while the
+window still exists, before the loop ends. Older versions
 without that capability require manual closure; no `WM_CLOSE` is sent to them.
 A portable instance from another directory is not closed. A request
 waits at most 15 seconds per process. A missing window with a live singleton is
@@ -55,6 +62,20 @@ treated as startup/busy, not proof of process absence.
 Exit codes: `0` means the observed processes exited and both singleton probes
 were clear; `10` means invalid arguments/relative target; `11` means identity
 could not be established; `12` means busy/refused/timeout or a failed request.
+
+Window lookup and `Local\` mutexes cannot see another session, so the helper also
+lists the running processes (`WTSEnumerateProcessesW`). It inspects only this
+user's `AutoKeyboardLayot.exe` processes in other sessions and refuses with `12`
+when one runs the install target. Another signed-in user's processes are never
+inspected: the list carries no SID for them, this user cannot open them, and they
+run that user's own copy, so they cannot block this user's setup or uninstall.
+Each of this user's processes is opened only for its limited information, which
+Windows grants also for an elevated one: its image path is compared first, and only
+a process of the target image is asked whether it still runs (its exit code). A copy
+whose path does not resolve in this session (a deleted folder, a drive letter of
+another session) is not the target, which exists, and is passed over. `11` remains
+for this user's own process whose path cannot be read at all. A first
+installation, with no executable at the target yet, has nothing to compare.
 
 After exit code 0, the installer must atomically create and hold both exact
 singleton names (`Local\AutoKeyboardLayot.Agent` and
@@ -68,22 +89,70 @@ The initial source in `installer/AutoKeyboardLayot.iss` uses this discipline for
 setup and uninstall. Inno Setup 6.7.3 accepted it with output disabled (`/O-`);
 this validates compilation, not installation, rollback or uninstall behavior.
 
+After the leases, setup opens the installation fence
+(`%LOCALAPPDATA%\AutoKeyboardLayot.installation.lock`) without sharing. A sharing
+violation means another setup, uninstall, agent or settings of this user holds it,
+possibly in another session (`AkFenceBusy`); any other failure, or a lock file that
+is not an empty ordinary file, is reported with the file name and the Windows error
+code (`AkFenceInvalid`), because retrying cannot help until the file is removed.
+Setup releases both leases and the fence as soon as the files are in place
+(`CurStepChanged(ssPostInstall)`), so the new shortcuts start the program while
+the Finished page is still open.
+
+The uninstaller closes the program only after the user has confirmed the removal
+(`CurUninstallStepChanged(usUninstall)`, where `Abort` ends the uninstall), so
+answering No leaves it running. When `{app}\AutoKeyboardLayot.exe` is missing (an
+antivirus quarantine, a deleted file, an interrupted upgrade) nothing can run from
+it: the close helper is skipped, and the leases and the fence are still taken.
+
 `--initialize-installation` requires both mutexes to be owned by another thread
 (the waiting installer), then acquires the configuration writer mutex. It only
 initializes a profile when all known unified/legacy source files are absent.
 The empty managed store is published first, then the English-only config with
-autoconversion off. Existing profiles remain byte-for-byte unchanged; malformed
+automatic conversion on. Existing profiles remain byte-for-byte unchanged; malformed
 configuration and partial/unrelated stores fail without reset. Exit `20` means
 missing lease/path/writer lock; `21` means profile initialization failed.
 
-Initialization precedes binary installation in the current prototype. If a
-later installer step fails or is cancelled, the new valid English-only profile
-may remain; it is not recursively removed or claimed to be a completed install.
+Initialization precedes binary installation in the current prototype. When setup
+then ends without installing (cancelled, or failed before the files were replaced),
+it removes the profile folder if that folder did not exist when setup started and
+holds only `config.ini` and `packages` (what initialization and the package store
+create); any other file keeps it. It also starts again the agent of this session
+that it closed (the owner's decision of 2026-10-22): setup still starts nothing
+after an installation.
+
+## Language page and startup task
+
+The language page checks the published catalog when it opens and lists its
+languages unchecked; English is always installed. Next with checked languages
+selects them in the package helper, runs `PrepareToInstall` (closing the program
+and its settings and taking the leases and the fence) and installs the languages
+before the wizard moves on; the page says so before the first Next. A refusal
+there (open settings with unsaved changes, a busy program, a held fence) is shown
+on the page and keeps the selection: the user removes the cause and presses Next
+again. The package helper lives as long as setup does, however long the user
+stays on the page.
+
+Setup continues with English only, without a selection, when the helper cannot
+start or fails (its replies stop or cannot be trusted), when the catalog check or
+the download fails, when the catalog offers no language this setup can install,
+and when an existing profile from an earlier version keeps no package store (the
+helper answers `reason=store_missing`). After a failed check or download the list
+is cleared and the page says that Next continues with English only; a download
+that failed after Next frees the leases and the fence again. Back, then Next
+checks the catalog again (with the same helper, or a new one after a helper
+failure). While a reply is pending, Cancel asks the helper to cancel first; a
+failed reply never leaves the page waiting for one.
+
+The startup task writes `HKCU\...\Run\AutoKeyboardLayot`; leaving it unchecked
+on a reinstall or upgrade deletes that value, and uninstall removes it.
 
 ## Remaining work
 
-The settings window refuses normal close while a package operation or file
-picker is active. It also refuses if the current editor values are invalid or
+The settings window refuses normal close while a package operation that changes
+the store (import, removal, rollback, download) or a file picker is active; the
+read-only refresh of the installed packages at opening does not hold X, Cancel or
+`WM_CLOSE`. It also refuses if the current editor values are invalid or
 different from the last saved document. Apply/OK saves explicitly; Cancel is
 the explicit discard action. This guard is shared by native window close and
 an externally delivered normal close request. It does not save on the user's
@@ -127,7 +196,12 @@ The current helper also supports `--verify-modular-base`: exit `0` requires the
 base feature set, while `23` identifies a legacy-bundled build. The setup source
 checks this before closure or profile initialization. This is a build-variant
 check on the reviewed payload, not a signature, source-provenance certificate,
-or substitute for validating the installer bundle itself.
+or substitute for validating the installer bundle itself. Only `23` is reported
+as a non-modular build; any other non-zero exit, such as `0xC0000135`
+(-1073741515) for a missing DLL, is reported with its code (`AkBaseProbeCode`).
+The executables link the C runtime statically (`.cargo/config.toml`), so neither
+the program nor the helpers need the Visual C++ redistributable, which setup
+neither ships nor checks.
 
 ## Dependency notice collection
 
@@ -194,6 +268,39 @@ All 10 passed on Windows. The receipt is
 This is neither a full Windows regression run nor physical typing acceptance.
 The installer output, language-selection page and upgrade VM gates remain open.
 
+## Installer acceptance on a VM
+
+`tools/test-installer-ui.ps1` drives the real setup in the tested user's interactive
+session, one scenario per run: `retry` (a held fence refuses Next on the language
+page, the selection stays, Next after the fence is free installs the language; the
+fence is free and the program starts while the Finished page is open; no Run value
+without the startup task), `helper-failure`, `timer-exception`, `no-store`,
+`uninstall-confirmation` (No leaves the running program alone, Yes closes and removes
+it), `missing-exe`, `startup-removal`, `fence-invalid`, `no-selectable-row` for a
+catalog whose packages all need a newer package API (or a test build of the package
+helper that reports every row unavailable), `probe` for a `/DInstallerUiProbe`
+build, and `settings-open` (a silent upgrade while the settings window is open:
+without edits the window closes and the upgrade installs; with an unsaved edit the
+window stays open with the edit and offers no graceful close, setup reports the
+program busy with helper code 12 without asking it and replaces nothing; after Apply
+the upgrade closes the window and installs).
+`download-failure` (the list cleared, English only said, the fence free, the
+catalog checked again after Back and Next, the profile folder Next created removed
+by Cancel) and `cancel-restarts-agent` (the program Next closed runs again after
+Cancel) need a setup built with a test build of the package helper that fails every
+download. The
+language list comes from the published catalog, so the VM needs network
+access. The script refuses to run when the user already has a profile or an
+installation, and removes what it created.
+
+`tools/run_vm_installer_ui.py OUTPUT BUILD_DIRECTORY SCENARIO...` stages a build of
+`tools/build_experimental_installer.py` and runs the scenarios through a scheduled
+task in the interactive session; `tools/run_vm_cross_session.py OUTPUT BUILD_DIRECTORY`
+runs `tools/test-vm-cross-session.ps1`, where a reader in session 0 holds the fence
+and the silent setup in session 1 must be refused with the fence message. Both read
+the machine from the `AKL_VM_*` variables of `tools/vm_config.py` and the ssh identity
+path from standard input.
+
 ## Setup message catalogs
 
 Application-owned setup labels and errors live in `installer/messages/*.isl`,
@@ -201,8 +308,8 @@ not Pascal string literals. Each language loads its stock Inno messages, then
 the English application fallback, then its own overrides. This ordering avoids
 global English entries overwriting translations, following Inno's
 [message-file ordering](https://jrsoftware.org/ishelp/topic_languagessection.htm).
-Current EN/RU/DE/ES/FR/PT-BR/JA/AR/ZH-CN/ID/UR/ET/HI/BN catalogs contain the same 11 keys and preserve `%1`
-arguments; source-coverage/placeholder tests and Inno 6.7.3 `/O-` compilation pass.
+Current EN/RU/DE/ES/FR/PT-BR/JA/AR/ZH-CN/ID/UR/ET/HI/BN catalogs contain the same 31 keys and preserve `%1`
+and `%2` arguments; source-coverage/placeholder tests and Inno 6.7.3 `/O-` compilation pass.
 `LanguageDetectionMethod=uilanguage` configures OS display-language selection.
 `UsePreviousLanguage=no` prevents the previous installer language from silently
 overriding that default; this does not change any application preference.

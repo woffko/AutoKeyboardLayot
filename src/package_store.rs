@@ -338,7 +338,7 @@ impl PackageStore {
             packages.push(Arc::new(VerifiedLanguagePackage::verify(&bytes, trust)?));
         }
         Ok(StoreSnapshot {
-            inventory: PackageInventory::restore(&state, &packages)?,
+            inventory: PackageInventory::restore(&state, &packages, trust)?,
             state_hash: hash,
         })
     }
@@ -463,9 +463,12 @@ impl PackageStore {
             }
             verified.push(Arc::new(VerifiedLanguagePackage::verify(bytes, trust)?));
         }
-        let inventory = PackageInventory::restore(&state, &verified)?;
+        let inventory = PackageInventory::restore(&state, &verified, trust)?;
         let state_hash = digest(&state);
-        if state_hash == current.state_hash {
+        // A no-op also when the loaded state forgot a catalog checkpoint (one saved before signing
+        // keys were recorded, or of a withdrawn key): the file still has it, so its hash differs,
+        // but writing the same generation again would fork the history a running agent follows.
+        if state_hash == current.state_hash || current.inventory.state_bytes()? == state {
             return Ok(current);
         }
         checkpoint(CommitPoint::Validated)?;
@@ -843,6 +846,38 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect()
+    }
+
+    #[test]
+    fn re_importing_over_a_forgotten_catalog_checkpoint_writes_nothing() {
+        // A state saved before signing keys were recorded (or with a catalog of a withdrawn key)
+        // keeps a checkpoint that every load forgets. Importing a package that is installed
+        // already changes nothing: a new state at the same generation would be one a running
+        // agent refuses to reload.
+        let (_directory, store, empty) = setup();
+        let bytes = artifact(1);
+        let first = store
+            .commit(&empty, &stage(&empty, &bytes), &[&bytes], &trust())
+            .unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&first.inventory().state_bytes().unwrap()).unwrap();
+        state["repository"] = json!("example/packs");
+        state["catalog"] = json!({"revision": 3, "sha256": hex(&[7; 32])});
+        let state = serde_json::to_vec(&state).unwrap();
+        let hash = digest(&state);
+        fs::write(store.root.join(state_name(&hash)), &state).unwrap();
+        fs::write(store.root.join("CURRENT"), hex(&hash)).unwrap();
+        let legacy = store.load(&trust()).unwrap();
+        assert_eq!(legacy.state_hash, hash);
+        assert_eq!(legacy.inventory().catalog_checkpoint(), None);
+        assert_eq!(legacy.inventory().generation(), 1);
+        let before = names(&store);
+        let again = store
+            .commit(&legacy, &stage(&legacy, &bytes), &[&bytes], &trust())
+            .unwrap();
+        assert_eq!(again.state_hash, hash);
+        assert_eq!(store.load(&trust()).unwrap().state_hash, hash);
+        assert_eq!(names(&store), before);
     }
 
     #[test]
@@ -1344,7 +1379,8 @@ mod tests {
             serde_json::from_slice(&PackageInventory::default().state_bytes().unwrap()).unwrap();
         unrelated["generation"] = json!(2);
         let unrelated =
-            PackageInventory::restore(&serde_json::to_vec(&unrelated).unwrap(), &[]).unwrap();
+            PackageInventory::restore(&serde_json::to_vec(&unrelated).unwrap(), &[], &trust())
+                .unwrap();
         assert!(matches!(
             store.commit(&first, &unrelated, &[], &trust()),
             Err(StoreError::Inventory(InventoryError::Rollback))

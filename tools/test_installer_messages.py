@@ -59,7 +59,9 @@ class InstallerMessageTests(unittest.TestCase):
         used.update(re.findall(r'\{cm:(Ak\w+)\}', source))
         self.assertEqual(used, set(catalog))
         self.assertTrue(all(catalog.values()))
-        self.assertEqual({key for key, text in pairs if '%1' in text}, {'AkCloseBusy', 'AkProfileReadFailed'})
+        self.assertEqual({key for key, text in pairs if '%1' in text},
+                         {'AkCloseBusy', 'AkProfileReadFailed', 'AkBaseProbeCode', 'AkFenceInvalid'})
+        self.assertEqual({key for key, text in pairs if '%2' in text}, {'AkFenceInvalid'})
         # Native language names are deliberately data, not translated UI prose.
         # Keep the no-hardcoded-messages check on all remaining installer code.
         names = re.search(r"function PackageName\(Id: String\): String;.*?\nend;", source, re.S)
@@ -94,6 +96,25 @@ class InstallerMessageTests(unittest.TestCase):
                     self.assertNotEqual(pairs['AkCatalogExpired'], 'AkCatalogExpired')
         self.assertIn('expired', english['AkCatalogExpired'])
         self.assertIn('clock', english['AkCatalogExpired'])
+
+    def test_the_package_page_intro_asks_for_next_in_every_language(self):
+        # Next installs the chosen languages at once (AkPackageCloses): the intro asks for that one
+        # step, as en.isl does, and promises no later confirmation. Each locale names its Next
+        # button as its own AkPackageEnglishNext does.
+        next_buttons = {
+            'en': 'Next', 'ru': '«Далее»', 'de': '„Weiter“', 'es': '«Siguiente»', 'fr': '« Suivant »',
+            'pt-BR': '“Avançar”', 'ja': '[次へ]', 'ar': '«التالي»', 'zh-CN': '“下一步”', 'id': 'Maju',
+            'ur': '«اگلا»', 'et': '„Edasi“', 'hi': '«आगे बढो»', 'bn': '«পরবর্তী»',
+        }
+        root = Path(__file__).resolve().parents[1] / 'installer/messages'
+        files = sorted(root.glob('*.isl'))
+        self.assertEqual({file.stem for file in files}, set(next_buttons))
+        for file in files:
+            pairs = dict(line.split('=', 1) for line in file.read_text(encoding='utf-8').splitlines()
+                         if line.startswith('Ak'))
+            with self.subTest(locale=file.stem):
+                self.assertIn(next_buttons[file.stem], pairs['AkPackageEnglishNext'])
+                self.assertIn(next_buttons[file.stem], pairs['AkPackageIntro'])
 
     def test_locale_keys_and_placeholders_match_english_fallback(self):
         root = Path(__file__).resolve().parents[1] / 'installer'

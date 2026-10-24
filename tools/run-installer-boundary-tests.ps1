@@ -40,15 +40,20 @@ try {
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
         $process = [System.Diagnostics.Process]::Start($startInfo)
-        if (-not $process.WaitForExit(10000)) {
-            $process.Kill()
-            throw 'A selected test process timed out; only that test process was stopped.'
-        }
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
+        # Read both streams while the test runs: a test that writes more than a pipe holds would
+        # otherwise wait for a reader that never comes and be reported as a timeout.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $finished = $process.WaitForExit(10000)
+        if (-not $finished) { $process.Kill() }
         $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         [IO.File]::WriteAllText((Join-Path $LogDirectory ($index.ToString() + '.stdout.txt')), $stdout)
         [IO.File]::WriteAllText((Join-Path $LogDirectory ($index.ToString() + '.stderr.txt')), $stderr)
+        if (-not $finished) {
+            throw 'A selected test process timed out; only that test process was stopped. Its output is in the log directory.'
+        }
         $receipt.tests += @{tag=$check.Tag; filter=$check.Filter; expected=$check.Expected; exit_code=$process.ExitCode; sha256=$artifact.sha256}
         if ($process.ExitCode -ne 0 -or $stdout -notmatch ('test result: ok\. ' + $check.Expected + ' passed; 0 failed;')) {
             Write-Output $stdout

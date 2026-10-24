@@ -18,6 +18,10 @@ const LAYOUT_MODEL_MINIMUM_CHARACTERS: usize = 3;
 /// Three-letter words are more often ambiguous and need more certainty.
 const LAYOUT_MODEL_THRESHOLD: f32 = 0.9;
 const LAYOUT_MODEL_SHORT_THRESHOLD: f32 = 0.97;
+/// A letter core shorter than this is known only as a common short word or a
+/// user word: the base word lists contain every letter and many two-letter
+/// abbreviations.
+const MINIMUM_BASE_LIST_CHARACTERS: usize = 3;
 
 /// Configuration for precision-first automatic detection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -252,6 +256,15 @@ impl Detector {
     /// word must be long enough, not excluded and not a known word in the typed
     /// layout, and the target must use the target language's alphabet. The
     /// model must be sure of another layout (LAYOUT_MODEL_*THRESHOLD).
+    ///
+    /// The model reads every key as a letter of some layout, so it never sees
+    /// a word with a character outside the typed alphabet at either edge ("it."
+    /// would become "шею", "\"Tallinn" would become "ÄTallinn"), a
+    /// contraction ("don't" would become "donät") or such a character after a
+    /// word the typed language knows ("key.md" would become "лунюьв"), and it
+    /// never reads such a character inside the word as a capital letter
+    /// ("LANGID:KLID" would become "LANGIDÖKLID"). Only the dictionary stage
+    /// judges them.
     fn detect_with_layout_model(
         &self,
         word: &str,
@@ -269,6 +282,10 @@ impl Detector {
         };
         if length < LAYOUT_MODEL_MINIMUM_CHARACTERS
             || self.word_exclusions.contains(current_language, word)
+            || self.letter_core(current_language, word) != word
+            || self.is_contraction(current_language, word)
+            || self.follows_known_word(current_language, word)
+            || period_between_letters(word)
         {
             return None;
         }
@@ -280,6 +297,9 @@ impl Detector {
             return None;
         }
         let typed = model.index_of(current_language)?;
+        // As in the dictionary stage, only layouts Windows has, each for one package, take part:
+        // without them (no snapshot, a layout missing or claimed twice) no reading is left.
+        let candidates = self.resolve_candidates(word, current_language, candidates);
         let texts: Vec<Option<&str>> = model
             .languages()
             .iter()
@@ -312,17 +332,13 @@ impl Detector {
             })
             .collect();
         let probabilities = model.probabilities(&features, typed, previous)?;
-        let (best, probability) = probabilities
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let best = confident_layout(&probabilities, threshold)?;
         let replacement = texts[best]?;
         let target_language = model.languages()[best];
         if best == typed
             || replacement == word
-            || probability < threshold
             || !self.accepts_word(target_language, replacement)
+            || self.capital_from_punctuation(current_language, word, replacement)
         {
             return None;
         }
@@ -358,15 +374,97 @@ impl Detector {
     /// Whether a visible character can still be part of a word after the same
     /// physical key is interpreted under an enabled target layout.
     pub fn can_extend_word(&self, character: char, current_language: Language) -> bool {
+        self.can_extend_word_with_readings(character, current_language, &[])
+    }
+
+    /// As `can_extend_word`, given what the platform reports the same key
+    /// prints in target layouts. A target without such a reading falls back to
+    /// the offline English/Russian key table, which knows no other layout: "["
+    /// typed for the Estonian "ü" continues a word only with a reading.
+    pub fn can_extend_word_with_readings(
+        &self,
+        character: char,
+        current_language: Language,
+        readings: &[(Language, char)],
+    ) -> bool {
         if !self.input_pack_is_eligible(current_language) {
             return false;
         }
         self.accepts_character(current_language, character)
             || self.automatic_targets(current_language).any(|target| {
-                self.input_bindings[&current_language]
-                    .transpose_character(character, self.input_bindings[&target])
+                readings
+                    .iter()
+                    .find(|(language, _)| *language == target)
+                    .map(|&(_, reading)| reading)
+                    .or_else(|| {
+                        self.input_bindings[&current_language]
+                            .transpose_character(character, self.input_bindings[&target])
+                    })
                     .is_some_and(|mapped| self.accepts_character(target, mapped))
             })
+    }
+
+    /// The word without the leading and trailing characters the language's
+    /// alphabet does not accept, such as punctuation typed after it.
+    fn letter_core<'a>(&self, language: Language, word: &'a str) -> &'a str {
+        word.trim_matches(|character| !self.accepts_character(language, character))
+    }
+
+    /// Whether `language` knows a word's letters without its edge punctuation.
+    fn knows_letter_core(&self, language: Language, core: &str) -> bool {
+        if core.chars().count() < MINIMUM_BASE_LIST_CHARACTERS {
+            self.common_short_contains(language, core)
+                || self.user_dictionary.contains(language, core)
+        } else {
+            self.dictionary_contains(language, core)
+        }
+    }
+
+    /// "don't", "I've", "hadn't", "Inno's": an apostrophe after a word the
+    /// language knows, or a single apostrophe after three or more characters
+    /// and before one. Estonian "ä" typed with the apostrophe key rarely sits
+    /// there, and the few such words ("aitäh") are in the dictionary.
+    fn is_contraction(&self, language: Language, word: &str) -> bool {
+        let parts: Vec<&str> = word.split(['\'', '\u{2019}']).collect();
+        let [first, .., last] = parts.as_slice() else {
+            return false;
+        };
+        self.knows_letter_core(language, first)
+            || (parts.len() == 2 && first.chars().count() >= 3 && last.chars().count() == 1)
+    }
+
+    /// "key.md", "Default::default", "self.items": a character outside the
+    /// typed alphabet right after three or more letters that make a word the
+    /// typed language knows, as in a file name or a code path. A word typed in
+    /// the wrong layout rarely spells a word of the typed language before one
+    /// of its letters on a punctuation key.
+    fn follows_known_word(&self, language: Language, word: &str) -> bool {
+        let mut run = String::new();
+        for character in word.chars() {
+            if self.accepts_character(language, character) {
+                run.push(character);
+                continue;
+            }
+            if run.chars().count() >= MINIMUM_BASE_LIST_CHARACTERS
+                && self.knows_letter_core(language, &run.to_lowercase())
+            {
+                return true;
+            }
+            run.clear();
+        }
+        false
+    }
+
+    /// Whether `replacement` reads a key that types no letter of the typed
+    /// language as a capital letter: inside a word that comes from Shift
+    /// between letters, as in a code path ("std::fs" reads "stdÖÖfs") or an
+    /// identifier ("LANGID:KLID"). A word typed in the wrong layout in lower
+    /// case reads those keys as small letters, and one that starts with such a
+    /// capital never reaches the model.
+    fn capital_from_punctuation(&self, language: Language, word: &str, replacement: &str) -> bool {
+        word.chars()
+            .zip(replacement.chars())
+            .any(|(typed, read)| !self.accepts_character(language, typed) && read.is_uppercase())
     }
 
     fn accepts_character(&self, language: Language, character: char) -> bool {
@@ -421,6 +519,12 @@ impl Detector {
             self.dictionary_contains(current_language, word)
         };
         if source_is_word && source_is_known {
+            return None;
+        }
+        // "key." reads as "луню" in Russian: punctuation typed after a known word
+        // must not turn it into another layout's word.
+        let core = self.letter_core(current_language, word);
+        if core != word && self.knows_letter_core(current_language, core) {
             return None;
         }
 
@@ -567,64 +671,6 @@ impl Detector {
         chosen
     }
 
-    /// Explicitly convert the current word without automatic thresholds or a
-    /// source-dictionary veto. A unique dictionary-backed target is preferred;
-    /// otherwise the best target must have a clear score lead.
-    pub fn force_mapped_candidates(
-        &self,
-        word: &str,
-        current_language: Language,
-        candidates: &[(Language, String)],
-    ) -> Option<Detection> {
-        self.dictionaries.active_language(current_language)?;
-        if word.is_empty() {
-            return None;
-        }
-        let source_score = score_word(
-            word,
-            current_language,
-            &self.user_dictionary,
-            &self.dictionaries,
-        );
-        let mut dictionary_candidates = Vec::new();
-        let mut other_candidates = Vec::new();
-        for (target_language, replacement) in
-            self.resolve_candidates(word, current_language, candidates)
-        {
-            if self.dictionaries.active_language(target_language).is_none()
-                || replacement.is_empty()
-                || !self.accepts_word(target_language, &replacement)
-            {
-                continue;
-            }
-            let target_score = score_word(
-                &replacement,
-                target_language,
-                &self.user_dictionary,
-                &self.dictionaries,
-            );
-            let detection = Detection {
-                source_language: current_language,
-                target_language,
-                original: word.to_owned(),
-                replacement,
-                source_score,
-                target_score,
-            };
-            if self.dictionary_contains(target_language, &detection.replacement) {
-                dictionary_candidates.push(detection);
-            } else {
-                other_candidates.push(detection);
-            }
-        }
-
-        if dictionary_candidates.is_empty() {
-            choose_clear_best(other_candidates)
-        } else {
-            choose_clear_best(dictionary_candidates)
-        }
-    }
-
     /// The languages of `readings` (one word read in several layouts) from the most to the least
     /// plausible reading. The word score decides, which includes the dictionary bonus; equal
     /// scores keep the given order. The hotkey sends a word to the first of them.
@@ -696,18 +742,6 @@ impl Detector {
         }
         resolved
     }
-}
-
-fn choose_clear_best(mut candidates: Vec<Detection>) -> Option<Detection> {
-    candidates.sort_by(|left, right| right.target_score.total_cmp(&left.target_score));
-    let best = candidates.first()?;
-    if candidates
-        .get(1)
-        .is_some_and(|second| best.target_score - second.target_score < 1.0)
-    {
-        return None;
-    }
-    Some(best.clone())
 }
 
 fn score_word(
@@ -793,6 +827,35 @@ fn ngram_score(
             }
         })
         .sum()
+}
+
+/// "ui.py", "IN.txt": a period between two runs of two or more letters, as in a
+/// file name or a member access. The period is a letter only in the Russian
+/// layout, and the Russian words it spells there (`утюги` is `en.ub`) are in
+/// the dictionary, which judges them before the model.
+fn period_between_letters(word: &str) -> bool {
+    let runs: Vec<usize> = word
+        .split(|character: char| !character.is_alphabetic() && character != '.')
+        .flat_map(|chunk| {
+            let parts: Vec<usize> = chunk.split('.').map(|part| part.chars().count()).collect();
+            parts
+                .windows(2)
+                .map(|pair| pair[0].min(pair[1]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    runs.iter().any(|shorter| *shorter >= 2)
+}
+
+/// The most probable layout, when its probability reaches `threshold`. A NaN
+/// from a broken model reaches no threshold.
+fn confident_layout(probabilities: &[f32], threshold: f32) -> Option<usize> {
+    let (best, probability) = probabilities
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    (probability >= threshold).then_some(best)
 }
 
 #[cfg(test)]
@@ -881,6 +944,100 @@ mod tests {
             assert_eq!(detection.replacement, expected);
             assert_eq!(detection.target_language, Language::Estonian);
         }
+    }
+
+    /// What Windows reports with the US (0x0409), Russian (0x0419) and Estonian (0x0425) layouts
+    /// of `layouts` loaded.
+    fn windows_profiles(layouts: &[usize]) -> crate::profile_resolver::ResolvedKeyboardProfiles {
+        use crate::profile_resolver::{KeyboardProfileProbe, resolve_keyboard_profiles};
+        struct Fixture(Vec<usize>, usize);
+        impl KeyboardProfileProbe for Fixture {
+            fn loaded_layouts(&mut self) -> Option<Vec<usize>> {
+                Some(self.0.clone())
+            }
+            fn current_layout(&mut self) -> Option<usize> {
+                Some(self.1)
+            }
+            fn is_ime(&mut self, _: usize) -> bool {
+                false
+            }
+            fn activate_layout(&mut self, layout: usize) -> Option<usize> {
+                Some(std::mem::replace(&mut self.1, layout))
+            }
+            fn current_layout_name(&mut self) -> Option<[u16; 9]> {
+                let name = format!("{:08x}", self.1);
+                let mut result = [0; 9];
+                for (slot, value) in result.iter_mut().zip(name.encode_utf16()) {
+                    *slot = value;
+                }
+                Some(result)
+            }
+        }
+        resolve_keyboard_profiles(&mut Fixture(layouts.to_vec(), layouts[0])).expect("profiles")
+    }
+
+    #[test]
+    fn the_layout_model_converts_only_between_layouts_windows_has() {
+        let mut detector = model_detector();
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду"),
+            (Language::Estonian, "küsimusele"),
+        ]);
+        let converted = |detector: &Detector| {
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &[Language::English],
+                )
+                .map(|detection| detection.target_language)
+        };
+        detector.set_resolved_profiles(Some(&windows_profiles(&[0x0409, 0x0419, 0x0425])));
+        assert_eq!(converted(&detector), Some(Language::Estonian));
+        // No profile snapshot: the model converts nothing, as the dictionary stage does not.
+        detector.set_resolved_profiles(None);
+        assert_eq!(converted(&detector), None);
+        // No Estonian layout: the model may not choose Estonian.
+        detector.set_resolved_profiles(Some(&windows_profiles(&[0x0409, 0x0419])));
+        assert_ne!(converted(&detector), Some(Language::Estonian));
+        // No English layout: the typed word belongs to no layout Windows has.
+        detector.set_resolved_profiles(Some(&windows_profiles(&[0x0419, 0x0425])));
+        assert_eq!(converted(&detector), None);
+    }
+
+    #[test]
+    fn only_a_probability_at_or_above_the_threshold_chooses_a_layout() {
+        assert_eq!(confident_layout(&[0.01, 0.95, 0.04], 0.9), Some(1));
+        assert_eq!(confident_layout(&[0.25, 0.75, 0.0], 0.75), Some(1));
+        assert_eq!(confident_layout(&[0.2, 0.7, 0.1], 0.9), None);
+        assert_eq!(confident_layout(&[0.0, f32::NAN, 0.99], 0.9), None);
+        assert_eq!(confident_layout(&[], 0.9), None);
+    }
+
+    #[test]
+    fn a_broken_layout_model_converts_nothing() {
+        let mut model = crate::layout_model::LayoutModel::parse(include_bytes!(
+            "../data/layout-model/en-ru-et.aklm"
+        ))
+        .unwrap();
+        model.overflow_for_tests();
+        let mut detector = crate::test_support::detector();
+        detector.set_layout_model(Some(Arc::new(model)));
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду"),
+            (Language::Estonian, "küsimusele"),
+        ]);
+        assert!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "k[simusele",
+                    Language::English,
+                    &candidates,
+                    &[Language::English]
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1168,14 +1325,143 @@ mod tests {
     }
 
     #[test]
-    fn layout_model_settles_a_dictionary_ambiguity_by_context_and_only_at_the_threshold() {
+    fn layout_model_never_converts_code_paths_file_names_or_identifiers() {
         let detector = model_detector();
-        // The same keys read as the Russian word "эллу" and the Estonian word
-        // "äkke": two plausible targets, so the dictionary stage fails closed.
+        // On its own the model is sure of another layout for each of these; each group is kept
+        // English by one rule alone.
+        for (word, russian, estonian) in [
+            // A word the typed language knows before a key outside its alphabet.
+            ("items[key", "шеуьыхлун", "itemsükey"),
+            ("list[index", "дшыехштвуч", "listüindex"),
+            ("value;return", "мфдгужкуегкт", "valueöreturn"),
+            ("Default::default", "ВуафгдеЖЖвуафгде", "DefaultÖÖdefault"),
+            ("key.md", "лунюьв", "key.md"),
+            // Such a key read as a capital letter inside the word.
+            ("LANGID:KLID", "ДФТПШВЖЛДШВ", "LANGIDÖKLID"),
+            ("HKL:KLID", "РЛДЖЛДШВ", "HKLÖKLID"),
+            ("std::fs", "ыевЖЖаы", "stdÖÖfs"),
+            // A period between runs of two or more letters.
+            ("ui.py", "гшюзн", "ui.py"),
+            ("IN.txt", "ШТюече", "IN.txt"),
+            ("et.as", "уеюфы", "et.as"),
+        ] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let probabilities = model_probabilities(&detector, word, &candidates, &[]);
+            let sure = probability_of(&probabilities, Language::Russian)
+                .max(probability_of(&probabilities, Language::Estonian));
+            assert!(
+                sure >= LAYOUT_MODEL_THRESHOLD,
+                "premise: the model alone converts {word} ({sure}); the model changed, pick another token"
+            );
+            assert!(
+                detector
+                    .detect_mapped_candidates_in_context(word, Language::English, &candidates, &[])
+                    .is_none(),
+                "{word}"
+            );
+        }
+        // The period is the Russian "ю": Russian words with it between letters are in the
+        // dictionary, which still converts them.
+        let detection = detector
+            .detect_mapped_candidates_in_context(
+                "en.ub",
+                Language::English,
+                &russian_or_estonian("утюги", "en.ub"),
+                &[],
+            )
+            .expect("en.ub is converted");
+        assert_eq!(detection.replacement, "утюги");
+    }
+
+    #[test]
+    fn layout_model_never_sees_edge_punctuation_or_contractions() {
+        let detector = model_detector();
+        // On its own the model is sure of another layout for each of these;
+        // only the punctuation at an edge, or the apostrophe after a known word
+        // or after a name and before one letter, keeps them English.
+        for (word, russian, estonian) in [
+            ("don't", "вщтэе", "donät"),
+            ("can't", "сфтэе", "canät"),
+            ("I've", "Шэму", "Iäve"),
+            ("hadn't", "рфвтэе", "hadnät"),
+            ("Inno's", "Шттщэы", "Innoäs"),
+            ("e.g.", "уюпю", "e.g."),
+            ("it.", "шею", "it."),
+            ("me.", "ьую", "me."),
+            ("now,", "тщцб", "now,"),
+            ("\"Tallinn", "ЭЕфддштт", "ÄTallinn"),
+        ] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let probabilities = model_probabilities(&detector, word, &candidates, &[]);
+            let sure = probability_of(&probabilities, Language::Russian)
+                .max(probability_of(&probabilities, Language::Estonian));
+            let threshold = if word.chars().count() == LAYOUT_MODEL_MINIMUM_CHARACTERS {
+                LAYOUT_MODEL_SHORT_THRESHOLD
+            } else {
+                LAYOUT_MODEL_THRESHOLD
+            };
+            assert!(
+                sure >= threshold,
+                "premise: the model alone converts {word} ({sure}); the model changed, pick another word"
+            );
+            assert!(
+                detector
+                    .detect_mapped_candidates_in_context(word, Language::English, &candidates, &[])
+                    .is_none(),
+                "{word}"
+            );
+        }
+        // Also where the model would be right: after Estonian words the keys
+        // 'kke read as "äkke" rather than the Russian "эллу", but the leading
+        // apostrophe keeps them from the model.
         let candidates = russian_or_estonian("эллу", "äkke");
+        let previous = [Language::Estonian; 3];
+        let probabilities = model_probabilities(&detector, "'kke", &candidates, &previous);
+        assert!(
+            probability_of(&probabilities, Language::Estonian) >= LAYOUT_MODEL_THRESHOLD,
+            "premise: the model alone converts 'kke after Estonian words ({probabilities:?})"
+        );
         assert!(
             detector
-                .detect_mapped_candidates("'kke", Language::English, &candidates)
+                .detect_mapped_candidates_in_context(
+                    "'kke",
+                    Language::English,
+                    &candidates,
+                    &previous
+                )
+                .is_none()
+        );
+        // Keys inside a word still reach the model, also the apostrophe key
+        // typed for the Estonian "ä".
+        for (word, russian, estonian) in [
+            ("kuup'ev", "лггзэум", "kuupäev"),
+            ("juurdep''s", "оггквузээы", "juurdepääs"),
+            ("j'i", "оэш", "jäi"),
+            ("p'eval", "зэумфд", "päeval"),
+        ] {
+            let candidates = russian_or_estonian(russian, estonian);
+            let detection = detector
+                .detect_mapped_candidates_in_context(
+                    word,
+                    Language::English,
+                    &candidates,
+                    &[Language::Estonian],
+                )
+                .unwrap_or_else(|| panic!("{word} is converted"));
+            assert_eq!(detection.replacement, estonian);
+        }
+    }
+
+    #[test]
+    fn layout_model_settles_an_ambiguity_by_context_and_only_at_the_threshold() {
+        let detector = model_detector();
+        // The keys read as the Estonian word "hõi" and as no Russian word. The
+        // dictionary stage leaves three-letter words to the short-word lists,
+        // so only the model and the languages of the previous words decide.
+        let candidates = russian_or_estonian("ръш", "hõi");
+        assert!(
+            detector
+                .detect_mapped_candidates("h]i", Language::English, &candidates)
                 .is_none()
         );
         // (previous words, converts)
@@ -1184,16 +1470,16 @@ mod tests {
             (vec![Language::Russian; 3], false),
             (vec![Language::Estonian; 3], true),
         ] {
-            let probabilities = model_probabilities(&detector, "'kke", &candidates, &previous);
+            let probabilities = model_probabilities(&detector, "h]i", &candidates, &previous);
             let best = probabilities.iter().copied().fold(0.0, f32::max);
             assert_eq!(
-                best >= LAYOUT_MODEL_THRESHOLD,
+                best >= LAYOUT_MODEL_SHORT_THRESHOLD,
                 converts,
                 "premise: probabilities {probabilities:?} for context {previous:?}; \
                  the model changed, pick other ambiguous keys"
             );
             let detection = detector.detect_mapped_candidates_in_context(
-                "'kke",
+                "h]i",
                 Language::English,
                 &candidates,
                 &previous,
@@ -1201,7 +1487,7 @@ mod tests {
             assert_eq!(detection.is_some(), converts, "context {previous:?}");
             if let Some(detection) = detection {
                 assert_eq!(detection.target_language, Language::Estonian);
-                assert_eq!(detection.replacement, "äkke");
+                assert_eq!(detection.replacement, "hõi");
             }
         }
         // When the model is sure in every context, context does not matter.
@@ -1229,6 +1515,12 @@ mod tests {
     }
 
     use crate::{DictionaryPack, PackId};
+
+    /// Pause, the agent's layout cycle, converts only between languages that have an input
+    /// profile, as automatic conversion does.
+    fn pause_cannot_convert(detector: &Detector, source: Language, target: Language) -> bool {
+        detector.input_profile(source).is_none() || detector.input_profile(target).is_none()
+    }
 
     fn custom_us_pack(id: PackId, profiles: &[&str]) -> DictionaryPack {
         let rows: Vec<_> = profiles
@@ -1301,11 +1593,6 @@ mod tests {
                 .detect_mapped_candidates("жжжжж", Language::Russian, &invalid)
                 .is_none()
         );
-        assert!(
-            detector
-                .force_mapped_candidates("жжжжж", Language::Russian, &invalid)
-                .is_none()
-        );
     }
 
     #[test]
@@ -1376,11 +1663,6 @@ mod tests {
         assert_eq!(detection.replacement, "hello");
         assert!(
             detector
-                .force_mapped_candidates("ghbdtn", custom, &[])
-                .is_some()
-        );
-        assert!(
-            detector
                 .detect_mapped_candidates(
                     "руддщ",
                     Language::Russian,
@@ -1404,15 +1686,6 @@ mod tests {
         for id in [custom, Language::English] {
             assert_eq!(previous.input_profile(id), None);
             assert!(previous.automatic_targets(id).next().is_none());
-            assert!(
-                previous
-                    .force_mapped_candidates(
-                        "ghbdtn",
-                        id,
-                        &[(Language::Russian, "привет".to_owned())]
-                    )
-                    .is_none()
-            );
         }
         registry.set_enabled([custom, Language::Russian]).unwrap();
         let next = Detector::with_registry(Default::default(), Arc::new(registry));
@@ -1431,11 +1704,6 @@ mod tests {
         let detector = Detector::with_registry(Default::default(), Arc::new(registry));
         assert_eq!(detector.input_profile(custom), None);
         assert!(detector.detect("ghbdtn", custom).is_none());
-        assert!(
-            detector
-                .force_mapped_candidates("ghbdtn", custom, &[])
-                .is_none()
-        );
     }
 
     #[test]
@@ -1463,10 +1731,6 @@ mod tests {
                 Detector::with_profile_selections(Default::default(), registry.clone(), &changed);
             assert_eq!(next.input_profile(custom), None);
             assert!(next.detect("ghbdtn", custom).is_none());
-            assert!(
-                next.force_mapped_candidates("ghbdtn", custom, &[])
-                    .is_none()
-            );
             assert_eq!(selected.input_profile(custom), Some(us));
         }
         selected.set_resolved_profiles(None);
@@ -1593,11 +1857,7 @@ mod tests {
                     .detect_mapped_candidates(word, source, &candidates)
                     .is_none()
             );
-            assert!(
-                detector
-                    .force_mapped_candidates(word, source, &candidates)
-                    .is_none()
-            );
+            assert!(pause_cannot_convert(&detector, source, target));
         }
     }
 
@@ -1659,11 +1919,7 @@ mod tests {
                         .detect_mapped_candidates(word, source, &candidates)
                         .is_none()
                 );
-                assert!(
-                    detector
-                        .force_mapped_candidates(word, source, &candidates)
-                        .is_none()
-                );
+                assert!(pause_cannot_convert(&detector, source, target));
                 assert!(old_detector.detect(word, source).is_some());
             }
         }
@@ -1774,11 +2030,7 @@ mod tests {
                     .detect_mapped_candidates(word, source, &candidates)
                     .is_none()
             );
-            assert!(
-                detector
-                    .force_mapped_candidates(word, source, &candidates)
-                    .is_none()
-            );
+            assert!(pause_cannot_convert(&detector, source, target));
         }
     }
 
@@ -1859,7 +2111,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_source_or_target_fails_closed_even_with_user_words_and_forcing() {
+    fn absent_source_or_target_fails_closed_even_with_user_words() {
         for selected in [
             vec![],
             vec!["en-US"],
@@ -1888,11 +2140,7 @@ mod tests {
                         .detect_mapped_candidates(word, source, &candidates)
                         .is_none()
                 );
-                assert!(
-                    detector
-                        .force_mapped_candidates(word, source, &candidates)
-                        .is_none()
-                );
+                assert!(pause_cannot_convert(&detector, source, target));
             }
         }
     }
@@ -1958,15 +2206,11 @@ mod tests {
             .set_enabled(["en-US", "ja-JP"].map(|id| PackId::parse(id).unwrap()))
             .unwrap();
         let detector = Detector::with_registry(DetectorConfig::default(), Arc::new(registry));
-        assert!(
-            detector
-                .force_mapped_candidates(
-                    "hello",
-                    Language::English,
-                    &[(Language::Japanese, "こんにちは".to_owned())]
-                )
-                .is_none()
-        );
+        assert!(pause_cannot_convert(
+            &detector,
+            Language::English,
+            Language::Japanese
+        ));
         assert!(
             detector
                 .detect_mapped_candidates(
@@ -2037,6 +2281,90 @@ mod tests {
     }
 
     #[test]
+    fn short_words_on_a_punctuation_key_at_an_edge_are_in_the_short_lists() {
+        // They never reach the model (a key outside the typed alphabet at an
+        // edge), and the dictionary stage leaves three-letter words to the
+        // short-word lists, so only those lists convert them.
+        let detector = crate::test_support::detector();
+        for (typed, expected) in [(",sk", "был"), ("vj.", "мою")] {
+            let detection = detector
+                .detect(typed, Language::English)
+                .unwrap_or_else(|| panic!("{typed} is converted"));
+            assert_eq!(detection.replacement, expected);
+        }
+        for (typed, russian, estonian) in [
+            ("[le", "хду", "üle"),
+            ("'ra", "экф", "ära"),
+            ("t;;", "ежж", "töö"),
+        ] {
+            let detection = detector
+                .detect_mapped_candidates_in_context(
+                    typed,
+                    Language::English,
+                    &russian_or_estonian(russian, estonian),
+                    &[],
+                )
+                .unwrap_or_else(|| panic!("{typed} is converted"));
+            assert_eq!(detection.replacement, estonian);
+        }
+        // In the English layout "[he" stays the English "he" with a bracket before it; typed in
+        // the Russian layout the same keys read "хру" and convert.
+        let detection = detector
+            .detect_mapped_candidates_in_context(
+                "хру",
+                Language::Russian,
+                &[
+                    (Language::English, "[he".to_owned()),
+                    (Language::Estonian, "ühe".to_owned()),
+                ],
+                &[],
+            )
+            .expect("хру is converted");
+        assert_eq!(detection.replacement, "ühe");
+    }
+
+    #[test]
+    fn punctuation_after_a_known_word_does_not_turn_it_into_a_russian_word() {
+        let detector = crate::test_support::detector();
+        for (typed, russian) in [
+            ("key.", "луню"),
+            ("next.", "тучею"),
+            ("Bye.", "Иную"),
+            ("net.", "туею"),
+            ("belt.", "иудею"),
+            ("cream.", "скуфью"),
+            ("rent;", "кутеж"),
+        ] {
+            assert!(
+                detector.dictionary_contains(Language::Russian, russian),
+                "premise: {russian} is a Russian word"
+            );
+            assert!(
+                detector.detect(typed, Language::English).is_none(),
+                "{typed}"
+            );
+        }
+        // Without the keys that read as Russian letters no known English word
+        // is left, so these still convert. Two letters such as "nj" or "tp"
+        // count only as common short words: the base list holds them as
+        // abbreviations.
+        for (typed, russian) in [
+            ("hf,jnftn", "работает"),
+            ("k.,k.", "люблю"),
+            (",skj", "было"),
+            ("b[", "их"),
+            (",s", "бы"),
+            ("'nj", "это"),
+            (",tp", "без"),
+        ] {
+            let detection = detector
+                .detect(typed, Language::English)
+                .unwrap_or_else(|| panic!("{typed} is converted"));
+            assert_eq!(detection.replacement, russian);
+        }
+    }
+
+    #[test]
     fn leaves_correct_words_unchanged() {
         let detector = crate::test_support::detector();
         assert_eq!(detector.detect("hello", Language::English), None);
@@ -2092,38 +2420,6 @@ mod tests {
     }
 
     #[test]
-    fn force_conversion_handles_a_short_word_without_automatic_thresholds() {
-        let detector = crate::test_support::configured_detector(DetectorConfig {
-            minimum_word_characters: 4,
-            ..DetectorConfig::default()
-        });
-        let candidates = [
-            (Language::Russian, "не".to_owned()),
-            (Language::Estonian, "yt".to_owned()),
-        ];
-        assert_eq!(detector.detect("yt", Language::English), None);
-        let forced = detector
-            .force_mapped_candidates("yt", Language::English, &candidates)
-            .expect("explicit conversion should select Russian");
-        assert_eq!(forced.target_language, Language::Russian);
-        assert_eq!(forced.replacement, "не");
-    }
-
-    #[test]
-    fn force_conversion_bypasses_an_automatic_word_exclusion() {
-        let mut detector = crate::test_support::detector();
-        let mut exclusions = UserLexicon::default();
-        assert!(exclusions.insert(Language::English, "ghbdtn"));
-        detector.replace_user_lexicons(UserLexicon::default(), exclusions);
-        let candidates = [(Language::Russian, "привет".to_owned())];
-        assert!(
-            detector
-                .force_mapped_candidates("ghbdtn", Language::English, &candidates)
-                .is_some()
-        );
-    }
-
-    #[test]
     fn refuses_short_or_mixed_tokens() {
         let detector = crate::test_support::detector();
         assert_eq!(detector.detect("руд", Language::Russian), None);
@@ -2169,16 +2465,31 @@ mod tests {
     }
 
     #[test]
+    fn short_russian_words_whose_keys_spell_english_words_stay_russian() {
+        // Typed in the Russian layout, the same keys spell "her" and "key" in English.
+        let detector = crate::test_support::detector();
+        for (russian, english) in [("рук", "her"), ("лун", "key")] {
+            let candidates = [(Language::English, english.to_owned())];
+            assert!(
+                detector
+                    .detect_mapped_candidates(russian, Language::Russian, &candidates)
+                    .is_none(),
+                "{russian}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_short_word_dictionary_and_exclusion_entries_are_authoritative() {
         let mut detector = crate::test_support::detector();
         detector.replace_user_lexicons(
-            UserLexicon::from_lines(["en-US yt"]),
+            UserLexicon::from_lines(["en-US: yt"]),
             UserLexicon::default(),
         );
         assert!(detector.detect("yt", Language::English).is_none());
         detector.replace_user_lexicons(
             UserLexicon::default(),
-            UserLexicon::from_lines(["en-US yt"]),
+            UserLexicon::from_lines(["en-US: yt"]),
         );
         assert!(detector.detect("yt", Language::English).is_none());
     }
@@ -2261,8 +2572,10 @@ mod tests {
             single_letter_words: true,
             ..Default::default()
         });
-        with_user_dictionary
-            .replace_user_lexicons(UserLexicon::from_lines(["ru-RU й"]), UserLexicon::default());
+        with_user_dictionary.replace_user_lexicons(
+            UserLexicon::from_lines(["ru-RU: й"]),
+            UserLexicon::default(),
+        );
         assert_eq!(
             with_user_dictionary
                 .detect("q", Language::English)
@@ -2274,8 +2587,10 @@ mod tests {
             single_letter_words: true,
             ..Default::default()
         });
-        with_exclusion
-            .replace_user_lexicons(UserLexicon::default(), UserLexicon::from_lines(["en-US z"]));
+        with_exclusion.replace_user_lexicons(
+            UserLexicon::default(),
+            UserLexicon::from_lines(["en-US: z"]),
+        );
         assert!(with_exclusion.detect("z", Language::English).is_none());
     }
 
@@ -2306,7 +2621,7 @@ mod tests {
             assert!(detector.detect(target, Language::Russian).is_none());
         }
         detector.replace_user_lexicons(
-            UserLexicon::from_lines(["en-US b", "en-US c"]),
+            UserLexicon::from_lines(["en-US: b", "en-US: c"]),
             UserLexicon::default(),
         );
         for source in ["b", "B", "c", "C"] {
@@ -2332,7 +2647,7 @@ mod tests {
         );
         let mut suppressed = crate::test_support::detector();
         suppressed.replace_user_lexicons(
-            UserLexicon::from_lines(["en-US vs"]),
+            UserLexicon::from_lines(["en-US: vs"]),
             UserLexicon::default(),
         );
         assert!(suppressed.detect("vs", Language::English).is_none());

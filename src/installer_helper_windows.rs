@@ -19,7 +19,9 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{
+            CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_EVENT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
         System::Threading::{
             MUTEX_MODIFY_STATE, OpenMutexW, OpenProcess, PROCESS_SYNCHRONIZE, ReleaseMutex,
             SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
@@ -95,6 +97,34 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+/// How long a request may stay unreadable: a virus scanner can hold a new file for a moment, and
+/// that must not end the session (it did, with a sharing violation, on the test VM).
+const REQUEST_READ_PATIENCE: Duration = Duration::from_secs(5);
+
+/// The request at `path`, read once no other process holds it; a sharing, lock or access error
+/// that lasts longer than `patience` is returned like any other.
+fn read_request(path: &Path, patience: Duration) -> Result<Vec<u8>> {
+    let started = Instant::now();
+    loop {
+        match read_bounded(path, 8192) {
+            Err(error)
+                if held_by_another_process(error.as_ref()) && started.elapsed() < patience =>
+            {
+                thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION.
+fn held_by_another_process(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| matches!(code, 5 | 32 | 33))
+}
+
 fn publish(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     plain_path(root)?;
     let target = root.join(name);
@@ -143,10 +173,24 @@ fn leases() -> std::result::Result<Vec<Handle>, InstallError> {
     Ok(handles)
 }
 
+/// The session lasts exactly as long as setup: `parent` is the state of a zero-timeout wait on
+/// the setup process. Idle time never ends it, because the page sends no request while the user
+/// reads or chooses, and a helper that left on its own would fail every later action of a page
+/// that is still open.
+fn session_continues(parent: WAIT_EVENT) -> bool {
+    parent == WAIT_TIMEOUT
+}
+
+/// Rejection of a download into a profile without a package store: an English-only profile
+/// from an earlier version. The page then continues with English only.
+const STORE_MISSING: &str = "store_missing";
+
 /// Coarse, path-free failure code for a rejected synchronous command.
 fn reject_reason(text: &str) -> &'static str {
     let text = text.to_ascii_lowercase();
-    if text.starts_with("check:") || text.contains("catalog") {
+    if text == STORE_MISSING {
+        STORE_MISSING
+    } else if text.starts_with("check:") || text.contains("catalog") {
         "catalog"
     } else if text.contains("selection") {
         "selection"
@@ -212,7 +256,6 @@ pub fn run() -> Result<()> {
             .as_bytes(),
         )?;
         let mut sequence = 1u64;
-        let mut last_activity = Instant::now();
         let mut outcome = "none";
         let mut reason = "none";
         loop {
@@ -234,9 +277,7 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
-            if unsafe { WaitForSingleObject(parent.0, 0) } != WAIT_TIMEOUT
-                || last_activity.elapsed() > Duration::from_secs(300)
-            {
+            if !session_continues(unsafe { WaitForSingleObject(parent.0, 0) }) {
                 break;
             }
             let request = directory.join(format!("request-{sequence}.json"));
@@ -245,7 +286,7 @@ pub fn run() -> Result<()> {
                 continue;
             }
             let command = decoder
-                .accept(&read_bounded(&request, 8192)?)
+                .accept(&read_request(&request, REQUEST_READ_PATIENCE)?)
                 .map_err(|e| format!("protocol: {e:?}"))?;
             let ids = if matches!(command, Command::Select { .. }) {
                 Some(
@@ -256,7 +297,6 @@ pub fn run() -> Result<()> {
             } else {
                 None
             };
-            last_activity = Instant::now();
             if matches!(command, Command::Close {}) {
                 break;
             }
@@ -318,6 +358,9 @@ pub fn run() -> Result<()> {
                             return Err("stale or busy".into());
                         }
                         let _leases = leases()?;
+                        if !store_root.try_exists()? {
+                            return Err(STORE_MISSING.into());
+                        }
                         let store = PackageStore::open(store_root)?;
                         real_seen = true;
                         if let Some((ticket, selected)) = session
@@ -438,4 +481,74 @@ pub fn run() -> Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::WAIT_FAILED;
+
+    #[test]
+    fn a_request_held_for_a_moment_is_read_once_it_is_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request-1.json");
+        fs::write(&path, br#"{"format":1}"#).unwrap();
+        // As a scanner may: open without sharing, then let go.
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            read_request(&path, Duration::from_secs(5)).unwrap(),
+            br#"{"format":1}"#
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_held_longer_than_the_patience_ends_the_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("request-1.json");
+        fs::write(&path, b"{}").unwrap();
+        let _held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = read_request(&path, Duration::from_millis(200)).unwrap_err();
+        assert!(held_by_another_process(error.as_ref()), "{error}");
+        // Other failures are not waited for.
+        let started = Instant::now();
+        assert!(
+            read_request(
+                &directory.path().join("missing.json"),
+                Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_missing_store_has_its_own_reason_and_the_others_keep_theirs() {
+        assert_eq!(reject_reason(STORE_MISSING), "store_missing");
+        assert_eq!(reject_reason("selection: Missing"), "selection");
+        assert_eq!(reject_reason("stale or busy"), "state");
+        assert_eq!(reject_reason("store missing elsewhere"), "rejected");
+    }
+
+    #[test]
+    fn the_session_ends_with_setup_and_never_for_idle_time() {
+        assert!(session_continues(WAIT_TIMEOUT));
+        assert!(!session_continues(WAIT_OBJECT_0));
+        assert!(!session_continues(WAIT_FAILED));
+        assert!(!session_continues(WAIT_ABANDONED));
+    }
 }

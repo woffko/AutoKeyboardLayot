@@ -18,13 +18,13 @@ use std::{
 use autokeyboardlayot::bounded_probe::{BoundedProbe, ProbeFailure};
 use autokeyboardlayot::conversion_sound::{self, SoundCue};
 use autokeyboardlayot::installed_packages::{InstalledPackages, PackageSource};
-use autokeyboardlayot::panic_guard::{FaultWindow, WorkerExit, guarded, run_contained};
-use autokeyboardlayot::profile_resolver::ResolvedKeyboardProfiles;
+use autokeyboardlayot::panic_guard::{BusyGuard, FaultWindow, WorkerExit, guarded, run_contained};
+use autokeyboardlayot::profile_resolver::{ProfileUpdate, ResolvedKeyboardProfiles};
 use autokeyboardlayot::rate_limit::RateLimit;
 use autokeyboardlayot::tray_visual::{self, TrayVisual};
 use autokeyboardlayot::ui_guard::{
-    ForegroundPrivilege, HookWatchdog, TrayThrottle, WatchdogAction, WatchdogFacts,
-    captures_keyboard, hooks_look_silent, retry_delay,
+    ForegroundPrivilege, HookSilence, HookWatchdog, PointerMotion, SilentHook, TrayThrottle,
+    WatchdogAction, WatchdogFacts, captures_keyboard, retry_delay, silent_hook,
 };
 use autokeyboardlayot::windows_input_profiles::KeyboardProfileCache;
 use ui_localization::{tr, tr_format};
@@ -43,8 +43,9 @@ pub use installer_lifecycle::{initialize_installation, prepare_upgrade};
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HGLOBAL,
-            HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, GetLastError, GlobalFree, HANDLE,
+            HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WAIT_ABANDONED, WAIT_OBJECT_0,
+            WPARAM,
         },
         Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ},
         Security::{
@@ -60,7 +61,7 @@ use windows::{
             },
             DataExchange::{
                 CloseClipboard, EmptyClipboard, GetClipboardOwner, GetClipboardSequenceNumber,
-                OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+                GetOpenClipboardWindow, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
             },
             LibraryLoader::GetModuleHandleW,
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
@@ -85,25 +86,27 @@ use windows::{
         },
         UI::{
             Accessibility::{
-                CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement,
-                IUIAutomationTextPattern, TextPatternRangeEndpoint_End,
+                CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
+                IUIAutomationTextPattern, IUIAutomationTextRange, TextPatternRangeEndpoint_End,
                 TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_CONTROLTYPE_ID,
-                UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_TextPatternId,
+                UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_IsPasswordPropertyId,
+                UIA_ProcessIdPropertyId, UIA_TextPatternId,
             },
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState,
                 GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
                 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
-                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_BACK,
-                VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_F24, VK_HOME,
-                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMPAD0,
-                VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
-                VK_TAB, VK_UP,
+                MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_APPS,
+                VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+                VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
+                VK_MENU, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
+                VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+                VK_UP,
             },
             Shell::{
-                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-                NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFYICON_VERSION_4,
-                NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD,
+                NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NINF_KEY, NOTIFY_ICON_MESSAGE,
+                NOTIFYICON_VERSION_4, NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
                 SHQueryUserNotificationState, Shell_NotifyIconW,
             },
             WindowsAndMessaging::{
@@ -121,9 +124,10 @@ use windows::{
                 TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
                 WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
                 WM_DESTROY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONDOWN,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN,
-                WNDCLASSW, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
+                WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_POWERBROADCAST, WM_QUIT,
+                WM_RBUTTONDOWN, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+                WM_TIMER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WNDCLASSW, WTS_CONSOLE_CONNECT,
+                WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK,
             },
         },
     },
@@ -134,10 +138,7 @@ use windows::{
 use windows::Win32::{
     Foundation::{ERROR_SUCCESS, SetLastError},
     System::DataExchange::{EnumClipboardFormats, GetClipboardData},
-    UI::{
-        Accessibility::UIA_TextControlTypeId,
-        Input::KeyboardAndMouse::{VK_F12, VK_PAUSE},
-    },
+    UI::{Accessibility::UIA_TextControlTypeId, Input::KeyboardAndMouse::VK_F12},
 };
 
 const WINDOW_CLASS: PCWSTR = w!("AutoKeyboardLayot.ObserverWindow");
@@ -160,10 +161,15 @@ const GATE_ARM_MESSAGE: u32 = WM_APP + 2;
 const GATE_RELEASE_MESSAGE: u32 = WM_APP + 3;
 const GATE_DRAIN_ACK_MESSAGE: u32 = WM_APP + 4;
 const GATE_FAIL_OPEN_MESSAGE: u32 = WM_APP + 5;
+/// The LPARAM of a fail-open request whose edit may have left the word selected.
+const GATE_FAIL_OPEN_SELECTION_LEFT: isize = 1;
 const GATE_HANDOFF_BUDGET_MESSAGE: u32 = WM_APP + 6;
 const LEXICON_OFFER_MESSAGE: u32 = WM_APP + 7;
 const SETTINGS_APPLIED_MESSAGE: u32 = WM_APP + 8;
 const RECOVERY_NOTICE_MESSAGE: u32 = WM_APP + 9;
+const HELD_KEYS_RETURN_MESSAGE: u32 = WM_APP + 10;
+/// A tray "add word" save finished on its own thread; the window reports it.
+const LEXICON_SAVED_MESSAGE: u32 = WM_APP + 11;
 const LAYOUT_TIMER_ID: usize = 1;
 const LAYOUT_TIMER_INTERVAL_MS: u32 = 250;
 const MENU_AUTO_ID: usize = 1002;
@@ -182,6 +188,10 @@ const UIA_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 50;
 /// correction gate's time budget accounts for.
 const UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS: u64 = 100;
 const UIA_MANUAL_SELECTION_ATTEMPTS: u32 = 2;
+/// How often, and for how long at most, the agent's own selection is collapsed and read back
+/// when an edit does not go ahead.
+const SELECTION_COLLAPSE_ATTEMPTS: u32 = 4;
+const SELECTION_COLLAPSE_BUDGET_MS: u64 = 200;
 /// How long, and for how many windows, the last word stays available to Pause after the agent
 /// stopped tracking it (a window switch, a click, a shortcut). Memory only, never written.
 const REMEMBERED_WORD_TTL: Duration = Duration::from_secs(120);
@@ -189,11 +199,53 @@ const REMEMBERED_WORD_WINDOWS: usize = 8;
 const NOTEPAD_REPLAY_STEP_DELAY_MS: u64 = 3;
 const NOTEPAD_REPLAY_GATE_MARGIN_MS: u64 = 200;
 const CLIPBOARD_OPEN_RETRIES: usize = 10;
+/// How often a broker copies the user's clipboard and installs the replacement when another
+/// program held the clipboard open, and how long it waits between the attempts. The worker's
+/// installation timeout ends the attempts before that.
+const CLIPBOARD_INSTALL_ATTEMPTS: u32 = 3;
+const CLIPBOARD_INSTALL_RETRY_MS: u64 = 15;
 /// Putting the user's clipboard back is worth a longer wait than installing the temporary text
 /// (30 x 2 ms instead of 10 x 2 ms): a clipboard manager may hold the clipboard open for a moment.
 const CLIPBOARD_RESTORE_OPEN_RETRIES: usize = 30;
 const CLIPBOARD_RETRY_DELAY_MS: u64 = 2;
 const CLIPBOARD_BROKER_TIMEOUT_MS: u64 = 500;
+/// How long a paste waits for the broker to put the user's clipboard back. The broker opens the
+/// clipboard for up to 60 ms; a restore that takes longer finishes on its own and is logged when
+/// it is over.
+const CLIPBOARD_RESTORE_WAIT_MS: u64 = 100;
+/// How long the broker of a paste that was sent but not confirmed waits for the paste's target to
+/// read the replacement before it leaves the replacement on the clipboard for good.
+const UNCONFIRMED_PASTE_WAIT_MS: u64 = 5_000;
+/// How long the replacement stays after the target of an unconfirmed paste read it. The read may
+/// be the target's own look at the new clipboard (a clipboard listener) rather than its paste, and
+/// a busy program handles its queued Ctrl+V right after: that paste still gets the replacement.
+const TARGET_READ_GRACE_MS: u64 = 500;
+/// The least time worth giving the installation of a paste's replacement.
+const PASTE_MIN_INSTALL_MS: u64 = 50;
+/// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
+/// the user's clipboard, the layout switch, the second commit and the UI Automation calls between.
+const PASTE_AFTER_SUBMIT_MS: u64 = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_COMMIT_MS;
+/// What a protected paste needs after the commit of the replacement: the restore of the user's
+/// clipboard, the layout switch, the second commit and the UI Automation calls between.
+const PASTE_AFTER_COMMIT_MS: u64 = CLIPBOARD_RESTORE_WAIT_MS
+    + LAYOUT_SWITCH_TIMEOUT_MS
+    + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    + PASTE_UIA_MARGIN_MS;
+/// The UI Automation calls between the steps of a protected paste.
+const PASTE_UIA_MARGIN_MS: u64 = 100;
+/// The least time the second commit check of a protected paste gets: the field showed the
+/// replacement once already.
+const PASTE_TARGET_COMMIT_MIN_MS: u64 = 50;
+/// What a protected paste keeps back after the commit of the replacement for the steps that
+/// follow at the least: the layout switch, the second commit's least check and the UI Automation
+/// calls between. The restore waits only for what is left (one that takes longer finishes on its
+/// own), and so does the second commit check beyond its least.
+const PASTE_AFTER_LATE_COMMIT_MS: u64 =
+    LAYOUT_SWITCH_TIMEOUT_MS + PASTE_TARGET_COMMIT_MIN_MS + PASTE_UIA_MARGIN_MS;
+/// How long past its poll a paste's commit check still waits for the field to answer its last
+/// read: a program busy with the paste (Viber) answers UI Automation only once it has handled
+/// it, and a paste counted as failed turns automatic conversion off.
+const PASTE_COMMIT_LATE_ANSWER_MS: u64 = 400;
 /// An automatic conversion waits this long for a busy clipboard, then leaves the word alone.
 const CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS: u64 = 200;
 const VK_V_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -206,14 +258,19 @@ const CORRECTION_GATE_CAPACITY: usize = 256;
 /// are then deleted, so that they cannot keep automatic conversion paused and Exit declined for
 /// hours. Preparing a recovery from the tray menu gives them this long again from then.
 const RETAINED_INPUT_LIFETIME_MS: u64 = 60_000;
+/// Held keys that the worker should hand back automatically are handed back by the UI thread
+/// when the worker is still busy this long after they were retained.
+const STALLED_WORKER_HAND_BACK_MS: u64 = 2_000;
 const TO_UNICODE_DO_NOT_CHANGE_KEYBOARD_STATE: u32 = 4;
 const PRIVACY_ALLOWED: u8 = 0;
 // Worker-only wait: the low-level hook never waits for UI Automation.
 // Give ordinary delayed replies more headroom before failing closed.
 const PRIVACY_PROBE_WAIT_MS: u64 = 300;
-/// How long a failed field check may lean on the last good one for the same input target. The
-/// provider of a busy terminal answers a check late now and then; see `settle_probe_outcome`.
-const PRIVACY_RECENT_OK_MS: u64 = 2_000;
+/// How long a failed field check may lean on the last good one for the same input target, or on
+/// the last conversion made in it. The provider of a busy terminal answers a check late now and
+/// then, and fails them for seconds after an edit; see `settle_probe_outcome` (the owner's
+/// decision of 2026-10-24: five seconds, two before).
+const PRIVACY_RECENT_OK_MS: u64 = 5_000;
 /// Periodic field checks run every half second while they are fast. A slow one spaces the next
 /// by twenty times its own length, so that periodic checks fill at most a twentieth of the
 /// worker's time, and never more than five seconds apart.
@@ -227,11 +284,21 @@ const SLOW_INPUT_DIAGNOSTIC_MS: u64 = 30;
 /// A privacy provider that keeps the probe busy this long without answering is replaced.
 const PRIVACY_PROBE_STUCK_AFTER_SECS: u64 = 5;
 const PRIVACY_PROBE_MAX_RESPAWNS: usize = 3;
+/// A text-barrier provider that has not taken a new read for this long is replaced by a fresh
+/// one, at most this many times.
+const BARRIER_PROBE_STUCK_AFTER_MS: u64 = 2_000;
+const BARRIER_PROBE_MAX_RESPAWNS: usize = 3;
 /// A hook callback slower than this is recorded; Windows gives hooks a tight time budget.
 const HOOK_SLOW_DIAGNOSTIC_MS: u64 = 50;
 /// Timer ticks are 250 ms apart; a longer gap means the UI thread was blocked.
 const UI_STALL_DIAGNOSTIC_MS: u64 = 700;
 const UIA_PROVIDER_TIMEOUT_MS: u32 = 100;
+/// The UI Automation timeout of the privacy check, which asks the field once (its process and
+/// whether it is a password field, in one cached request): a program busy for a moment after a
+/// conversion or under fast typing still answers, and the one call fits the worker's wait
+/// (`PRIVACY_PROBE_WAIT_MS`). An unanswered check makes the word being typed manual-only.
+const UIA_PRIVACY_TIMEOUT_MS: u32 = 250;
+const _: () = assert!((UIA_PRIVACY_TIMEOUT_MS as u64) < PRIVACY_PROBE_WAIT_MS);
 const PRIVACY_PASSWORD: u8 = 1;
 const PRIVACY_EXCLUDED: u8 = 2;
 const PRIVACY_UNAVAILABLE: u8 = 3;
@@ -246,6 +313,10 @@ const BACKEND_SELECTION_MISMATCH: u8 = 6;
 const BACKEND_SELECTION_UNSUPPORTED: u8 = 7;
 const INJECTED_EVENT_MARKER: usize = 0x414B_4C59_5458_0001;
 const DRAINED_EVENT_MARKER: usize = 0x414B_4C59_5458_0002;
+/// Keys the desktop acceptance types for the agent. Injected like any program's keys, they count as
+/// the user's typing in test builds only: the agent itself never takes another program's keys.
+#[cfg(test)]
+const ACCEPTANCE_TYPING_MARKER: usize = 0x414B_4C59_5458_0003;
 const GATE_FENCE_MARKER_BASE: usize = 0x414B_4C59_5458_8000;
 const LEXICON_OFFER_SECONDS: u64 = 120;
 const MAX_UIA_EDITABLE_ANCESTOR_DEPTH: usize = 32;
@@ -297,9 +368,10 @@ thread_local! {
     static UI_GUARDS: RefCell<UiGuards> = RefCell::new(UiGuards::new());
 }
 
-/// Milliseconds (`GetTickCount64`) of the last hook callback or hook installation. The watchdog
-/// compares it with the time of the last user input.
-static HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+/// Milliseconds (`GetTickCount64`) of the last callback or installation of the keyboard hook and
+/// of the mouse hook. The watchdog compares each with the input that hook must have seen.
+static KEYBOARD_HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+static MOUSE_HOOK_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 /// The window message registered as "TaskbarCreated"; 0 until it is registered.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -326,6 +398,7 @@ impl Retry {
 /// UI-thread state of the rules that keep the thread responsive for the hooks (see `ui_guard`).
 struct UiGuards {
     watchdog: HookWatchdog,
+    pointer: PointerMotion,
     tray: TrayThrottle,
     hook_retry: Option<Retry>,
     tray_retry: Option<Retry>,
@@ -335,6 +408,7 @@ impl UiGuards {
     fn new() -> Self {
         Self {
             watchdog: HookWatchdog::new(),
+            pointer: PointerMotion::new(),
             tray: TrayThrottle::new(),
             hook_retry: None,
             tray_retry: None,
@@ -353,8 +427,13 @@ struct ObserverMetrics {
     input_epoch: AtomicU64,
     configuration_pending: AtomicBool,
     configuration_ack: AtomicU64,
+    // A revision whose application panicked in the worker; the UI drops it instead of waiting.
+    configuration_rejected: AtomicU64,
     last_input_layout: AtomicUsize,
     privacy_reason: AtomicU8,
+    // The process whose policy the worker applied to `privacy_reason` (0 before any). A key in
+    // another process meets a verdict that is not its own.
+    privacy_process_id: AtomicU32,
     auto_enabled: AtomicBool,
     safety_paused: AtomicBool,
     pause_break_undo: AtomicBool,
@@ -369,13 +448,21 @@ struct ObserverMetrics {
     backend_status: AtomicU8,
     diagnostics_enabled: AtomicBool,
     dropped_diagnostics: AtomicU64,
+    // Records the log writer could not write, and full logs it could not move aside.
+    diagnostic_log_errors: AtomicU64,
     gate_replayed_events: AtomicU64,
     observed_input_sequence: AtomicU64,
     forwarded_input_sequence: AtomicU64,
     active_gate_token: AtomicU64,
     cancelled_gate_token: AtomicU64,
     privacy_refresh_queued: AtomicBool,
+    profile_refresh_queued: AtomicBool,
     worker_busy: AtomicBool,
+    // The worker is inside an edit that may have selected or typed text in the field.
+    edit_in_flight: AtomicBool,
+    // The gate whose paste may have left the word selected: its held keys come back only when the
+    // user asks for them.
+    selection_left_token: AtomicU64,
     // Set when the input worker gave up after repeated internal faults.
     worker_dead: AtomicBool,
     // Gate release requests made by the worker, counted before any window is involved.
@@ -400,8 +487,10 @@ impl Default for ObserverMetrics {
             input_epoch: AtomicU64::new(0),
             configuration_pending: AtomicBool::new(false),
             configuration_ack: AtomicU64::new(0),
+            configuration_rejected: AtomicU64::new(0),
             last_input_layout: AtomicUsize::new(0),
             privacy_reason: AtomicU8::new(PRIVACY_UNAVAILABLE),
+            privacy_process_id: AtomicU32::new(0),
             auto_enabled: AtomicBool::new(false),
             safety_paused: AtomicBool::new(false),
             pause_break_undo: AtomicBool::new(true),
@@ -416,13 +505,17 @@ impl Default for ObserverMetrics {
             backend_status: AtomicU8::new(BACKEND_OBSERVE_ONLY),
             diagnostics_enabled: AtomicBool::new(false),
             dropped_diagnostics: AtomicU64::new(0),
+            diagnostic_log_errors: AtomicU64::new(0),
             gate_replayed_events: AtomicU64::new(0),
             observed_input_sequence: AtomicU64::new(0),
             forwarded_input_sequence: AtomicU64::new(0),
             active_gate_token: AtomicU64::new(0),
             cancelled_gate_token: AtomicU64::new(0),
             privacy_refresh_queued: AtomicBool::new(false),
+            profile_refresh_queued: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            edit_in_flight: AtomicBool::new(false),
+            selection_left_token: AtomicU64::new(0),
             worker_dead: AtomicBool::new(false),
             gate_release_requests: AtomicU64::new(0),
             clipboard_restore_failures: AtomicU64::new(0),
@@ -505,6 +598,13 @@ struct RawKeyEvent {
     sequence: u64,
     drain_token: u64,
     hotkey_trigger: bool,
+    /// A key-down of a key that was already down: an auto-repeat. Recorded only for edges a
+    /// correction gate holds, where it decides which held key-ups must still be delivered.
+    repeat: bool,
+    /// The modifier keys physically held once this edge is applied, in the layout of
+    /// `PHYSICAL_MODIFIER_KEYS`: the worker takes them over after a focus change or a new input
+    /// epoch instead of assuming every modifier released.
+    held_modifiers: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,6 +620,8 @@ enum GateFailureCause {
     DownstreamHook,
     InternalFault,
     HookReinstall,
+    /// The worker's edit may have left the word selected, so the held keys would replace it.
+    SelectionLeft,
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +632,15 @@ struct RetainedInput {
     delivery_uncertain: bool,
     /// When the keys are deleted unless they were recovered first.
     expires_at: Instant,
+    /// The worker is sending these keys right now; the lifetime timer leaves the record alone.
+    recovering: bool,
+    /// When the keys were retained.
+    retained_at: Instant,
+    /// The gate broke for a cause that hands its keys back without being asked (see
+    /// `hands_held_keys_back_automatically`).
+    auto_recover: bool,
+    /// `AppState::typed_input` when the keys were retained.
+    input_mark: u64,
 }
 
 struct CorrectionGate {
@@ -625,14 +736,16 @@ impl CorrectionGate {
             && !self.awaiting_worker_ack
     }
 
-    fn handoff(&mut self, old_token: u64, new_token: u64) -> bool {
+    /// Hands the gate to `new_token` when the budget prepared for it still fits before the
+    /// deadline at `now`.
+    fn handoff(&mut self, old_token: u64, new_token: u64, now: Instant) -> bool {
         if !self.active
             || self.cancelled
             || !self.awaiting_worker_ack
             || self.token != old_token
             || new_token == 0
             || self.handoff_budget_ms == 0
-            || self.deadline.saturating_duration_since(Instant::now())
+            || self.deadline.saturating_duration_since(now)
                 < Duration::from_millis(self.handoff_budget_ms)
         {
             return false;
@@ -648,18 +761,29 @@ impl CorrectionGate {
         true
     }
 
-    fn prepare_handoff_budget(&mut self, old_token: u64, required_ms: u64) -> bool {
+    /// Prepares handing the gate of `old_token` over to a conversion that needs `required_ms`.
+    /// Returns what the gate has left at `now`, which the conversion may use, when that covers
+    /// `required_ms`.
+    fn prepare_handoff_budget(
+        &mut self,
+        old_token: u64,
+        required_ms: u64,
+        now: Instant,
+    ) -> Option<u64> {
+        let remaining_ms =
+            u64::try_from(self.deadline.saturating_duration_since(now).as_millis()).ok()?;
         if !self.active
             || self.cancelled
             || !self.awaiting_worker_ack
             || self.token != old_token
             || required_ms == 0
             || required_ms > CORRECTION_GATE_MAX_HOLD_MS
+            || remaining_ms < required_ms
         {
-            return false;
+            return None;
         }
         self.handoff_budget_ms = required_ms;
-        true
+        Some(remaining_ms)
     }
 }
 
@@ -669,6 +793,10 @@ enum RawInputEvent {
     Mouse,
     ExternalInjection,
     PrivacyRefresh(ForegroundContext),
+    /// Keeps the keyboard profile snapshot fresh on every timer tick, also while no privacy
+    /// refresh runs (the shell in the foreground): without it the first key after six quiet
+    /// seconds finds the snapshot expired and the word, undo and remembered words are dropped.
+    ProfileRefresh,
     ReloadConfiguration,
     RecoverInput {
         sequence: u64,
@@ -676,6 +804,13 @@ enum RawInputEvent {
     },
     /// Held keys nobody recovered were deleted; automatic conversion may resume (policy D1).
     RetainedInputExpired,
+    /// The UI thread sent `submitted` of the `requested` inputs of the retained record `token`
+    /// past a stalled worker; the worker finishes that recovery.
+    RetainedInputHandedBack {
+        token: u64,
+        submitted: usize,
+        requested: usize,
+    },
     GateDrainReady {
         token: u64,
         drained_count: usize,
@@ -701,6 +836,26 @@ struct QueuedInputEvent {
 struct ConfigurationReload {
     revision: u64,
     snapshot: RuntimeConfiguration,
+}
+
+/// What became of a configuration offered to the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigurationHandoff {
+    Queued,
+    /// Not now: a correction gate or retained keys, two revisions the worker has not acknowledged
+    /// yet, or a full queue. These pass by themselves, so the same snapshot can be offered again.
+    Busy,
+    /// Never: the agent is stopping, the worker is gone, or the snapshot would take back a
+    /// configuration source or a package generation.
+    Refused,
+}
+
+/// Why an event did not reach the worker's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueRefusal {
+    Full,
+    /// No queue or no worker behind it.
+    Closed,
 }
 
 #[derive(Debug, Clone)]
@@ -791,6 +946,11 @@ impl VolatileLexiconCandidate {
     fn is_valid_at(&self, now: Instant) -> bool {
         now <= self.expires_at
     }
+
+    /// The same word for the same list, whenever it was offered.
+    fn same_offer(&self, other: &Self) -> bool {
+        self.target == other.target && self.language == other.language && self.word == other.word
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,9 +976,14 @@ enum TextEditAttempt {
     Applied,
     /// The edit is confirmed; only the user's previous clipboard could not be restored.
     AppliedClipboardNotRestored,
+    /// Nothing was typed: the field could not be inspected or selected.
     Unsupported,
     Cancelled,
-    Failed,
+    /// Input reached the field but the edit did not complete, for this reason.
+    Failed(ConversionFailureReason),
+    /// The edit did not go ahead and the agent's selection of the word could not be shown gone:
+    /// keys typed now would replace the word.
+    SelectionLeft,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,100 +1192,696 @@ fn stgmedium_has_custom_releaser(medium: &STGMEDIUM) -> bool {
 
 #[derive(Debug, Clone, Copy)]
 enum ClipboardBrokerCommand {
+    /// Put the user's clipboard back, if the clipboard still holds the replacement.
     Restore,
+    /// Leave the replacement there and drop the copy of the user's clipboard.
     Abandon,
+    /// The Ctrl+V was sent at `submitted_at` but not confirmed: leave the replacement until
+    /// `process`, the paste's target, has read it, then put the user's clipboard back
+    /// (`TARGET_READ_GRACE_MS` after the read); leave it for good after `wait`.
+    Defer {
+        process: u32,
+        wait: Duration,
+        submitted_at: Instant,
+    },
+}
+
+/// What a broker found while waiting for the worker.
+#[derive(Debug, Clone, Copy)]
+enum BrokerWait {
+    Command(ClipboardBrokerCommand),
+    Timeout,
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ClipboardBrokerResponse {
     Installed { sequence: u32, owner: usize },
     Finished(bool),
-    Failed,
+    Failed(BrokerRefusal),
 }
 
-struct ProtectedClipboard {
-    owner: HWND,
+/// Why a clipboard broker did not put the replacement on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerFailure {
+    /// OLE or the broker's window could not be set up.
+    Setup,
+    /// The user's clipboard could not be copied whole.
+    Snapshot,
+    /// Another program held the clipboard open.
+    Open,
+    /// The clipboard changed after the copy was taken.
+    Changed,
+    /// The worker stopped waiting.
+    Cancelled,
+    /// The replacement could not be prepared, or the clipboard could not be emptied.
+    Prepare,
+    /// The clipboard was emptied and the replacement could not be put there whole; the user's
+    /// clipboard was put back.
+    Emptied,
+}
+
+impl BrokerFailure {
+    /// A program that holds the clipboard open lets go in a moment, and a copy fails while it
+    /// does: worth another attempt while the worker waits.
+    const fn is_transient(self) -> bool {
+        matches!(self, Self::Open | Self::Snapshot)
+    }
+}
+
+/// A broker's failure as the worker logs it: why, after how many attempts, and the process that
+/// held the clipboard open then (0 when none did).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrokerRefusal {
+    reason: BrokerFailure,
+    attempts: u32,
+    holder: u32,
+}
+
+/// How a clipboard broker ended; logged for a broker the worker stopped waiting for.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerEnd {
+    Running = 0,
+    /// The user's clipboard was never changed.
+    Untouched = 1,
+    /// The user's clipboard was put back.
+    Restored = 2,
+    /// The user's clipboard could not be put back, or another program had replaced the
+    /// replacement meanwhile.
+    NotRestored = 3,
+    /// The replacement was left there on purpose: its paste was not confirmed.
+    Kept = 4,
+    /// The paste was not confirmed and its target never read the replacement within the wait: it
+    /// stays, and the user's clipboard is lost.
+    Unread = 5,
+}
+
+impl BrokerEnd {
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Untouched,
+            2 => Self::Restored,
+            3 => Self::NotRestored,
+            4 => Self::Kept,
+            5 => Self::Unread,
+            _ => Self::Running,
+        }
+    }
+}
+
+/// What the worker and its clipboard broker share besides their channels.
+#[derive(Default)]
+struct BrokerShared {
+    /// Set when the worker stopped waiting for the installation: the broker must not put the
+    /// replacement on the clipboard any more.
+    cancelled: AtomicBool,
+    /// How the broker ended (`BrokerEnd`).
+    end: AtomicU8,
+}
+
+impl BrokerShared {
+    fn finish(&self, end: BrokerEnd) {
+        self.end.store(end as u8, Ordering::Release);
+    }
+
+    fn end(&self) -> BrokerEnd {
+        BrokerEnd::from_code(self.end.load(Ordering::Acquire))
+    }
+}
+
+/// Clipboard brokers the worker stopped waiting for: an installation or a restore that took too
+/// long. Only one broker runs at a time, so no paste starts while one of these still runs, and
+/// each one's end is logged once it is over.
+#[derive(Default)]
+struct ClipboardBrokers {
+    lingering: RefCell<Vec<(JoinHandle<()>, Arc<BrokerShared>)>>,
+}
+
+impl ClipboardBrokers {
+    fn busy(&self) -> bool {
+        self.lingering
+            .borrow()
+            .iter()
+            .any(|(worker, _)| !worker.is_finished())
+    }
+
+    fn linger(&self, worker: JoinHandle<()>, shared: Arc<BrokerShared>) {
+        self.lingering.borrow_mut().push((worker, shared));
+    }
+
+    /// Joins the brokers that are over and says how each one ended.
+    fn reap(&self) -> Vec<BrokerEnd> {
+        let mut lingering = self.lingering.borrow_mut();
+        let mut ended = Vec::new();
+        let mut index = 0;
+        while index < lingering.len() {
+            if lingering[index].0.is_finished() {
+                let (worker, shared) = lingering.swap_remove(index);
+                let _ = worker.join();
+                ended.push(shared.end());
+            } else {
+                index += 1;
+            }
+        }
+        ended
+    }
+}
+
+/// What an installation did to the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    /// Nothing changed: the clipboard could not be opened, it changed since the copy was taken,
+    /// the worker stopped waiting, or the data could not be prepared.
+    Untouched(BrokerFailure),
+    /// The clipboard was emptied, but the replacement could not be put there whole.
+    Emptied {
+        sequence: u32,
+    },
+    Installed {
+        sequence: u32,
+    },
+}
+
+/// The clipboard calls of a broker, made on its own thread. `SystemClipboard` makes them on the
+/// system clipboard; tests script them.
+trait ClipboardSystem {
+    type Snapshot;
+    /// The clipboard's sequence number.
+    fn sequence(&self) -> u32;
+    /// The broker's clipboard owner, as the worker compares it.
+    fn owner(&self) -> usize;
+    /// Whether the broker owns the clipboard.
+    fn owned(&self) -> bool;
+    /// Renders and copies every format of the current clipboard.
+    fn snapshot(&mut self) -> Option<Self::Snapshot>;
+    /// Puts `text` on the clipboard with the history, cloud and monitoring opt-outs, unless the
+    /// clipboard changed since its sequence was `expected` or the worker stopped waiting.
+    fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome;
+    /// Puts `snapshot` back, with `expected` only while the clipboard still holds the broker's
+    /// item of that sequence, and adds the opt-outs the snapshot lacks.
+    fn restore(&mut self, expected: Option<u32>, snapshot: &mut Self::Snapshot) -> bool;
+    /// Waits for the worker's command, or without `commands` only lets time pass, at most
+    /// `timeout` when one is given. Requests to render the replacement are served meanwhile.
+    fn wait(
+        &mut self,
+        commands: Option<&Receiver<ClipboardBrokerCommand>>,
+        timeout: Option<Duration>,
+    ) -> BrokerWait;
+    /// Whether `process`, whose Ctrl+V was sent at `submitted_at`, has read the replacement since
+    /// it was put on the clipboard (see replacement_read_by).
+    fn read_by(&self, process: u32, submitted_at: Instant) -> bool;
+    /// The process holding the clipboard open with a window, 0 when none does.
+    fn holder(&self) -> u32;
+}
+
+/// The broker's work: copy the user's clipboard, put the replacement there, report it, and on
+/// the worker's command put the copy back or leave the replacement. The clipboard is changed only
+/// if it did not change since the copy was taken; an installation that emptied the clipboard and
+/// failed is undone at once, and only such a one.
+fn run_clipboard_broker<S: ClipboardSystem>(
+    system: &mut S,
+    text: &str,
+    shared: &BrokerShared,
+    commands: &Receiver<ClipboardBrokerCommand>,
+    responses: &SyncSender<ClipboardBrokerResponse>,
+) {
+    let mut attempts = 1;
+    let (mut snapshot, sequence) = loop {
+        let before = system.sequence();
+        let reason = match system.snapshot() {
+            None => BrokerFailure::Snapshot,
+            Some(mut snapshot) => match system.install(text, before, &shared.cancelled) {
+                InstallOutcome::Installed { sequence } => break (snapshot, sequence),
+                InstallOutcome::Untouched(reason) => reason,
+                InstallOutcome::Emptied { sequence } => {
+                    let end = if system.restore(Some(sequence), &mut snapshot) {
+                        BrokerEnd::Restored
+                    } else {
+                        BrokerEnd::NotRestored
+                    };
+                    shared.finish(end);
+                    let _ = responses.send(ClipboardBrokerResponse::Failed(BrokerRefusal {
+                        reason: BrokerFailure::Emptied,
+                        attempts,
+                        holder: 0,
+                    }));
+                    return;
+                }
+            },
+        };
+        // Clipboard listeners open the clipboard after every change, for some milliseconds each.
+        if reason.is_transient()
+            && attempts < CLIPBOARD_INSTALL_ATTEMPTS
+            && !shared.cancelled.load(Ordering::Acquire)
+        {
+            attempts += 1;
+            thread::sleep(Duration::from_millis(CLIPBOARD_INSTALL_RETRY_MS));
+            continue;
+        }
+        shared.finish(BrokerEnd::Untouched);
+        let _ = responses.send(ClipboardBrokerResponse::Failed(BrokerRefusal {
+            reason,
+            attempts,
+            holder: system.holder(),
+        }));
+        return;
+    };
+    // A worker that stopped waiting has already sent its command; it is read below.
+    let _ = responses.send(ClipboardBrokerResponse::Installed {
+        sequence,
+        owner: system.owner(),
+    });
+    let mut waited = system.wait(Some(commands), None);
+    let end = loop {
+        waited = match waited {
+            BrokerWait::Command(ClipboardBrokerCommand::Restore) => {
+                break restore_if_current(system, sequence, &mut snapshot);
+            }
+            BrokerWait::Command(ClipboardBrokerCommand::Defer {
+                process,
+                wait,
+                submitted_at,
+            }) => {
+                match wait_for_reader(system, commands, sequence, (process, submitted_at), wait) {
+                    ReaderWait::Read => break restore_if_current(system, sequence, &mut snapshot),
+                    ReaderWait::Replaced => break BrokerEnd::NotRestored,
+                    ReaderWait::Expired => break BrokerEnd::Unread,
+                    ReaderWait::Command(command) => BrokerWait::Command(command),
+                }
+            }
+            BrokerWait::Command(ClipboardBrokerCommand::Abandon)
+            | BrokerWait::Timeout
+            | BrokerWait::Disconnected => break BrokerEnd::Kept,
+        };
+    };
+    shared.finish(end);
+    let _ = responses.send(ClipboardBrokerResponse::Finished(
+        end == BrokerEnd::Restored,
+    ));
+}
+
+/// Puts the user's clipboard back while the clipboard still holds the broker's replacement.
+fn restore_if_current<S: ClipboardSystem>(
+    system: &mut S,
+    sequence: u32,
+    snapshot: &mut S::Snapshot,
+) -> BrokerEnd {
+    if system.sequence() != sequence || !system.owned() {
+        return BrokerEnd::NotRestored;
+    }
+    if system.restore(Some(sequence), snapshot) {
+        BrokerEnd::Restored
+    } else {
+        BrokerEnd::NotRestored
+    }
+}
+
+/// How the wait for a paste's target to read the replacement ended.
+enum ReaderWait {
+    Read,
+    /// Another program replaced the replacement: theirs stays.
+    Replaced,
+    Expired,
+    /// The worker sent a command meanwhile.
+    Command(ClipboardBrokerCommand),
+}
+
+/// Waits up to `wait` for `target`, the paste's process and when its Ctrl+V was sent, to read the
+/// replacement, and `TARGET_READ_GRACE_MS` more once it did. Requests to render it are served
+/// meanwhile, also once the worker no longer listens.
+fn wait_for_reader<S: ClipboardSystem>(
+    system: &mut S,
+    commands: &Receiver<ClipboardBrokerCommand>,
+    sequence: u32,
+    target: (u32, Instant),
+    wait: Duration,
+) -> ReaderWait {
+    let mut deadline = Instant::now() + wait;
+    let mut read = false;
+    let mut commands = Some(commands);
+    loop {
+        if system.sequence() != sequence || !system.owned() {
+            return ReaderWait::Replaced;
+        }
+        let now = Instant::now();
+        if !read && system.read_by(target.0, target.1) {
+            read = true;
+            deadline = now + Duration::from_millis(TARGET_READ_GRACE_MS);
+        }
+        if now >= deadline {
+            return if read {
+                ReaderWait::Read
+            } else {
+                ReaderWait::Expired
+            };
+        }
+        let slice = (deadline - now).min(Duration::from_millis(10));
+        match system.wait(commands, Some(slice)) {
+            BrokerWait::Timeout => {}
+            BrokerWait::Command(command) => return ReaderWait::Command(command),
+            BrokerWait::Disconnected => commands = None,
+        }
+    }
+}
+
+fn spawn_clipboard_broker<S, F>(
+    text: String,
+    make: F,
+    shared: Arc<BrokerShared>,
+    commands: Receiver<ClipboardBrokerCommand>,
+    responses: SyncSender<ClipboardBrokerResponse>,
+) -> JoinHandle<()>
+where
+    S: ClipboardSystem,
+    F: FnOnce() -> Option<S> + Send + 'static,
+{
+    thread::spawn(move || {
+        let Some(mut system) = make() else {
+            shared.finish(BrokerEnd::Untouched);
+            let _ = responses.send(ClipboardBrokerResponse::Failed(BrokerRefusal {
+                reason: BrokerFailure::Setup,
+                attempts: 1,
+                holder: 0,
+            }));
+            return;
+        };
+        run_clipboard_broker(&mut system, &text, &shared, &commands, &responses);
+    })
+}
+
+/// Why a protected paste could not put its replacement on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardBeginFailure {
+    /// A broker the worker stopped waiting for still runs.
+    Busy,
+    /// The replacement was not on the clipboard in time. The broker does not put it there any
+    /// more, and puts the user's clipboard back if it already had. With the broker's own refusal,
+    /// or none when it did not answer in time.
+    NotInstalled(Option<BrokerRefusal>),
+}
+
+/// The replacement on the clipboard for one paste. The user's clipboard is put back (`restore`)
+/// once the paste is confirmed. Once the Ctrl+V was sent and not confirmed (`defer`), the
+/// replacement stays until the paste's target has read it: a field that handles the paste late
+/// then gets the replacement, never the user's own clipboard, which comes back afterwards.
+/// Dropping it restores before the Ctrl+V was sent and defers after.
+struct ProtectedClipboard<'a> {
+    owner: usize,
     temporary_sequence: u32,
+    /// The process the paste goes to, and how long a paste that was not confirmed waits for it.
+    target_process: u32,
+    deferred_wait: Duration,
     command: SyncSender<ClipboardBrokerCommand>,
     response: Receiver<ClipboardBrokerResponse>,
     worker: Option<JoinHandle<()>>,
+    shared: Arc<BrokerShared>,
+    brokers: &'a ClipboardBrokers,
+    /// Reads the clipboard's sequence number and owner on the worker's side.
+    probe: Box<dyn Fn() -> (u32, usize)>,
     active: bool,
+    /// When the Ctrl+V was about to be sent.
+    submitted_at: Option<Instant>,
+    /// The last command was not answered in time: the broker finishes on its own.
+    lingering: bool,
 }
 
-impl ProtectedClipboard {
-    fn begin(text: &str, install_timeout: Duration) -> Option<Self> {
+impl<'a> ProtectedClipboard<'a> {
+    fn begin(
+        text: &str,
+        install_timeout: Duration,
+        brokers: &'a ClipboardBrokers,
+        target_process: u32,
+    ) -> core::result::Result<Self, ClipboardBeginFailure> {
+        Self::begin_with(
+            text,
+            install_timeout,
+            brokers,
+            (
+                target_process,
+                Duration::from_millis(UNCONFIRMED_PASTE_WAIT_MS),
+            ),
+            SystemClipboard::new,
+            Box::new(system_clipboard_state),
+        )
+    }
+
+    /// `target`: the paste's target process, and how long a paste that was not confirmed waits
+    /// for it to read the replacement.
+    fn begin_with<S, F>(
+        text: &str,
+        install_timeout: Duration,
+        brokers: &'a ClipboardBrokers,
+        target: (u32, Duration),
+        make: F,
+        probe: Box<dyn Fn() -> (u32, usize)>,
+    ) -> core::result::Result<Self, ClipboardBeginFailure>
+    where
+        S: ClipboardSystem,
+        F: FnOnce() -> Option<S> + Send + 'static,
+    {
+        if brokers.busy() {
+            return Err(ClipboardBeginFailure::Busy);
+        }
         let (command_sender, command_receiver) = sync_channel(1);
         let (response_sender, response_receiver) = sync_channel(1);
-        let text = text.to_owned();
-        let worker = thread::spawn(move || {
-            protected_clipboard_broker(text, command_receiver, response_sender);
-        });
-        let installed = response_receiver.recv_timeout(install_timeout).ok();
-        let Some(ClipboardBrokerResponse::Installed {
-            sequence: temporary_sequence,
-            owner,
-        }) = installed
-        else {
-            let _ = command_sender.try_send(ClipboardBrokerCommand::Restore);
-            if worker.is_finished() {
-                let _ = worker.join();
+        let shared = Arc::new(BrokerShared::default());
+        let worker = spawn_clipboard_broker(
+            text.to_owned(),
+            make,
+            Arc::clone(&shared),
+            command_receiver,
+            response_sender,
+        );
+        match response_receiver.recv_timeout(install_timeout) {
+            Ok(ClipboardBrokerResponse::Installed { sequence, owner }) => Ok(Self {
+                owner,
+                temporary_sequence: sequence,
+                target_process: target.0,
+                deferred_wait: target.1,
+                command: command_sender,
+                response: response_receiver,
+                worker: Some(worker),
+                shared,
+                brokers,
+                probe,
+                active: true,
+                submitted_at: None,
+                lingering: false,
+            }),
+            answer => {
+                shared.cancelled.store(true, Ordering::Release);
+                let _ = command_sender.try_send(ClipboardBrokerCommand::Restore);
+                brokers.linger(worker, shared);
+                Err(ClipboardBeginFailure::NotInstalled(match answer {
+                    Ok(ClipboardBrokerResponse::Failed(refusal)) => Some(refusal),
+                    _ => None,
+                }))
             }
-            return None;
-        };
-
-        Some(Self {
-            owner: HWND(owner as *mut c_void),
-            temporary_sequence,
-            command: command_sender,
-            response: response_receiver,
-            worker: Some(worker),
-            active: true,
-        })
+        }
     }
 
     fn is_current(&self) -> bool {
-        self.active
-            && unsafe { GetClipboardSequenceNumber() } == self.temporary_sequence
-            && unsafe { GetClipboardOwner().ok() } == Some(self.owner)
+        self.active && (self.probe)() == (self.temporary_sequence, self.owner)
     }
 
+    /// The Ctrl+V is about to be sent: from now on the replacement stays until the paste was
+    /// confirmed (`restore`) or its target read it (`defer`).
+    fn mark_submitted(&mut self) {
+        self.submitted_at = Some(Instant::now());
+    }
+
+    /// Puts the user's clipboard back if the clipboard still holds the replacement. Waits
+    /// `CLIPBOARD_RESTORE_WAIT_MS` for the broker; a restore that takes longer finishes on its
+    /// own and is logged and counted when it is over (`restore_pending`).
     fn restore(&mut self) -> bool {
+        self.restore_waiting(Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS))
+    }
+
+    /// `restore`, waiting at most `wait` for the broker.
+    fn restore_waiting(&mut self, wait: Duration) -> bool {
         if !self.active {
             return true;
         }
         self.active = false;
-        let was_current = self.is_current_after_deactivation();
-        let command = if was_current {
-            ClipboardBrokerCommand::Restore
+        if (self.probe)() == (self.temporary_sequence, self.owner) {
+            self.finish(ClipboardBrokerCommand::Restore, wait)
         } else {
-            ClipboardBrokerCommand::Abandon
-        };
-        if self.command.send(command).is_err() {
-            if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-                let _ = self.worker.take().map(JoinHandle::join);
-            }
-            return false;
+            // Another program replaced the replacement: theirs stays, and the broker ends now.
+            let _ = self.finish(ClipboardBrokerCommand::Abandon, wait);
+            false
         }
-        let response = self
-            .response
-            .recv_timeout(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
-            .ok();
-        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            let _ = self.worker.take().map(JoinHandle::join);
-        }
-        was_current && matches!(response, Some(ClipboardBrokerResponse::Finished(true)))
     }
 
-    fn is_current_after_deactivation(&self) -> bool {
-        (unsafe { GetClipboardSequenceNumber() }) == self.temporary_sequence
-            && (unsafe { GetClipboardOwner().ok() }) == Some(self.owner)
+    /// The restore did not answer in time: whether the user's clipboard came back is known only
+    /// once its broker is over.
+    fn restore_pending(&self) -> bool {
+        self.lingering
+    }
+
+    /// The Ctrl+V was sent and not confirmed: the broker leaves the replacement until the paste's
+    /// target has read it and then puts the user's clipboard back, or leaves it for good after
+    /// the deferred wait. The worker does not wait for that; the broker's end is logged.
+    fn defer(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let _ = self.command.send(ClipboardBrokerCommand::Defer {
+            process: self.target_process,
+            wait: self.deferred_wait,
+            submitted_at: self.submitted_at.unwrap_or_else(Instant::now),
+        });
+        if let Some(worker) = self.worker.take() {
+            self.brokers.linger(worker, Arc::clone(&self.shared));
+        }
+    }
+
+    /// Sends the last command and waits for the broker's answer; a broker that does not answer in
+    /// time is left to finish and logged later. True when the user's clipboard was put back.
+    fn finish(&mut self, command: ClipboardBrokerCommand, wait: Duration) -> bool {
+        let response = if self.command.send(command).is_ok() {
+            self.response.recv_timeout(wait).ok()
+        } else {
+            None
+        };
+        if let Some(worker) = self.worker.take() {
+            if response.is_some() {
+                let _ = worker.join();
+            } else {
+                self.lingering = true;
+                self.brokers.linger(worker, Arc::clone(&self.shared));
+            }
+        }
+        matches!(response, Some(ClipboardBrokerResponse::Finished(true)))
     }
 }
 
-impl Drop for ProtectedClipboard {
+impl Drop for ProtectedClipboard<'_> {
     fn drop(&mut self) {
-        let _ = self.restore();
+        if self.submitted_at.is_some() {
+            self.defer();
+        } else {
+            let _ = self.restore();
+        }
     }
+}
+
+/// The clipboard's sequence number and owner, as the worker compares them with the broker's.
+fn system_clipboard_state() -> (u32, usize) {
+    unsafe {
+        (
+            GetClipboardSequenceNumber(),
+            GetClipboardOwner().map_or(0, |owner| owner.0 as usize),
+        )
+    }
+}
+
+thread_local! {
+    /// On a clipboard broker's thread: the replacement it renders on request, and the processes
+    /// that asked for it.
+    static BROKER_RENDER: RefCell<Option<BrokerRender>> = const { RefCell::new(None) };
+}
+
+struct BrokerRender {
+    text: String,
+    /// The process of each request (0 when the clipboard was opened without a window) and when.
+    readers: Vec<(u32, Instant)>,
+}
+
+const CLIPBOARD_BROKER_CLASS: PCWSTR = w!("AutoKeyboardLayotClipboardBroker");
+
+/// The broker window's procedure. The replacement's text is rendered when a program asks for it,
+/// and the process of the window holding the clipboard open is noted as a reader; a broker window
+/// that goes away renders it first, so a replacement left on the clipboard stays readable.
+unsafe extern "system" fn clipboard_broker_procedure(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    guarded(
+        || match message {
+            WM_RENDERFORMAT => {
+                if wparam.0 == usize::from(CF_UNICODETEXT.0) {
+                    render_replacement(true);
+                }
+                LRESULT(0)
+            }
+            WM_RENDERALLFORMATS => {
+                render_before_destroy(
+                    |retries| ClipboardOpenGuard::open(hwnd, retries),
+                    || unsafe { GetClipboardOwner().ok() } == Some(hwnd),
+                    || render_replacement(false),
+                );
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        },
+        || LRESULT(0),
+    )
+}
+
+/// Before the broker window goes away it renders the replacement, so that one left on the
+/// clipboard stays readable: with the clipboard open (`open` with its retries: another program
+/// may hold it a moment, as for every opening) and only while the window still owns it. True when
+/// it rendered.
+fn render_before_destroy<G>(
+    open: impl FnOnce(usize) -> Option<G>,
+    owned: impl FnOnce() -> bool,
+    render: impl FnOnce(),
+) -> bool {
+    let Some(_open) = open(CLIPBOARD_OPEN_RETRIES) else {
+        return false;
+    };
+    if !owned() {
+        return false;
+    }
+    render();
+    true
+}
+
+/// Restores the user's clipboard with it open (`open`). Only then does `forget` end the broker's
+/// rendering of the replacement: a restore that cannot open the clipboard leaves the replacement
+/// there, and the broker window renders it before it goes away, so it stays readable.
+fn restore_holding_clipboard<G>(
+    open: impl FnOnce() -> Option<G>,
+    forget: impl FnOnce(),
+    restore: impl FnOnce(&G) -> bool,
+) -> bool {
+    let Some(open) = open() else {
+        return false;
+    };
+    forget();
+    restore(&open)
+}
+
+fn forget_replacement() {
+    BROKER_RENDER.with(|render| *render.borrow_mut() = None);
+}
+
+/// Puts the replacement's text on the clipboard for a delayed-rendering request; when a program
+/// asked for it, the process of the window holding the clipboard open is noted as a reader, or 0
+/// when it was opened without a window (see replacement_read_by).
+fn render_replacement(requested: bool) {
+    BROKER_RENDER.with(|render| {
+        let mut render = render.borrow_mut();
+        let Some(render) = render.as_mut() else {
+            return;
+        };
+        if requested {
+            let mut process = 0;
+            if let Ok(reader) = unsafe { GetOpenClipboardWindow() } {
+                unsafe {
+                    GetWindowThreadProcessId(reader, Some(&mut process));
+                }
+            }
+            render.readers.push((process, Instant::now()));
+        }
+        if let Some(mut data) = global_utf16(&render.text) {
+            let _ = data.transfer(u32::from(CF_UNICODETEXT.0));
+        }
+    });
 }
 
 struct ClipboardBrokerWindow(HWND);
@@ -1128,10 +1889,20 @@ struct ClipboardBrokerWindow(HWND);
 impl ClipboardBrokerWindow {
     fn new() -> Option<Self> {
         let module = unsafe { GetModuleHandleW(None).ok()? };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(clipboard_broker_procedure),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: CLIPBOARD_BROKER_CLASS,
+            ..Default::default()
+        };
+        // Fails harmlessly once the class exists.
+        unsafe {
+            RegisterClassW(&class);
+        }
         let window = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
-                w!("STATIC"),
+                CLIPBOARD_BROKER_CLASS,
                 w!("AutoKeyboardLayot clipboard broker"),
                 WINDOW_STYLE(0),
                 0,
@@ -1157,74 +1928,110 @@ impl Drop for ClipboardBrokerWindow {
     }
 }
 
-fn protected_clipboard_broker(
-    text: String,
-    commands: Receiver<ClipboardBrokerCommand>,
-    responses: SyncSender<ClipboardBrokerResponse>,
-) {
-    if unsafe { OleInitialize(None).is_err() } {
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
-        return;
-    }
-    let Some(owner) = ClipboardBrokerWindow::new() else {
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
-        unsafe {
-            OleUninitialize();
-        }
-        return;
-    };
-    let owner_handle = owner.0;
-    let mut snapshot = materialize_current_clipboard();
-    let installed = snapshot.is_some() && install_protected_clipboard(owner_handle, &text);
-    if !installed {
-        if let Some(snapshot) = &mut snapshot {
-            let _ = restore_materialized_clipboard(owner_handle, None, snapshot);
-        }
-        let _ = responses.send(ClipboardBrokerResponse::Failed);
-        unsafe {
-            OleUninitialize();
-        }
-        return;
-    }
+/// The system clipboard for a broker thread: OLE is initialized on that thread, and a hidden
+/// window owns the clipboard while the replacement is on it.
+struct SystemClipboard {
+    owner: ClipboardBrokerWindow,
+}
 
-    let temporary_sequence = unsafe { GetClipboardSequenceNumber() };
-    if responses
-        .send(ClipboardBrokerResponse::Installed {
-            sequence: temporary_sequence,
-            owner: owner_handle.0 as usize,
-        })
-        .is_err()
-    {
-        if let Some(snapshot) = &mut snapshot {
-            let _ =
-                restore_materialized_clipboard(owner_handle, Some(temporary_sequence), snapshot);
+impl SystemClipboard {
+    fn new() -> Option<Self> {
+        if unsafe { OleInitialize(None).is_err() } {
+            return None;
         }
-        unsafe {
-            OleUninitialize();
-        }
-        return;
-    }
-
-    let restored = match wait_clipboard_broker_command(&commands) {
-        Ok(ClipboardBrokerCommand::Restore)
-            if (unsafe { GetClipboardSequenceNumber() }) == temporary_sequence
-                && (unsafe { GetClipboardOwner().ok() }) == Some(owner_handle) =>
-        {
-            snapshot.as_mut().is_some_and(|snapshot| {
-                restore_materialized_clipboard(owner_handle, Some(temporary_sequence), snapshot)
-            })
-        }
-        Ok(ClipboardBrokerCommand::Restore | ClipboardBrokerCommand::Abandon) | Err(_) => false,
-    };
-    let _ = responses.send(ClipboardBrokerResponse::Finished(restored));
-    unsafe {
-        OleUninitialize();
+        let Some(owner) = ClipboardBrokerWindow::new() else {
+            unsafe {
+                OleUninitialize();
+            }
+            return None;
+        };
+        Some(Self { owner })
     }
 }
 
+impl Drop for SystemClipboard {
+    fn drop(&mut self) {
+        unsafe {
+            OleUninitialize();
+        }
+    }
+}
+
+impl ClipboardSystem for SystemClipboard {
+    type Snapshot = Vec<MaterializedClipboardEntry>;
+
+    fn sequence(&self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
+    fn owner(&self) -> usize {
+        self.owner.0.0 as usize
+    }
+
+    fn owned(&self) -> bool {
+        (unsafe { GetClipboardOwner().ok() }) == Some(self.owner.0)
+    }
+
+    fn snapshot(&mut self) -> Option<Self::Snapshot> {
+        materialize_current_clipboard()
+    }
+
+    fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome {
+        install_protected_clipboard(self.owner.0, text, expected, cancelled)
+    }
+
+    fn restore(&mut self, expected: Option<u32>, snapshot: &mut Self::Snapshot) -> bool {
+        let owner = self.owner.0;
+        restore_holding_clipboard(
+            || ClipboardOpenGuard::open(owner, CLIPBOARD_RESTORE_OPEN_RETRIES),
+            forget_replacement,
+            |_open| restore_materialized_clipboard(owner, expected, snapshot),
+        )
+    }
+
+    fn wait(
+        &mut self,
+        commands: Option<&Receiver<ClipboardBrokerCommand>>,
+        timeout: Option<Duration>,
+    ) -> BrokerWait {
+        wait_clipboard_broker_command(commands, timeout)
+    }
+
+    fn read_by(&self, process: u32, submitted_at: Instant) -> bool {
+        BROKER_RENDER.with(|render| {
+            render
+                .borrow()
+                .as_ref()
+                .is_some_and(|render| replacement_read_by(&render.readers, process, submitted_at))
+        })
+    }
+
+    fn holder(&self) -> u32 {
+        let mut process = 0;
+        if let Ok(window) = unsafe { GetOpenClipboardWindow() } {
+            unsafe {
+                GetWindowThreadProcessId(window, Some(&mut process));
+            }
+        }
+        process
+    }
+}
+
+/// Whether the paste's target, `process`, has read the replacement among `readers`. A reader that
+/// held the clipboard open without a window (process 0) after the Ctrl+V was sent at
+/// `submitted_at` counts as the target: .NET, consoles and many toolkits read that way, and the
+/// clipboard cannot tell who they are. Before the Ctrl+V such a reader cannot be the paste.
+fn replacement_read_by(readers: &[(u32, Instant)], process: u32, submitted_at: Instant) -> bool {
+    readers
+        .iter()
+        .any(|&(reader, at)| reader == process || (reader == 0 && at >= submitted_at))
+}
+
 fn wait_clipboard_broker_command(
-    commands: &Receiver<ClipboardBrokerCommand>,
-) -> core::result::Result<ClipboardBrokerCommand, ()> {
+    commands: Option<&Receiver<ClipboardBrokerCommand>>,
+    timeout: Option<Duration>,
+) -> BrokerWait {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         let mut message = MSG::default();
         unsafe {
@@ -1233,45 +2040,102 @@ fn wait_clipboard_broker_command(
                 DispatchMessageW(&message);
             }
         }
-        match commands.try_recv() {
-            Ok(command) => return Ok(command),
-            Err(TryRecvError::Disconnected) => return Err(()),
-            Err(TryRecvError::Empty) => {}
+        if let Some(commands) = commands {
+            match commands.try_recv() {
+                Ok(command) => return BrokerWait::Command(command),
+                Err(TryRecvError::Disconnected) => return BrokerWait::Disconnected,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return BrokerWait::Timeout;
         }
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn install_protected_clipboard(owner: HWND, text: &str) -> bool {
-    let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES) else {
-        return false;
+/// Announces `format` for delayed rendering. The call returns no handle even when it succeeds.
+fn announce_delayed_clipboard_format(format: u32) -> bool {
+    unsafe { SetClipboardData(format, None) }
+        .map_or_else(|error| error.code() == HRESULT(0), |_| true)
+}
+
+/// The formats that keep an item out of clipboard history, cloud sync and clipboard managers:
+/// `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` and
+/// `CanUploadToCloudClipboard`.
+fn clipboard_opt_out_formats() -> Option<[u32; 3]> {
+    let formats = unsafe {
+        [
+            RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")),
+            RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory")),
+            RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")),
+        ]
     };
-    let exclusion =
-        unsafe { RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing")) };
-    let history = unsafe { RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory")) };
-    let cloud = unsafe { RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")) };
-    if exclusion == 0 || history == 0 || cloud == 0 {
-        return false;
+    formats.iter().all(|format| *format != 0).then_some(formats)
+}
+
+/// The opt-out formats a restored item does not carry itself.
+fn missing_opt_out_formats(present: &[u32], opt_outs: [u32; 3]) -> Vec<u32> {
+    opt_outs
+        .into_iter()
+        .filter(|format| !present.contains(format))
+        .collect()
+}
+
+fn install_protected_clipboard(
+    owner: HWND,
+    text: &str,
+    expected: u32,
+    cancelled: &AtomicBool,
+) -> InstallOutcome {
+    let installed = {
+        let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES) else {
+            return InstallOutcome::Untouched(BrokerFailure::Open);
+        };
+        // Checked with the clipboard open, so that nothing can change it before it is emptied:
+        // what another program put there after the copy was taken is never replaced.
+        if cancelled.load(Ordering::Acquire) {
+            return InstallOutcome::Untouched(BrokerFailure::Cancelled);
+        }
+        if unsafe { GetClipboardSequenceNumber() } != expected {
+            return InstallOutcome::Untouched(BrokerFailure::Changed);
+        }
+        let Some(opt_outs) = clipboard_opt_out_formats() else {
+            return InstallOutcome::Untouched(BrokerFailure::Prepare);
+        };
+        let mut opt_out_data = Vec::with_capacity(opt_outs.len());
+        for _ in opt_outs {
+            let Some(data) = global_bytes(&0u32.to_ne_bytes()) else {
+                return InstallOutcome::Untouched(BrokerFailure::Prepare);
+            };
+            opt_out_data.push(data);
+        }
+        // The text itself is rendered when a program asks for it (`clipboard_broker_procedure`),
+        // so the broker learns whether the paste's target read it.
+        BROKER_RENDER.with(|render| {
+            *render.borrow_mut() = Some(BrokerRender {
+                text: text.to_owned(),
+                readers: Vec::new(),
+            });
+        });
+        if unsafe { EmptyClipboard().is_err() } {
+            return InstallOutcome::Untouched(BrokerFailure::Prepare);
+        }
+        // Emptying waits for the previous owner to let go, which a hung program delays: a worker
+        // that stopped waiting meanwhile gets the user's clipboard back instead of the replacement.
+        !cancelled.load(Ordering::Acquire)
+            && opt_out_data
+                .iter_mut()
+                .zip(opt_outs)
+                .all(|(data, format)| data.transfer(format))
+            && announce_delayed_clipboard_format(u32::from(CF_UNICODETEXT.0))
+    };
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if installed {
+        InstallOutcome::Installed { sequence }
+    } else {
+        InstallOutcome::Emptied { sequence }
     }
-    let Some(mut exclusion_data) = global_bytes(&0u32.to_ne_bytes()) else {
-        return false;
-    };
-    let Some(mut history_data) = global_bytes(&0u32.to_ne_bytes()) else {
-        return false;
-    };
-    let Some(mut cloud_data) = global_bytes(&0u32.to_ne_bytes()) else {
-        return false;
-    };
-    let Some(mut text_data) = global_utf16(text) else {
-        return false;
-    };
-    if unsafe { EmptyClipboard().is_err() } {
-        return false;
-    }
-    exclusion_data.transfer(exclusion)
-        && history_data.transfer(history)
-        && cloud_data.transfer(cloud)
-        && text_data.transfer(u32::from(CF_UNICODETEXT.0))
 }
 
 fn global_bytes(bytes: &[u8]) -> Option<OwnedClipboardHandle> {
@@ -1304,14 +2168,13 @@ fn global_utf16(text: &str) -> Option<OwnedClipboardHandle> {
     global_bytes(bytes)
 }
 
+/// Puts `entries` on the clipboard, which the caller holds open, with `expected_sequence` only
+/// while the clipboard still holds `owner`'s item of that sequence.
 fn restore_materialized_clipboard(
     owner: HWND,
     expected_sequence: Option<u32>,
     entries: &mut [MaterializedClipboardEntry],
 ) -> bool {
-    let Some(_open) = ClipboardOpenGuard::open(owner, CLIPBOARD_RESTORE_OPEN_RETRIES) else {
-        return false;
-    };
     if expected_sequence.is_some_and(|sequence| {
         (unsafe { GetClipboardSequenceNumber() }) != sequence
             || (unsafe { GetClipboardOwner().ok() }) != Some(owner)
@@ -1319,9 +2182,23 @@ fn restore_materialized_clipboard(
     {
         return false;
     }
-    entries
+    let present: Vec<u32> = entries
+        .iter()
+        .map(|entry| u32::from(entry.format.cfFormat))
+        .collect();
+    let restored = entries
         .iter_mut()
-        .all(MaterializedClipboardEntry::transfer_to_open_clipboard)
+        .all(MaterializedClipboardEntry::transfer_to_open_clipboard);
+    // The user's item comes back as it was, not as a new copy for clipboard history, cloud sync
+    // or clipboard managers: the opt-outs it did not carry itself are added.
+    if let Some(opt_outs) = clipboard_opt_out_formats() {
+        for format in missing_opt_out_formats(&present, opt_outs) {
+            if let Some(mut data) = global_bytes(&0u32.to_ne_bytes()) {
+                let _ = data.transfer(format);
+            }
+        }
+    }
+    restored
 }
 
 #[repr(u8)]
@@ -1336,6 +2213,9 @@ enum ConversionFailureReason {
     GateDrain = 6,
     ClipboardEdit = 7,
     InternalFault = 8,
+    SelectionLeft = 9,
+    /// The replacement was pasted, but the keyboard layout did not switch after it.
+    LayoutSwitch = 10,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1386,16 +2266,30 @@ enum BarrierCharacterClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TextBarrierStage {
+    /// Not reached.
     #[default]
     None,
+    /// The text is empty or longer than the barrier checks.
+    TextLength,
     Resolver,
+    /// The selection could not be read.
     Selection,
+    /// The selection is not exactly one range.
+    SelectionRanges,
+    /// The only selection range could not be read.
     Caret,
+    /// Text is selected instead of an empty caret.
+    CaretNotEmpty,
+    /// The caret range could not be copied.
+    RangeClone,
     RangeMove,
     TextRead,
     TextCompared,
     SelectCall,
     SelectionConfirm,
+    /// The barrier's provider thread did not answer by the deadline, or was still busy with an
+    /// earlier read.
+    Provider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1434,6 +2328,8 @@ struct TextBarrierReport {
     confirmation: Option<SelectionConfirmation>,
     /// How many selection attempts ran.
     attempts: u32,
+    /// What became of the agent's selection when it was collapsed again.
+    cleanup: Option<SelectionCleanup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,6 +2436,8 @@ struct TrayStatus {
     failures: u64,
     failure_reason: u8,
     backend_status: u8,
+    // Diagnostics records dropped from a full queue or not written, and failed rotations.
+    diagnostic_errors: u64,
 }
 
 impl TrayStatus {
@@ -1556,6 +2454,7 @@ impl TrayStatus {
             failures: 0,
             failure_reason: ConversionFailureReason::None as u8,
             backend_status: BACKEND_OBSERVE_ONLY,
+            diagnostic_errors: 0,
         }
     }
 }
@@ -1578,10 +2477,26 @@ struct AppState {
     configuration_sources: autokeyboardlayot::configuration::ConfigurationSources,
     package_source: PackageSource,
     pending_configuration: Option<ConfigurationReload>,
+    /// A loaded configuration that the worker could not take yet; offered again on timer ticks.
+    deferred_configuration: Option<RuntimeConfiguration>,
     configuration_loader: Option<RuntimeConfigurationLoader>,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
+    lexicon_saves: LexiconSaves,
     diagnostic_sender: Option<SyncSender<String>>,
     diagnostic_worker: Option<JoinHandle<()>>,
+    /// Key-ups of keys pressed before a gate, delivered after that gate broke.
+    pending_key_releases: Vec<RawKeyEvent>,
+    /// Held keys handed back unchanged after a contained internal fault, or past a stalled worker.
+    pending_held_replay: Vec<RawKeyEvent>,
+    /// The token of the retained record the UI thread handed back past a stalled worker: once its
+    /// keys were sent, the worker finishes the recovery.
+    pending_hand_back: Option<u64>,
+    /// `ObserverMetrics::clipboard_restore_failures` as last announced to the user.
+    announced_clipboard_failures: u64,
+    /// Physical key-downs that reached the application, clicks and input injected by other
+    /// programs, counted by the hooks. Retained keys are handed back past a busy worker only when
+    /// none came after them, as they would land after that newer input.
+    typed_input: u64,
 }
 
 impl AppState {
@@ -1624,18 +2539,16 @@ impl AppState {
         })
     }
 
-    /// A contained panic makes the state untrustworthy: release held keys unchanged, end hotkey
-    /// gestures that may be half tracked, discard queued work of the old epoch and pause
-    /// automatic conversion.
+    /// A contained panic makes the state untrustworthy: pause automatic conversion, hand held keys
+    /// back unchanged (or retain them when the input target changed meanwhile), end hotkey
+    /// gestures that may be half tracked and discard queued work of the old epoch.
     fn record_engine_fault(&mut self) {
-        self.break_correction_gate_fail_open(GateFailureCause::InternalFault);
-        self.metrics
-            .undo_hotkey_active
-            .store(false, Ordering::Release);
-        self.metrics
-            .hotkey_waiting_for_release
-            .store(false, Ordering::Release);
-        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.record_engine_fault_with_target(current_foreground_context());
+    }
+
+    fn record_engine_fault_with_target(&mut self, current: Option<ForegroundContext>) {
+        // The fault's own pause comes first: breaking the gate must not record it as a gate
+        // drain, which policy D1 would lift on its own once the retained keys expire.
         if self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
             self.metrics.last_failure_reason.store(
                 ConversionFailureReason::InternalFault as u8,
@@ -1645,6 +2558,23 @@ impl AppState {
             self.metrics
                 .conversion_failures
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        self.break_correction_gate(GateFailureCause::InternalFault, current);
+        self.metrics
+            .undo_hotkey_active
+            .store(false, Ordering::Release);
+        self.metrics
+            .hotkey_waiting_for_release
+            .store(false, Ordering::Release);
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        if self.metrics.worker_dead.load(Ordering::Acquire) {
+            // Nobody can acknowledge a reload any more; it must not keep input and Exit blocked.
+            self.pending_configuration = None;
+            self.metrics
+                .configuration_pending
+                .store(false, Ordering::Release);
+            // Nor carry out a prepared recovery: Pause must not be swallowed for it.
+            self.metrics.recovery_armed.store(false, Ordering::Release);
         }
         self.gate_diagnostic(
             "fault",
@@ -1661,25 +2591,25 @@ impl AppState {
     }
 
     fn enqueue(&self, event: RawInputEvent) -> bool {
-        self.enqueue_with_configuration(event, None)
+        self.enqueue_with_configuration(event, None).is_ok()
     }
 
     fn enqueue_with_configuration(
         &self,
         event: RawInputEvent,
         configuration: Option<Box<ConfigurationReload>>,
-    ) -> bool {
+    ) -> core::result::Result<(), QueueRefusal> {
         let Some(sender) = &self.input_sender else {
-            return false;
+            return Err(QueueRefusal::Closed);
         };
-        let privacy_refresh = matches!(event, RawInputEvent::PrivacyRefresh(_));
-        if privacy_refresh
-            && self
-                .metrics
-                .privacy_refresh_queued
-                .swap(true, Ordering::AcqRel)
-        {
-            return true;
+        // At most one refresh of each kind waits in the queue, and a full queue only drops it.
+        let refresh_queued = match event {
+            RawInputEvent::PrivacyRefresh(_) => Some(&self.metrics.privacy_refresh_queued),
+            RawInputEvent::ProfileRefresh => Some(&self.metrics.profile_refresh_queued),
+            _ => None,
+        };
+        if refresh_queued.is_some_and(|queued| queued.swap(true, Ordering::AcqRel)) {
+            return Ok(());
         }
         if let RawInputEvent::Key(key) = event {
             self.metrics
@@ -1693,32 +2623,29 @@ impl AppState {
             configuration,
         };
         match sender.try_send(queued) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(TrySendError::Disconnected(_)) => {
-                if privacy_refresh {
-                    self.metrics
-                        .privacy_refresh_queued
-                        .store(false, Ordering::Release);
+                if let Some(queued) = refresh_queued {
+                    queued.store(false, Ordering::Release);
                 }
-                false
+                Err(QueueRefusal::Closed)
             }
             Err(TrySendError::Full(_)) => {
-                if privacy_refresh {
-                    self.metrics
-                        .privacy_refresh_queued
-                        .store(false, Ordering::Release);
-                    return false;
+                if let Some(queued) = refresh_queued {
+                    queued.store(false, Ordering::Release);
+                    return Err(QueueRefusal::Full);
                 }
                 self.metrics.dropped_events.fetch_add(1, Ordering::Relaxed);
                 self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
-                false
+                Err(QueueRefusal::Full)
             }
         }
     }
 
-    fn enqueue_configuration(&mut self, snapshot: RuntimeConfiguration) -> bool {
-        if self.shutdown.load(Ordering::Acquire) {
-            return false;
+    fn enqueue_configuration(&mut self, snapshot: RuntimeConfiguration) -> ConfigurationHandoff {
+        if self.shutdown.load(Ordering::Acquire) || self.metrics.worker_dead.load(Ordering::Acquire)
+        {
+            return ConfigurationHandoff::Refused;
         }
         let previous_sources = self
             .pending_configuration
@@ -1727,7 +2654,7 @@ impl AppState {
                 pending.snapshot.sources
             });
         if !previous_sources.accepts_reload(snapshot.sources) {
-            return false;
+            return ConfigurationHandoff::Refused;
         }
         let previous_packages = self
             .pending_configuration
@@ -1736,26 +2663,32 @@ impl AppState {
                 pending.snapshot.package_source
             });
         if !previous_packages.accepts_reload(snapshot.package_source) {
-            return false;
+            return ConfigurationHandoff::Refused;
         }
+        // One snapshot at a time: the slot holds it until the UI published or dropped it, and a
+        // newer one queued over it would be lost with it when the newer one is rejected. A
+        // rejected revision is settled like an acknowledged one.
+        let settled = self
+            .metrics
+            .configuration_ack
+            .load(Ordering::Acquire)
+            .max(self.metrics.configuration_rejected.load(Ordering::Acquire));
         if self.correction_gate.active
             || has_retained_input(&self.metrics)
-            || self
-                .next_configuration_revision
-                .saturating_sub(self.metrics.configuration_ack.load(Ordering::Acquire))
-                >= 2
+            || self.pending_configuration.is_some()
+            || self.next_configuration_revision.saturating_sub(settled) >= 2
         {
-            return false;
+            return ConfigurationHandoff::Busy;
         }
         let Some(revision) = self.next_configuration_revision.checked_add(1) else {
-            return false;
+            return ConfigurationHandoff::Refused;
         };
         let reload = ConfigurationReload { revision, snapshot };
         self.metrics
             .configuration_pending
             .store(true, Ordering::Release);
         self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
-        if !self.enqueue_with_configuration(
+        if let Err(refusal) = self.enqueue_with_configuration(
             RawInputEvent::ReloadConfiguration,
             Some(Box::new(reload.clone())),
         ) {
@@ -1763,10 +2696,63 @@ impl AppState {
             self.metrics
                 .configuration_pending
                 .store(self.pending_configuration.is_some(), Ordering::Release);
-            return false;
+            return match refusal {
+                QueueRefusal::Full => ConfigurationHandoff::Busy,
+                QueueRefusal::Closed => ConfigurationHandoff::Refused,
+            };
         }
         self.next_configuration_revision = revision;
         self.pending_configuration = Some(reload);
+        ConfigurationHandoff::Queued
+    }
+
+    /// Hands a freshly loaded configuration, or else the one deferred earlier, to the worker. A
+    /// snapshot that the worker cannot take yet is kept and offered again on the next timer tick,
+    /// unless a newer load replaces it. Returns the message for the user, if any: a load that
+    /// failed is a read error, a snapshot the worker can never take an apply error.
+    fn hand_off_configuration(
+        &mut self,
+        loaded: Option<std::io::Result<RuntimeConfiguration>>,
+    ) -> Option<String> {
+        let snapshot = match loaded {
+            Some(Ok(snapshot)) => snapshot,
+            Some(Err(error)) => {
+                // The files changed again and cannot be read: what was deferred is out of date.
+                self.deferred_configuration = None;
+                return Some(tr_format(
+                    "error.read_config",
+                    &[("error", &error.to_string())],
+                ));
+            }
+            None => self.deferred_configuration.take()?,
+        };
+        match self.enqueue_configuration(snapshot.clone()) {
+            ConfigurationHandoff::Queued => None,
+            ConfigurationHandoff::Busy => {
+                self.deferred_configuration = Some(snapshot);
+                None
+            }
+            ConfigurationHandoff::Refused => Some(tr_format(
+                "error.apply_config",
+                &[("error", "configuration_handoff_unavailable")],
+            )),
+        }
+    }
+
+    /// Drops the pending configuration when the worker rejected it after a contained panic; the
+    /// published settings stay as they were. True when it was dropped.
+    fn drop_rejected_configuration(&mut self) -> bool {
+        let Some(pending) = self.pending_configuration.as_ref() else {
+            return false;
+        };
+        if self.metrics.configuration_rejected.load(Ordering::Acquire) != pending.revision {
+            return false;
+        }
+        self.pending_configuration = None;
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
         true
     }
 
@@ -1809,6 +2795,18 @@ impl AppState {
     }
 
     fn break_correction_gate_fail_open(&mut self, cause: GateFailureCause) {
+        self.break_correction_gate(cause, current_foreground_context());
+    }
+
+    /// Ends the gate without the worker. Key-ups of keys pressed before the gate are delivered,
+    /// because they type nothing and withholding them would leave the key pressed; the rest is
+    /// retained for recovery. After a contained internal fault the held keys go back unchanged
+    /// while `current`, the input target now, is still the gate's target.
+    fn break_correction_gate(
+        &mut self,
+        cause: GateFailureCause,
+        current: Option<ForegroundContext>,
+    ) {
         if !self.correction_gate.active {
             return;
         }
@@ -1817,6 +2815,18 @@ impl AppState {
         let sequence = self.metrics.observed_input_sequence.load(Ordering::Acquire);
         let foreground = self.correction_gate.origin;
         let held = core::mem::take(&mut self.correction_gate.held);
+        let replay_unchanged = cause == GateFailureCause::InternalFault
+            && foreground
+                .is_some_and(|origin| current.is_some_and(|now| same_input_target(origin, now)));
+        let replayed = if replay_unchanged { held.len() } else { 0 };
+        let (held, releases) = if replay_unchanged {
+            self.pending_held_replay.extend(held);
+            (Vec::new(), Vec::new())
+        } else {
+            split_delivered_key_releases(held)
+        };
+        let returned = releases.len();
+        self.pending_key_releases.extend(releases);
         let mut retained = false;
         if !held.is_empty() {
             // There cannot be a second gate while recovery is outstanding.
@@ -1833,14 +2843,18 @@ impl AppState {
                     token,
                     foreground: foreground
                         .map(|origin| {
-                            current_foreground_context()
-                                .filter(|current| same_input_target(origin, *current))
+                            current
+                                .filter(|now| same_input_target(origin, *now))
                                 .unwrap_or(origin)
                         })
                         .unwrap_or(fallback),
                     events: held,
                     delivery_uncertain: cause == GateFailureCause::DownstreamHook,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+                    recovering: false,
+                    retained_at: Instant::now(),
+                    auto_recover: hands_held_keys_back_automatically(cause),
+                    input_mark: self.typed_input,
                 });
                 retained = true;
             }
@@ -1861,24 +2875,19 @@ impl AppState {
             self.record_gate_failure_without_worker();
         }
         self.gate_diagnostic("abort", format!(
-            "cause={cause:?} token={token} held={held_count} released={} in_flight={} awaiting_ack={} worker_busy={} paused={failed}",
+            "cause={cause:?} token={token} held={held_count} returned={returned} replayed={replayed} released={} in_flight={} awaiting_ack={} worker_busy={} paused={failed}",
             self.correction_gate.released_count, self.correction_gate.drain_in_flight,
             self.correction_gate.awaiting_worker_ack, self.metrics.worker_busy.load(Ordering::Acquire),
         ));
+        if returned != 0 || replayed != 0 {
+            self.post_held_keys_return();
+        }
         let _ = self.enqueue(RawInputEvent::GateDrainReady {
             token,
             drained_count: 0,
             replay_succeeded: false,
         });
-        if retained
-            && matches!(
-                cause,
-                GateFailureCause::Deadline
-                    | GateFailureCause::Capacity
-                    | GateFailureCause::WorkerQueue
-                    | GateFailureCause::HookReinstall
-            )
-        {
+        if retained && hands_held_keys_back_automatically(cause) {
             let _ = self.enqueue(RawInputEvent::RecoverInput {
                 sequence,
                 explicit: false,
@@ -1894,6 +2903,56 @@ impl AppState {
                 );
             }
         }
+    }
+
+    /// Queued input from before a hook reinstall is stale. The epoch moves first: the recovery a
+    /// broken gate queues for its held keys must carry the epoch the worker sees as current.
+    fn invalidate_for_hook_reinstall(&mut self) {
+        self.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        self.break_correction_gate_fail_open(GateFailureCause::HookReinstall);
+    }
+
+    /// Asks the window procedure to send the queued held keys, outside any hook procedure that
+    /// may be running now. The timer sends them as well if this message cannot be posted.
+    fn post_held_keys_return(&self) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.window),
+                HELD_KEYS_RETURN_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+
+    /// Queues the key-ups that leave with a record of retained input (see
+    /// split_delivered_key_releases).
+    fn queue_delivered_key_releases(&mut self, releases: Vec<RawKeyEvent>) {
+        if releases.is_empty() {
+            return;
+        }
+        self.pending_key_releases.extend(releases);
+        self.post_held_keys_return();
+    }
+
+    /// Holds an edge that arrived while the gate is active. A gate that is full or past its
+    /// deadline breaks, and the edge joins the retained input as well: forwarding it now would
+    /// overtake every edge held before it. False when no gate is active, so the edge passes.
+    fn hold_gated_edge(&mut self, raw: RawKeyEvent) -> bool {
+        if self.correction_gate.hold(raw) {
+            return true;
+        }
+        if !self.correction_gate.active {
+            return false;
+        }
+        let cause = if Instant::now() >= self.correction_gate.deadline {
+            GateFailureCause::Deadline
+        } else {
+            GateFailureCause::Capacity
+        };
+        self.correction_gate.held.push(raw);
+        self.break_correction_gate_fail_open(cause);
+        true
     }
 
     fn close_drained_gate(&mut self) {
@@ -1945,6 +3004,8 @@ impl AppState {
             // A hook can cancel the gate while SendInput is returning. Its
             // suffix has already moved to recovery; the unsent prefix still
             // belongs before it and must not be lost or overwrite that suffix.
+            let (mut prefix, releases) = split_delivered_key_releases(prefix);
+            self.queue_delivered_key_releases(releases);
             let mut retained = self
                 .metrics
                 .retained_input
@@ -1961,6 +3022,10 @@ impl AppState {
                     events: prefix,
                     delivery_uncertain: sent != 0,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+                    recovering: false,
+                    retained_at: Instant::now(),
+                    auto_recover: false,
+                    input_mark: self.typed_input,
                 });
             }
         }
@@ -2206,14 +3271,29 @@ fn finish_shutdown(hwnd: HWND) -> bool {
     requested
 }
 
-fn touch_hook_activity() {
-    HOOK_ACTIVITY_MS.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+/// Marks a callback or an installation of the hook whose mark `activity` is.
+fn touch_hook_activity(activity: &AtomicU64) {
+    activity.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
 }
 
-/// Time since the last hook callback or installation.
-fn hook_silence() -> Duration {
+/// Each hook's time since its last callback or installation.
+fn hook_silence() -> HookSilence {
     let now = unsafe { GetTickCount64() };
-    Duration::from_millis(now.saturating_sub(HOOK_ACTIVITY_MS.load(Ordering::Relaxed)))
+    let since = |activity: &AtomicU64| {
+        Duration::from_millis(now.saturating_sub(activity.load(Ordering::Relaxed)))
+    };
+    HookSilence {
+        keyboard: since(&KEYBOARD_HOOK_ACTIVITY_MS),
+        mouse: since(&MOUSE_HOOK_ACTIVITY_MS),
+    }
+}
+
+/// The pointer's position on the screen, when the input desktop lets it be read.
+fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }
+        .is_ok()
+        .then_some((point.x, point.y))
 }
 
 /// Time since the last user input of the session, from `GetLastInputInfo`.
@@ -2262,13 +3342,24 @@ fn input_desktop_is_default() -> bool {
 }
 
 fn foreground_privilege() -> ForegroundPrivilege {
-    let Some(context) = current_foreground_context() else {
+    foreground_privilege_of(
+        current_foreground_context().map(|context| context.process_id),
+        unsafe { GetCurrentProcessId() },
+        process_integrity_level,
+    )
+}
+
+/// The privilege of the `foreground` process (`None`: nothing is in the foreground) compared with
+/// the `agent` process, from the integrity level `integrity_level` reads for a process id.
+fn foreground_privilege_of(
+    foreground: Option<u32>,
+    agent: u32,
+    integrity_level: impl Fn(u32) -> Option<u32>,
+) -> ForegroundPrivilege {
+    let Some(foreground) = foreground else {
         return ForegroundPrivilege::None;
     };
-    ForegroundPrivilege::compare(
-        process_integrity_level(context.process_id),
-        process_integrity_level(unsafe { GetCurrentProcessId() }),
-    )
+    ForegroundPrivilege::compare(integrity_level(foreground), integrity_level(agent))
 }
 
 /// Why the hooks are reinstalled for a session change notification, if they are.
@@ -2299,16 +3390,20 @@ fn hook_watchdog_tick(hwnd: HWND) {
     if !running {
         return;
     }
+    // Followed on every tick: the pointer counts as moving only over consecutive ticks.
+    let pointer_moving =
+        UI_GUARDS.with(|guards| guards.borrow_mut().pointer.observe(cursor_position()));
     let Some(input_idle) = input_idle() else {
         return;
     };
-    let hook_silent = hook_silence();
-    if !hooks_look_silent(input_idle, hook_silent) {
+    let silence = hook_silence();
+    let Some(hook) = silent_hook(input_idle, silence, pointer_moving) else {
         return;
-    }
+    };
     let facts = WatchdogFacts {
         input_idle,
-        hook_silent,
+        silence,
+        pointer_moving,
         foreground: foreground_privilege(),
         input_desktop_is_default: input_desktop_is_default(),
         foreground_captures_input: foreground_captures_input(),
@@ -2318,7 +3413,10 @@ fn hook_watchdog_tick(hwnd: HWND) {
     match action {
         WatchdogAction::Nothing => {}
         WatchdogAction::Reinstall => {
-            reinstall_hooks("silent");
+            reinstall_hooks(match hook {
+                SilentHook::Keyboard => "silent-keyboard",
+                SilentHook::Mouse => "silent-mouse",
+            });
         }
         WatchdogAction::WarnUnstable => notify_hooks_unstable(hwnd, "watchdog-limit"),
     }
@@ -2360,7 +3458,12 @@ fn install_missing_hooks() -> bool {
         })
         .flatten();
     // A fresh hook has had no chance to be called yet.
-    touch_hook_activity();
+    if keyboard.is_some() {
+        touch_hook_activity(&KEYBOARD_HOOK_ACTIVITY_MS);
+    }
+    if mouse.is_some() {
+        touch_hook_activity(&MOUSE_HOOK_ACTIVITY_MS);
+    }
     let stored = APP_STATE.with(|slot| {
         let mut borrowed = slot.borrow_mut();
         let state = borrowed.as_mut()?;
@@ -2395,8 +3498,7 @@ fn reinstall_hooks(reason: &str) -> bool {
         if state.shutdown.load(Ordering::Acquire) {
             return None;
         }
-        state.break_correction_gate_fail_open(GateFailureCause::HookReinstall);
-        state.metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        state.invalidate_for_hook_reinstall();
         Some((state.keyboard_hook.take(), state.mouse_hook.take()))
     });
     let Some((keyboard, mouse)) = handles else {
@@ -2470,34 +3572,66 @@ fn retry_missing_hooks(hwnd: HWND) {
     }
 }
 
-/// Adds the tray icon; on failure a retry is scheduled, because Explorer may still be starting.
-fn add_tray(hwnd: HWND, indicator: LayoutIndicator) -> bool {
+/// Adds the tray icon showing `status`; on failure a retry is scheduled, because Explorer may
+/// still be starting.
+fn add_tray(hwnd: HWND, status: TrayStatus) -> bool {
     let now = Instant::now();
-    match TrayIcon::add(hwnd, indicator) {
+    match TrayIcon::add(hwnd, status) {
         Ok(tray) => {
             let duplicate = APP_STATE.with(|slot| {
                 let mut borrowed = slot.borrow_mut();
                 let state = borrowed.as_mut()?;
                 if state.tray.is_none() {
                     state.tray = Some(tray);
-                    // The new icon shows the initial status; the next refresh brings it up to date.
-                    state.last_tray_status = TrayStatus::initial(indicator);
+                    // The next refresh compares with what the new icon shows.
+                    state.last_tray_status = status;
                     None
                 } else {
                     Some(tray)
                 }
             });
             // Dropping an icon deletes it from the shell by id, which would remove the live one.
-            core::mem::forget(duplicate);
-            UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None);
+            if let Some(duplicate) = duplicate {
+                duplicate.discard_replaced();
+            }
+            let failures = UI_GUARDS.with(|guards| {
+                guards
+                    .borrow_mut()
+                    .tray_retry
+                    .take()
+                    .map_or(0, |retry| retry.failures)
+            });
+            if failures > 0 {
+                APP_STATE.with(|slot| {
+                    if let Ok(borrowed) = slot.try_borrow()
+                        && let Some(state) = borrowed.as_ref()
+                    {
+                        state.event_diagnostic("tray", format!("result=added failures={failures}"));
+                    }
+                });
+            }
             true
         }
-        Err(_) => {
-            UI_GUARDS.with(|guards| {
+        Err(error) => {
+            let failures = UI_GUARDS.with(|guards| {
                 let mut guards = guards.borrow_mut();
                 match guards.tray_retry.as_mut() {
                     Some(retry) => retry.failed_again(now),
                     None => guards.tray_retry = Some(Retry::first(now)),
+                }
+                guards.tray_retry.as_ref().map_or(0, |retry| retry.failures)
+            });
+            APP_STATE.with(|slot| {
+                if let Ok(borrowed) = slot.try_borrow()
+                    && let Some(state) = borrowed.as_ref()
+                {
+                    state.event_diagnostic(
+                        "tray",
+                        format!(
+                            "result=unavailable failures={failures} error={:#010x}",
+                            error.code().0
+                        ),
+                    );
                 }
             });
             false
@@ -2505,19 +3639,21 @@ fn add_tray(hwnd: HWND, indicator: LayoutIndicator) -> bool {
     }
 }
 
-/// Explorer restarted (`TaskbarCreated`) and every notification icon is gone: build a new one.
+/// Explorer restarted (`TaskbarCreated`) and every notification icon is gone: build a new one
+/// that shows what the old one showed. Starting from the initial status instead would announce
+/// an old conversion failure again at the next refresh.
 fn recreate_tray(hwnd: HWND) {
     let taken = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
-            .map(|state| (state.tray.take(), state.last_tray_status.indicator))
+            .map(|state| (state.tray.take(), state.last_tray_status))
     });
-    let Some((old, indicator)) = taken else {
+    let Some((old, status)) = taken else {
         return;
     };
     // Dropping the old icon calls the shell, so no borrow is held here.
     drop(old);
-    add_tray(hwnd, indicator);
+    add_tray(hwnd, status);
 }
 
 /// Repeats a failed tray registration with backoff while the icon is missing.
@@ -2533,15 +3669,15 @@ fn retry_tray(hwnd: HWND) {
     if !due {
         return;
     }
-    let indicator = APP_STATE.with(|slot| {
+    let status = APP_STATE.with(|slot| {
         slot.borrow()
             .as_ref()
             .filter(|state| state.tray.is_none())
-            .map(|state| state.last_tray_status.indicator)
+            .map(|state| state.last_tray_status)
     });
-    match indicator {
-        Some(indicator) => {
-            add_tray(hwnd, indicator);
+    match status {
+        Some(status) => {
+            add_tray(hwnd, status);
         }
         None => UI_GUARDS.with(|guards| guards.borrow_mut().tray_retry = None),
     }
@@ -2633,13 +3769,20 @@ struct ShutdownFacts {
 }
 
 /// The reasons for declining Exit, in reporting order. A finished worker thread cannot be busy,
-/// so the stale flag a crashed worker leaves behind is ignored.
+/// acknowledge a reload or recover held keys, so the stale flags a crashed worker leaves behind
+/// are ignored, and so are held keys only it could bring back.
 fn shutdown_blockers(facts: &ShutdownFacts) -> Vec<&'static str> {
     [
         ("correction-gate", facts.correction_gate_active),
-        ("retained-input", facts.retained_input),
+        (
+            "retained-input",
+            facts.retained_input && !facts.worker_finished,
+        ),
         ("worker-busy", facts.worker_busy && !facts.worker_finished),
-        ("configuration-pending", facts.configuration_pending),
+        (
+            "configuration-pending",
+            facts.configuration_pending && !facts.worker_finished,
+        ),
         ("undo-hotkey", facts.undo_hotkey_active),
         ("hotkey-release", facts.hotkey_waiting_for_release),
     ]
@@ -2666,6 +3809,10 @@ fn arm_input_recovery(hwnd: HWND) {
     let details = APP_STATE.with(|slot| {
         let state = slot.borrow();
         let state = state.as_ref()?;
+        // Only the worker replays retained input; a stopped one can never use the hotkey.
+        if state.metrics.worker_dead.load(Ordering::Acquire) {
+            return None;
+        }
         let retained = state
             .metrics
             .retained_input
@@ -2732,6 +3879,71 @@ fn prepare_retained_recovery(metrics: &ObserverMetrics, token: u64, now: Instant
     same_record
 }
 
+/// How long past its lifetime a record stays while the worker is sending it. A worker that died
+/// in the middle must not keep the keys, the pause and the declined Exit forever.
+const RETAINED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
+
+/// Marks the retained record `token` as being sent by the worker. False when it is gone (expired,
+/// discarded or replaced) or another recovery is already sending it.
+fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> bool {
+    let mut retained = metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match retained.as_mut() {
+        Some(input) if input.token == token && !input.recovering => {
+            input.recovering = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Ends a recovery that sent `sent` of `requested` inputs: a complete one removes the record, an
+/// incomplete one keeps it for another attempt, marked uncertain when part of it went out.
+fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, requested: usize) {
+    let mut retained = metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(input) = retained.as_mut()
+        && input.token == token
+    {
+        if sent == requested {
+            *retained = None;
+        } else {
+            input.recovering = false;
+            input.delivery_uncertain |= sent != 0;
+        }
+    }
+}
+
+/// Deletes the held keys the user confirmed deleting. True when they were deleted: their lifetime
+/// may have ended while the question was open, or the worker may be typing them right now.
+fn discard_confirmed_retained_input(state: &mut AppState) -> bool {
+    let discarded = {
+        let mut retained = state
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if retained.as_ref().is_some_and(|input| !input.recovering) {
+            retained.take()
+        } else {
+            None
+        }
+    };
+    state.metrics.recovery_armed.store(false, Ordering::Release);
+    let Some(discarded) = discarded else {
+        return false;
+    };
+    state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
+    // Deleting a key-up whose key-down was typed would leave that key pressed.
+    let (_, releases) = split_delivered_key_releases(discarded.events);
+    state.queue_delivered_key_releases(releases);
+    true
+}
+
 fn discard_retained_input(hwnd: HWND) {
     let confirmed = unsafe {
         MessageBoxW(
@@ -2744,24 +3956,10 @@ fn discard_retained_input(hwnd: HWND) {
     if confirmed != IDYES {
         return;
     }
-    // The keys' lifetime may have ended while the question was open.
     let discarded = APP_STATE.with(|slot| {
-        let state = slot.borrow();
-        let Some(state) = state.as_ref() else {
-            return false;
-        };
-        let discarded = state
-            .metrics
-            .retained_input
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .is_some();
-        state.metrics.recovery_armed.store(false, Ordering::Release);
-        if discarded {
-            state.gate_diagnostic("recovery_discarded", "explicit=true".to_owned());
-        }
-        discarded
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(discard_confirmed_retained_input)
     });
     if discarded {
         show_tray_information(
@@ -2809,15 +4007,22 @@ fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: &Settings) {
         .store(false, Ordering::Release);
 }
 
-fn enqueue_configuration_reload(configuration: RuntimeConfiguration) -> bool {
-    APP_STATE.with(|slot| {
+fn finish_configuration_reload(hwnd: HWND) {
+    let rejected = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
-            .is_some_and(|state| state.enqueue_configuration(configuration))
-    })
-}
-
-fn finish_configuration_reload(hwnd: HWND) {
+            .is_some_and(AppState::drop_rejected_configuration)
+    });
+    if rejected {
+        show_configuration_error(
+            hwnd,
+            &tr_format(
+                "error.apply_config",
+                &[("error", "configuration_apply_failed")],
+            ),
+        );
+        return;
+    }
     let configuration = APP_STATE.with(|slot| {
         slot.borrow_mut()
             .as_mut()
@@ -2852,34 +4057,19 @@ fn reload_configuration_from_disk(hwnd: HWND) {
     }
 }
 
+/// Hands a configuration the loader finished, or one deferred on an earlier tick, to the worker.
 fn finish_configuration_load(hwnd: HWND) {
-    let result = APP_STATE.with(|slot| {
-        slot.borrow_mut()
+    let message = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        let loaded = state
+            .configuration_loader
             .as_mut()
-            .and_then(|state| state.configuration_loader.as_mut())
-            .and_then(RuntimeConfigurationLoader::poll)
+            .and_then(RuntimeConfigurationLoader::poll);
+        state.hand_off_configuration(loaded)
     });
-    let Some(result) = result else {
-        return;
-    };
-    let configuration = match result {
-        Ok(configuration) => configuration,
-        Err(error) => {
-            show_configuration_error(
-                hwnd,
-                &tr_format("error.read_config", &[("error", &error.to_string())]),
-            );
-            return;
-        }
-    };
-    if !enqueue_configuration_reload(configuration) {
-        show_configuration_error(
-            hwnd,
-            &tr_format(
-                "error.read_config",
-                &[("error", "configuration_handoff_unavailable")],
-            ),
-        );
+    if let Some(message) = message {
+        show_configuration_error(hwnd, &message);
     }
 }
 
@@ -2915,11 +4105,144 @@ fn expire_lexicon_candidate() {
     let _ = valid_lexicon_candidate();
 }
 
+/// Tray "add word" saves finished on their own threads, waiting for the window to report them.
+struct LexiconSaves {
+    sender: SyncSender<(VolatileLexiconCandidate, std::io::Result<()>)>,
+    finished: Receiver<(VolatileLexiconCandidate, std::io::Result<()>)>,
+    /// The offers being saved now.
+    in_flight: Vec<VolatileLexiconCandidate>,
+}
+
+impl LexiconSaves {
+    fn new() -> Self {
+        let (sender, finished) = sync_channel(8);
+        Self {
+            sender,
+            finished,
+            in_flight: Vec::new(),
+        }
+    }
+
+    /// Whether a save of `candidate` may start: not while the same offer, chosen twice in the
+    /// tray, is being saved, which would put two writers on the configuration.
+    fn begin(&mut self, candidate: &VolatileLexiconCandidate) -> bool {
+        if self
+            .in_flight
+            .iter()
+            .any(|saving| saving.same_offer(candidate))
+        {
+            return false;
+        }
+        self.in_flight.push(candidate.clone());
+        true
+    }
+
+    /// A save of `candidate` finished (or never started).
+    fn end(&mut self, candidate: &VolatileLexiconCandidate) {
+        self.in_flight
+            .retain(|saving| !saving.same_offer(candidate));
+    }
+}
+
+/// Messages the window ignores once the agent shuts down: a finished word save would reload the
+/// configuration on a thread of its own during the teardown.
+fn ignored_while_shutting_down(message: u32) -> bool {
+    matches!(
+        message,
+        WM_COMMAND | TRAY_CALLBACK_MESSAGE | SETTINGS_APPLIED_MESSAGE | LEXICON_SAVED_MESSAGE
+    )
+}
+
+/// Saves the word a tray offer names. Reading, merging and writing the configuration waits for
+/// its writer lock and for the disk, so it runs on a thread of its own: this thread serves the
+/// keyboard hook. The window reports the outcome (`finish_lexicon_saves`).
 fn add_recent_lexicon_offer(hwnd: HWND) {
     let Some(candidate) = valid_lexicon_candidate() else {
         return;
     };
-    if let Err(error) = persist_lexicon_candidate(&candidate) {
+    let Some(sender) = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let state = borrowed.as_mut()?;
+        state
+            .lexicon_saves
+            .begin(&candidate)
+            .then(|| state.lexicon_saves.sender.clone())
+    }) else {
+        return;
+    };
+    let window = hwnd.0 as usize;
+    let started = configuration_directory()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
+        })
+        .and_then(|directory| {
+            save_lexicon_candidate_in_background(
+                directory,
+                candidate.clone(),
+                move |candidate, result| {
+                    let _ = sender.send((candidate, result));
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(window as *mut c_void)),
+                            LEXICON_SAVED_MESSAGE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                },
+            )
+        });
+    if let Err(error) = started {
+        APP_STATE.with(|slot| {
+            if let Some(state) = slot.borrow_mut().as_mut() {
+                state.lexicon_saves.end(&candidate);
+            }
+        });
+        report_lexicon_save(hwnd, &candidate, Err(error));
+    }
+}
+
+/// Saves `candidate` into the configuration in `directory` on a thread of its own; `finished`
+/// gets the outcome there.
+fn save_lexicon_candidate_in_background(
+    directory: PathBuf,
+    candidate: VolatileLexiconCandidate,
+    finished: impl FnOnce(VolatileLexiconCandidate, std::io::Result<()>) + Send + 'static,
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("autokey-lexicon-save".into())
+        .spawn(move || {
+            let result = persist_lexicon_candidate(&directory, &candidate);
+            finished(candidate, result);
+        })
+        .map(drop)
+}
+
+/// Reports the tray "add word" saves that finished; polled on the timer too, in case their
+/// message could not be posted.
+fn finish_lexicon_saves(hwnd: HWND) {
+    let finished: Vec<_> = APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let Some(state) = borrowed.as_mut() else {
+            return Vec::new();
+        };
+        let finished: Vec<_> = state.lexicon_saves.finished.try_iter().collect();
+        for (candidate, _) in &finished {
+            state.lexicon_saves.end(candidate);
+        }
+        finished
+    });
+    for (candidate, result) in finished {
+        report_lexicon_save(hwnd, &candidate, result);
+    }
+}
+
+fn report_lexicon_save(
+    hwnd: HWND,
+    candidate: &VolatileLexiconCandidate,
+    result: std::io::Result<()>,
+) {
+    if let Err(error) = result {
         let destination = match candidate.target {
             LexiconOfferTarget::UserDictionary => tr("dictionary.destination"),
             LexiconOfferTarget::WordExclusions => tr("word_exclusions.destination"),
@@ -2933,9 +4256,13 @@ fn add_recent_lexicon_offer(hwnd: HWND) {
         );
         return;
     }
+    // A newer offer made while this one was saved stays.
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow().as_ref()
             && let Ok(mut stored) = state.lexicon_candidate.lock()
+            && stored
+                .as_ref()
+                .is_some_and(|offer| offer.same_offer(candidate))
         {
             stored.take();
         }
@@ -3001,8 +4328,45 @@ fn foreground_captures_input() -> bool {
             .is_some_and(|path| captures_keyboard(&path))
 }
 
+/// The worker's periodic refreshes for a timer tick: the keyboard profiles on every tick, and the
+/// focused field's privacy check at its own interval, except for the shell.
+fn queue_periodic_refreshes(
+    state: &mut AppState,
+    context: ForegroundContext,
+    shell_foreground: bool,
+    now: Instant,
+) {
+    state.enqueue(RawInputEvent::ProfileRefresh);
+    if shell_foreground {
+        // The desktop is no full-screen program, and no refresh will report it.
+        state
+            .metrics
+            .foreground_full_screen
+            .store(false, Ordering::Release);
+    } else if now >= state.next_privacy_refresh {
+        state.enqueue(RawInputEvent::PrivacyRefresh(context));
+        let last_check = state.metrics.privacy_probe_cost_ms.load(Ordering::Acquire);
+        state.next_privacy_refresh =
+            now + privacy_refresh_interval(Duration::from_millis(last_check));
+    }
+}
+
+/// While the tray menu is open the agent's own window is in front and the menu runs its own loop:
+/// only the keyboard profiles are refreshed, so that they do not age out (PROFILE_MAX_AGE) under
+/// a menu left open. True when the menu is open.
+fn queue_refreshes_under_menu(state: &mut AppState) -> bool {
+    if state.menu_open {
+        state.enqueue(RawInputEvent::ProfileRefresh);
+    }
+    state.menu_open
+}
+
 fn refresh_tray_state() {
-    if APP_STATE.with(|slot| slot.borrow().as_ref().is_some_and(|state| state.menu_open)) {
+    if APP_STATE.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .is_some_and(queue_refreshes_under_menu)
+    }) {
         return;
     }
     let Some(context) = current_foreground_context() else {
@@ -3012,20 +4376,8 @@ fn refresh_tray_state() {
     let now = Instant::now();
     APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
-        let Some(state) = state.as_mut() else {
-            return;
-        };
-        if shell_foreground {
-            // The desktop is no full-screen program, and no refresh will report it.
-            state
-                .metrics
-                .foreground_full_screen
-                .store(false, Ordering::Release);
-        } else if now >= state.next_privacy_refresh {
-            state.enqueue(RawInputEvent::PrivacyRefresh(context));
-            let last_check = state.metrics.privacy_probe_cost_ms.load(Ordering::Acquire);
-            state.next_privacy_refresh =
-                now + privacy_refresh_interval(Duration::from_millis(last_check));
+        if let Some(state) = state.as_mut() {
+            queue_periodic_refreshes(state, context, shell_foreground, now);
         }
     });
     let last_input_layout = APP_STATE.with(|slot| {
@@ -3048,6 +4400,24 @@ fn refresh_tray_state() {
     } else {
         LayoutIndicator::from_layout(context.layout)
     };
+    update_tray(indicator, now);
+}
+
+/// Whether a changed status may go to the tray icon now: only to an icon that exists, so that
+/// an update that cannot happen (no icon yet, or one the shell refused) spends none of the
+/// throttle's budget and the icon added a moment later shows the status at once.
+fn tray_update_allowed(
+    has_icon: bool,
+    gate_active: bool,
+    throttle: &mut TrayThrottle,
+    now: Instant,
+) -> bool {
+    has_icon && throttle.allow(now, gate_active)
+}
+
+/// Shows the agent's current status with `indicator` in the tray icon when it changed, and
+/// announces a new conversion failure.
+fn update_tray(indicator: LayoutIndicator, now: Instant) {
     let Some((mut tray, status, notify_failure)) = APP_STATE.with(|slot| {
         let mut borrowed = slot.borrow_mut();
         let state = borrowed.as_mut()?;
@@ -3063,6 +4433,7 @@ fn refresh_tray_state() {
             failures: state.metrics.conversion_failures.load(Ordering::Relaxed),
             failure_reason: state.metrics.last_failure_reason.load(Ordering::Acquire),
             backend_status: state.metrics.backend_status.load(Ordering::Acquire),
+            diagnostic_errors: diagnostic_error_count(&state.metrics),
         };
         if status == state.last_tray_status {
             return None;
@@ -3071,7 +4442,10 @@ fn refresh_tray_state() {
         // thread: at most two updates per second and none while a gate holds keys. The status
         // stays different from the shown one, so a refused update is tried again on a later tick.
         let gate_active = state.correction_gate.active;
-        if !UI_GUARDS.with(|guards| guards.borrow_mut().tray.allow(now, gate_active)) {
+        let has_icon = state.tray.is_some();
+        if !UI_GUARDS.with(|guards| {
+            tray_update_allowed(has_icon, gate_active, &mut guards.borrow_mut().tray, now)
+        }) {
             return None;
         }
         let notify_failure = should_notify_conversion_failure(state.last_tray_status, status);
@@ -3084,18 +4458,28 @@ fn refresh_tray_state() {
     // pump messages and re-enter either the window procedure or a hook.
     let updated = tray.update(status).is_ok();
     let window = tray.hwnd;
-    let mut tray_slot = Some(tray);
-    APP_STATE.with(|slot| {
-        if let Some(state) = slot.borrow_mut().as_mut()
-            && state.tray.is_none()
-        {
-            state.tray = tray_slot.take();
+    // The icon comes back when it cannot be put back: the state is gone (shutdown), or a message
+    // dispatched during the update (TaskbarCreated) added a new icon meanwhile.
+    let left_over = APP_STATE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(state) if state.tray.is_none() => {
+            state.tray = Some(tray);
             if updated {
                 state.last_tray_status = status;
             }
+            None
         }
+        Some(_) => Some((tray, true)),
+        None => Some((tray, false)),
     });
-    if updated && notify_failure {
+    let stored = left_over.is_none();
+    match left_over {
+        // The shell knows the new icon by the same id: deleting this one would remove it. The
+        // next refresh shows the status in the new icon and announces a failure there.
+        Some((stale, true)) => stale.discard_replaced(),
+        Some((gone, false)) => drop(gone),
+        None => {}
+    }
+    if updated && notify_failure && stored {
         show_tray_information(
             window,
             tr("conversion.paused_title"),
@@ -3103,6 +4487,37 @@ fn refresh_tray_state() {
                 "conversion.paused_body",
                 &[("reason", conversion_failure_label(status.failure_reason))],
             ),
+        );
+    }
+}
+
+/// Whether `current` restore failures (`ObserverMetrics::clipboard_restore_failures`) hold one not
+/// announced yet; `announced` then catches up with them.
+fn clipboard_failures_to_announce(announced: &mut u64, current: u64) -> bool {
+    if current <= *announced {
+        return false;
+    }
+    *announced = current;
+    true
+}
+
+/// Tells the user when the clipboard they had did not come back after a paste (once for the
+/// failures since the last notice).
+fn announce_clipboard_failures(hwnd: HWND) {
+    let announce = APP_STATE.with(|slot| {
+        slot.borrow_mut().as_mut().is_some_and(|state| {
+            let current = state
+                .metrics
+                .clipboard_restore_failures
+                .load(Ordering::Relaxed);
+            clipboard_failures_to_announce(&mut state.announced_clipboard_failures, current)
+        })
+    });
+    if announce {
+        show_tray_information(
+            hwnd,
+            tr("clipboard.not_restored_title"),
+            tr("clipboard.not_restored_body"),
         );
     }
 }
@@ -3119,28 +4534,30 @@ struct TrayIcon {
 }
 
 impl TrayIcon {
-    fn add(hwnd: HWND, indicator: LayoutIndicator) -> Result<Self> {
-        let icon = create_indicator_icon(TrayVisual::Disabled, indicator)?;
+    fn add(hwnd: HWND, status: TrayStatus) -> Result<Self> {
+        let visual = tray_visual_state(status);
+        let icon = create_indicator_icon(visual, status.indicator)?;
         let mut data = notify_icon_data(hwnd, icon);
-        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        // With NOTIFYICON_VERSION_4 the shell shows the tooltip only when every call asks for it.
+        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY_CALLBACK_MESSAGE;
-        let tooltip = tray_tooltip(TrayStatus::initial(indicator));
+        let tooltip = tray_tooltip(status);
         set_tooltip(&mut data, &tooltip);
-        if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-            unsafe {
+        if !shell_notify_icon(NIM_ADD, &data) {
+            return Err(last_error_then(|| unsafe {
                 let _ = DestroyIcon(icon);
-            }
-            return Err(Error::from_thread());
+            }));
         }
 
         let mut version_data = notify_icon_data(hwnd, icon);
         version_data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &version_data) }.as_bool() {
-            unsafe {
-                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-                let _ = DestroyIcon(icon);
-            }
-            return Err(Error::from_thread());
+        if !shell_notify_icon(NIM_SETVERSION, &version_data) {
+            return Err(last_error_then(|| {
+                let _ = shell_notify_icon(NIM_DELETE, &data);
+                unsafe {
+                    let _ = DestroyIcon(icon);
+                }
+            }));
         }
         unsafe {
             let _ = SetWindowTextW(hwnd, &HSTRING::from(&tooltip));
@@ -3148,8 +4565,8 @@ impl TrayIcon {
         Ok(Self {
             hwnd,
             icon,
-            visual: TrayVisual::Disabled,
-            indicator,
+            visual,
+            indicator: status.indicator,
         })
     }
 
@@ -3164,6 +4581,7 @@ impl TrayIcon {
         let icon = new_icon.unwrap_or(self.icon);
         let mut data = notify_icon_data(self.hwnd, icon);
         data.uFlags = NIF_TIP
+            | NIF_SHOWTIP
             | if visual_changed {
                 NIF_ICON
             } else {
@@ -3171,13 +4589,14 @@ impl TrayIcon {
             };
         let tooltip = tray_tooltip(status);
         set_tooltip(&mut data, &tooltip);
-        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
-            if let Some(new_icon) = new_icon {
-                unsafe {
-                    let _ = DestroyIcon(new_icon);
+        if !shell_notify_icon(NIM_MODIFY, &data) {
+            return Err(last_error_then(|| {
+                if let Some(new_icon) = new_icon {
+                    unsafe {
+                        let _ = DestroyIcon(new_icon);
+                    }
                 }
-            }
-            return Err(Error::from_thread());
+            }));
         }
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(&tooltip));
@@ -3193,16 +4612,44 @@ impl TrayIcon {
         }
         Ok(())
     }
+
+    /// Destroys the image of an icon that a newer one replaced under the same window and id,
+    /// and leaves the notification icon alone: deleting it would remove the newer one.
+    fn discard_replaced(self) {
+        let icon = self.icon;
+        core::mem::forget(self);
+        unsafe {
+            let _ = DestroyIcon(icon);
+        }
+    }
 }
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
         let data = notify_icon_data(self.hwnd, self.icon);
+        let _ = shell_notify_icon(NIM_DELETE, &data);
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
             let _ = DestroyIcon(self.icon);
         }
     }
+}
+
+/// `Shell_NotifyIconW`. Tests put a scripted notification area in its place, which records the
+/// calls and answers them.
+fn shell_notify_icon(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
+    #[cfg(test)]
+    if let Some(answer) = tests::scripted_shell_call(message, data) {
+        return answer;
+    }
+    unsafe { Shell_NotifyIconW(message, data) }.as_bool()
+}
+
+/// The error of the call that just failed, read before `cleanup` runs: the cleanup's own calls
+/// may leave another last error behind.
+fn last_error_then(cleanup: impl FnOnce()) -> Error {
+    let error = Error::from_thread();
+    cleanup();
+    error
 }
 
 /// Panics of this process are written to crash.log in the profile folder (never their message).
@@ -3287,7 +4734,6 @@ pub fn run() -> Result<()> {
             .map(|context| LayoutIndicator::from_layout(context.layout))
             .unwrap_or(LayoutIndicator::Unavailable);
         installer_lifecycle::advertise_safe_close(hwnd);
-        let tray = TrayIcon::add(hwnd, initial_indicator)?;
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(
             initial_configuration
@@ -3307,7 +4753,14 @@ pub fn run() -> Result<()> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let lexicon_candidate = Arc::new(Mutex::new(None));
         let (diagnostic_sender, diagnostic_receiver) = sync_channel(DIAGNOSTIC_QUEUE_CAPACITY);
-        let diagnostic_worker = thread::spawn(move || diagnostic_worker(diagnostic_receiver));
+        let diagnostic_metrics = Arc::clone(&metrics);
+        let diagnostic_worker = thread::spawn(move || {
+            diagnostic_worker(
+                diagnostic_receiver,
+                diagnostic_log_path(),
+                &diagnostic_metrics,
+            );
+        });
         let correction_gate = CorrectionGate::default();
         let (input_sender, input_receiver) = sync_channel(INPUT_QUEUE_CAPACITY);
         let worker_metrics = Arc::clone(&metrics);
@@ -3331,7 +4784,7 @@ pub fn run() -> Result<()> {
         APP_STATE.with(|slot| {
             *slot.borrow_mut() = Some(AppState {
                 window: hwnd,
-                tray: Some(tray),
+                tray: None,
                 keyboard_hook: None,
                 mouse_hook: None,
                 input_sender: Some(input_sender),
@@ -3347,19 +4800,30 @@ pub fn run() -> Result<()> {
                 configuration_sources: initial_configuration.sources,
                 package_source: initial_configuration.package_source,
                 pending_configuration: None,
+                deferred_configuration: None,
                 configuration_loader: RuntimeConfigurationLoader::spawn().ok(),
                 lexicon_candidate,
+                lexicon_saves: LexiconSaves::new(),
                 diagnostic_sender: Some(diagnostic_sender),
                 diagnostic_worker: Some(diagnostic_worker),
+                pending_key_releases: Vec::new(),
+                pending_held_replay: Vec::new(),
+                pending_hand_back: None,
+                announced_clipboard_failures: 0,
+                typed_input: 0,
             });
         });
+        // The agent starts with the session, possibly before the taskbar exists. It works without
+        // the icon meanwhile: a refused icon is retried with backoff, and TaskbarCreated adds it as
+        // soon as Explorer is ready.
+        add_tray(hwnd, TrayStatus::initial(initial_indicator));
 
         let keyboard_hook =
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(instance), 0) {
                 Ok(hook) => hook,
                 Err(error) => {
                     drop(take_app_state());
-                    let _ = DestroyWindow(hwnd);
+                    abandon_startup(hwnd);
                     return Err(error);
                 }
             };
@@ -3369,7 +4833,7 @@ pub fn run() -> Result<()> {
                 Err(error) => {
                     let _ = UnhookWindowsHookEx(keyboard_hook);
                     drop(take_app_state());
-                    let _ = DestroyWindow(hwnd);
+                    abandon_startup(hwnd);
                     return Err(error);
                 }
             };
@@ -3379,11 +4843,12 @@ pub fn run() -> Result<()> {
                 state.mouse_hook = Some(mouse_hook);
             }
         });
-        touch_hook_activity();
+        touch_hook_activity(&KEYBOARD_HOOK_ACTIVITY_MS);
+        touch_hook_activity(&MOUSE_HOOK_ACTIVITY_MS);
 
         if SetTimer(Some(hwnd), LAYOUT_TIMER_ID, LAYOUT_TIMER_INTERVAL_MS, None) == 0 {
             let error = Error::from_thread();
-            let _ = DestroyWindow(hwnd);
+            abandon_startup(hwnd);
             return Err(error);
         }
 
@@ -3402,6 +4867,17 @@ pub fn run() -> Result<()> {
 
         drop(take_app_state());
         Ok(())
+    }
+}
+
+/// Destroys the agent's window after a start-up failure. Its WM_DESTROY posts WM_QUIT for a
+/// message loop that never ran; left in the queue, that message would close the error dialog that
+/// `main` shows next before anyone could read it.
+fn abandon_startup(hwnd: HWND) {
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+        let mut message = MSG::default();
+        while PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool() {}
     }
 }
 
@@ -3449,14 +4925,13 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if matches!(
-        message,
-        WM_COMMAND | TRAY_CALLBACK_MESSAGE | SETTINGS_APPLIED_MESSAGE
-    ) && APP_STATE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|state| state.shutdown.load(Ordering::Acquire))
-    }) {
+    if ignored_while_shutting_down(message)
+        && APP_STATE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|state| state.shutdown.load(Ordering::Acquire))
+        })
+    {
         return LRESULT(0);
     }
     match message {
@@ -3469,10 +4944,20 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             hook_watchdog_tick(hwnd);
             retry_missing_hooks(hwnd);
             retry_tray(hwnd);
-            finish_configuration_load(hwnd);
+            // Publishing first frees the slot for a configuration loaded meanwhile.
             finish_configuration_reload(hwnd);
+            finish_configuration_load(hwnd);
+            finish_lexicon_saves(hwnd);
             expire_correction_gate();
             expire_retained_input(hwnd, Instant::now());
+            announce_clipboard_failures(hwnd);
+            hand_back_stalled_retained_input(
+                current_foreground_context(),
+                physical_modifiers_released(),
+                Instant::now(),
+            );
+            // In case the message that normally sends them could not be posted.
+            send_pending_held_keys();
             expire_lexicon_candidate();
             refresh_tray_state();
             LRESULT(0)
@@ -3524,20 +5009,31 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(acknowledge_correction_gate_drain(old_token, new_token) as isize)
         }
         GATE_FAIL_OPEN_MESSAGE => {
-            fail_open_correction_gate(wparam.0 as u64);
+            fail_open_correction_gate(wparam.0 as u64, fail_open_cause(lparam.0));
+            LRESULT(0)
+        }
+        HELD_KEYS_RETURN_MESSAGE => {
+            send_pending_held_keys();
             LRESULT(0)
         }
         GATE_HANDOFF_BUDGET_MESSAGE => {
             let old_token = wparam.0 as u64;
             let required_ms = u64::try_from(lparam.0).unwrap_or_default();
-            let prepared = APP_STATE.with(|slot| {
-                slot.borrow_mut().as_mut().is_some_and(|state| {
-                    state
-                        .correction_gate
-                        .prepare_handoff_budget(old_token, required_ms)
+            // What the gate has left, or 0 when it cannot be handed over.
+            let remaining_ms = APP_STATE.with(|slot| {
+                slot.borrow_mut().as_mut().and_then(|state| {
+                    state.correction_gate.prepare_handoff_budget(
+                        old_token,
+                        required_ms,
+                        Instant::now(),
+                    )
                 })
             });
-            LRESULT(prepared as isize)
+            LRESULT(remaining_ms.map_or(0, |remaining_ms| remaining_ms as isize))
+        }
+        LEXICON_SAVED_MESSAGE => {
+            finish_lexicon_saves(hwnd);
+            LRESULT(0)
         }
         LEXICON_OFFER_MESSAGE => {
             if let Some(candidate) = valid_lexicon_candidate() {
@@ -3558,10 +5054,12 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         RECOVERY_NOTICE_MESSAGE => {
+            // A stopped worker gets its own notice; recovery would be an empty promise.
             if APP_STATE.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .is_some_and(|state| has_retained_input(&state.metrics))
+                slot.borrow().as_ref().is_some_and(|state| {
+                    has_retained_input(&state.metrics)
+                        && !state.metrics.worker_dead.load(Ordering::Acquire)
+                })
             }) {
                 show_tray_information(
                     hwnd,
@@ -3573,10 +5071,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         TRAY_CALLBACK_MESSAGE => {
             let notification = (lparam.0 as u32) & 0xffff;
-            match tray_interaction(notification) {
+            match tray_interaction(notification, wparam) {
                 TrayInteraction::Settings => settings_window::show(hwnd),
-                TrayInteraction::QuickMenu => {
-                    let _ = show_tray_menu(hwnd, None);
+                TrayInteraction::QuickMenu(anchor) => {
+                    let _ = show_tray_menu(hwnd, anchor);
                 }
                 TrayInteraction::Ignore => {}
             }
@@ -3630,17 +5128,21 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum TrayInteraction {
     Settings,
-    QuickMenu,
+    /// The menu, opened at this screen point.
+    QuickMenu(POINT),
     Ignore,
 }
 
-fn tray_interaction(notification: u32) -> TrayInteraction {
+/// What a notification of the icon asks for. With NOTIFYICON_VERSION_4, `anchor` (wParam) holds
+/// where a menu belongs: the pointer after a right click, the icon after the menu key or
+/// Shift+F10.
+fn tray_interaction(notification: u32, anchor: WPARAM) -> TrayInteraction {
     match notification {
         WM_LBUTTONDBLCLK | NIN_KEYSELECT | NIN_SELECT => TrayInteraction::Settings,
-        WM_CONTEXTMENU => TrayInteraction::QuickMenu,
+        WM_CONTEXTMENU => TrayInteraction::QuickMenu(point_from_packed_word(anchor)),
         _ => TrayInteraction::Ignore,
     }
 }
@@ -3648,7 +5150,7 @@ fn tray_interaction(notification: u32) -> TrayInteraction {
 /// Hook callbacks must not unwind (that aborts the process). A contained panic passes the event
 /// on untouched and raises `ENGINE_FAULT`.
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    touch_hook_activity();
+    touch_hook_activity(&KEYBOARD_HOOK_ACTIVITY_MS);
     let started = Instant::now();
     let result = guarded(
         || unsafe { keyboard_hook_body(code, wparam, lparam) },
@@ -3671,6 +5173,13 @@ fn report_slow_hook(started: Instant, hook: &str) {
         // The callback may run while this thread holds the state; skip the record then.
         if let Ok(borrowed) = slot.try_borrow()
             && let Some(state) = borrowed.as_ref()
+            && slow_hook_may_be_logged(
+                hook,
+                hook_privacy_reason(
+                    &state.metrics,
+                    current_foreground_context().map_or(0, |current| current.process_id),
+                ),
+            )
         {
             state.event_diagnostic(
                 "hook_slow",
@@ -3678,6 +5187,33 @@ fn report_slow_hook(started: Instant, hook: &str) {
             );
         }
     });
+}
+
+/// The privacy verdict the hooks act on for input to `process_id`: the worker's, once it applied
+/// that process's policy; before that the program may be an excluded one, so it is unknown. The
+/// worker publishes the process after the verdict.
+fn hook_privacy_reason(metrics: &ObserverMetrics, process_id: u32) -> u8 {
+    if metrics.privacy_process_id.load(Ordering::Acquire) != process_id {
+        return PRIVACY_UNAVAILABLE;
+    }
+    metrics.privacy_reason.load(Ordering::Acquire)
+}
+
+/// A slow keyboard callback is one line per key when the system is loaded: while privacy blocks
+/// the field it is not written, as it would give a secret's length and rhythm.
+const fn slow_hook_may_be_logged(hook: &str, privacy_reason: u8) -> bool {
+    privacy_reason == PRIVACY_ALLOWED || !matches!(hook.as_bytes(), b"keyboard")
+}
+
+/// Whether an injected key is the desktop acceptance typing for the agent (test builds only).
+#[cfg(test)]
+const fn acceptance_typing(marker: usize) -> bool {
+    marker == ACCEPTANCE_TYPING_MARKER
+}
+
+#[cfg(not(test))]
+const fn acceptance_typing(_marker: usize) -> bool {
+    false
 }
 
 unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -3735,8 +5271,12 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         return;
                     }
                     drained_event = drained;
-                    if event.flags.contains(LLKHF_INJECTED) && !drained {
+                    if event.flags.contains(LLKHF_INJECTED)
+                        && !drained
+                        && !acceptance_typing(event.dwExtraInfo)
+                    {
                         state.break_correction_gate_fail_open(GateFailureCause::ExternalInjection);
+                        state.typed_input = state.typed_input.wrapping_add(1);
                         state
                             .metrics
                             .observed_input_sequence
@@ -3764,9 +5304,21 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             0
                         },
                         hotkey_trigger: false,
+                        repeat: false,
+                        held_modifiers: held_modifiers_for_event(
+                            event.vkCode as u16,
+                            key_down,
+                            key_up,
+                        ),
                     };
+                    if !drained {
+                        // A newer physical edge of a key supersedes a key-up still queued for it.
+                        cancel_superseded_key_release(&mut state.pending_key_releases, &raw);
+                    }
 
                     let mut claimed_hotkey = false;
+                    // The claimed hotkey is a modifier key-up that also reaches the application.
+                    let mut passes_through = false;
                     if !drained {
                         match contextual_hotkey_action(
                             &state.metrics,
@@ -3807,6 +5359,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                                     raw.hotkey_trigger = false;
                                 } else {
                                     claimed_hotkey = true;
+                                    passes_through = true;
                                     raw.hotkey_trigger = true;
                                 }
                             }
@@ -3824,25 +5377,23 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         if key_down && hotkey_modifier_bit(event.vkCode as u16).is_none() {
                             state.correction_gate.pending_hotkey = None;
                         }
-                        if state.correction_gate.hold(raw) {
-                            swallow = true;
-                            return;
+                        if state.correction_gate.active && key_down {
+                            raw.repeat =
+                                gated_key_down_repeats(&state.correction_gate.held, &raw, || {
+                                    let key_state =
+                                        unsafe { GetAsyncKeyState(event.vkCode as i32) };
+                                    key_state as u16 & 0x8000 != 0
+                                });
                         }
-                        if state.correction_gate.active {
-                            let cause = if Instant::now() >= state.correction_gate.deadline {
-                                GateFailureCause::Deadline
-                            } else {
-                                GateFailureCause::Capacity
-                            };
-                            // Include this edge in recovery as well: forwarding
-                            // it now would overtake all previously swallowed input.
-                            state.correction_gate.held.push(raw);
+                        if state.hold_gated_edge(raw) {
                             swallow = true;
-                            state.break_correction_gate_fail_open(cause);
                             return;
                         }
                     }
 
+                    if key_down && !drained {
+                        state.typed_input = state.typed_input.wrapping_add(1);
+                    }
                     let sequence = state
                         .metrics
                         .observed_input_sequence
@@ -3861,7 +5412,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         key_down,
                         event.vkCode as u16,
                         state.metrics.auto_enabled.load(Ordering::Acquire),
-                        state.metrics.privacy_reason.load(Ordering::Acquire),
+                        hook_privacy_reason(&state.metrics, foreground.process_id),
                         state.correction_gate.active,
                         shortcut_modifiers_released(),
                     ) && !has_retained_input(&state.metrics)
@@ -3880,18 +5431,16 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             .store(0, Ordering::Release);
                     }
                     let queued = if claimed_hotkey && has_retained_input(&state.metrics) {
-                        if state.metrics.recovery_armed.swap(false, Ordering::AcqRel) {
-                            state.enqueue(RawInputEvent::RecoverInput {
-                                sequence,
-                                explicit: true,
-                            })
-                        } else {
+                        let armed = state.metrics.recovery_armed.swap(false, Ordering::AcqRel);
+                        if !armed {
                             state.gate_diagnostic(
                                 "recovery_not_armed",
                                 format!("sequence={sequence}"),
                             );
-                            true
                         }
+                        let (key, recovery) = retained_hotkey_events(raw, passes_through, armed);
+                        let key_queued = key.is_none_or(|key| state.enqueue(key));
+                        key_queued && recovery.is_none_or(|recovery| state.enqueue(recovery))
                     } else {
                         state.enqueue(RawInputEvent::Key(raw))
                     };
@@ -3945,7 +5494,7 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    touch_hook_activity();
+    touch_hook_activity(&MOUSE_HOOK_ACTIVITY_MS);
     let started = Instant::now();
     let result = guarded(
         || unsafe { mouse_hook_body(code, wparam, lparam) },
@@ -3968,20 +5517,28 @@ unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT 
         let event = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         APP_STATE.with(|slot| {
             if let Some(state) = slot.borrow_mut().as_mut() {
-                state
-                    .metrics
-                    .observed_input_sequence
-                    .fetch_add(1, Ordering::AcqRel);
-                if event.flags & LLMHF_INJECTED == 0 {
-                    state.break_correction_gate_fail_open(GateFailureCause::Mouse);
-                    state.enqueue(RawInputEvent::Mouse);
-                } else {
-                    state.enqueue(RawInputEvent::ExternalInjection);
-                }
+                observe_mouse_button(state, event.flags & LLMHF_INJECTED != 0);
             }
         });
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// A mouse button went down. A click, physical or injected by another program, may move the caret,
+/// so held keys must not be replayed after it: the gate breaks either way.
+fn observe_mouse_button(state: &mut AppState, injected: bool) {
+    state.typed_input = state.typed_input.wrapping_add(1);
+    state
+        .metrics
+        .observed_input_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    if injected {
+        state.break_correction_gate_fail_open(GateFailureCause::ExternalInjection);
+        state.enqueue(RawInputEvent::ExternalInjection);
+    } else {
+        state.break_correction_gate_fail_open(GateFailureCause::Mouse);
+        state.enqueue(RawInputEvent::Mouse);
+    }
 }
 
 fn drain_correction_gate(token: u64) {
@@ -4042,6 +5599,139 @@ fn fail_correction_gate_drain(token: u64, unsent: Vec<RawKeyEvent>, sent: usize)
     });
 }
 
+/// The events a claimed hotkey queues while held input is retained: the explicit recovery when it
+/// was armed, and, when the hotkey fired on a modifier key-up that also reaches the application,
+/// that key-up as a plain key event, so the worker sees the modifier released.
+fn retained_hotkey_events(
+    raw: RawKeyEvent,
+    passes_through: bool,
+    recovery_armed: bool,
+) -> (Option<RawInputEvent>, Option<RawInputEvent>) {
+    let key = passes_through.then_some(RawInputEvent::Key(RawKeyEvent {
+        hotkey_trigger: false,
+        ..raw
+    }));
+    let recovery = recovery_armed.then_some(RawInputEvent::RecoverInput {
+        sequence: raw.sequence,
+        explicit: true,
+    });
+    (key, recovery)
+}
+
+/// Whether a key-down a gate is about to hold repeats a key that is already down. The last edge of
+/// the same key the gate holds decides: the system never saw it, so its key state still shows a
+/// key released in the gate as down. Without one, `system_down` reads the async key state, which
+/// the hook updates only after this edge: it still tells whether the key was down before it.
+fn gated_key_down_repeats(
+    held: &[RawKeyEvent],
+    raw: &RawKeyEvent,
+    system_down: impl FnOnce() -> bool,
+) -> bool {
+    let key = (raw.virtual_key, raw.scan_code, raw.extended);
+    held.iter()
+        .rev()
+        .find(|event| (event.virtual_key, event.scan_code, event.extended) == key)
+        .map_or_else(system_down, |last| {
+            matches!(last.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+        })
+}
+
+/// Splits edges that leave a gate without being typed into the ones that stay retained and the
+/// key-ups that must be delivered now. A key-up with no earlier fresh key-down of the same key in
+/// `events` belongs to a key whose key-down reached the application before the gate (directly or
+/// as the first of an auto-repeat): it types nothing, and withholding it would leave the key
+/// logically pressed system-wide. A key-down after a key-up of the same key in `events` is fresh
+/// whatever it is marked.
+fn split_delivered_key_releases(events: Vec<RawKeyEvent>) -> (Vec<RawKeyEvent>, Vec<RawKeyEvent>) {
+    let mut pressed = std::collections::BTreeSet::new();
+    let mut released = std::collections::BTreeSet::new();
+    let mut retained = Vec::with_capacity(events.len());
+    let mut releases = Vec::new();
+    for event in events {
+        let key = (event.virtual_key, event.scan_code, event.extended);
+        if matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            if !event.repeat || released.contains(&key) {
+                pressed.insert(key);
+            }
+            retained.push(event);
+        } else {
+            released.insert(key);
+            if pressed.remove(&key) {
+                retained.push(event);
+            } else {
+                releases.push(event);
+            }
+        }
+    }
+    (retained, releases)
+}
+
+/// Drops queued key-ups of the key `event` belongs to: a newer physical edge of that key has
+/// already set its state, and delivering the old key-up afterwards would release it again.
+fn cancel_superseded_key_release(pending: &mut Vec<RawKeyEvent>, event: &RawKeyEvent) {
+    if !pending.is_empty() {
+        pending.retain(|queued| {
+            (queued.virtual_key, queued.scan_code, queued.extended)
+                != (event.virtual_key, event.scan_code, event.extended)
+        });
+    }
+}
+
+/// Held keys a broken gate queued for the window procedure, ready to send.
+struct HeldKeysReturn {
+    inputs: Vec<INPUT>,
+    /// The retained record handed back with them past a stalled worker.
+    handed_back: Option<u64>,
+}
+
+/// Takes what a broken gate queued: the held keys handed back unchanged after a contained fault or
+/// past a stalled worker, then the key-ups of keys pressed before the gate. A key they leave down
+/// is released at the end, as in a recovery.
+fn take_held_keys_return(state: &mut AppState) -> Option<HeldKeysReturn> {
+    if state.pending_held_replay.is_empty() && state.pending_key_releases.is_empty() {
+        return None;
+    }
+    let mut events = core::mem::take(&mut state.pending_held_replay);
+    events.append(&mut state.pending_key_releases);
+    Some(HeldKeysReturn {
+        inputs: build_balanced_replay_inputs(&events).unwrap_or_default(),
+        handed_back: state.pending_hand_back.take(),
+    })
+}
+
+/// Records that `sent` of the inputs of `held` were sent; a record handed back past a stalled
+/// worker is reported to the worker, which finishes its recovery.
+fn finish_held_keys_return(state: &AppState, held: &HeldKeysReturn, sent: usize) {
+    state.gate_diagnostic(
+        "returned",
+        format!("requested={} submitted={sent}", held.inputs.len()),
+    );
+    if let Some(token) = held.handed_back {
+        let _ = state.enqueue(RawInputEvent::RetainedInputHandedBack {
+            token,
+            submitted: sent,
+            requested: held.inputs.len(),
+        });
+    }
+}
+
+/// Sends what a broken gate queued (see take_held_keys_return). Runs in the window procedure,
+/// never in a hook.
+fn send_pending_held_keys() {
+    let Some(held) = APP_STATE.with(|slot| take_held_keys_return(slot.borrow_mut().as_mut()?))
+    else {
+        return;
+    };
+    let sent = send_input_count(&held.inputs);
+    APP_STATE.with(|slot| {
+        if let Ok(borrowed) = slot.try_borrow()
+            && let Some(state) = borrowed.as_ref()
+        {
+            finish_held_keys_return(state, &held, sent);
+        }
+    });
+}
+
 fn take_held_replay_prefix(held: &mut Vec<RawKeyEvent>) -> Vec<RawKeyEvent> {
     let end = held
         .iter()
@@ -4053,11 +5743,13 @@ fn take_held_replay_prefix(held: &mut Vec<RawKeyEvent>) -> Vec<RawKeyEvent> {
     held.drain(..end).collect()
 }
 
+/// Whether replaying `held` after a conversion changes the text after the converted word, which
+/// ends its undo. Only a key-down of a non-modifier key types; a key-up never does (a letter
+/// released after the Space while typing fast, or the Space's own key-up).
 fn held_tail_invalidates_undo(held: &[RawKeyEvent]) -> bool {
     held.iter().any(|event| {
         hotkey_modifier_bit(event.virtual_key as u16).is_none()
-            && (event.virtual_key as u16 != VK_SPACE.0
-                || !matches!(event.message, WM_KEYUP | WM_SYSKEYUP))
+            && matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN)
     })
 }
 
@@ -4092,7 +5784,9 @@ fn acknowledge_correction_gate_drain(old_token: u64, new_token: u64) -> bool {
                 .load(Ordering::Acquire)
                 != new_token
                 || !state.metrics.auto_enabled.load(Ordering::Acquire)
-                || !state.correction_gate.handoff(old_token, new_token)
+                || !state
+                    .correction_gate
+                    .handoff(old_token, new_token, Instant::now())
             {
                 return false;
             }
@@ -4128,21 +5822,132 @@ fn acknowledge_correction_gate_drain(old_token: u64, new_token: u64) -> bool {
             .is_ok()
         };
         if !posted {
-            fail_open_correction_gate(old_token);
+            fail_open_correction_gate(old_token, GateFailureCause::WorkerAck);
         }
     }
     acknowledged
 }
 
-fn fail_open_correction_gate(token: u64) {
+fn fail_open_correction_gate(token: u64, cause: GateFailureCause) {
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut()
             && state.correction_gate.active
             && state.correction_gate.token == token
         {
-            state.break_correction_gate_fail_open(GateFailureCause::WorkerAck);
+            state.break_correction_gate_fail_open(cause);
         }
     });
+}
+
+/// Causes after which held keys come back without being asked: the worker recovers them once it
+/// sees the abort, or the UI thread does when the worker stays busy.
+const fn hands_held_keys_back_automatically(cause: GateFailureCause) -> bool {
+    matches!(
+        cause,
+        GateFailureCause::Deadline
+            | GateFailureCause::Capacity
+            | GateFailureCause::WorkerQueue
+            | GateFailureCause::HookReinstall
+    )
+}
+
+/// What the UI thread knows when it considers handing retained keys back past a busy worker.
+#[derive(Debug, Clone, Copy)]
+struct HandBackFacts {
+    now: Instant,
+    /// The worker is busy, and not inside an edit that may have selected or typed text.
+    worker_stalled: bool,
+    /// `AppState::typed_input` now.
+    typed_input: u64,
+    /// The gate whose paste may have left the word selected (`ObserverMetrics`).
+    selection_left_token: u64,
+    modifiers_released: bool,
+    current: Option<ForegroundContext>,
+    privacy: Option<PrivacyBlockReason>,
+}
+
+/// Hands held keys back from the UI thread when the worker that should recover them stays busy:
+/// a provider call that never returns would otherwise keep them until they are deleted. See
+/// `stalled_worker_may_hand_back` for when this is safe.
+fn hand_back_stalled_retained_input(
+    current: Option<ForegroundContext>,
+    modifiers_released: bool,
+    now: Instant,
+) {
+    APP_STATE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let Some(state) = borrowed.as_mut() else {
+            return;
+        };
+        let facts = HandBackFacts {
+            now,
+            worker_stalled: state.metrics.worker_busy.load(Ordering::Acquire)
+                && !state.metrics.edit_in_flight.load(Ordering::Acquire),
+            typed_input: state.typed_input,
+            selection_left_token: state.metrics.selection_left_token.load(Ordering::Acquire),
+            modifiers_released,
+            current,
+            privacy: privacy_reason_from_code(state.metrics.privacy_reason.load(Ordering::Acquire)),
+        };
+        let record = {
+            let mut retained = state
+                .metrics
+                .retained_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if retained
+                .as_ref()
+                .is_some_and(|input| stalled_worker_may_hand_back(input, facts))
+            {
+                retained.take()
+            } else {
+                None
+            }
+        };
+        let Some(record) = record else {
+            return;
+        };
+        state.metrics.recovery_armed.store(false, Ordering::Release);
+        state.gate_diagnostic(
+            "recovery_handed_back",
+            format!("token={} held={}", record.token, record.events.len()),
+        );
+        state.pending_held_replay.extend(record.events);
+        state.pending_hand_back = Some(record.token);
+        state.post_held_keys_return();
+    });
+}
+
+/// Whether the UI thread hands a retained record back itself: the record is one that comes back
+/// automatically, is not being sent and was certainly never typed; the worker has been busy for
+/// `STALLED_WORKER_HAND_BACK_MS` since the keys were retained, but not inside an edit that may
+/// have selected or typed text; nothing was typed or clicked since, and no modifier is held; no
+/// paste of its gate may have left the word selected; the input target is still the record's;
+/// and no positive privacy finding keeps the keys back.
+fn stalled_worker_may_hand_back(input: &RetainedInput, facts: HandBackFacts) -> bool {
+    input.auto_recover
+        && !input.recovering
+        && !input.delivery_uncertain
+        && facts.worker_stalled
+        && facts.typed_input == input.input_mark
+        && facts.selection_left_token != input.token
+        && facts.modifiers_released
+        && facts.now.saturating_duration_since(input.retained_at)
+            >= Duration::from_millis(STALLED_WORKER_HAND_BACK_MS)
+        && facts
+            .current
+            .is_some_and(|current| same_input_target(input.foreground, current))
+        && recovery_privacy_allows(facts.privacy)
+}
+
+/// The cause a worker's fail-open request names in its LPARAM: a selection the edit may have
+/// left, or else a drain acknowledgement that was refused.
+const fn fail_open_cause(code: isize) -> GateFailureCause {
+    if code == GATE_FAIL_OPEN_SELECTION_LEFT {
+        GateFailureCause::SelectionLeft
+    } else {
+        GateFailureCause::WorkerAck
+    }
 }
 
 /// Deletes held keys that were neither handed back nor recovered within their lifetime. They were
@@ -4151,17 +5956,24 @@ fn fail_open_correction_gate(token: u64) {
 /// automatic conversion resumes, under the budget of a recovered gate abort (policy D1).
 fn expire_retained_input(hwnd: HWND, now: Instant) {
     let expired = APP_STATE.with(|slot| {
-        let state = slot.borrow();
-        let state = state.as_ref()?;
+        let mut state = slot.borrow_mut();
+        let state = state.as_mut()?;
         let expired = {
             let mut retained = state
                 .metrics
                 .retained_input
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            let deadline = |input: &RetainedInput| {
+                if input.recovering {
+                    input.expires_at + RETAINED_RECOVERY_GRACE
+                } else {
+                    input.expires_at
+                }
+            };
             if retained
                 .as_ref()
-                .is_some_and(|input| now >= input.expires_at)
+                .is_some_and(|input| now >= deadline(input))
             {
                 retained.take()
             } else {
@@ -4177,6 +5989,9 @@ fn expire_retained_input(hwnd: HWND, now: Instant) {
                 expired.events.len()
             ),
         );
+        // Deleting a key-up whose key-down was typed would leave that key pressed.
+        let (_, releases) = split_delivered_key_releases(expired.events);
+        state.queue_delivered_key_releases(releases);
         let _ = state.enqueue(RawInputEvent::RetainedInputExpired);
         Some(())
     });
@@ -4281,17 +6096,25 @@ fn window_belongs_to_context(window: HWND, expected: ForegroundContext) -> bool 
 
 struct PrivacyGuard {
     automation: Option<IUIAutomation>,
+    /// The focused field's process and password property, fetched with the field in one call.
+    privacy_cache: Option<IUIAutomationCacheRequest>,
     com_initialized: bool,
     last_barrier_report: Cell<TextBarrierReport>,
 }
 
 impl PrivacyGuard {
     fn new() -> Self {
+        Self::with_timeout(UIA_PROVIDER_TIMEOUT_MS)
+    }
+
+    /// A guard whose UI Automation calls each give up after `timeout_ms`.
+    fn with_timeout(timeout_ms: u32) -> Self {
         unsafe {
             let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             if !initialized {
                 return Self {
                     automation: None,
+                    privacy_cache: None,
                     com_initialized: false,
                     last_barrier_report: Cell::new(TextBarrierReport::default()),
                 };
@@ -4302,22 +6125,32 @@ impl PrivacyGuard {
             let automation: Option<IUIAutomation> = (|| -> Result<IUIAutomation> {
                 let client: IUIAutomation2 =
                     CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
-                client.SetConnectionTimeout(UIA_PROVIDER_TIMEOUT_MS)?;
-                client.SetTransactionTimeout(UIA_PROVIDER_TIMEOUT_MS)?;
+                client.SetConnectionTimeout(timeout_ms)?;
+                client.SetTransactionTimeout(timeout_ms)?;
                 client.cast()
             })()
             .ok();
-            if automation.is_none() {
+            let Some(automation) = automation else {
                 CoUninitialize();
                 return Self {
                     automation: None,
+                    privacy_cache: None,
                     com_initialized: false,
                     last_barrier_report: Cell::new(TextBarrierReport::default()),
                 };
-            }
+            };
+            let privacy_cache = automation
+                .CreateCacheRequest()
+                .and_then(|request| {
+                    request.AddProperty(UIA_ProcessIdPropertyId)?;
+                    request.AddProperty(UIA_IsPasswordPropertyId)?;
+                    Ok(request)
+                })
+                .ok();
 
             Self {
-                automation,
+                automation: Some(automation),
+                privacy_cache,
                 com_initialized: true,
                 last_barrier_report: Cell::new(TextBarrierReport::default()),
             }
@@ -4325,20 +6158,21 @@ impl PrivacyGuard {
     }
 
     fn inspect(&self, expected_process_id: u32) -> Option<PrivacyBlockReason> {
-        let Some(automation) = &self.automation else {
+        let (Some(automation), Some(cache)) = (&self.automation, &self.privacy_cache) else {
             return Some(PrivacyBlockReason::InspectionUnavailable);
         };
         unsafe {
-            let Ok(element) = automation.GetFocusedElement() else {
+            // One call to the field's program: a second and a third would each wait for it again.
+            let Ok(element) = automation.GetFocusedElementBuildCache(cache) else {
                 return Some(PrivacyBlockReason::FieldInspectionUnavailable);
             };
-            let Ok(process_id) = element.CurrentProcessId() else {
+            let Ok(process_id) = element.CachedProcessId() else {
                 return Some(PrivacyBlockReason::InspectionUnavailable);
             };
             if process_id < 0 || process_id as u32 != expected_process_id {
                 return Some(PrivacyBlockReason::InspectionUnavailable);
             }
-            match element.CurrentIsPassword() {
+            match element.CachedIsPassword() {
                 Ok(value) if value.as_bool() => Some(PrivacyBlockReason::PasswordField),
                 Ok(_) => None,
                 Err(_) => Some(PrivacyBlockReason::FieldInspectionUnavailable),
@@ -4351,311 +6185,63 @@ impl PrivacyGuard {
         expected_process_id: u32,
         expected_text: &str,
     ) -> TextBarrierStatus {
-        self.last_barrier_report.set(TextBarrierReport {
+        let report = &self.last_barrier_report;
+        report.set(TextBarrierReport {
             expected_chars: expected_text.chars().count(),
             ..TextBarrierReport::default()
         });
-        let Ok(character_count) = i32::try_from(expected_text.encode_utf16().count()) else {
+        let Some(units) = barrier_units(expected_text) else {
+            set_barrier_stage(report, TextBarrierStage::TextLength);
             return TextBarrierStatus::Unavailable;
         };
-        if character_count == 0 || character_count > 128 {
-            return TextBarrierStatus::Unavailable;
-        }
-
-        unsafe {
-            let (_element, pattern) = match self.focused_editable_text_pattern(expected_process_id)
-            {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            let Ok(ranges) = pattern.GetSelection() else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Selection,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Unavailable;
-            };
-            if ranges.Length().ok() != Some(1) {
-                return TextBarrierStatus::Mismatch;
-            }
-            let Ok(caret) = ranges.GetElement(0) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Unavailable;
-            };
-            if caret
-                .CompareEndpoints(
-                    TextPatternRangeEndpoint_Start,
-                    &caret,
-                    TextPatternRangeEndpoint_End,
-                )
-                .ok()
-                != Some(0)
-            {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Mismatch;
-            }
-            let Ok(range) = caret.Clone() else {
-                return TextBarrierStatus::Unavailable;
-            };
-            let moved = range
-                .MoveEndpointByUnit(
-                    TextPatternRangeEndpoint_Start,
-                    TextUnit_Character,
-                    -character_count,
-                )
-                .ok();
-            if moved != Some(-character_count) {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::RangeMove,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or(i32::MIN),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Mismatch;
-            }
-            let Ok(actual) = range.GetText(-1) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::TextRead,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or_default(),
-                    ..TextBarrierReport::default()
-                });
-                return TextBarrierStatus::Unavailable;
-            };
-            let actual = actual.to_string();
-            self.last_barrier_report.set(classify_text_barrier(
-                &actual,
-                expected_text,
-                TextBarrierStage::TextCompared,
-                moved.unwrap_or_default(),
-            ));
-            if text_barrier_matches(&actual, expected_text) {
-                TextBarrierStatus::Match
-            } else {
-                TextBarrierStatus::Mismatch
-            }
+        let field = match self.focused_text_field(expected_process_id) {
+            Ok(field) => field,
+            Err(status) => return status,
+        };
+        match read_preceding_text(&field, units, expected_text, report) {
+            Ok(_) => TextBarrierStatus::Match,
+            Err(status) => status,
         }
     }
 
+    /// Selects the text before the caret, trying again only when the field did not show the
+    /// selection and it was collapsed. Returns the status and what became of the selection when
+    /// it was collapsed again.
     fn select_preceding_text(
         &self,
         expected_process_id: u32,
         expected_text: &str,
         patience: PastePatience,
-    ) -> TextBarrierStatus {
-        let (status, attempts) = retry_unshown_selection(patience.attempts(), || {
-            self.select_preceding_text_once(
-                expected_process_id,
-                expected_text,
-                patience.confirm_timeout(),
-            )
-        });
-        let mut report = self.last_barrier_report.get();
-        report.attempts = attempts;
-        self.last_barrier_report.set(report);
-        status
+        budget: PasteBudget,
+    ) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+        select_preceding_text_retrying(
+            expected_text,
+            patience,
+            budget,
+            &self.last_barrier_report,
+            || self.focused_text_field(expected_process_id),
+        )
     }
 
-    /// One attempt: check the text before the caret, select it and confirm the selection.
-    /// The confirmation is returned when a selection was made.
-    fn select_preceding_text_once(
-        &self,
-        expected_process_id: u32,
-        expected_text: &str,
-        confirm_timeout: Duration,
-    ) -> (TextBarrierStatus, Option<SelectionConfirmation>) {
-        self.last_barrier_report.set(TextBarrierReport {
-            expected_chars: expected_text.chars().count(),
-            ..TextBarrierReport::default()
-        });
-        let Ok(character_count) = i32::try_from(expected_text.encode_utf16().count()) else {
-            return (TextBarrierStatus::Unavailable, None);
+    /// Collapses the agent's confirmed selection when the edit does not go ahead after all, and
+    /// reads it back. The report keeps the step it described and adds only the cleanup.
+    fn collapse_selection_to_end(&self, expected_process_id: u32) -> SelectionCleanup {
+        let report = self.last_barrier_report.get();
+        let cleanup = match self.focused_text_field(expected_process_id) {
+            Ok(field) => collapse_selection(&field),
+            Err(_) => SelectionCleanup::Unverified,
         };
-        if character_count == 0 || character_count > 128 {
-            return (TextBarrierStatus::Unavailable, None);
-        }
-
-        unsafe {
-            let (_element, pattern) = match self.focused_editable_text_pattern(expected_process_id)
-            {
-                Ok(value) => value,
-                Err(status) => return (status, None),
-            };
-            let Ok(ranges) = pattern.GetSelection() else {
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            if ranges.Length().ok() != Some(1) {
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            let Ok(caret) = ranges.GetElement(0) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            if caret
-                .CompareEndpoints(
-                    TextPatternRangeEndpoint_Start,
-                    &caret,
-                    TextPatternRangeEndpoint_End,
-                )
-                .ok()
-                != Some(0)
-            {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::Caret,
-                    expected_chars: expected_text.chars().count(),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            let Ok(range) = caret.Clone() else {
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            let moved = range
-                .MoveEndpointByUnit(
-                    TextPatternRangeEndpoint_Start,
-                    TextUnit_Character,
-                    -character_count,
-                )
-                .ok();
-            if moved != Some(-character_count) {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::RangeMove,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or(i32::MIN),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            let Ok(actual) = range.GetText(-1) else {
-                self.last_barrier_report.set(TextBarrierReport {
-                    stage: TextBarrierStage::TextRead,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units: moved.unwrap_or_default(),
-                    ..TextBarrierReport::default()
-                });
-                return (TextBarrierStatus::Unavailable, None);
-            };
-            let actual = actual.to_string();
-            self.last_barrier_report.set(classify_text_barrier(
-                &actual,
-                expected_text,
-                TextBarrierStage::TextCompared,
-                moved.unwrap_or_default(),
-            ));
-            if !text_barrier_matches(&actual, expected_text) {
-                return (TextBarrierStatus::Mismatch, None);
-            }
-            if range.Select().is_err() {
-                let mut report = self.last_barrier_report.get();
-                report.stage = TextBarrierStage::SelectCall;
-                self.last_barrier_report.set(report);
-                return (TextBarrierStatus::Mismatch, None);
-            }
-
-            let moved_units = moved.unwrap_or_default();
-            let confirmation = confirm_selection(
-                confirm_timeout,
-                || {
-                    let Ok(selected_ranges) = pattern.GetSelection() else {
-                        return SelectionPoll::Unreadable;
-                    };
-                    if selected_ranges.Length().ok() != Some(1) {
-                        return SelectionPoll::NotOneRange;
-                    }
-                    let Ok(selected) = selected_ranges.GetElement(0) else {
-                        return SelectionPoll::Unreadable;
-                    };
-                    if selected
-                        .CompareEndpoints(
-                            TextPatternRangeEndpoint_Start,
-                            &selected,
-                            TextPatternRangeEndpoint_End,
-                        )
-                        .ok()
-                        == Some(0)
-                    {
-                        return SelectionPoll::Empty;
-                    }
-                    match selected.GetText(-1) {
-                        Ok(actual) => {
-                            let actual = actual.to_string();
-                            self.last_barrier_report.set(classify_text_barrier(
-                                &actual,
-                                expected_text,
-                                TextBarrierStage::SelectionConfirm,
-                                moved_units,
-                            ));
-                            SelectionPoll::Text(actual)
-                        }
-                        Err(_) => SelectionPoll::Unreadable,
-                    }
-                },
-                |actual| text_barrier_matches(actual, expected_text),
-                || thread::sleep(Duration::from_millis(1)),
-                || self.collapse_selection_to_end(expected_process_id),
-            );
-            let mut report = if confirmation == SelectionConfirmation::Unreadable {
-                TextBarrierReport {
-                    stage: TextBarrierStage::SelectionConfirm,
-                    expected_chars: expected_text.chars().count(),
-                    moved_units,
-                    ..TextBarrierReport::default()
-                }
-            } else {
-                self.last_barrier_report.get()
-            };
-            report.confirmation = Some(confirmation);
-            self.last_barrier_report.set(report);
-            (confirmation.status(), Some(confirmation))
-        }
+        self.last_barrier_report.set(TextBarrierReport {
+            cleanup: Some(cleanup),
+            ..report
+        });
+        cleanup
     }
 
-    fn collapse_selection_to_end(&self, expected_process_id: u32) {
-        unsafe {
-            let Ok((_element, pattern)) = self.focused_editable_text_pattern(expected_process_id)
-            else {
-                return;
-            };
-            let Ok(ranges) = pattern.GetSelection() else {
-                return;
-            };
-            if ranges.Length().ok() != Some(1) {
-                return;
-            }
-            let Ok(range) = ranges.GetElement(0) else {
-                return;
-            };
-            if range
-                .MoveEndpointByRange(
-                    TextPatternRangeEndpoint_Start,
-                    &range,
-                    TextPatternRangeEndpoint_End,
-                )
-                .is_ok()
-            {
-                let _ = range.Select();
-            }
-        }
-    }
-
-    fn focused_editable_text_pattern(
+    fn focused_text_field(
         &self,
         expected_process_id: u32,
-    ) -> core::result::Result<(IUIAutomationElement, IUIAutomationTextPattern), TextBarrierStatus>
-    {
+    ) -> core::result::Result<UiaTextField, TextBarrierStatus> {
         let Some(automation) = &self.automation else {
             self.set_resolver_failure(EditableResolverReason::AutomationUnavailable, 0);
             return Err(TextBarrierStatus::Unavailable);
@@ -4710,7 +6296,7 @@ impl PrivacyGuard {
                     EditableResolverAction::Continue => {}
                     EditableResolverAction::ReturnCurrent => {
                         return pattern
-                            .map(|pattern| (element, pattern))
+                            .map(|pattern| UiaTextField { pattern })
                             .ok_or(TextBarrierStatus::Unavailable);
                     }
                 }
@@ -4758,6 +6344,8 @@ impl PrivacyGuard {
 
 impl Drop for PrivacyGuard {
     fn drop(&mut self) {
+        // COM objects are released before COM is uninitialized on this thread.
+        self.privacy_cache.take();
         self.automation.take();
         if self.com_initialized {
             unsafe {
@@ -4914,38 +6502,43 @@ const fn paste_patience(forced: bool) -> PastePatience {
 }
 
 /// Runs selection attempts until one is not an unshown selection or `attempts` have run. Only a
-/// selection the field did not show is tried again, and every attempt reads and checks the text
-/// before the caret again before it selects. Returns the last status and how many attempts ran.
+/// selection the field did not show, and that was collapsed again, is tried again, and only while
+/// `may_retry` says another attempt still fits the gate; every attempt reads and checks the text
+/// before the caret again before it selects, and is told whether an earlier attempt ran. Returns
+/// the last attempt and how many attempts ran.
 fn retry_unshown_selection(
     attempts: u32,
-    mut attempt: impl FnMut() -> (TextBarrierStatus, Option<SelectionConfirmation>),
-) -> (TextBarrierStatus, u32) {
+    mut may_retry: impl FnMut() -> bool,
+    mut attempt: impl FnMut(bool) -> SelectionAttempt,
+) -> (SelectionAttempt, u32) {
     let mut ran = 0;
     loop {
+        let result = attempt(ran > 0);
         ran += 1;
-        let (status, confirmation) = attempt();
-        if confirmation != Some(SelectionConfirmation::NotShown) || ran >= attempts {
-            return (status, ran);
+        let unshown = result.confirmation == Some(SelectionConfirmation::NotShown)
+            && result.cleanup == Some(SelectionCleanup::Collapsed);
+        if !unshown || ran >= attempts || !may_retry() {
+            return (result, ran);
         }
     }
 }
 
 /// Confirms that the selection made by `Select()` holds the expected text, polling until
-/// `timeout`. Every outcome but `Confirmed` collapses the selection, exactly once: the selection
+/// `expired` says the time for it is over. Every outcome but `Confirmed` collapses the selection, exactly once: the selection
 /// is ours, made a moment ago, and must not be left behind to be typed over. This runs only
 /// after our own successful `Select()`, so a selection the user made is never collapsed.
+/// Returns the outcome and, when the selection was collapsed, what became of it.
 fn confirm_selection(
-    timeout: Duration,
+    mut expired: impl FnMut() -> bool,
     mut poll: impl FnMut() -> SelectionPoll,
     text_matches: impl Fn(&str) -> bool,
     mut sleep: impl FnMut(),
-    collapse: impl FnOnce(),
-) -> SelectionConfirmation {
-    let deadline = Instant::now() + timeout;
+    collapse: impl FnOnce() -> SelectionCleanup,
+) -> (SelectionConfirmation, Option<SelectionCleanup>) {
     let mut saw_other_text = false;
     let mut saw_not_shown = false;
     let outcome = loop {
-        if Instant::now() >= deadline {
+        if expired() {
             break if saw_other_text {
                 SelectionConfirmation::OtherText
             } else if saw_not_shown {
@@ -4966,10 +6559,379 @@ fn confirm_selection(
         }
         sleep();
     };
-    if outcome != SelectionConfirmation::Confirmed {
-        collapse();
+    let cleanup = (outcome != SelectionConfirmation::Confirmed).then(collapse);
+    (outcome, cleanup)
+}
+
+/// What became of the agent's own selection when it was collapsed again because the edit did
+/// not go ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionCleanup {
+    /// Collapsed to its end, and read back empty.
+    Collapsed,
+    /// Not collapsed, or not read back empty in time: the field may still show the word
+    /// selected, and keys typed now would replace it.
+    Unverified,
+}
+
+/// One selection attempt: its status, how the selection was confirmed when one was made, and
+/// what became of the selection when it was collapsed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionAttempt {
+    status: TextBarrierStatus,
+    confirmation: Option<SelectionConfirmation>,
+    cleanup: Option<SelectionCleanup>,
+}
+
+/// The selection of a field as one read found it.
+enum SelectionRead<R> {
+    /// The selection could not be read.
+    Unreadable,
+    /// The selection is not exactly one range.
+    NotOneRange,
+    /// The only range could not be read.
+    RangeUnreadable,
+    One(R),
+}
+
+/// The text pattern calls that the text barrier and the selection make on one field. UI
+/// Automation makes them on the focused control (`UiaTextField`); tests script them.
+trait TextField {
+    type Range;
+    fn selection(&self) -> SelectionRead<Self::Range>;
+    /// Whether the range is empty; `None` when the comparison fails.
+    fn is_empty(&self, range: &Self::Range) -> Option<bool>;
+    fn clone_range(&self, range: &Self::Range) -> Option<Self::Range>;
+    /// Moves the start of the range by `units` characters and returns how far it moved.
+    fn move_start(&self, range: &Self::Range, units: i32) -> Option<i32>;
+    fn text(&self, range: &Self::Range) -> Option<String>;
+    fn select(&self, range: &Self::Range) -> bool;
+    /// Moves the start of the range onto its end.
+    fn collapse_to_end(&self, range: &Self::Range) -> bool;
+}
+
+/// The focused editable control, through its UI Automation text pattern.
+struct UiaTextField {
+    pattern: IUIAutomationTextPattern,
+}
+
+// The calls go to COM interfaces obtained on this thread; a provider that fails or does not
+// answer in time returns an error, which each method turns into its failure value.
+impl TextField for UiaTextField {
+    type Range = IUIAutomationTextRange;
+
+    fn selection(&self) -> SelectionRead<IUIAutomationTextRange> {
+        unsafe {
+            let Ok(ranges) = self.pattern.GetSelection() else {
+                return SelectionRead::Unreadable;
+            };
+            if ranges.Length().ok() != Some(1) {
+                return SelectionRead::NotOneRange;
+            }
+            ranges
+                .GetElement(0)
+                .map_or(SelectionRead::RangeUnreadable, SelectionRead::One)
+        }
     }
-    outcome
+
+    fn is_empty(&self, range: &IUIAutomationTextRange) -> Option<bool> {
+        unsafe {
+            range
+                .CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    range,
+                    TextPatternRangeEndpoint_End,
+                )
+                .ok()
+                .map(|order| order == 0)
+        }
+    }
+
+    fn clone_range(&self, range: &IUIAutomationTextRange) -> Option<IUIAutomationTextRange> {
+        unsafe { range.Clone().ok() }
+    }
+
+    fn move_start(&self, range: &IUIAutomationTextRange, units: i32) -> Option<i32> {
+        unsafe {
+            range
+                .MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, units)
+                .ok()
+        }
+    }
+
+    fn text(&self, range: &IUIAutomationTextRange) -> Option<String> {
+        unsafe { range.GetText(-1).ok().map(|text| text.to_string()) }
+    }
+
+    fn select(&self, range: &IUIAutomationTextRange) -> bool {
+        unsafe { range.Select().is_ok() }
+    }
+
+    fn collapse_to_end(&self, range: &IUIAutomationTextRange) -> bool {
+        unsafe {
+            range
+                .MoveEndpointByRange(
+                    TextPatternRangeEndpoint_Start,
+                    range,
+                    TextPatternRangeEndpoint_End,
+                )
+                .is_ok()
+        }
+    }
+}
+
+/// The length in UTF-16 units of a text the barrier checks: none for an empty text or one longer
+/// than 128 units.
+fn barrier_units(expected_text: &str) -> Option<i32> {
+    i32::try_from(expected_text.encode_utf16().count())
+        .ok()
+        .filter(|units| (1..=128).contains(units))
+}
+
+fn set_barrier_stage(report: &Cell<TextBarrierReport>, stage: TextBarrierStage) {
+    report.set(TextBarrierReport {
+        stage,
+        ..report.get()
+    });
+}
+
+/// Checks that the `units` UTF-16 units before the caret of `field` are `expected_text`. Each
+/// early exit records its own stage in `report`; a comparison records what it found. Returns
+/// the range over that text when it matches.
+fn read_preceding_text<F: TextField>(
+    field: &F,
+    units: i32,
+    expected_text: &str,
+    report: &Cell<TextBarrierReport>,
+) -> core::result::Result<F::Range, TextBarrierStatus> {
+    let stop = |stage, status| {
+        set_barrier_stage(report, stage);
+        status
+    };
+    let caret = match field.selection() {
+        SelectionRead::Unreadable => {
+            return Err(stop(
+                TextBarrierStage::Selection,
+                TextBarrierStatus::Unavailable,
+            ));
+        }
+        SelectionRead::NotOneRange => {
+            return Err(stop(
+                TextBarrierStage::SelectionRanges,
+                TextBarrierStatus::Mismatch,
+            ));
+        }
+        SelectionRead::RangeUnreadable => {
+            return Err(stop(
+                TextBarrierStage::Caret,
+                TextBarrierStatus::Unavailable,
+            ));
+        }
+        SelectionRead::One(caret) => caret,
+    };
+    if field.is_empty(&caret) != Some(true) {
+        return Err(stop(
+            TextBarrierStage::CaretNotEmpty,
+            TextBarrierStatus::Mismatch,
+        ));
+    }
+    let Some(range) = field.clone_range(&caret) else {
+        return Err(stop(
+            TextBarrierStage::RangeClone,
+            TextBarrierStatus::Unavailable,
+        ));
+    };
+    let moved = field.move_start(&range, -units);
+    if moved != Some(-units) {
+        report.set(TextBarrierReport {
+            moved_units: moved.unwrap_or(i32::MIN),
+            ..report.get()
+        });
+        return Err(stop(
+            TextBarrierStage::RangeMove,
+            TextBarrierStatus::Mismatch,
+        ));
+    }
+    let Some(actual) = field.text(&range) else {
+        report.set(TextBarrierReport {
+            moved_units: -units,
+            ..report.get()
+        });
+        return Err(stop(
+            TextBarrierStage::TextRead,
+            TextBarrierStatus::Unavailable,
+        ));
+    };
+    report.set(classify_text_barrier(
+        &actual,
+        expected_text,
+        TextBarrierStage::TextCompared,
+        -units,
+    ));
+    if text_barrier_matches(&actual, expected_text) {
+        Ok(range)
+    } else {
+        Err(TextBarrierStatus::Mismatch)
+    }
+}
+
+/// One attempt to select the text before the caret of the field `resolve` finds: read and check
+/// the text, select it, confirm the selection and collapse it again unless it was confirmed.
+/// After an earlier attempt, text selected at the caret is that attempt's selection shown late,
+/// and is collapsed too; a first attempt leaves a selection it finds alone, as the user made it.
+/// The attempts of `PrivacyGuard::select_preceding_text` on the field `resolve` finds each time: a
+/// second attempt only while `budget` leaves it its time. The report counts the attempts.
+fn select_preceding_text_retrying<F: TextField>(
+    expected_text: &str,
+    patience: PastePatience,
+    budget: PasteBudget,
+    report: &Cell<TextBarrierReport>,
+    mut resolve: impl FnMut() -> core::result::Result<F, TextBarrierStatus>,
+) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+    let may_retry = || budget.allows_selection(Instant::now(), patience);
+    let (attempt, attempts) = retry_unshown_selection(patience.attempts(), may_retry, |earlier| {
+        report.set(TextBarrierReport {
+            expected_chars: expected_text.chars().count(),
+            ..TextBarrierReport::default()
+        });
+        select_preceding_text_in(
+            expected_text,
+            patience.confirm_timeout(),
+            earlier,
+            report,
+            &mut resolve,
+        )
+    });
+    let mut counted = report.get();
+    counted.attempts = attempts;
+    report.set(counted);
+    (attempt.status, attempt.cleanup)
+}
+
+fn select_preceding_text_in<F: TextField>(
+    expected_text: &str,
+    confirm_timeout: Duration,
+    earlier_attempt: bool,
+    report: &Cell<TextBarrierReport>,
+    resolve: impl FnOnce() -> core::result::Result<F, TextBarrierStatus>,
+) -> SelectionAttempt {
+    let refused = |status| SelectionAttempt {
+        status,
+        confirmation: None,
+        cleanup: None,
+    };
+    let Some(units) = barrier_units(expected_text) else {
+        set_barrier_stage(report, TextBarrierStage::TextLength);
+        return refused(TextBarrierStatus::Unavailable);
+    };
+    let field = match resolve() {
+        Ok(field) => field,
+        Err(status) => return refused(status),
+    };
+    let range = match read_preceding_text(&field, units, expected_text, report) {
+        Ok(range) => range,
+        Err(status) => {
+            let late_selection =
+                earlier_attempt && report.get().stage == TextBarrierStage::CaretNotEmpty;
+            let cleanup = late_selection.then(|| collapse_selection(&field));
+            report.set(TextBarrierReport {
+                cleanup,
+                ..report.get()
+            });
+            return SelectionAttempt {
+                status,
+                confirmation: None,
+                cleanup,
+            };
+        }
+    };
+    if !field.select(&range) {
+        // The call can fail after the field applied it (a provider timeout, say): what is
+        // selected is unknown, so it is collapsed like any selection that was not confirmed.
+        let cleanup = collapse_selection(&field);
+        report.set(TextBarrierReport {
+            stage: TextBarrierStage::SelectCall,
+            cleanup: Some(cleanup),
+            ..report.get()
+        });
+        return SelectionAttempt {
+            status: TextBarrierStatus::Mismatch,
+            confirmation: None,
+            cleanup: Some(cleanup),
+        };
+    }
+    let confirm_deadline = Instant::now() + confirm_timeout;
+    let (confirmation, cleanup) = confirm_selection(
+        || Instant::now() >= confirm_deadline,
+        || match field.selection() {
+            SelectionRead::Unreadable | SelectionRead::RangeUnreadable => SelectionPoll::Unreadable,
+            SelectionRead::NotOneRange => SelectionPoll::NotOneRange,
+            SelectionRead::One(selected) => {
+                if field.is_empty(&selected) == Some(true) {
+                    return SelectionPoll::Empty;
+                }
+                match field.text(&selected) {
+                    Some(actual) => {
+                        report.set(classify_text_barrier(
+                            &actual,
+                            expected_text,
+                            TextBarrierStage::SelectionConfirm,
+                            -units,
+                        ));
+                        SelectionPoll::Text(actual)
+                    }
+                    None => SelectionPoll::Unreadable,
+                }
+            }
+        },
+        |actual| text_barrier_matches(actual, expected_text),
+        || thread::sleep(Duration::from_millis(1)),
+        || collapse_selection(&field),
+    );
+    let mut final_report = if confirmation == SelectionConfirmation::Unreadable {
+        TextBarrierReport {
+            stage: TextBarrierStage::SelectionConfirm,
+            expected_chars: expected_text.chars().count(),
+            moved_units: -units,
+            ..TextBarrierReport::default()
+        }
+    } else {
+        report.get()
+    };
+    final_report.confirmation = Some(confirmation);
+    final_report.cleanup = cleanup;
+    report.set(final_report);
+    SelectionAttempt {
+        status: confirmation.status(),
+        confirmation: Some(confirmation),
+        cleanup,
+    }
+}
+
+/// Collapses the selection of `field` to its end and reads it back. A selection read back empty
+/// is `Collapsed`; one that cannot be read, or is still not empty after
+/// `SELECTION_COLLAPSE_ATTEMPTS` reads or `SELECTION_COLLAPSE_BUDGET_MS`, is `Unverified`.
+fn collapse_selection<F: TextField>(field: &F) -> SelectionCleanup {
+    let deadline = Instant::now() + Duration::from_millis(SELECTION_COLLAPSE_BUDGET_MS);
+    for attempt in 0..SELECTION_COLLAPSE_ATTEMPTS {
+        if attempt > 0 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let SelectionRead::One(range) = field.selection() else {
+            continue;
+        };
+        match field.is_empty(&range) {
+            Some(true) => return SelectionCleanup::Collapsed,
+            Some(false) if field.collapse_to_end(&range) => {
+                let _ = field.select(&range);
+            }
+            _ => {}
+        }
+    }
+    SelectionCleanup::Unverified
 }
 
 /// The result of a protected paste whose text edit and clipboard restoration are known.
@@ -4980,7 +6942,7 @@ const fn protected_paste_outcome(
     match (target_confirmed, clipboard_restored) {
         (true, true) => TextEditAttempt::Applied,
         (true, false) => TextEditAttempt::AppliedClipboardNotRestored,
-        (false, _) => TextEditAttempt::Failed,
+        (false, _) => TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
     }
 }
 
@@ -5028,12 +6990,55 @@ fn classify_text_barrier(
         resolver_process_id: 0,
         confirmation: None,
         attempts: 0,
+        cleanup: None,
     }
+}
+
+/// The text barrier's question: is the text before the caret of the focused field of
+/// `process_id` the word an edit is about to replace? `check` numbers the barrier checks: a read
+/// still running when its check gave up answers for the field as it was then, never for a later
+/// check of the same word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BarrierRead {
+    process_id: u32,
+    text: String,
+    check: u64,
+}
+
+/// Text-barrier reads on a provider thread of their own, answered with the barrier's report.
+type BarrierProbe = BoundedProbe<BarrierRead, (TextBarrierStatus, TextBarrierReport)>;
+
+/// The answer to `read` from `probe` by `deadline`, or `Unavailable` at the stage `Provider` when
+/// the provider is busy with an earlier read, stuck or late; an answer to `read` given more than
+/// `max_age` after the read began counts as late. The barrier only reads, so a read left behind
+/// at the deadline changes nothing in the field.
+fn barrier_answer(
+    probe: &mut BarrierProbe,
+    read: BarrierRead,
+    deadline: Instant,
+    max_age: Duration,
+) -> (TextBarrierStatus, TextBarrierReport) {
+    let expected_chars = read.text.chars().count();
+    let wait = deadline.saturating_duration_since(Instant::now());
+    probe
+        .query_result(read, wait, max_age)
+        .unwrap_or_else(|_| unanswered_barrier(expected_chars))
+}
+
+fn unanswered_barrier(expected_chars: usize) -> (TextBarrierStatus, TextBarrierReport) {
+    (
+        TextBarrierStatus::Unavailable,
+        TextBarrierReport {
+            stage: TextBarrierStage::Provider,
+            expected_chars,
+            ..TextBarrierReport::default()
+        },
+    )
 }
 
 fn format_text_barrier_report(report: TextBarrierReport) -> String {
     format!(
-        "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_is_word={},drop_last_is_word={},leading={:?},trailing={:?},confirm={:?},attempts={}",
+        "stage={:?},resolver_reason={:?},resolver_depth={},resolver_pid={},expected_chars={},actual_chars={},moved_units={},exact={},nbsp_equiv={},word_at_start={},word_at_end={},drop_first_matches={},drop_last_matches={},leading={:?},trailing={:?},confirm={:?},attempts={},cleanup={:?}",
         report.stage,
         report.resolver_reason,
         report.resolver_depth,
@@ -5051,6 +7056,7 @@ fn format_text_barrier_report(report: TextBarrierReport) -> String {
         report.trailing,
         report.confirmation,
         report.attempts,
+        report.cleanup,
     )
 }
 
@@ -5100,13 +7106,24 @@ struct RuntimeConfigurationLoader {
 }
 impl RuntimeConfigurationLoader {
     fn spawn() -> std::io::Result<Self> {
+        Self::spawn_with(load_runtime_configuration)
+    }
+
+    /// `load` runs on the loader thread for each request. A load that panics answers as a failed
+    /// read, and the loader goes on serving later requests.
+    fn spawn_with(
+        load: impl Fn() -> std::io::Result<RuntimeConfiguration> + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (requests, receive) = sync_channel(1);
         let (reply, replies) = sync_channel(1);
         thread::Builder::new()
             .name("autokey-package-loader".into())
             .spawn(move || {
                 while receive.recv().is_ok() {
-                    if reply.send(load_runtime_configuration()).is_err() {
+                    let result = guarded(&load, || {
+                        Err(std::io::Error::other("configuration_loader_panicked"))
+                    });
+                    if reply.send(result).is_err() {
                         break;
                     }
                 }
@@ -5206,10 +7223,6 @@ fn configuration_directory() -> Option<PathBuf> {
         .map(|path| path.join("AutoKeyboardLayot"))
 }
 
-fn configuration_path() -> Option<PathBuf> {
-    configuration_directory().map(|directory| directory.join("config.ini"))
-}
-
 fn try_load_configuration_document() -> std::io::Result<ConfigurationDocument> {
     load_configuration_snapshot().map(|loaded| loaded.document)
 }
@@ -5274,18 +7287,20 @@ fn write_configuration_file_atomically(path: &Path, contents: &str) -> std::io::
     Ok(())
 }
 
+/// Every writer of the configuration, in any process, holds this lock for its whole
+/// read-modify-write.
+#[cfg(not(test))]
+const CONFIGURATION_WRITE_MUTEX: PCWSTR = w!("Local\\AutoKeyboardLayot.ConfigurationWrite");
+/// Tests take a lock of their own: they never wait for an agent running in the same session.
+#[cfg(test)]
+const CONFIGURATION_WRITE_MUTEX: PCWSTR = w!("Local\\AutoKeyboardLayot.ConfigurationWrite.Tests");
+
 struct ConfigurationWriteGuard(ProcessHandle);
 
 impl ConfigurationWriteGuard {
     fn acquire() -> std::io::Result<Self> {
-        let handle = unsafe {
-            CreateMutexW(
-                None,
-                false,
-                w!("Local\\AutoKeyboardLayot.ConfigurationWrite"),
-            )
-        }
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let handle = unsafe { CreateMutexW(None, false, CONFIGURATION_WRITE_MUTEX) }
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let handle = ProcessHandle(handle);
         match unsafe { WaitForSingleObject(handle.0, 250) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
@@ -5305,30 +7320,40 @@ impl Drop for ConfigurationWriteGuard {
     }
 }
 
+/// The profile folder, or an error when LOCALAPPDATA is unavailable.
+fn configuration_directory_or_error() -> std::io::Result<PathBuf> {
+    configuration_directory().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
+    })
+}
+
+/// Saves `document` into the configuration in `directory`, unless the configuration there is no
+/// longer `original`, the one the draft was made from (`AlreadyExists`).
 fn save_configuration_if_unchanged(
+    directory: &Path,
     document: &ConfigurationDocument,
     original: &ConfigurationDocument,
 ) -> std::io::Result<()> {
     let _guard = ConfigurationWriteGuard::acquire()?;
-    let current = try_load_configuration_document()?;
+    let current = autokeyboardlayot::configuration::load_configuration_directory(directory)?;
     if &current != original {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "Configuration changed outside this window. Reopen settings before saving; your current draft has not been discarded.",
         ));
     }
-    write_configuration_document(document)
+    write_configuration_document(directory, document)
 }
 
 // Caller holds ConfigurationWriteGuard through its entire read/modify/write.
-fn write_configuration_document(document: &ConfigurationDocument) -> std::io::Result<()> {
-    let path = configuration_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable")
-    })?;
+fn write_configuration_document(
+    directory: &Path,
+    document: &ConfigurationDocument,
+) -> std::io::Result<()> {
     let contents = document
         .to_text()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    write_configuration_file_atomically(&path, &contents)
+    write_configuration_file_atomically(&directory.join("config.ini"), &contents)
 }
 
 fn merge_lexicon_entry(existing: &str, candidate: &VolatileLexiconCandidate) -> Option<String> {
@@ -5345,64 +7370,107 @@ fn merge_lexicon_entry(existing: &str, candidate: &VolatileLexiconCandidate) -> 
     Some(merged)
 }
 
-fn persist_lexicon_candidate(candidate: &VolatileLexiconCandidate) -> std::io::Result<()> {
+fn persist_lexicon_candidate(
+    directory: &Path,
+    candidate: &VolatileLexiconCandidate,
+) -> std::io::Result<()> {
     let _guard = ConfigurationWriteGuard::acquire()?;
-    let mut document = try_load_configuration_document()?;
-    let entries = match candidate.target {
-        LexiconOfferTarget::UserDictionary => &mut document.user_dictionary,
-        LexiconOfferTarget::WordExclusions => &mut document.word_exclusions,
+    let mut document = autokeyboardlayot::configuration::load_configuration_directory(directory)?;
+    let (entries, other) = match candidate.target {
+        LexiconOfferTarget::UserDictionary => {
+            (&mut document.user_dictionary, &mut document.word_exclusions)
+        }
+        LexiconOfferTarget::WordExclusions => {
+            (&mut document.word_exclusions, &mut document.user_dictionary)
+        }
     };
+    // A word is in one list only: the offer moves it out of the other.
+    other.retain(|line| {
+        !UserLexicon::from_lines([line.as_str()]).contains(candidate.language, &candidate.word)
+    });
     let existing = entries.join("\n");
     let merged = merge_lexicon_entry(&existing, candidate).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid exclusion word")
     })?;
     *entries = merged.lines().map(str::to_owned).collect();
-    write_configuration_document(&document)
+    write_configuration_document(directory, &document)
 }
 
 fn diagnostic_log_path() -> Option<PathBuf> {
     configuration_directory().map(|directory| directory.join("diagnostics.log"))
 }
 
-fn diagnostic_worker(receiver: Receiver<String>) {
+fn diagnostic_worker(receiver: Receiver<String>, path: Option<PathBuf>, metrics: &ObserverMetrics) {
     while let Ok(record) = receiver.recv() {
-        let _ = append_diagnostic_record(&record);
+        let failed = match path.as_deref() {
+            Some(path) => !matches!(
+                append_diagnostic_record(path, &record, DIAGNOSTIC_LOG_MAX_BYTES),
+                Ok(DiagnosticAppend::Appended)
+            ),
+            None => true,
+        };
+        if failed {
+            metrics
+                .diagnostic_log_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-fn append_diagnostic_record(record: &str) -> std::io::Result<()> {
-    let Some(path) = diagnostic_log_path() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "LOCALAPPDATA is unavailable",
-        ));
-    };
-    let Some(directory) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "diagnostic path has no parent",
-        ));
-    };
-    fs::create_dir_all(directory)?;
+/// How one record reached the diagnostics log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticAppend {
+    Appended,
+    /// The full log could not be moved aside (a viewer may hold it open without sharing delete
+    /// access), so the record went past the limit.
+    AppendedPastLimit,
+    /// The full log could not be moved aside and had reached twice the limit: it was started
+    /// again with this record.
+    Restarted,
+}
+
+/// Appends one record to the log at `path`. A log that would pass `max_bytes` is first moved
+/// aside to `<name>.1.log`, which replaces the previous one only when the move succeeds. When it
+/// fails, records still land: past the limit up to twice it, then in a restarted log. So the log
+/// neither stops nor grows without bound while something holds it.
+fn append_diagnostic_record(
+    path: &Path,
+    record: &str,
+    max_bytes: u64,
+) -> std::io::Result<DiagnosticAppend> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let record = record.replace(['\r', '\n'], " ");
     let line = format!("{timestamp} {record}\r\n");
-    let current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    if current_size.saturating_add(line.len() as u64) > DIAGNOSTIC_LOG_MAX_BYTES {
-        let rotated = path.with_extension("1.log");
-        if rotated.exists() {
-            fs::remove_file(&rotated)?;
-        }
-        if path.exists() {
-            fs::rename(&path, rotated)?;
-        }
+    let current_size = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    let size_after = current_size.saturating_add(line.len() as u64);
+    let mut outcome = DiagnosticAppend::Appended;
+    if current_size > 0
+        && size_after > max_bytes
+        && fs::rename(path, path.with_extension("1.log")).is_err()
+    {
+        outcome = if size_after > max_bytes.saturating_mul(2) {
+            DiagnosticAppend::Restarted
+        } else {
+            DiagnosticAppend::AppendedPastLimit
+        };
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true);
+    if outcome == DiagnosticAppend::Restarted {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    let mut file = options.open(path)?;
     file.write_all(line.as_bytes())?;
-    file.flush()
+    file.flush()?;
+    Ok(outcome)
 }
 
 fn input_worker(
@@ -5435,6 +7503,7 @@ fn input_worker(
         |processor, event| processor.process(event),
         |processor| {
             ENGINE_FAULT.store(true, Ordering::Release);
+            processor.reject_faulted_configuration();
             processor.record_conversion_failure(ConversionFailureReason::InternalFault);
         },
     );
@@ -5448,16 +7517,41 @@ struct InputProcessor {
     input_profiles: KeyboardProfileCache,
     #[cfg(test)]
     profile_override: Option<ResolvedKeyboardProfiles>,
+    // Tests pin the input target that has the focus, instead of the real foreground window.
+    #[cfg(test)]
+    foreground_override: Option<ForegroundContext>,
+    // Tests describe the process behind the input target: its image path and integrity level.
+    #[cfg(test)]
+    process_override: Option<(Option<String>, Option<u32>)>,
+    // Tests script the steps of a protected paste that reach UI Automation, the clipboard,
+    // SendInput and the keyboard layout.
+    #[cfg(test)]
+    paste_seam: Option<RefCell<Box<dyn PasteSeam + Send>>>,
+    // Tests give what each key prints in each layout (by handle), instead of the layouts Windows
+    // has loaded.
+    #[cfg(test)]
+    test_keyboard: Option<fn(ReplayKey, usize) -> Option<char>>,
     session: InputSession,
     modifiers: Modifiers,
+    // After a focus change, a new input epoch or the start the tracked modifiers are unknown: the
+    // next key event's held modifiers replace them.
+    resync_modifiers: bool,
     privacy_guard: PrivacyGuard,
-    privacy_probe: Option<BoundedProbe<(ForegroundContext, u64), Option<PrivacyBlockReason>>>,
+    // Keyed by the input target, the input epoch and the privacy generation.
+    privacy_probe: Option<BoundedProbe<(ForegroundContext, u64, u64), Option<PrivacyBlockReason>>>,
+    // The text barrier's reads, bounded by the barrier's own deadline. Selecting and collapsing
+    // change the field and stay on the worker: abandoned at a deadline they could still take
+    // effect later, under keys the user types meanwhile.
+    barrier_probe: RefCell<Option<BarrierProbe>>,
     exclusion_policy: ExclusionPolicy,
     backend_rules: BackendRules,
     settings: Settings,
     lexicon_candidate: Arc<Mutex<Option<VolatileLexiconCandidate>>>,
     diagnostic_sender: Option<SyncSender<String>>,
     privacy_needs_check: bool,
+    // Moves on with every input that may move the focus (mark_privacy_dirty). It is part of the
+    // probe's key, so an answer requested before such input never decides the field after it.
+    privacy_generation: u64,
     privacy_reason: Option<PrivacyBlockReason>,
     recent_privacy_ok: Option<RecentPrivacyOk>,
     // The input target of the last periodic field check and how long it took.
@@ -5466,11 +7560,16 @@ struct InputProcessor {
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
-    // Field-inspection fallback authorizes manual input only. Recovery of UIA
-    // must not promote a word captured under that exception to automatic input.
+    // Field-inspection fallback authorizes manual input only, until a check of the
+    // same field passes before the word ends (`manual_only_inspection`); the
+    // recent-good rule's softened failure is no such check.
     // A word resumed by erasing its delimiter is also manual-only, so erasing
     // and retyping a space never re-triggers automatic conversion.
     manual_only_word: bool,
+    // The manual-only mark comes from the field-inspection fallback, not from a resumed word:
+    // a check of the same field that passes before the word ends lifts it (the owner's decision
+    // of 2026-10-24; a focus change, a click, Tab or Enter ends the word first).
+    manual_only_inspection: bool,
     // Whether the active manual token began at a known word start. A token
     // typed after a shortcut has an unknown left context; erasing it must not
     // re-enable automatic conversion for the following text.
@@ -5502,12 +7601,31 @@ struct InputProcessor {
     gate_window: usize,
     // Token of the most recent gate release request (0 when none yet).
     last_gate_release_token: u64,
+    // Token of the most recent gate ended with its held keys kept for recovery (0 when none).
+    last_gate_retention_token: u64,
+    // The gate whose held keys are kept for recovery when it ends, instead of replayed.
+    held_keys_kept_for: Option<u64>,
+    // When the gate holding the keys typed after the word being converted lets them go.
+    edit_deadline: Cell<Option<Instant>>,
+    // Numbers the text barrier's checks (see BarrierRead).
+    barrier_checks: Cell<u64>,
+    // Clipboard brokers the worker stopped waiting for.
+    clipboard_brokers: ClipboardBrokers,
     // Policy D1: how often automatic conversion may resume after a recovered gate abort.
     auto_resumes: RateLimit,
     // Replacements of the privacy provider that were already logged.
     reported_probe_respawns: u32,
     // Plays the conversion sounds; started on the first cue while they are enabled.
     sound_player: Option<SyncSender<SoundCue>>,
+    // Held keys were replayed without the hooks seeing them, so the word at the caret is unknown:
+    // until that word ends (a boundary, a click, a focus change), an epoch reset keeps the
+    // session suppressed instead of clearing it.
+    recovered_mid_word: bool,
+    // The cancelled gate token at the time an automatic edit last failed (0 when none). An edit
+    // that failed because of a gate abort forbids resuming after that abort (policy D1).
+    failed_edit_gate_token: u64,
+    // The configuration revision being applied; a contained panic rejects exactly this one.
+    applying_configuration: Option<u64>,
 }
 
 impl InputProcessor {
@@ -5569,8 +7687,17 @@ impl InputProcessor {
             input_profiles: KeyboardProfileCache::default(),
             #[cfg(test)]
             profile_override: None,
+            #[cfg(test)]
+            foreground_override: None,
+            #[cfg(test)]
+            process_override: None,
+            #[cfg(test)]
+            paste_seam: None,
+            #[cfg(test)]
+            test_keyboard: None,
             session,
             modifiers: Modifiers::default(),
+            resync_modifiers: true,
             privacy_guard: PrivacyGuard::new(),
             // A UIA call that never returns would leave every later check "queue busy" and
             // privacy unavailable for good. A provider stuck for 5 s is replaced by a fresh one,
@@ -5578,8 +7705,8 @@ impl InputProcessor {
             privacy_probe: BoundedProbe::spawn_resilient(
                 "autokey-privacy",
                 || {
-                    let guard = PrivacyGuard::new();
-                    move |(foreground, _epoch): (ForegroundContext, u64)| {
+                    let guard = PrivacyGuard::with_timeout(UIA_PRIVACY_TIMEOUT_MS);
+                    move |(foreground, _epoch, _generation): (ForegroundContext, u64, u64)| {
                         if !foreground_identity_matches(foreground) {
                             return Some(PrivacyBlockReason::InspectionUnavailable);
                         }
@@ -5594,12 +7721,30 @@ impl InputProcessor {
                 PRIVACY_PROBE_MAX_RESPAWNS,
             )
             .ok(),
+            // A barrier read that never returns would hold the worker, which waits for it, for
+            // good. On a thread of its own it holds no longer than the barrier's deadline.
+            barrier_probe: RefCell::new(
+                BoundedProbe::spawn_resilient(
+                    "autokey-barrier",
+                    || {
+                        let guard = PrivacyGuard::new();
+                        move |read: BarrierRead| {
+                            let status = guard.preceding_text_status(read.process_id, &read.text);
+                            (status, guard.last_barrier_report.get())
+                        }
+                    },
+                    Duration::from_millis(BARRIER_PROBE_STUCK_AFTER_MS),
+                    BARRIER_PROBE_MAX_RESPAWNS,
+                )
+                .ok(),
+            ),
             exclusion_policy: configuration.process_exclusions,
             backend_rules: configuration.backend_rules,
             settings: configuration.settings,
             lexicon_candidate,
             diagnostic_sender,
             privacy_needs_check: true,
+            privacy_generation: 0,
             privacy_reason: Some(PrivacyBlockReason::InspectionUnavailable),
             recent_privacy_ok: None,
             last_refresh_check: None,
@@ -5608,6 +7753,7 @@ impl InputProcessor {
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
             manual_only_word: false,
+            manual_only_inspection: false,
             manual_token_start_known: false,
             last_word_reset: "none",
             recent_languages: Vec::new(),
@@ -5628,10 +7774,224 @@ impl InputProcessor {
             metrics,
             gate_window,
             last_gate_release_token: 0,
+            last_gate_retention_token: 0,
+            held_keys_kept_for: None,
+            edit_deadline: Cell::new(None),
+            barrier_checks: Cell::new(0),
+            clipboard_brokers: ClipboardBrokers::default(),
             auto_resumes: RateLimit::new(3, Duration::from_secs(60 * 60)),
             reported_probe_respawns: 0,
             sound_player: None,
+            recovered_mid_word: false,
+            failed_edit_gate_token: 0,
+            applying_configuration: None,
         }
+    }
+
+    /// Whether the input target `expected` still has the focus. Tests pin the focused target.
+    fn foreground_matches(&self, expected: ForegroundContext) -> bool {
+        #[cfg(test)]
+        if let Some(current) = self.foreground_override {
+            return same_input_target(current, expected);
+        }
+        foreground_identity_matches(expected)
+    }
+
+    /// The input target that has the focus now, with its layout. Tests pin it.
+    fn current_foreground(&self) -> Option<ForegroundContext> {
+        #[cfg(test)]
+        if self.foreground_override.is_some() {
+            return self.foreground_override;
+        }
+        current_foreground_context()
+    }
+
+    /// Whether the text before the caret is the word an edit is about to replace, as its settle
+    /// step reads it. Tests script it.
+    fn settle_text_status(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        deadline: Instant,
+    ) -> TextBarrierStatus {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().settle();
+        }
+        self.barrier_text_status(process_id, expected_text, deadline)
+    }
+
+    /// Whether the text before the caret is `expected_text`, as the barrier's provider thread
+    /// reads it, waited for until `deadline` at most. Without a provider the barrier is
+    /// unavailable, and no edit that needs it goes ahead.
+    fn barrier_text_status(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        deadline: Instant,
+    ) -> TextBarrierStatus {
+        let read = self.next_barrier_read(process_id, expected_text);
+        self.answer_barrier_read(
+            read,
+            deadline,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+        )
+    }
+
+    /// A new barrier check of `expected_text` before the caret of `process_id`'s field.
+    fn next_barrier_read(&self, process_id: u32, expected_text: &str) -> BarrierRead {
+        self.barrier_checks
+            .set(self.barrier_checks.get().wrapping_add(1));
+        BarrierRead {
+            process_id,
+            text: expected_text.to_owned(),
+            check: self.barrier_checks.get(),
+        }
+    }
+
+    /// Asks the provider `read` by `deadline` (see barrier_answer) and keeps the report.
+    fn answer_barrier_read(
+        &self,
+        read: BarrierRead,
+        deadline: Instant,
+        max_age: Duration,
+    ) -> TextBarrierStatus {
+        let expected_chars = read.text.chars().count();
+        let (status, report) = match self.barrier_probe.borrow_mut().as_mut() {
+            Some(probe) => barrier_answer(probe, read, deadline, max_age),
+            None => unanswered_barrier(expected_chars),
+        };
+        self.privacy_guard.last_barrier_report.set(report);
+        status
+    }
+
+    /// Whether the provider answered the last barrier read, Match or not.
+    fn barrier_answered(&self) -> bool {
+        self.privacy_guard.last_barrier_report().stage != TextBarrierStage::Provider
+    }
+
+    /// One read of a paste's commit check, answered by `until`: its status and whether the field
+    /// answered at all. A read waits behind one still under way in a busy field, so its answer
+    /// counts up to `PASTE_COMMIT_LATE_ANSWER_MS` later than a poll's.
+    fn commit_read(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        until: Instant,
+    ) -> (TextBarrierStatus, bool) {
+        let read = self.next_barrier_read(process_id, expected_text);
+        let status = self.answer_barrier_read(
+            read,
+            until,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_COMMIT_LATE_ANSWER_MS),
+        );
+        (status, self.barrier_answered())
+    }
+
+    /// The image path and the integrity level of `process_id`. Tests describe the process.
+    fn process_facts(&self, process_id: u32) -> (Option<String>, Option<u32>) {
+        #[cfg(test)]
+        if let Some((image, integrity)) = &self.process_override {
+            return (image.clone(), *integrity);
+        }
+        (
+            process_image_name(process_id),
+            process_integrity_level(process_id),
+        )
+    }
+
+    /// Selects the text before the caret for a paste. Tests script it.
+    fn paste_select(
+        &self,
+        process_id: u32,
+        expected_text: &str,
+        patience: PastePatience,
+        budget: PasteBudget,
+    ) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().select();
+        }
+        self.privacy_guard
+            .select_preceding_text(process_id, expected_text, patience, budget)
+    }
+
+    /// Puts a paste's replacement on the clipboard. Tests give it a clipboard of their own.
+    fn paste_clipboard(
+        &self,
+        text: &str,
+        install_timeout: Duration,
+        target_process: u32,
+    ) -> core::result::Result<ProtectedClipboard<'_>, ClipboardBeginFailure> {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().begin(
+                text,
+                install_timeout,
+                &self.clipboard_brokers,
+                target_process,
+            );
+        }
+        ProtectedClipboard::begin(
+            text,
+            install_timeout,
+            &self.clipboard_brokers,
+            target_process,
+        )
+    }
+
+    /// Sends a paste's keys and says how many SendInput took. Tests script it.
+    fn paste_submit(&self, inputs: &[INPUT]) -> usize {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().submit(inputs.len());
+        }
+        send_input_count(inputs)
+    }
+
+    /// Waits for the field to show a paste's text. Tests script it.
+    fn paste_commit(
+        &self,
+        foreground: ForegroundContext,
+        input_sequence: u64,
+        expected_layout: usize,
+        expected_text: &str,
+        (deadline, late_until): (Instant, Instant),
+    ) -> ReplayAttempt {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().commit();
+        }
+        self.wait_for_text_commit(
+            foreground,
+            input_sequence,
+            expected_layout,
+            expected_text,
+            (deadline, late_until),
+        )
+    }
+
+    /// Switches the layout after a paste. Tests script it.
+    fn paste_switch_layout(
+        &self,
+        foreground: ForegroundContext,
+        target_layout: HKL,
+        input_sequence: u64,
+    ) -> ReplayAttempt {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().switch_layout();
+        }
+        self.switch_layout_and_wait(foreground, target_layout, input_sequence)
+    }
+
+    /// Collapses a paste's selection. Tests script it.
+    fn paste_collapse(&self, process_id: u32) -> SelectionCleanup {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().collapse();
+        }
+        self.privacy_guard.collapse_selection_to_end(process_id)
     }
 
     fn resolved_profiles(&self) -> Option<&ResolvedKeyboardProfiles> {
@@ -5647,29 +8007,36 @@ impl InputProcessor {
         if self.profile_override.is_some() {
             return;
         }
-        let changed = self.input_profiles.poll();
-        self.apply_profile_refresh(changed);
+        let update = self.input_profiles.poll();
+        self.apply_profile_refresh(update);
     }
 
-    fn apply_profile_refresh(&mut self, changed: bool) {
-        if changed {
-            let snapshot = self.resolved_profiles().cloned();
-            self.detector.set_resolved_profiles(snapshot.as_ref());
+    /// Takes up a refreshed profile snapshot. Only changed bindings make what was planned under
+    /// the old ones stale (the word, its boundary, a Pause cycle, the remembered words); a
+    /// snapshot that aged out, as under a tray menu left open, and came back with the same
+    /// bindings keeps them.
+    fn apply_profile_refresh(&mut self, update: ProfileUpdate) {
+        if update == ProfileUpdate::Unchanged {
+            return;
+        }
+        let snapshot = self.resolved_profiles().cloned();
+        self.detector.set_resolved_profiles(snapshot.as_ref());
+        if update == ProfileUpdate::Bindings {
             self.invalidate_conversion_state();
             if self.session.buffered_character_count() != 0 {
                 self.suppress_session();
             }
             self.replay_keys.clear();
             self.layout_switch_in_flight = None;
-            self.diagnostic(
-                "input_profiles",
-                format!(
-                    "generation={} available={}",
-                    self.input_profiles.generation(),
-                    snapshot.is_some()
-                ),
-            );
         }
+        self.diagnostic(
+            "input_profiles",
+            format!(
+                "generation={} available={}",
+                self.input_profiles.generation(),
+                snapshot.is_some()
+            ),
+        );
     }
 
     fn language_for_layout(&self, layout: usize) -> Option<Language> {
@@ -5692,10 +8059,13 @@ impl InputProcessor {
         Some(HKL(handle as *mut c_void))
     }
 
+    /// The source layout is the field's layout when the edit starts: after a manual switch Pause
+    /// replaces a word typed in another layout, so it need not be the source language's own, nor
+    /// any enabled language's. An automatic conversion starts from the layout the word was typed
+    /// in. Any change of the profiles since the edit was planned changes the generation.
     fn pending_profiles_match(&self, pending: &PendingConversion) -> bool {
         pending.profile_generation == self.input_profiles.generation()
-            && self.language_for_layout(pending.source_layout)
-                == Some(pending.transaction.source_language)
+            && (pending.forced || self.language_for_layout(pending.source_layout).is_some())
             && self
                 .find_layout(pending.transaction.target_language)
                 .is_some()
@@ -5703,6 +8073,12 @@ impl InputProcessor {
 
     fn diagnostic(&self, event: &'static str, details: String) {
         if !self.metrics.diagnostics_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        // The owner's decision: while privacy blocks the input target nothing about the typing
+        // there is written. Even a counter or a timestamp per key tells a secret's length and
+        // rhythm.
+        if self.privacy_reason.is_some() && describes_typing(event) {
             return;
         }
         let Some(sender) = &self.diagnostic_sender else {
@@ -5731,12 +8107,18 @@ impl InputProcessor {
     /// conversion, a shortcut modifier) used to leave the held keys waiting for the deadline and
     /// aborting the gate. Releasing is always safe: it only replays held keys unchanged.
     fn process(&mut self, queued: QueuedInputEvent) {
+        self.log_finished_clipboard_brokers();
         let armed = self.armed_gate_token(&queued);
         let reason = if armed == 0 {
             ""
         } else {
             self.gate_bypass_reason(&queued)
         };
+        // The gate armed with this Space lets the held keys go this long after it was armed.
+        self.edit_deadline.set(
+            (armed != 0)
+                .then(|| queued.captured_at + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS)),
+        );
         self.process_event(queued);
         if armed != 0 && self.last_gate_release_token != armed {
             self.diagnostic(
@@ -5744,6 +8126,19 @@ impl InputProcessor {
                 format!("phase=release_forced token={armed} reason={reason}"),
             );
             self.request_gate_release(armed);
+        }
+    }
+
+    /// Logs how each clipboard broker the worker stopped waiting for ended, once it is over.
+    /// Logs how each broker the worker stopped waiting for ended, and counts the user's clipboard
+    /// it did not put back (a deferred paste whose target never read the replacement, a restore or
+    /// an installation that took too long and failed).
+    fn log_finished_clipboard_brokers(&self) {
+        for end in self.clipboard_brokers.reap() {
+            self.diagnostic("paste", format!("phase=broker_end result={end:?}"));
+            if matches!(end, BrokerEnd::NotRestored | BrokerEnd::Unread) {
+                self.count_clipboard_not_restored();
+            }
         }
     }
 
@@ -5791,24 +8186,41 @@ impl InputProcessor {
                 RawInputEvent::Key(_) => "key",
                 RawInputEvent::GateDrainReady { .. } => "gate_ack",
                 RawInputEvent::PrivacyRefresh(_) => "privacy",
+                RawInputEvent::ProfileRefresh => "profiles",
                 RawInputEvent::RecoverInput { .. } => "recovery",
                 RawInputEvent::RetainedInputExpired => "recovery_expired",
+                RawInputEvent::RetainedInputHandedBack { .. } => "recovery_handed_back",
                 RawInputEvent::Mouse => "mouse",
                 RawInputEvent::ExternalInjection => "external",
                 RawInputEvent::ReloadConfiguration => "configuration",
             };
-            self.diagnostic(
-                "input_queue",
-                format!(
-                    "kind={kind} wait_ms={queue_wait_ms} queued_epoch={}",
-                    queued.epoch
-                ),
+            // A key's wait is about typing: it is not written while the privacy of its input
+            // target is unknown (a new window, a field not checked since the focus may have moved)
+            // or blocked.
+            let unknown_target = matches!(
+                &queued.event,
+                RawInputEvent::Key(key) if !self.privacy_known_allowed(key.foreground)
             );
+            if !unknown_target {
+                self.diagnostic(
+                    "input_queue",
+                    format!(
+                        "kind={kind} wait_ms={queue_wait_ms} queued_epoch={}",
+                        queued.epoch
+                    ),
+                );
+            }
         }
-        if matches!(queued.event, RawInputEvent::PrivacyRefresh(_)) {
-            self.metrics
+        match queued.event {
+            RawInputEvent::PrivacyRefresh(_) => self
+                .metrics
                 .privacy_refresh_queued
-                .store(false, Ordering::Release);
+                .store(false, Ordering::Release),
+            RawInputEvent::ProfileRefresh => self
+                .metrics
+                .profile_refresh_queued
+                .store(false, Ordering::Release),
+            _ => {}
         }
         if matches!(queued.event, RawInputEvent::ReloadConfiguration) {
             // Configuration revisions are independent of input overflow epochs.
@@ -5819,7 +8231,9 @@ impl InputProcessor {
                 // state before enqueue. This private FIFO carries only accepted
                 // snapshots; adding another rejection path here would require
                 // a negative-ack protocol.
+                self.applying_configuration = Some(reload.revision);
                 self.apply_configuration_reload(Ok(reload.snapshot));
+                self.applying_configuration = None;
                 self.configuration_revision = reload.revision;
                 self.metrics
                     .configuration_ack
@@ -5832,7 +8246,26 @@ impl InputProcessor {
             self.resume_after_recovered_abort(Instant::now());
             return;
         }
+        if let RawInputEvent::RetainedInputHandedBack {
+            token,
+            submitted,
+            requested,
+        } = queued.event
+        {
+            // Not input either: the keys were typed whatever epoch the queue is in now.
+            self.finish_recovery(token, false, submitted, requested);
+            return;
+        }
         let current_epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        if let RawInputEvent::RecoverInput { sequence, explicit } = queued.event {
+            // Held keys are no stale input: a published configuration or a hook reinstall since
+            // the request, or a pending reload, must not leave them waiting until they expire.
+            if self.last_input_epoch != current_epoch {
+                self.reset_for_epoch(current_epoch);
+            }
+            self.recover_retained_input(sequence, explicit);
+            return;
+        }
         if queued.epoch != current_epoch {
             if self.last_input_epoch != current_epoch {
                 self.reset_for_epoch(current_epoch);
@@ -5861,7 +8294,7 @@ impl InputProcessor {
         }
 
         if self.metrics.configuration_pending.load(Ordering::Acquire) {
-            self.log_word_discard("configuration", String::new());
+            self.log_word_discard("configuration", WordDiscardDetail::None);
             self.invalidate_conversion_state();
             self.session.clear();
             self.replay_keys.clear();
@@ -5873,8 +8306,9 @@ impl InputProcessor {
                 if let Some(target) = self.last_key_foreground {
                     self.remember_word(target, self.last_layout, Instant::now());
                 }
-                self.log_word_discard("mouse", String::new());
+                self.log_word_discard("mouse", WordDiscardDetail::None);
                 self.last_word_reset = "mouse";
+                self.recovered_mid_word = false;
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
                 self.last_boundary = None;
@@ -5889,8 +8323,11 @@ impl InputProcessor {
                 self.mark_privacy_dirty(true);
             }
             RawInputEvent::Key(event) => self.process_key(event),
-            RawInputEvent::RecoverInput { sequence, explicit } => {
-                self.recover_retained_input(sequence, explicit)
+            RawInputEvent::ProfileRefresh => {
+                // Like the privacy refresh, never in the way of a fence acknowledgement.
+                if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
+                    self.refresh_input_profiles();
+                }
             }
             RawInputEvent::PrivacyRefresh(foreground) => {
                 // Periodic refresh is not a gate-control dependency. The next
@@ -5899,7 +8336,7 @@ impl InputProcessor {
                     return;
                 }
                 self.refresh_input_profiles();
-                if !foreground_identity_matches(foreground) {
+                if !self.foreground_matches(foreground) {
                     self.mark_privacy_dirty(false);
                     return;
                 }
@@ -5916,9 +8353,27 @@ impl InputProcessor {
                 self.last_refresh_check = Some((foreground, started.elapsed()));
             }
             RawInputEvent::ReloadConfiguration => unreachable!(),
+            RawInputEvent::RecoverInput { .. } => unreachable!(),
             RawInputEvent::RetainedInputExpired => unreachable!(),
+            RawInputEvent::RetainedInputHandedBack { .. } => unreachable!(),
             RawInputEvent::GateDrainReady { .. } => unreachable!(),
         }
+    }
+
+    /// After a contained panic: a reload that was being applied is rejected, so the UI stops
+    /// waiting for it and keeps the published settings that match the policy still in force.
+    fn reject_faulted_configuration(&mut self) {
+        let Some(revision) = self.applying_configuration.take() else {
+            return;
+        };
+        self.configuration_revision = revision;
+        self.metrics
+            .configuration_rejected
+            .store(revision, Ordering::Release);
+        self.diagnostic(
+            "configuration",
+            format!("result=rejected revision={revision} reason=internal-fault"),
+        );
     }
 
     fn apply_configuration_reload(&mut self, result: std::io::Result<RuntimeConfiguration>) {
@@ -5937,7 +8392,9 @@ impl InputProcessor {
                 return;
             }
         };
-        self.detector = Detector::with_profile_selections(
+        // Everything that can fail is built before anything is replaced: a contained panic here
+        // leaves the previous policy, including every exclusion, in force.
+        let mut detector = Detector::with_profile_selections(
             DetectorConfig {
                 single_letter_words: configuration.settings.single_letter_words,
                 ..Default::default()
@@ -5946,16 +8403,17 @@ impl InputProcessor {
             &configuration.input_profiles,
         );
         let profiles = self.resolved_profiles().cloned();
-        self.detector.set_resolved_profiles(profiles.as_ref());
-        self.detector
+        detector.set_resolved_profiles(profiles.as_ref());
+        detector
             .replace_user_lexicons(configuration.user_dictionary, configuration.word_exclusions);
-        self.detector.set_layout_model(
+        detector.set_layout_model(
             configuration
                 .settings
                 .layout_model
                 .then(autokeyboardlayot::layout_model::embedded)
                 .flatten(),
         );
+        self.detector = detector;
         self.recent_languages.clear();
         self.exclusion_policy = configuration.process_exclusions;
         self.backend_rules = configuration.backend_rules;
@@ -5973,6 +8431,10 @@ impl InputProcessor {
         self.last_process_id = None;
         self.process_reason = None;
         self.mark_privacy_dirty(false);
+        // The program in use may be excluded now: blocked at once, not at its next letter.
+        if let Some(foreground) = self.last_key_foreground {
+            self.refresh_process_policy(foreground.process_id);
+        }
         self.diagnostic(
             "configuration",
             format!(
@@ -6009,29 +8471,30 @@ impl InputProcessor {
                 .pending_conversion
                 .as_ref()
                 .is_some_and(|pending| pending.space_down_sequence == deferred.boundary_sequence);
-            let required_ms = self.pending_conversion.as_ref().and_then(|pending| {
-                let step_count = pending
-                    .transaction
-                    .forward
-                    .erase_characters
-                    .checked_add(pending.replay_keys.len())?
-                    .checked_add(1)?;
-                conversion_gate_budget_ms(
-                    step_count,
-                    self.text_edit_backend.requires_text_barrier(),
-                    matches!(self.text_edit_backend, TextEditBackend::CapabilityProbe),
-                    matches!(
-                        self.text_edit_backend,
-                        TextEditBackend::ProtectedPaste | TextEditBackend::CapabilityProbe
-                    ),
-                    false,
-                )
-            });
-            if pending_matches
-                && required_ms.is_some_and(|required_ms| {
+            let required_ms =
+                self.pending_conversion
+                    .as_ref()
+                    .and_then(|pending| match self.text_edit_backend {
+                        TextEditBackend::ProtectedPaste => Some(paste_gate_budget_ms(false)),
+                        TextEditBackend::CapabilityProbe => Some(paste_gate_budget_ms(true)),
+                        TextEditBackend::PhysicalReplay | TextEditBackend::ObserveOnly => {
+                            let step_count = pending
+                                .transaction
+                                .forward
+                                .erase_characters
+                                .checked_add(pending.replay_keys.len())?
+                                .checked_add(1)?;
+                            conversion_gate_budget_ms(step_count, false, false)
+                        }
+                    });
+            let deadline = required_ms
+                .filter(|_| pending_matches)
+                .and_then(|required_ms| {
                     self.handoff_correction_gate(token, deferred.boundary_sequence, required_ms)
-                })
-            {
+                });
+            if let Some(deadline) = deadline {
+                // The edit has what the handed-over gate has left, at least `required_ms`.
+                self.edit_deadline.set(Some(deadline));
                 self.execute_pending_conversion(deferred.boundary_sequence);
                 return;
             }
@@ -6043,9 +8506,16 @@ impl InputProcessor {
     fn reset_for_epoch(&mut self, epoch: u64) {
         let dropped_events = self.metrics.dropped_events.load(Ordering::Acquire);
         let queue_overflowed = dropped_events != self.last_dropped_events;
-        self.log_word_discard("epoch", format!("overflow={queue_overflowed}"));
+        self.log_word_discard(
+            "epoch",
+            WordDiscardDetail::Epoch {
+                overflow: queue_overflowed,
+            },
+        );
         self.invalidate_conversion_state();
-        if queue_overflowed {
+        // Input the worker never saw (a queue overflow, or keys a recovery replayed past the
+        // hooks) leaves the current word unknown until the next boundary.
+        if queue_overflowed || core::mem::take(&mut self.recovered_mid_word) {
             self.session
                 .handle(InputEvent::QueueOverflow, None, &self.detector);
         } else {
@@ -6053,6 +8523,7 @@ impl InputProcessor {
         }
         self.replay_keys.clear();
         self.modifiers = Modifiers::default();
+        self.resync_modifiers = true;
         self.metrics
             .undo_hotkey_active
             .store(false, Ordering::Release);
@@ -6077,8 +8548,19 @@ impl InputProcessor {
         if record.delivery_uncertain && !explicit {
             return;
         }
-        if !self.input_sequence_is_current(sequence)
-            || !foreground_identity_matches(record.foreground)
+        // The paste of this gate may have left the word selected: replaying the keys would type
+        // over it, so only the user brings them back.
+        if !explicit && self.metrics.selection_left_token.load(Ordering::Acquire) == record.token {
+            self.diagnostic(
+                "recovery",
+                format!(
+                    "token={} result=retained reason=selection-left",
+                    record.token
+                ),
+            );
+            return;
+        }
+        if !self.input_sequence_is_current(sequence) || !self.foreground_matches(record.foreground)
         {
             self.diagnostic(
                 "recovery",
@@ -6115,30 +8597,31 @@ impl InputProcessor {
         {
             return;
         }
-        let sent = send_input_count(&inputs);
-        {
-            let mut retained = self
-                .metrics
-                .retained_input
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(current) = retained.as_mut()
-                && current.token == record.token
-            {
-                if sent == inputs.len() {
-                    *retained = None;
-                } else if sent != 0 {
-                    current.delivery_uncertain = true;
-                }
-            }
+        // Marked under the lock before sending, so that the lifetime timer cannot report keys as
+        // deleted while they are being typed.
+        if !begin_retained_recovery(&self.metrics, record.token) {
+            self.diagnostic(
+                "recovery",
+                format!("token={} result=retained reason=gone", record.token),
+            );
+            return;
         }
+        let sent = send_input_count(&inputs);
+        finish_retained_recovery(&self.metrics, record.token, sent, inputs.len());
+        self.finish_recovery(record.token, explicit, sent, inputs.len());
+    }
+
+    /// Bookkeeping after a recovery sent `sent` of `requested` inputs. The replayed keys bypass
+    /// the hooks, so the word they may have started is unknown: the session stays suppressed until
+    /// the next boundary, also across the epoch reset that an automatic resume causes.
+    fn finish_recovery(&mut self, token: u64, explicit: bool, sent: usize, requested: usize) {
         self.invalidate_conversion_state();
-        self.session.clear();
-        self.replay_keys.clear();
-        self.diagnostic("recovery", format!("token={} explicit={explicit} submitted={sent} requested={} evidence=input-submitted-text-unverified", record.token, inputs.len()));
+        self.suppress_session();
+        self.recovered_mid_word = true;
+        self.diagnostic("recovery", format!("token={token} explicit={explicit} submitted={sent} requested={requested} evidence=input-submitted-text-unverified"));
         // Only the automatic recovery of a gate abort, and only when every held key was handed
         // back, may resume automatic conversion; explicit or partial recovery leaves it paused.
-        if should_resume_after_recovery(explicit, sent, inputs.len()) {
+        if should_resume_after_recovery(explicit, sent, requested) {
             self.resume_after_recovered_abort(Instant::now());
         }
     }
@@ -6154,6 +8637,16 @@ impl InputProcessor {
             && metrics.last_failure_reason.load(Ordering::Acquire)
                 == ConversionFailureReason::GateDrain as u8;
         if !paused_by_the_abort {
+            return;
+        }
+        let aborted_gate = metrics.cancelled_gate_token.load(Ordering::Acquire);
+        if aborted_gate != 0 && self.failed_edit_gate_token == aborted_gate {
+            // An automatic edit failed because of this abort, so the text is in an unknown
+            // state: that pause is not the abort's alone.
+            self.diagnostic(
+                "gate",
+                "phase=auto_resume_declined reason=failed-edit".to_owned(),
+            );
             return;
         }
         if !self.auto_resumes.try_take(now) {
@@ -6184,22 +8677,27 @@ impl InputProcessor {
             if let Some(previous) = self.last_key_foreground {
                 self.remember_word(previous, self.last_layout, Instant::now());
             }
+            // A new window may belong to a new process that reuses the previous one's ID: its
+            // image, integrity and exclusion are read again instead of taken from the cache. A
+            // blocked program is blocked before anything about this key is written.
+            self.last_process_id = None;
+            self.refresh_process_policy(event.foreground.process_id);
             if let Some((hwnd, focus, process_id)) = self.last_foreground {
                 // Handles are opaque identities; only which parts changed is
                 // recorded, to explain words split by transient focus changes.
                 self.log_word_discard(
                     "focus",
-                    format!(
-                        "window_changed={} focus_changed={} process_changed={} focus_was_null={} focus_is_null={}",
-                        hwnd != foreground_key.0,
-                        focus != foreground_key.1,
-                        process_id != foreground_key.2,
-                        focus == 0,
-                        foreground_key.1 == 0,
-                    ),
+                    WordDiscardDetail::Focus {
+                        window_changed: hwnd != foreground_key.0,
+                        focus_changed: focus != foreground_key.1,
+                        process_changed: process_id != foreground_key.2,
+                        focus_was_null: focus == 0,
+                        focus_is_null: foreground_key.1 == 0,
+                    },
                 );
             }
             self.last_word_reset = "focus";
+            self.recovered_mid_word = false;
             self.recent_languages.clear();
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -6208,10 +8706,11 @@ impl InputProcessor {
             self.transpose_cycle = None;
             self.session
                 .handle(InputEvent::FocusChanged, language, &self.detector);
-            self.modifiers = Modifiers::default();
+            // Keys released in the other window never reached this worker, and keys held across
+            // the switch stay held: the modifiers come from this event.
+            self.resync_modifiers = true;
             self.last_foreground = Some(foreground_key);
             self.last_layout = Some(event.foreground.layout);
-            self.refresh_process_policy(event.foreground.process_id);
             self.mark_privacy_dirty(false);
         } else if self.last_layout != Some(event.foreground.layout) {
             let expected_switch = self
@@ -6242,14 +8741,17 @@ impl InputProcessor {
                     }),
                     _ => self.last_boundary.take(),
                 };
+                // A Pause cycle goes on from the layout the field shows now; the next key that
+                // types ends it as usual.
+                let cycle = self.transpose_cycle.take();
                 self.invalidate_conversion_state();
-                self.transpose_cycle = None;
                 self.handle_switching_rule(
                     InputEvent::LayoutChanged,
                     language,
                     self.settings.suppress_after_manual_layout_change,
                 );
                 self.last_boundary = kept;
+                self.transpose_cycle = cycle;
                 self.last_layout = Some(event.foreground.layout);
             }
         } else if self
@@ -6267,7 +8769,13 @@ impl InputProcessor {
             return;
         }
 
+        if core::mem::take(&mut self.resync_modifiers) {
+            self.modifiers = Modifiers::from_held(event.held_modifiers);
+        }
         let modifier_event = self.modifiers.update(event.virtual_key, key_down, key_up);
+        if key_down && !modifier_event {
+            self.modifiers.forget_released(event.held_modifiers);
+        }
         if event.hotkey_trigger {
             let released = self.settings.pause_break_undo && self.wait_for_hotkey_release(event);
             self.diagnostic(
@@ -6306,6 +8814,12 @@ impl InputProcessor {
         if !key_down {
             return;
         }
+        if switches_keyboard_layout(event.virtual_key, self.modifiers) {
+            // Win+Space changes the layout and types nothing. The word stays, so that once the
+            // next key shows the new layout the manual-switch rule keeps it for Pause, as after
+            // Alt+Shift, whose keys are all modifiers.
+            return;
+        }
 
         if self.modifiers.has_shortcut_modifier() {
             // Alt+Tab, Ctrl+Shift+Esc and the like end tracking below; keep the word for Pause.
@@ -6342,6 +8856,10 @@ impl InputProcessor {
                 return;
             }
             let kind = shortcut_kind(event.virtual_key, self.modifiers);
+            // The shortcut may be the first key in a password field (after Tab in a web form):
+            // the field is checked before anything about the shortcut is written.
+            self.ensure_privacy(event.foreground, ProbeTrigger::Typing);
+            self.last_word_reset = "shortcut";
             self.diagnostic(
                 "input",
                 format!("result=suppressed reason=shortcut kind={kind}"),
@@ -6376,49 +8894,19 @@ impl InputProcessor {
                 );
             }
             key if key == VK_LEFT.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_left,
-                );
+                self.navigate(language, self.settings.suppress_after_left);
             }
             key if key == VK_RIGHT.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_right,
-                );
+                self.navigate(language, self.settings.suppress_after_right);
             }
             key if key == VK_UP.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_up,
-                );
+                self.navigate(language, self.settings.suppress_after_up);
             }
             key if key == VK_DOWN.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_down,
-                );
+                self.navigate(language, self.settings.suppress_after_down);
             }
             key if key == VK_HOME.0 || key == VK_END.0 => {
-                self.last_word_reset = "navigation";
-                self.replay_keys.clear();
-                self.handle_switching_rule(
-                    InputEvent::Navigation,
-                    language,
-                    self.settings.suppress_after_home_end,
-                );
+                self.navigate(language, self.settings.suppress_after_home_end);
             }
             key if key == VK_SPACE.0 => {
                 let last_keys = self.replay_keys.clone();
@@ -6441,24 +8929,36 @@ impl InputProcessor {
                 // handle_boundary explains an unconverted word by what cancelled it, so the
                 // boundary itself is recorded only after it.
                 self.last_word_reset = "boundary";
-                if let Some((transaction, replay_keys)) = completed
-                    && self.metrics.auto_enabled.load(Ordering::Acquire)
-                    && !self.modifiers.shift()
-                    && replay_keys.len() == transaction.original.chars().count()
-                    && replay_keys
+                if let Some((transaction, replay_keys)) = completed {
+                    // A candidate that is not converted says why, never what it was.
+                    let not_attempted = if !self.metrics.auto_enabled.load(Ordering::Acquire) {
+                        Some("automatic-off")
+                    } else if self.modifiers.shift() {
+                        Some("shift")
+                    } else if replay_keys.len() != transaction.original.chars().count() {
+                        Some("keys")
+                    } else if replay_keys
                         .iter()
-                        .all(|key| key.caps_lock == event.caps_lock)
-                {
-                    self.pending_conversion = Some(PendingConversion {
-                        transaction,
-                        foreground: event.foreground,
-                        source_layout: event.foreground.layout,
-                        profile_generation: self.input_profiles.generation(),
-                        space_down_sequence: event.sequence,
-                        replay_keys,
-                        forced: false,
-                        cycle_order: Vec::new(),
-                    });
+                        .any(|key| key.caps_lock != event.caps_lock)
+                    {
+                        Some("caps-lock")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = not_attempted {
+                        self.diagnostic("word", format!("result=not-attempted reason={reason}"));
+                    } else {
+                        self.pending_conversion = Some(PendingConversion {
+                            transaction,
+                            foreground: event.foreground,
+                            source_layout: event.foreground.layout,
+                            profile_generation: self.input_profiles.generation(),
+                            space_down_sequence: event.sequence,
+                            replay_keys,
+                            forced: false,
+                            cycle_order: Vec::new(),
+                        });
+                    }
                 }
                 if event.drain_token == 0 && self.metrics.auto_enabled.load(Ordering::Acquire) {
                     self.execute_pending_conversion(event.sequence);
@@ -6475,6 +8975,12 @@ impl InputProcessor {
                 self.handle_boundary(language, None, true);
                 self.last_word_reset = "boundary";
             }
+            key if may_move_focus_within_window(key) => {
+                // These keys type nothing but can move the focus inside the window (closing a
+                // dialog, switching panes, opening a menu, paging a form): they always end the
+                // word.
+                self.navigate(language, true);
+            }
             key if key == VK_RETURN.0 => {
                 self.last_boundary = None;
                 self.transpose_cycle = None;
@@ -6486,13 +8992,7 @@ impl InputProcessor {
                 if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
-                    self.diagnostic(
-                        "input",
-                        format!(
-                            "result=suppressed reason=privacy pid={} route={:?}",
-                            event.foreground.process_id, self.text_edit_backend
-                        ),
-                    );
+                    // Nothing is logged here: one line per key would give a secret's length.
                     self.last_word_reset = "privacy";
                     self.suppress_session();
                     return;
@@ -6500,11 +9000,28 @@ impl InputProcessor {
                 if language.is_none() {
                     self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
-                let printable = translate_printable(event, self.modifiers);
-                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
-                    if language
-                        .is_some_and(|language| self.detector.can_extend_word(character, language))
+                let printable = self.printable_character(event);
+                // A letter the offline tables place needs no readings. Any other key is judged by
+                // what it prints in the target layouts, such as the Estonian "ü" typed as "[" in
+                // the English layout, or the keypad's "." that prints "," in Russian where the
+                // offline table reads the main row's "." as "ю".
+                let readings = match (
+                    printable,
+                    language,
+                    replay_key_from_event(event, self.modifiers),
+                ) {
+                    (Some(character), Some(language), Some(key))
+                        if !self.letter_extends_word(character, language) =>
                     {
+                        self.key_readings(key, language, &mut self.key_mapper())
+                    }
+                    _ => Vec::new(),
+                };
+                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
+                    if language.is_some_and(|language| {
+                        self.detector
+                            .can_extend_word_with_readings(character, language, &readings)
+                    }) {
                         InputEvent::Printable(character)
                     } else if character.is_whitespace() || character.is_ascii_punctuation() {
                         InputEvent::Boundary
@@ -6512,6 +9029,11 @@ impl InputProcessor {
                         InputEvent::UnsupportedInput
                     }
                 });
+                // Before the reset below is overwritten: a token may start with a digit right
+                // after a shortcut or a manual layout switch.
+                let buffered_before = self.session.buffered_character_count();
+                let token_keys =
+                    self.take_manual_token_keys(input_event, printable.is_some(), buffered_before);
                 if input_event == InputEvent::UnsupportedInput {
                     self.last_word_reset = "unsupported";
                     self.diagnostic(
@@ -6531,17 +9053,21 @@ impl InputProcessor {
                 let boundary = input_event == InputEvent::Boundary;
                 if boundary {
                     self.last_word_reset = "boundary";
+                    self.recovered_mid_word = false;
                 }
-                let buffered_before = self.session.buffered_character_count();
-                let token_keys =
-                    self.take_manual_token_keys(input_event, printable.is_some(), buffered_before);
                 if matches!(input_event, InputEvent::Printable(_)) && buffered_before == 0 {
                     // Bind the manual-only mark to the word being started. Resets
                     // such as focus, mouse or layout changes discard the previous
                     // word without passing through a boundary or suppression.
                     self.manual_only_word = self.privacy_reason.is_some();
+                    self.manual_only_inspection = self.manual_only_word;
                 }
-                let action = self.session.handle(input_event, language, &self.detector);
+                let action = self.session.handle_with_readings(
+                    input_event,
+                    language,
+                    &self.detector,
+                    &readings,
+                );
                 match action {
                     SessionAction::Candidate(_) => {
                         // Deliberately retain only a counter. The candidate's
@@ -6623,7 +9149,7 @@ impl InputProcessor {
         let deadline = Instant::now() + Duration::from_millis(HOOK_FORWARD_TIMEOUT_MS);
         loop {
             if !self.input_sequence_is_current(event.sequence)
-                || !foreground_identity_matches(event.foreground)
+                || !self.foreground_matches(event.foreground)
             {
                 return false;
             }
@@ -6651,18 +9177,24 @@ impl InputProcessor {
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
         let manual_only = core::mem::take(&mut self.manual_only_word);
+        // A boundary ends the unknown word a recovery may have left.
+        self.recovered_mid_word = false;
         // What happened to a word that is not converted is logged as a category only, so a
         // missed conversion can be explained from the log without recording the word.
         let suppressed = self.session.is_suppressed();
         let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
+        let map_to_layout = self.key_mapper();
         let candidates = language
             .map(|language| {
-                mapped_layout_candidates(
-                    &replay_keys,
+                mapped_layout_candidates_with(
                     language,
                     &self.settings,
                     &self.detector,
-                    self.resolved_profiles(),
+                    |target_language| {
+                        let profile = self.detector.input_profile(target_language)?;
+                        let handle = self.resolved_profiles()?.unique_layout(profile)?;
+                        map_to_layout(&replay_keys, handle)
+                    },
                 )
             })
             .unwrap_or_default();
@@ -6703,18 +9235,18 @@ impl InputProcessor {
                 );
                 let transaction = delimiter
                     .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter));
-                // The following words see this one as the target language only when the
-                // conversion will be attempted; otherwise the text stays as typed.
-                let attempted =
-                    transaction.is_some() && self.metrics.auto_enabled.load(Ordering::Acquire);
-                self.remember_word_language(if attempted {
-                    detection.target_language
-                } else {
-                    detection.source_language
-                });
+                if transaction.is_none() {
+                    // Tab or Enter: the edit could not put the word back before them.
+                    self.diagnostic("word", "result=not-attempted reason=boundary".to_owned());
+                }
+                // The following words see this one as typed until its conversion is applied
+                // (finish_applied_conversion).
+                self.remember_word_language(detection.source_language);
                 transaction
             } else {
-                if !replay_keys.is_empty()
+                // A suppressed token (digits, text after a shortcut) is no word of a language.
+                if !suppressed
+                    && !replay_keys.is_empty()
                     && let Some(language) = language
                 {
                     self.remember_word_language(language);
@@ -6736,10 +9268,12 @@ impl InputProcessor {
             }
         } else {
             if had_word {
-                let result = if manual_only {
-                    "manual-only"
-                } else {
-                    "privacy"
+                // Why a word is manual-only: a field check that did not pass while it was typed,
+                // or a word resumed by erasing its delimiter.
+                let result = match (manual_only, self.manual_only_inspection) {
+                    (true, true) => "manual-only cause=field-check",
+                    (true, false) => "manual-only cause=resumed",
+                    (false, _) => "privacy",
                 };
                 self.diagnostic("word", format!("result={result}"));
             }
@@ -6770,9 +9304,67 @@ impl InputProcessor {
         event: RawKeyEvent,
         language: Option<Language>,
     ) -> bool {
-        self.erase_or_resume_word_with(previous_boundary, event, language, |keys, layout| {
+        let map_to_layout = self.key_mapper();
+        self.erase_or_resume_word_with(previous_boundary, event, language, map_to_layout)
+    }
+
+    /// Maps keys to what they print in a layout (by handle), as for the word's candidates.
+    fn key_mapper(&self) -> impl Fn(&[ReplayKey], usize) -> Option<String> + use<> {
+        #[cfg(test)]
+        let keyboard = self.test_keyboard;
+        move |keys, layout| {
+            #[cfg(test)]
+            if let Some(keyboard) = keyboard {
+                return keys.iter().map(|&key| keyboard(key, layout)).collect();
+            }
             map_replay_keys_to_layout(keys, HKL(layout as *mut c_void))
-        })
+        }
+    }
+
+    /// The character a key event prints in its foreground layout.
+    fn printable_character(&self, event: RawKeyEvent) -> Option<char> {
+        #[cfg(test)]
+        if let Some(keyboard) = self.test_keyboard {
+            return keyboard(
+                replay_key_from_event(event, self.modifiers)?,
+                event.foreground.layout,
+            );
+        }
+        translate_printable(event, self.modifiers)
+    }
+
+    /// A letter that continues a word by the offline tables alone. Another character, even one
+    /// those tables read as a letter of a target layout ("." as "ю"), is judged by what its key
+    /// prints there (`key_readings`): the keypad's "." prints "," in Russian.
+    fn letter_extends_word(&self, character: char, language: Language) -> bool {
+        character.is_alphabetic() && self.detector.can_extend_word(character, language)
+    }
+
+    /// What `key` prints in the layout of each enabled automatic target of `language`, from the
+    /// same mapping that gives the word's candidates at its boundary.
+    fn key_readings(
+        &self,
+        key: ReplayKey,
+        language: Language,
+        map_to_layout: &mut impl FnMut(&[ReplayKey], usize) -> Option<String>,
+    ) -> Vec<(Language, char)> {
+        let mut readings = Vec::new();
+        for target in self.detector.automatic_targets(language) {
+            if !self.settings.language_enabled(target) {
+                continue;
+            }
+            let Some(layout) = self.find_layout(target) else {
+                continue;
+            };
+            let Some(text) = map_to_layout(core::slice::from_ref(&key), layout.0 as usize) else {
+                continue;
+            };
+            let mut characters = text.chars();
+            if let (Some(character), None) = (characters.next(), characters.next()) {
+                readings.push((target, character));
+            }
+        }
+        readings
     }
 
     /// With Backspace suppression disabled, a plain Backspace edits the tracked
@@ -6785,7 +9377,7 @@ impl InputProcessor {
         previous_boundary: Option<LastBoundary>,
         event: RawKeyEvent,
         language: Option<Language>,
-        map_to_layout: impl FnOnce(&[ReplayKey], usize) -> Option<String>,
+        mut map_to_layout: impl FnMut(&[ReplayKey], usize) -> Option<String>,
     ) -> bool {
         if self.session.is_suppressed() && !self.replay_keys.is_empty() {
             // Manual token (see take_manual_token_keys). Erasing all of it
@@ -6827,14 +9419,33 @@ impl InputProcessor {
         if word.chars().count() != last.replay_keys.len()
             || !word
                 .chars()
-                .all(|character| self.detector.can_extend_word(character, language))
+                .zip(&last.replay_keys)
+                .all(|(character, &key)| {
+                    self.detector.can_extend_word(character, language) || {
+                        let readings = self.key_readings(key, language, &mut map_to_layout);
+                        self.detector
+                            .can_extend_word_with_readings(character, language, &readings)
+                    }
+                })
             || !self.session.restore_word(&word)
         {
             return false;
         }
         self.replay_keys = last.replay_keys;
         self.manual_only_word = true;
+        self.manual_only_inspection = false;
         true
+    }
+
+    /// A key that moves the caret or the focus without typing. It may have moved to another field
+    /// of the same window (Down from a user name to a password field in a web form), so the next
+    /// key gets a fresh privacy check and no earlier good check stands for it, also when the
+    /// word goes on.
+    fn navigate(&mut self, language: Option<Language>, suppress_until_boundary: bool) {
+        self.last_word_reset = "navigation";
+        self.replay_keys.clear();
+        self.handle_switching_rule(InputEvent::Navigation, language, suppress_until_boundary);
+        self.mark_privacy_dirty(false);
     }
 
     fn handle_switching_rule(
@@ -6848,15 +9459,15 @@ impl InputProcessor {
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
-            self.log_word_discard("switching-rule", format!("rule={}", event.category()));
+            self.log_word_discard("switching-rule", WordDiscardDetail::Rule(event.category()));
             self.session.clear();
         }
     }
 
     /// Record that a buffered word was dropped without suppressing the rest of
     /// it, so the following letters would start a new word. Only the category
-    /// and length are logged, never text.
-    fn log_word_discard(&self, reason: &str, detail: String) {
+    /// and length are logged, never text: the detail is typed and holds no string.
+    fn log_word_discard(&self, reason: &'static str, detail: WordDiscardDetail) {
         let chars = self
             .session
             .buffered_character_count()
@@ -6864,7 +9475,7 @@ impl InputProcessor {
         if chars != 0 {
             self.diagnostic(
                 "word_discard",
-                format!("reason={reason} chars={chars} {detail}"),
+                format!("reason={reason} chars={chars} {}", detail.describe()),
             );
         }
     }
@@ -6935,8 +9546,25 @@ impl InputProcessor {
             .iter()
             .position(|entry| same_input_target(entry.target, target))?;
         let entry = self.remembered_words.remove(position);
-        self.transpose_cycle = entry.cycle;
-        self.last_boundary = entry.word;
+        // The paste checks the text before the caret, so an entry outlives input epochs (a
+        // settings Apply, a mode toggle, an aborted gate). Only changed keyboard profiles make it
+        // stale, and then it goes without touching the word being typed.
+        let generation = self.input_profiles.generation();
+        if entry
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.profile_generation != generation)
+            || entry
+                .word
+                .as_ref()
+                .is_some_and(|word| word.profile_generation != generation)
+        {
+            self.diagnostic("hotkey", "source=remembered result=stale".to_owned());
+            return None;
+        }
+        let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        self.transpose_cycle = entry.cycle.map(|cycle| TransposeCycle { epoch, ..cycle });
+        self.last_boundary = entry.word.map(|word| LastBoundary { epoch, ..word });
         Some(now.saturating_duration_since(entry.at))
     }
 
@@ -6991,22 +9619,24 @@ impl InputProcessor {
             .clone()
             .filter(|cycle| same_input_target(cycle.foreground, event.foreground))
         {
-            let Some(source_layout) = self.find_layout(cycle.language) else {
+            if self.find_layout(cycle.language).is_none() {
                 self.diagnostic(
                     "hotkey",
                     "result=ignored reason=layout-unavailable".to_owned(),
                 );
                 return;
-            };
+            }
             if !self.forced_privacy_allows(event.foreground) {
                 self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
                 return;
             }
+            // The cycle knows its text; the edit starts from the layout the field has now, which
+            // the user may have switched since the last press.
             self.advance_layout_cycle(
                 cycle.replay_keys,
                 cycle.delimiter,
                 cycle.foreground,
-                source_layout.0 as usize,
+                event.foreground.layout,
                 cycle.language,
                 cycle.text,
                 event.sequence,
@@ -7016,7 +9646,7 @@ impl InputProcessor {
         }
         // The manual hotkey walks the word through every enabled layout, so it
         // works even when the word is not in any dictionary.
-        let Some((replay_keys, delimiter, source_layout)) = self.forced_conversion_source(event)
+        let Some((replay_keys, delimiter, typed_layout)) = self.forced_conversion_source(event)
         else {
             self.diagnostic(
                 "hotkey",
@@ -7027,16 +9657,14 @@ impl InputProcessor {
             );
             return;
         };
-        let Some(source_language) = self.language_for_layout(source_layout) else {
+        let Some(source_language) = self.language_for_layout(typed_layout) else {
             self.diagnostic(
                 "hotkey",
                 "result=ignored reason=unsupported-layout".to_owned(),
             );
             return;
         };
-        let Some(current_text) =
-            map_replay_keys_to_layout(&replay_keys, HKL(source_layout as *mut c_void))
-        else {
+        let Some(current_text) = (self.key_mapper())(&replay_keys, typed_layout) else {
             // A key of the word gives no single character in the layout it was typed in, so
             // the text on screen cannot be read back and replaced safely.
             self.diagnostic(
@@ -7049,11 +9677,13 @@ impl InputProcessor {
             self.diagnostic("hotkey", "result=ignored reason=privacy".to_owned());
             return;
         }
+        // The keys are read in the layout they were typed in; the edit starts from the layout the
+        // field has now, which differs after a manual switch.
         self.advance_layout_cycle(
             replay_keys,
             delimiter,
             event.foreground,
-            source_layout,
+            event.foreground.layout,
             source_language,
             current_text,
             event.sequence,
@@ -7102,6 +9732,7 @@ impl InputProcessor {
             );
             return;
         }
+        let map_to_layout = self.key_mapper();
         let order = cycle_order
             .filter(|order| {
                 order.len() == enabled.len()
@@ -7114,7 +9745,7 @@ impl InputProcessor {
                     .filter(|language| *language != source_language)
                     .filter_map(|language| {
                         let layout = self.find_layout(language)?;
-                        Some((language, map_replay_keys_to_layout(&replay_keys, layout)?))
+                        Some((language, map_to_layout(&replay_keys, layout.0 as usize)?))
                     })
                     .collect();
                 layout_cycle_order(
@@ -7134,6 +9765,12 @@ impl InputProcessor {
         // example Latin Estonian keeps a Latin English word unchanged) so one
         // press always reaches a visibly different representation when one
         // exists.
+        // The presses always pass through the original layout: a layout that reads the keys as
+        // the original text (Estonian for Latin letters typed in English) stands for it, so they
+        // never leave the user in a lookalike layout that types ö or ü for ; and [.
+        let original_text = self
+            .find_layout(order[0])
+            .and_then(|layout| map_to_layout(&replay_keys, layout.0 as usize));
         let mut target = None;
         for step in 1..order.len() {
             let candidate_index = (position + step) % order.len();
@@ -7141,12 +9778,16 @@ impl InputProcessor {
             let Some(candidate_layout) = self.find_layout(candidate_language) else {
                 continue;
             };
-            let Some(candidate_text) = map_replay_keys_to_layout(&replay_keys, candidate_layout)
+            let Some(candidate_text) = map_to_layout(&replay_keys, candidate_layout.0 as usize)
             else {
                 continue;
             };
             if candidate_text != current_text {
-                target = Some((candidate_index, candidate_language, candidate_text));
+                target = Some(if original_text.as_ref() == Some(&candidate_text) {
+                    (0, order[0], candidate_text)
+                } else {
+                    (candidate_index, candidate_language, candidate_text)
+                });
                 break;
             }
         }
@@ -7203,6 +9844,14 @@ impl InputProcessor {
         self.execute_pending_conversion(sequence);
     }
 
+    /// Whether `foreground` is the input target the last privacy check found allowed, with no
+    /// reason since to check it again.
+    fn privacy_known_allowed(&self, foreground: ForegroundContext) -> bool {
+        !self.privacy_needs_check
+            && self.privacy_reason.is_none()
+            && self.last_foreground == Some(foreground_identity_key(foreground))
+    }
+
     fn ensure_privacy(&mut self, foreground: ForegroundContext, trigger: ProbeTrigger) -> bool {
         self.refresh_process_policy(foreground.process_id);
         if self.privacy_needs_check {
@@ -7219,7 +9868,7 @@ impl InputProcessor {
         self.refresh_process_policy(foreground.process_id);
         self.evaluate_privacy(foreground, ProbeTrigger::Manual);
         epoch == self.metrics.input_epoch.load(Ordering::Acquire)
-            && foreground_identity_matches(foreground)
+            && self.foreground_matches(foreground)
             && self.manual_privacy_allows_current(foreground)
     }
 
@@ -7235,16 +9884,19 @@ impl InputProcessor {
         let terminal = self.process_reason.is_none()
             && self.last_process_id == Some(foreground.process_id)
             && self.text_edit_backend == TextEditBackend::PhysicalReplay
-            && process_image_name(foreground.process_id).is_some_and(|path| {
-                matches!(
-                    path.rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or("")
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
-                )
-            });
+            && self
+                .process_facts(foreground.process_id)
+                .0
+                .is_some_and(|path| {
+                    matches!(
+                        path.rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
+                    )
+                });
         autokeyboardlayot::privacy::manual_conversion_allowed(
             reason,
             self.settings.manual_terminal_uia_fallback,
@@ -7271,22 +9923,11 @@ impl InputProcessor {
             (Some(reason), "process-policy")
         } else {
             match self.privacy_probe.as_mut() {
-                Some(probe) => match probe.query_result(
-                    (foreground, epoch),
+                Some(probe) => probe_verdict(probe.query_result(
+                    (foreground, epoch, self.privacy_generation),
                     Duration::from_millis(PRIVACY_PROBE_WAIT_MS),
                     Duration::from_millis(500),
-                ) {
-                    Ok(reason) => (reason, "provider"),
-                    Err(failure) => (
-                        Some(PrivacyBlockReason::InspectionUnavailable),
-                        match failure {
-                            ProbeFailure::Timeout => "wait-timeout",
-                            ProbeFailure::Busy => "queue-busy",
-                            ProbeFailure::Disconnected => "provider-disconnected",
-                            ProbeFailure::Expired => "reply-expired",
-                        },
-                    ),
-                },
+                )),
                 None => (
                     Some(PrivacyBlockReason::InspectionUnavailable),
                     "probe-missing",
@@ -7296,7 +9937,7 @@ impl InputProcessor {
         self.report_probe_respawn();
         // A late safe reply cannot authorize a different focus or input epoch.
         let context_current = self.metrics.input_epoch.load(Ordering::Acquire) == epoch
-            && foreground_identity_matches(foreground);
+            && self.foreground_matches(foreground);
         self.apply_probe_answer(
             ProbeAnswer { reason, source },
             context_current,
@@ -7329,7 +9970,23 @@ impl InputProcessor {
         let verdict =
             self.settle_probe_outcome(reason, source, foreground, epoch, Instant::now(), trigger);
         let (reason, source) = (verdict.reason, verdict.source);
-        if reason != self.privacy_reason
+        let changed = reason != self.privacy_reason;
+        self.metrics.privacy_probe_cost_ms.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        self.privacy_needs_check = false;
+        let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
+            && self.manual_privacy_allows_reason(reason, foreground);
+        self.set_privacy_reason_with_manual_exception(reason, manual_exception);
+        // The field that could not be checked when the word began has now passed a check of its
+        // own (a softened failure is no check): the word is no longer manual-only.
+        if reason.is_none() && source == "provider" && self.manual_only_inspection {
+            self.manual_only_word = false;
+            self.manual_only_inspection = false;
+        }
+        // Logged under the new verdict, so a check that blocks the field leaves no line.
+        if changed
             || verdict.recent_ok_age.is_some()
             || started.elapsed() >= Duration::from_millis(SLOW_INPUT_DIAGNOSTIC_MS)
         {
@@ -7345,14 +10002,6 @@ impl InputProcessor {
                 ),
             );
         }
-        self.metrics.privacy_probe_cost_ms.store(
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            Ordering::Release,
-        );
-        self.privacy_needs_check = false;
-        let manual_exception = reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
-            && self.manual_privacy_allows_reason(reason, foreground);
-        self.set_privacy_reason_with_manual_exception(reason, manual_exception);
     }
 
     fn refresh_process_policy(&mut self, process_id: u32) {
@@ -7360,7 +10009,7 @@ impl InputProcessor {
             return;
         }
         self.last_process_id = Some(process_id);
-        let image = process_image_name(process_id);
+        let (image, integrity) = self.process_facts(process_id);
         let process_name = image
             .as_deref()
             .and_then(|path| path.rsplit(['/', '\\']).next())
@@ -7375,11 +10024,7 @@ impl InputProcessor {
         self.metrics
             .backend_status
             .store(self.text_edit_backend.status_code(), Ordering::Release);
-        self.process_reason = match (
-            image,
-            process_integrity_level(process_id),
-            self.current_integrity_level,
-        ) {
+        self.process_reason = match (image, integrity, self.current_integrity_level) {
             (Some(path), _, _) if self.exclusion_policy.is_excluded(&path) => {
                 Some(PrivacyBlockReason::ExcludedProcess)
             }
@@ -7390,13 +10035,24 @@ impl InputProcessor {
             _ => Some(PrivacyBlockReason::InspectionUnavailable),
         };
         self.privacy_needs_check = true;
-        self.diagnostic(
-            "context",
-            format!(
-                "pid={process_id} process={process_name} route={:?} privacy={:?}",
-                self.text_edit_backend, self.process_reason
-            ),
-        );
+        // A blocked program is blocked from its first key on, whatever key that is, and for the
+        // hooks as well: they take the verdict once it names this process.
+        if self.process_reason.is_some() {
+            self.set_privacy_reason(self.process_reason);
+        }
+        self.metrics
+            .privacy_process_id
+            .store(process_id, Ordering::Release);
+        // A blocked process leaves no line: it would mark when typing there began.
+        if self.process_reason.is_none() {
+            self.diagnostic(
+                "context",
+                format!(
+                    "pid={process_id} process={process_name} route={:?}",
+                    self.text_edit_backend
+                ),
+            );
+        }
     }
 
     /// Applies the recent-good rule to one finished check.
@@ -7412,7 +10068,7 @@ impl InputProcessor {
     /// Only the provider's own field-inspection failure is softened. A password field, an
     /// excluded or unreadable process, a changed context and every transport failure stand, and a
     /// failure never renews the good check, so a window that keeps failing counts as failing
-    /// after two seconds.
+    /// after five seconds.
     fn settle_probe_outcome(
         &mut self,
         reason: Option<PrivacyBlockReason>,
@@ -7453,6 +10109,21 @@ impl InputProcessor {
         }
     }
 
+    /// An edit was just made in `foreground`. When the last good field check was of that same
+    /// target in this input epoch (anything since that could move the focus would have cleared
+    /// it), it counts from now: a program busy with the edit fails checks for a while after it
+    /// (Windows Terminal for seconds), and the recent-good rule should not run out meanwhile (the
+    /// owner's decision of 2026-10-24). A record of another target, or none, is left as it is.
+    fn renew_recent_privacy_ok(&mut self, foreground: ForegroundContext) {
+        let epoch = self.metrics.input_epoch.load(Ordering::Acquire);
+        if let Some(recent) = self.recent_privacy_ok.as_mut()
+            && same_input_target(recent.foreground, foreground)
+            && recent.epoch == epoch
+        {
+            recent.at = Instant::now();
+        }
+    }
+
     /// Asks for a conversion sound when the user enabled them. The sound plays on a thread of its
     /// own; a cue that arrives while one plays is dropped, never queued.
     fn request_sound(&mut self, cue: SoundCue) {
@@ -7481,6 +10152,8 @@ impl InputProcessor {
 
     fn mark_privacy_dirty(&mut self, pause_now: bool) {
         self.privacy_needs_check = true;
+        // A check still running for the field before this input must not decide the next one.
+        self.privacy_generation = self.privacy_generation.wrapping_add(1);
         // Tab, Enter, a click, a shortcut, injected input and focus changes all come through
         // here: the field may be another one now, so no earlier good check applies to it.
         self.recent_privacy_ok = None;
@@ -7514,6 +10187,7 @@ impl InputProcessor {
         if reason.is_some() {
             if manual_exception && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) {
                 self.manual_only_word = true;
+                self.manual_only_inspection = true;
                 self.pending_conversion = None;
                 self.deferred_drained_conversion = None;
                 self.clear_undo();
@@ -7528,13 +10202,24 @@ impl InputProcessor {
     fn suppress_session(&mut self) {
         self.replay_keys.clear();
         self.manual_only_word = false;
+        self.manual_only_inspection = false;
         self.session
             .handle(InputEvent::UnsupportedInput, None, &self.detector);
     }
 
     fn execute_pending_conversion(&mut self, boundary_sequence: u64) {
         self.execute_pending_conversion_inner(boundary_sequence);
-        self.request_gate_release(boundary_sequence);
+        self.end_conversion_gate(boundary_sequence);
+    }
+
+    /// Ends the gate of a conversion or an undo. Its held keys are replayed, unless the edit may
+    /// have left the word selected: then they are kept for recovery, as they would type over it.
+    fn end_conversion_gate(&mut self, token: u64) {
+        if self.held_keys_kept_for.take() == Some(token) {
+            self.request_gate_retention(token);
+        } else {
+            self.request_gate_release(token);
+        }
     }
 
     fn execute_pending_conversion_inner(&mut self, boundary_sequence: u64) {
@@ -7618,8 +10303,11 @@ impl InputProcessor {
                     &pending.transaction.forward.insert_text,
                     paste_patience(pending.forced),
                 );
-                let Some(strategy) = self.apply_paste_attempt_result(attempt, boundary_sequence)
-                else {
+                let Some(strategy) = self.apply_paste_attempt_result(
+                    attempt,
+                    boundary_sequence,
+                    PasteRoute::Backend,
+                ) else {
                     return;
                 };
                 strategy
@@ -7672,36 +10360,14 @@ impl InputProcessor {
                                 )
                             ),
                         );
-                        match attempt {
-                            TextEditAttempt::Applied
-                            | TextEditAttempt::AppliedClipboardNotRestored => {
-                                if attempt == TextEditAttempt::AppliedClipboardNotRestored {
-                                    self.note_clipboard_not_restored(boundary_sequence);
-                                }
-                                self.metrics
-                                    .backend_status
-                                    .store(BACKEND_PROTECTED_PASTE, Ordering::Release);
-                                EditStrategy::ProtectedPaste
-                            }
-                            TextEditAttempt::Cancelled => {
-                                self.metrics
-                                    .backend_status
-                                    .store(BACKEND_SELECTION_MISMATCH, Ordering::Release);
-                                return;
-                            }
-                            TextEditAttempt::Unsupported => {
-                                self.metrics
-                                    .backend_status
-                                    .store(BACKEND_SELECTION_UNSUPPORTED, Ordering::Release);
-                                return;
-                            }
-                            TextEditAttempt::Failed => {
-                                self.record_conversion_failure(
-                                    ConversionFailureReason::ClipboardEdit,
-                                );
-                                return;
-                            }
-                        }
+                        let Some(strategy) = self.apply_paste_attempt_result(
+                            attempt,
+                            boundary_sequence,
+                            PasteRoute::CapabilityProbe,
+                        ) else {
+                            return;
+                        };
+                        strategy
                     }
                     CapabilityDecision::CancelMismatch => {
                         self.metrics
@@ -7732,8 +10398,29 @@ impl InputProcessor {
             }
         };
 
+        self.finish_applied_conversion(pending, boundary_sequence, target_layout, edit_strategy);
+    }
+
+    /// The bookkeeping of a conversion whose edit was applied: the target layout is current, the
+    /// word may be resumed, cycled, undone or added to the dictionary, and the following words
+    /// see an automatically converted word as the target language. Its boundary recorded it as
+    /// typed, so a conversion that ends without an edit leaves the model's context as typed.
+    fn finish_applied_conversion(
+        &mut self,
+        pending: PendingConversion,
+        boundary_sequence: u64,
+        target_layout: HKL,
+        edit_strategy: EditStrategy,
+    ) {
+        if !pending.forced
+            && let Some(last) = self.recent_languages.last_mut()
+            && *last == pending.transaction.source_language
+        {
+            *last = pending.transaction.target_language;
+        }
         self.commit_confirmed_layout(target_layout.0 as usize);
         self.session.clear();
+        self.renew_recent_privacy_ok(pending.foreground);
         if let Some(delimiter) = pending.transaction.delimiter {
             self.last_boundary = Some(LastBoundary {
                 replay_keys: pending.replay_keys.clone(),
@@ -7816,23 +10503,47 @@ impl InputProcessor {
                 return None;
             }
         }
-        match self.wait_for_replay_commit(
+        let commit = self.wait_for_replay_commit(
             pending.foreground,
             input_sequence,
             target_layout.0 as usize,
-        ) {
-            ReplayAttempt::Applied => Some(EditStrategy::PhysicalReplay),
+        );
+        self.finish_replay_commit(
+            commit,
+            input_sequence,
+            target_layout.0 as usize,
+            "conversion",
+        )
+        .then_some(EditStrategy::PhysicalReplay)
+    }
+
+    /// What the commit wait of a physical replay found. Every key was sent by then: a guard lost
+    /// while waiting (new input, a click) leaves the edit applied but unconfirmed, which is logged
+    /// as `applied-uncertain` under `event`. True when the edit is confirmed.
+    fn finish_replay_commit(
+        &mut self,
+        commit: ReplayAttempt,
+        sequence: u64,
+        layout: usize,
+        event: &'static str,
+    ) -> bool {
+        match commit {
+            ReplayAttempt::Applied => true,
             ReplayAttempt::Cancelled => {
-                self.layout_switch_in_flight = Some((
-                    target_layout.0 as usize,
-                    Instant::now() + Duration::from_secs(1),
-                ));
+                self.diagnostic(
+                    event,
+                    format!(
+                        "sequence={sequence} result=applied-uncertain strategy=PhysicalReplay evidence=input-submitted-guard-lost"
+                    ),
+                );
+                self.layout_switch_in_flight =
+                    Some((layout, Instant::now() + Duration::from_secs(1)));
                 self.session.clear();
-                None
+                false
             }
             ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::ReplayCommit);
-                None
+                false
             }
         }
     }
@@ -7853,7 +10564,7 @@ impl InputProcessor {
         {
             let active_gate = self.metrics.active_gate_token.load(Ordering::Acquire);
             if self.metrics.cancelled_gate_token.load(Ordering::Acquire) == input_sequence
-                || !foreground_identity_matches(foreground)
+                || !self.foreground_matches(foreground)
                 || (active_gate != input_sequence
                     && (!self.input_sequence_is_current(input_sequence)
                         || !physical_modifiers_released()))
@@ -7880,13 +10591,15 @@ impl InputProcessor {
             if !self.edit_guard_is_current(foreground, input_sequence) {
                 return ReplayAttempt::Cancelled;
             }
-            if current_foreground_context().is_none_or(|current| current.layout != source_layout) {
+            if self
+                .current_foreground()
+                .is_none_or(|current| current.layout != source_layout)
+            {
                 return ReplayAttempt::Cancelled;
             }
             if self.text_edit_backend.requires_text_barrier()
                 && matches!(
-                    self.privacy_guard
-                        .preceding_text_status(foreground.process_id, expected_text),
+                    self.settle_text_status(foreground.process_id, expected_text, settle_deadline),
                     TextBarrierStatus::Match
                 )
             {
@@ -7901,37 +10614,36 @@ impl InputProcessor {
         }
     }
 
+    /// Waits until `deadline` for the field to show a paste's `expected_text`
+    /// (poll_text_commit), until `late_until` when the field does not answer.
     fn wait_for_text_commit(
         &self,
         foreground: ForegroundContext,
         input_sequence: u64,
         expected_layout: usize,
         expected_text: &str,
+        (deadline, late_until): (Instant, Instant),
     ) -> ReplayAttempt {
-        let deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
-        while Instant::now() < deadline {
-            if !self.edit_guard_is_current(foreground, input_sequence) {
-                self.diagnostic(
-                    "paste_guard",
-                    format!("sequence={input_sequence} reason=input-or-focus-changed"),
-                );
-                return ReplayAttempt::Cancelled;
-            }
-            let current = current_foreground_context();
-            if current.is_none_or(|current| current.layout != expected_layout) {
-                self.diagnostic("paste_guard", format!("sequence={input_sequence} reason=layout-changed expected={expected_layout:x} actual={:x}", current.map_or(0, |context| context.layout)));
-                return ReplayAttempt::Failed;
-            }
-            if matches!(
-                self.privacy_guard
-                    .preceding_text_status(foreground.process_id, expected_text),
-                TextBarrierStatus::Match
-            ) {
-                return ReplayAttempt::Applied;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        ReplayAttempt::Failed
+        poll_text_commit(
+            deadline,
+            late_until,
+            || {
+                if !self.edit_guard_is_current(foreground, input_sequence) {
+                    self.diagnostic(
+                        "paste_guard",
+                        format!("sequence={input_sequence} reason=input-or-focus-changed"),
+                    );
+                    return Some(ReplayAttempt::Cancelled);
+                }
+                let current = current_foreground_context();
+                if current.is_none_or(|current| current.layout != expected_layout) {
+                    self.diagnostic("paste_guard", format!("sequence={input_sequence} reason=layout-changed expected={expected_layout:x} actual={:x}", current.map_or(0, |context| context.layout)));
+                    return Some(ReplayAttempt::Failed);
+                }
+                None
+            },
+            |until| self.commit_read(foreground.process_id, expected_text, until),
+        )
     }
 
     fn wait_for_capability_text_barrier(
@@ -7950,10 +10662,7 @@ impl InputProcessor {
             {
                 return TextBarrierStatus::Mismatch;
             }
-            match self
-                .privacy_guard
-                .preceding_text_status(foreground.process_id, expected_text)
-            {
+            match self.barrier_text_status(foreground.process_id, expected_text, deadline) {
                 TextBarrierStatus::Match => return TextBarrierStatus::Match,
                 TextBarrierStatus::Mismatch => saw_mismatch = true,
                 TextBarrierStatus::Unavailable => {}
@@ -7999,7 +10708,7 @@ impl InputProcessor {
             .forwarded_input_sequence
             .fetch_max(pause_sequence, Ordering::AcqRel);
         self.execute_undo_inner(pause_sequence);
-        self.request_gate_release(pause_sequence);
+        self.end_conversion_gate(pause_sequence);
     }
 
     fn execute_undo_inner(&mut self, pause_sequence: u64) {
@@ -8016,7 +10725,7 @@ impl InputProcessor {
         {
             return;
         }
-        if !foreground_identity_matches(record.foreground)
+        if !self.foreground_matches(record.foreground)
             || current_foreground_context()
                 .and_then(|current| self.language_for_layout(current.layout))
                 != Some(record.transaction.target_language)
@@ -8048,7 +10757,7 @@ impl InputProcessor {
                     PastePatience::Manual,
                 );
                 if self
-                    .apply_paste_attempt_result(attempt, pause_sequence)
+                    .apply_paste_attempt_result(attempt, pause_sequence, PasteRoute::Backend)
                     .is_none()
                 {
                     return;
@@ -8074,41 +10783,19 @@ impl InputProcessor {
                         return;
                     }
                 }
-                match self.wait_for_replay_commit(
+                let commit = self.wait_for_replay_commit(
                     record.foreground,
                     pause_sequence,
                     record.source_layout,
-                ) {
-                    ReplayAttempt::Applied => {}
-                    ReplayAttempt::Cancelled => {
-                        self.layout_switch_in_flight = Some((
-                            record.source_layout,
-                            Instant::now() + Duration::from_secs(1),
-                        ));
-                        self.session.clear();
-                        return;
-                    }
-                    ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
-                        self.record_conversion_failure(ConversionFailureReason::ReplayCommit);
-                        return;
-                    }
+                );
+                if !self.finish_replay_commit(commit, pause_sequence, record.source_layout, "undo")
+                {
+                    return;
                 }
             }
         }
 
-        self.commit_confirmed_layout(record.source_layout);
-        self.session.clear();
-        self.transpose_cycle = None;
-        self.last_boundary = record.transaction.delimiter.map(|delimiter| LastBoundary {
-            replay_keys: record.replay_keys.clone(),
-            delimiter: Some(delimiter),
-            foreground: ForegroundContext {
-                layout: record.source_layout,
-                ..record.foreground
-            },
-            epoch: self.last_input_epoch,
-            profile_generation: record.profile_generation,
-        });
+        self.finish_applied_undo(&record);
         self.request_sound(SoundCue::Undone);
         self.diagnostic(
             "undo",
@@ -8129,6 +10816,31 @@ impl InputProcessor {
                 record.transaction.original,
             );
         }
+    }
+
+    /// The bookkeeping of an undo whose edit was applied: the word is back as typed, in the
+    /// layout it was typed in, and may be converted again with Pause.
+    fn finish_applied_undo(&mut self, record: &UndoRecord) {
+        // The applied conversion made the word count as the target language for the following
+        // words (finish_applied_conversion); undone, it counts as typed again.
+        if let Some(last) = self.recent_languages.last_mut()
+            && *last == record.transaction.target_language
+        {
+            *last = record.transaction.source_language;
+        }
+        self.commit_confirmed_layout(record.source_layout);
+        self.session.clear();
+        self.transpose_cycle = None;
+        self.last_boundary = record.transaction.delimiter.map(|delimiter| LastBoundary {
+            replay_keys: record.replay_keys.clone(),
+            delimiter: Some(delimiter),
+            foreground: ForegroundContext {
+                layout: record.source_layout,
+                ..record.foreground
+            },
+            epoch: self.last_input_epoch,
+            profile_generation: record.profile_generation,
+        });
     }
 
     fn set_lexicon_offer(&self, target: LexiconOfferTarget, language: Language, word: String) {
@@ -8162,6 +10874,12 @@ impl InputProcessor {
         patience: PastePatience,
     ) -> TextEditAttempt {
         let started = Instant::now();
+        // From the selection on, the field may show the word selected or replaced: the UI thread
+        // does not hand held keys back past a worker stuck in here.
+        let _edit = BusyGuard::new(&self.metrics.edit_in_flight);
+        let budget = PasteBudget {
+            deadline: self.edit_deadline.get(),
+        };
         if !self.edit_guard_is_current(foreground, input_sequence) {
             self.diagnostic(
                 "paste",
@@ -8169,79 +10887,123 @@ impl InputProcessor {
             );
             return TextEditAttempt::Cancelled;
         }
-        let selection = self.privacy_guard.select_preceding_text(
-            foreground.process_id,
-            expected_source,
-            patience,
-        );
+        if !budget.allows_selection(Instant::now(), patience) {
+            self.note_paste_budget(input_sequence, "selection", budget);
+            return TextEditAttempt::Cancelled;
+        }
+        let (selection, cleanup) =
+            self.paste_select(foreground.process_id, expected_source, patience, budget);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=selection result={selection:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
+        if cleanup == Some(SelectionCleanup::Unverified) {
+            return TextEditAttempt::SelectionLeft;
+        }
         match selection {
             TextBarrierStatus::Match => {}
             TextBarrierStatus::Mismatch => return TextEditAttempt::Cancelled,
             TextBarrierStatus::Unavailable => return TextEditAttempt::Unsupported,
         }
-        if !self.edit_guard_is_current(foreground, input_sequence) {
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Cancelled;
-        }
-
-        let Some(mut clipboard) =
-            ProtectedClipboard::begin(replacement, patience.clipboard_install_timeout())
-        else {
-            self.diagnostic(
-                "paste",
-                format!(
-                    "sequence={input_sequence} phase=clipboard_prepare result=failed elapsed_ms={}",
-                    started.elapsed().as_millis()
-                ),
-            );
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            // Nothing was typed and the user's clipboard was not replaced: a busy clipboard is a
-            // word left alone, not a failed edit, so automatic conversion stays on.
-            return TextEditAttempt::Cancelled;
+        let Some(install_timeout) = budget.install_timeout(Instant::now(), patience) else {
+            self.note_paste_budget(input_sequence, "install", budget);
+            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         };
+        let mut clipboard =
+            match self.paste_clipboard(replacement, install_timeout, foreground.process_id) {
+                Ok(clipboard) => clipboard,
+                Err(failure) => {
+                    self.diagnostic(
+                    "paste",
+                    format!(
+                        "sequence={input_sequence} phase=clipboard_prepare result={} elapsed_ms={}",
+                        self.clipboard_failure_text(failure),
+                        started.elapsed().as_millis()
+                    ),
+                );
+                    // Nothing was typed and the user's clipboard was not replaced: a busy
+                    // clipboard is a word left alone, not a failed edit, so automatic conversion
+                    // stays on.
+                    return self.abandon_selection(
+                        foreground,
+                        input_sequence,
+                        TextEditAttempt::Cancelled,
+                    );
+                }
+            };
         let clipboard_current = clipboard.is_current();
         self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_prepare result=ready current={clipboard_current} elapsed_ms={}", started.elapsed().as_millis()));
-        if !clipboard_current || !self.edit_guard_is_current(foreground, input_sequence) {
+        let submit_fits = budget.allows_submit(Instant::now());
+        if !clipboard_current
+            || !submit_fits
+            || !self.edit_guard_is_current(foreground, input_sequence)
+        {
+            // Nothing was sent yet, so putting the user's clipboard back cannot reach the field.
             let restored = clipboard.restore();
-            self.diagnostic("paste", format!("sequence={input_sequence} phase=before_submit result=cancelled restored={restored}"));
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Cancelled;
+            self.diagnostic("paste", format!("sequence={input_sequence} phase=before_submit result=cancelled restored={restored} budget_ok={submit_fits}"));
+            if !restored && !clipboard.restore_pending() {
+                self.count_clipboard_not_restored();
+            }
+            return self.abandon_selection(foreground, input_sequence, TextEditAttempt::Cancelled);
         }
 
+        clipboard.mark_submitted();
         let paste_inputs = build_paste_inputs();
-        let submitted = send_input_count(&paste_inputs);
+        let submitted = self.paste_submit(&paste_inputs);
         self.diagnostic("paste", format!("sequence={input_sequence} phase=submit submitted={submitted} requested={} elapsed_ms={}", paste_inputs.len(), started.elapsed().as_millis()));
         if submitted != paste_inputs.len() {
             let control_up = [keyboard_input(VK_LCONTROL, 0, KEYEVENTF_KEYUP)];
-            let _ = send_input_batch(&control_up);
-            let _ = clipboard.restore();
-            self.privacy_guard
-                .collapse_selection_to_end(foreground.process_id);
-            return TextEditAttempt::Failed;
+            let _ = self.paste_submit(&control_up);
+            // Part of the chord reached the field and may still paste: the replacement stays until
+            // the field reads it.
+            clipboard.defer();
+            self.diagnostic(
+                "paste",
+                format!("sequence={input_sequence} phase=clipboard_restore result=deferred reason=partial-submit"),
+            );
+            return self.abandon_selection(
+                foreground,
+                input_sequence,
+                TextEditAttempt::Failed(ConversionFailureReason::ClipboardEdit),
+            );
         }
 
-        let paste_commit =
-            self.wait_for_text_commit(foreground, input_sequence, source_layout, replacement);
+        // A whole poll fits (allows_submit); a late answer gets what the steps after it leave.
+        let poll_end = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        let late_until =
+            budget.commit_late_until(poll_end, Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS));
+        let paste_commit = self.paste_commit(
+            foreground,
+            input_sequence,
+            source_layout,
+            replacement,
+            (poll_end, late_until),
+        );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
-        let owned_before_restore = clipboard.is_current();
-        let clipboard_restored = clipboard.restore();
-        self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
-        if !matches!(paste_commit, ReplayAttempt::Applied) {
-            // The paste may not have replaced the selected word: do not leave our selection behind,
-            // unless the user has already moved on.
-            if self.edit_guard_is_current(foreground, input_sequence) {
-                self.privacy_guard
-                    .collapse_selection_to_end(foreground.process_id);
-            }
-            return TextEditAttempt::Failed;
+        if clipboard_after_paste(paste_commit) == ClipboardAfterPaste::Defer {
+            clipboard.defer();
+            self.diagnostic(
+                "paste",
+                format!("sequence={input_sequence} phase=clipboard_restore result=deferred reason=paste-unconfirmed"),
+            );
+            // The paste may not have replaced the selected word: do not leave our selection
+            // behind, unless the user has already moved on.
+            return self.abandon_selection(
+                foreground,
+                input_sequence,
+                TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
+            );
         }
-        let switched = self.switch_layout_and_wait(foreground, target_layout, input_sequence);
+        let owned_before_restore = clipboard.is_current();
+        let clipboard_restored = clipboard.restore_waiting(budget.wait_within(
+            Instant::now(),
+            Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS),
+            Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS),
+        ));
+        self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
+        if !clipboard_restored && !clipboard.restore_pending() {
+            self.count_clipboard_not_restored();
+        }
+        let switched = self.paste_switch_layout(foreground, target_layout, input_sequence);
         self.diagnostic(
             "paste",
             format!(
@@ -8253,13 +11015,24 @@ impl InputProcessor {
             ReplayAttempt::Applied => {}
             ReplayAttempt::Cancelled
             | ReplayAttempt::Failed
-            | ReplayAttempt::LayoutSwitchFailed => return TextEditAttempt::Failed,
+            | ReplayAttempt::LayoutSwitchFailed => {
+                return TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch);
+            }
         }
-        let target_commit = self.wait_for_text_commit(
+        let now = Instant::now();
+        let margin = Duration::from_millis(PASTE_UIA_MARGIN_MS);
+        let poll_end = now
+            + budget.wait_within(
+                now,
+                Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+                margin,
+            );
+        let target_commit = self.paste_commit(
             foreground,
             input_sequence,
             target_layout.0 as usize,
             replacement,
+            (poll_end, budget.commit_late_until(poll_end, margin)),
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=target_commit result={target_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
@@ -8269,47 +11042,146 @@ impl InputProcessor {
         )
     }
 
-    /// Decides what a finished paste attempt means for the conversion. `Some` carries the strategy
-    /// to record when the text edit was made. A confirmed edit whose clipboard could not be
-    /// restored still counts as success (policy D2): it is logged and counted, and automatic
-    /// conversion stays on.
+    /// A failed installation as the log shows it: the broker's reason, its attempts and the
+    /// program that held the clipboard open then. An excluded program is not named.
+    fn clipboard_failure_text(&self, failure: ClipboardBeginFailure) -> String {
+        let refusal = match failure {
+            ClipboardBeginFailure::Busy => return "Busy".to_owned(),
+            ClipboardBeginFailure::NotInstalled(None) => {
+                return "NotInstalled reason=timeout".to_owned();
+            }
+            ClipboardBeginFailure::NotInstalled(Some(refusal)) => refusal,
+        };
+        let holder = match refusal.holder {
+            0 => "none".to_owned(),
+            process => match self.process_facts(process).0 {
+                Some(path) if self.exclusion_policy.is_excluded(&path) => "excluded".to_owned(),
+                Some(path) => path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                None => "unavailable".to_owned(),
+            },
+        };
+        format!(
+            "NotInstalled reason={:?} attempts={} holder={holder}",
+            refusal.reason, refusal.attempts
+        )
+    }
+
+    /// A paste step the gate's remaining time does not cover: the paste stops before it.
+    fn note_paste_budget(&self, input_sequence: u64, step: &'static str, budget: PasteBudget) {
+        self.diagnostic(
+            "paste",
+            format!(
+                "sequence={input_sequence} phase=budget result=cancelled step={step} remaining_ms={}",
+                budget
+                    .remaining(Instant::now())
+                    .map_or(0, |remaining| remaining.as_millis())
+            ),
+        );
+    }
+
+    /// Ends a paste that does not go ahead after the word was selected. While the input target
+    /// and its input are still the edit's, the selection is collapsed: the attempt ends as
+    /// `outcome` when the field shows it gone, and as `SelectionLeft` when it cannot be shown
+    /// gone. Once the user acted (new input, a click, another field), what is selected may be
+    /// theirs and is left alone; it may still be the agent's selection, so the attempt ends as
+    /// `SelectionLeft` too, which keeps the held keys from being typed over it.
+    fn abandon_selection(
+        &self,
+        foreground: ForegroundContext,
+        input_sequence: u64,
+        outcome: TextEditAttempt,
+    ) -> TextEditAttempt {
+        if !self.edit_guard_is_current(foreground, input_sequence) {
+            self.diagnostic(
+                "paste",
+                format!("sequence={input_sequence} phase=cleanup result=skipped reason=input-or-focus-changed"),
+            );
+            return TextEditAttempt::SelectionLeft;
+        }
+        let cleanup = self.paste_collapse(foreground.process_id);
+        self.diagnostic(
+            "paste",
+            format!("sequence={input_sequence} phase=cleanup result={cleanup:?}"),
+        );
+        match cleanup {
+            SelectionCleanup::Collapsed => outcome,
+            SelectionCleanup::Unverified => TextEditAttempt::SelectionLeft,
+        }
+    }
+
+    /// Decides what a finished paste attempt means for the conversion, on both routes. `Some`
+    /// carries the strategy to record when the text edit was made. A confirmed edit whose clipboard
+    /// could not be restored still counts as success (policy D2): it is logged and counted, and
+    /// automatic conversion stays on. Nothing typed (`Cancelled`, `Unsupported`) is no failure;
+    /// every failure after input reached the field is recorded with its own reason. The capability
+    /// route also records the backend state it found.
     fn apply_paste_attempt_result(
         &mut self,
         attempt: TextEditAttempt,
         sequence: u64,
+        route: PasteRoute,
     ) -> Option<EditStrategy> {
+        if route == PasteRoute::CapabilityProbe {
+            let status = match attempt {
+                TextEditAttempt::Applied | TextEditAttempt::AppliedClipboardNotRestored => {
+                    Some(BACKEND_PROTECTED_PASTE)
+                }
+                TextEditAttempt::Cancelled => Some(BACKEND_SELECTION_MISMATCH),
+                TextEditAttempt::Unsupported => Some(BACKEND_SELECTION_UNSUPPORTED),
+                TextEditAttempt::Failed(_) | TextEditAttempt::SelectionLeft => None,
+            };
+            if let Some(status) = status {
+                self.metrics.backend_status.store(status, Ordering::Release);
+            }
+        }
         match attempt {
             TextEditAttempt::Applied => Some(EditStrategy::ProtectedPaste),
             TextEditAttempt::AppliedClipboardNotRestored => {
-                self.note_clipboard_not_restored(sequence);
+                // Counted by the paste, where the clipboard did not come back.
+                self.diagnostic(
+                    "paste",
+                    format!("sequence={sequence} clipboard_restored=false edit=confirmed"),
+                );
                 Some(EditStrategy::ProtectedPaste)
             }
-            TextEditAttempt::Cancelled => {
-                // The field did not confirm the word before the caret, so nothing was typed;
-                // the paste lines of the same sequence say at which step.
+            TextEditAttempt::Cancelled | TextEditAttempt::Unsupported => {
+                // Nothing was typed; the paste lines of the same sequence say at which step.
                 self.diagnostic(
                     "conversion",
                     format!(
-                        "sequence={sequence} result=cancelled strategy=ProtectedPaste edit=none"
+                        "sequence={sequence} result=cancelled strategy=ProtectedPaste edit=none unsupported={}",
+                        attempt == TextEditAttempt::Unsupported
                     ),
                 );
                 None
             }
-            TextEditAttempt::Unsupported | TextEditAttempt::Failed => {
-                self.record_conversion_failure(ConversionFailureReason::ClipboardEdit);
+            TextEditAttempt::Failed(reason) => {
+                self.record_conversion_failure(reason);
+                None
+            }
+            TextEditAttempt::SelectionLeft => {
+                // The field may still show the word selected: the keys the gate holds would type
+                // over it, so they are kept for recovery instead of being replayed, and come back
+                // only when the user asks for them.
+                self.held_keys_kept_for = Some(sequence);
+                self.metrics
+                    .selection_left_token
+                    .store(sequence, Ordering::Release);
+                self.record_conversion_failure(ConversionFailureReason::SelectionLeft);
                 None
             }
         }
     }
 
-    fn note_clipboard_not_restored(&self, sequence: u64) {
+    /// Counts a user's clipboard that did not come back after a paste; the tray then says so.
+    fn count_clipboard_not_restored(&self) {
         self.metrics
             .clipboard_restore_failures
             .fetch_add(1, Ordering::Relaxed);
-        self.diagnostic(
-            "paste",
-            format!("sequence={sequence} clipboard_restored=false edit=confirmed"),
-        );
     }
 
     fn perform_physical_edit(
@@ -8321,6 +11193,8 @@ impl InputProcessor {
         replay_keys: &[ReplayKey],
         delimiter: Option<char>,
     ) -> ReplayAttempt {
+        // Erasing and retyping may stop halfway: see perform_protected_paste.
+        let _edit = BusyGuard::new(&self.metrics.edit_in_flight);
         if !self.edit_guard_is_current(foreground, input_sequence) {
             return ReplayAttempt::Cancelled;
         }
@@ -8432,38 +11306,53 @@ impl InputProcessor {
                 Some(&mut message_result),
             )
         };
-        sent.0 != 0 && message_result == 1
-    }
-
-    fn handoff_correction_gate(&self, old_token: u64, new_token: u64, required_ms: u64) -> bool {
-        self.prepare_gate_handoff_budget(old_token, required_ms)
-            && self.send_gate_drain_ack(old_token, new_token)
-    }
-
-    fn prepare_gate_handoff_budget(&self, old_token: u64, required_ms: u64) -> bool {
-        if old_token == 0 || required_ms == 0 || self.gate_window == 0 {
-            return false;
+        let armed = sent.0 != 0 && message_result == 1;
+        if armed {
+            self.edit_deadline.set(Some(
+                Instant::now() + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS),
+            ));
         }
-        let Ok(required_ms) = isize::try_from(required_ms) else {
-            return false;
-        };
+        armed
+    }
+
+    /// Hands the gate of `old_token` over to the conversion of `new_token`, which needs
+    /// `required_ms`. Returns the gate's deadline, which the conversion's edit may use.
+    fn handoff_correction_gate(
+        &self,
+        old_token: u64,
+        new_token: u64,
+        required_ms: u64,
+    ) -> Option<Instant> {
+        let deadline = self.prepare_gate_handoff_budget(old_token, required_ms)?;
+        (self.send_gate_drain_ack(old_token, new_token) == GateAckOutcome::Accepted)
+            .then_some(deadline)
+    }
+
+    /// Asks the UI thread to prepare a handoff; it answers what the gate has left (0: no). The
+    /// deadline is counted from before the question, so it is never later than the gate's.
+    fn prepare_gate_handoff_budget(&self, old_token: u64, required_ms: u64) -> Option<Instant> {
+        if old_token == 0 || required_ms == 0 || self.gate_window == 0 {
+            return None;
+        }
+        let required = isize::try_from(required_ms).ok()?;
+        let asked_at = Instant::now();
         let mut message_result = 0usize;
         let sent = unsafe {
             SendMessageTimeoutW(
                 HWND(self.gate_window as *mut c_void),
                 GATE_HANDOFF_BUDGET_MESSAGE,
                 WPARAM(old_token as usize),
-                LPARAM(required_ms),
+                LPARAM(required),
                 SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
                 100,
                 Some(&mut message_result),
             )
         };
-        sent.0 != 0 && message_result == 1
+        handed_over_gate_deadline(sent.0 != 0, asked_at, message_result, required_ms)
     }
 
     fn acknowledge_correction_gate_drain(&self, token: u64) {
-        if !self.send_gate_drain_ack(token, 0) && self.gate_window != 0 {
+        if fail_open_after_ack(self.send_gate_drain_ack(token, 0)) && self.gate_window != 0 {
             unsafe {
                 let _ = PostMessageW(
                     Some(HWND(self.gate_window as *mut c_void)),
@@ -8475,12 +11364,12 @@ impl InputProcessor {
         }
     }
 
-    fn send_gate_drain_ack(&self, old_token: u64, new_token: u64) -> bool {
+    fn send_gate_drain_ack(&self, old_token: u64, new_token: u64) -> GateAckOutcome {
         if old_token == 0 || self.gate_window == 0 {
-            return false;
+            return GateAckOutcome::Refused;
         }
         let Ok(new_token) = isize::try_from(new_token) else {
-            return false;
+            return GateAckOutcome::Refused;
         };
         let mut message_result = 0usize;
         let sent = unsafe {
@@ -8494,7 +11383,8 @@ impl InputProcessor {
                 Some(&mut message_result),
             )
         };
-        sent.0 != 0 && message_result == 1
+        let timed_out = sent.0 == 0 && unsafe { GetLastError() } == ERROR_TIMEOUT;
+        gate_ack_outcome(sent.0 != 0, message_result, timed_out)
     }
 
     fn request_gate_release(&mut self, token: u64) {
@@ -8531,8 +11421,30 @@ impl InputProcessor {
         }
     }
 
+    /// Asks the UI thread to end the gate `token` keeping its held keys for recovery. It counts
+    /// as the gate's release, so `process` does not release it as well.
+    fn request_gate_retention(&mut self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        // Recorded before the window check so that tests, which run without a window, see it.
+        self.last_gate_release_token = token;
+        self.last_gate_retention_token = token;
+        if self.gate_window == 0 {
+            return;
+        }
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.gate_window as *mut c_void)),
+                GATE_FAIL_OPEN_MESSAGE,
+                WPARAM(token as usize),
+                LPARAM(GATE_FAIL_OPEN_SELECTION_LEFT),
+            );
+        }
+    }
+
     fn edit_guard_is_current(&self, foreground: ForegroundContext, input_sequence: u64) -> bool {
-        self.input_guard_is_current(input_sequence) && foreground_identity_matches(foreground)
+        self.input_guard_is_current(input_sequence) && self.foreground_matches(foreground)
     }
 
     fn pre_forward_guard_is_current(
@@ -8541,7 +11453,7 @@ impl InputProcessor {
         input_sequence: u64,
     ) -> bool {
         self.pre_forward_input_guard_is_current(input_sequence)
-            && foreground_identity_matches(foreground)
+            && self.foreground_matches(foreground)
     }
 
     fn pre_forward_input_guard_is_current(&self, input_sequence: u64) -> bool {
@@ -8615,6 +11527,9 @@ impl InputProcessor {
 
     fn record_conversion_failure(&mut self, reason: ConversionFailureReason) {
         self.diagnostic("conversion", format!("result=failed reason={reason:?}"));
+        // Remembered even when automatic conversion is already off: an edit that failed because a
+        // gate was aborted must keep that abort from resuming automatic conversion.
+        self.failed_edit_gate_token = self.metrics.cancelled_gate_token.load(Ordering::Acquire);
         self.invalidate_conversion_state();
         // What the failed edit left in the document is uncertain, so the recent
         // words no longer describe it.
@@ -8637,6 +11552,128 @@ impl InputProcessor {
             .conversion_failures
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// What a synchronous gate acknowledgement achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAckOutcome {
+    Accepted,
+    Refused,
+    /// Not answered in time. The message can still be handled later, so this is no refusal.
+    Unanswered,
+}
+
+/// Classifies a SendMessageTimeoutW acknowledgement: `returned` is its non-zero return,
+/// `timed_out` a zero return with ERROR_TIMEOUT.
+const fn gate_ack_outcome(
+    returned: bool,
+    message_result: usize,
+    timed_out: bool,
+) -> GateAckOutcome {
+    if returned {
+        if message_result == 1 {
+            GateAckOutcome::Accepted
+        } else {
+            GateAckOutcome::Refused
+        }
+    } else if timed_out {
+        GateAckOutcome::Unanswered
+    } else {
+        GateAckOutcome::Refused
+    }
+}
+
+/// Only a refused acknowledgement fails the gate open. An unanswered one may still be handled,
+/// and a fail-open queued behind it would break a gate that is healthy by then; the gate's
+/// deadline ends it if it is never handled.
+const fn fail_open_after_ack(outcome: GateAckOutcome) -> bool {
+    matches!(outcome, GateAckOutcome::Refused)
+}
+
+/// Diagnostics that describe typing in the current input target. None of them is written while
+/// privacy blocks that target (a password field, or an excluded, elevated or uninspectable
+/// program or field).
+fn describes_typing(event: &str) -> bool {
+    matches!(
+        event,
+        "input"
+            | "input_queue"
+            | "word"
+            | "word_discard"
+            | "candidate"
+            | "hotkey"
+            | "privacy_probe"
+    )
+}
+
+/// What a privacy probe's result means for the field: the provider's answer, or for every
+/// transport failure that the field cannot be inspected, with the failure as the source.
+const fn probe_verdict(
+    result: core::result::Result<Option<PrivacyBlockReason>, ProbeFailure>,
+) -> (Option<PrivacyBlockReason>, &'static str) {
+    match result {
+        Ok(reason) => (reason, "provider"),
+        Err(failure) => (
+            Some(PrivacyBlockReason::InspectionUnavailable),
+            match failure {
+                ProbeFailure::Timeout => "wait-timeout",
+                ProbeFailure::Busy => "queue-busy",
+                ProbeFailure::Disconnected => "provider-disconnected",
+                ProbeFailure::Expired => "reply-expired",
+            },
+        ),
+    }
+}
+
+/// What a word-discard line adds to its reason: flags and fixed labels only, so no text can
+/// reach the log through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordDiscardDetail {
+    None,
+    /// Which parts of the input target changed (handles are opaque identities).
+    Focus {
+        window_changed: bool,
+        focus_changed: bool,
+        process_changed: bool,
+        focus_was_null: bool,
+        focus_is_null: bool,
+    },
+    /// An input epoch change, and whether the input queue had overflowed.
+    Epoch {
+        overflow: bool,
+    },
+    /// The category of the input event that ended the word.
+    Rule(&'static str),
+}
+
+impl WordDiscardDetail {
+    fn describe(self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Focus {
+                window_changed,
+                focus_changed,
+                process_changed,
+                focus_was_null,
+                focus_is_null,
+            } => format!(
+                "window_changed={window_changed} focus_changed={focus_changed} process_changed={process_changed} focus_was_null={focus_was_null} focus_is_null={focus_is_null}"
+            ),
+            Self::Epoch { overflow } => format!("overflow={overflow}"),
+            Self::Rule(rule) => format!("rule={rule}"),
+        }
+    }
+}
+
+/// Keys that type nothing but can move the focus within one window: Esc, the function keys, the
+/// menu key, Page Up and Page Down. Tab, Enter, the arrows, Home, End and shortcuts with Ctrl, Alt
+/// or Win are handled on their own paths.
+fn may_move_focus_within_window(virtual_key: u16) -> bool {
+    virtual_key == VK_ESCAPE.0
+        || virtual_key == VK_APPS.0
+        || virtual_key == VK_PRIOR.0
+        || virtual_key == VK_NEXT.0
+        || (VK_F1.0..=VK_F24.0).contains(&virtual_key)
 }
 
 fn foreground_identity_matches(expected: ForegroundContext) -> bool {
@@ -8679,9 +11716,47 @@ fn physical_modifiers_released() -> bool {
 }
 
 fn shortcut_modifiers_released() -> bool {
+    shortcut_modifiers_released_by(|key| unsafe {
+        GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0
+    })
+}
+
+/// No Ctrl, Alt or Windows key is down, as `held` reports each one. With one of them a Space is a
+/// shortcut (Win+Space switches the layout), not the end of a word.
+fn shortcut_modifiers_released_by(held: impl Fn(VIRTUAL_KEY) -> bool) -> bool {
     [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
         .into_iter()
-        .all(|key| unsafe { GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 == 0 })
+        .all(|key| !held(key))
+}
+
+/// The modifier keys of `RawKeyEvent::held_modifiers`, one bit each from bit 0: left and right
+/// Shift, Ctrl, Alt and Windows, every pair in the layout of the `Modifiers` masks.
+const PHYSICAL_MODIFIER_KEYS: [VIRTUAL_KEY; 8] = [
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+];
+
+/// The modifier keys physically held once this key edge is applied. In a low-level hook the
+/// asynchronous key state does not show the edge itself yet.
+fn held_modifiers_for_event(virtual_key: u16, key_down: bool, key_up: bool) -> u8 {
+    let mut held = 0;
+    for (bit, key) in PHYSICAL_MODIFIER_KEYS.into_iter().enumerate() {
+        let pressed = if key.0 == virtual_key {
+            key_down && !key_up
+        } else {
+            unsafe { GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000 != 0 }
+        };
+        if pressed {
+            held |= 1 << bit;
+        }
+    }
+    held
 }
 
 fn pressed_hotkey_modifiers_for_event(virtual_key: u16, key_down: bool, key_up: bool) -> u8 {
@@ -8865,6 +11940,20 @@ const fn should_arm_space_decision_gate(
         && shortcut_modifiers_released
 }
 
+/// The deadline of a gate handed over to a conversion: `answer` is what the gate had left when
+/// the UI thread was asked at `asked_at` (0: it cannot be handed over). An answer short of
+/// `required_ms` refuses it as well.
+fn handed_over_gate_deadline(
+    sent: bool,
+    asked_at: Instant,
+    answer: usize,
+    required_ms: u64,
+) -> Option<Instant> {
+    let remaining_ms = u64::try_from(answer).ok()?;
+    (sent && remaining_ms != 0 && remaining_ms >= required_ms)
+        .then(|| asked_at + Duration::from_millis(remaining_ms))
+}
+
 fn post_layout_switch(expected: ForegroundContext, target_layout: HKL) -> bool {
     let Some(current) = current_foreground_context() else {
         return false;
@@ -8963,20 +12052,6 @@ fn map_replay_key_to_layout(key: ReplayKey, layout: HKL) -> Option<char> {
         return None;
     }
     char::decode_utf16(output[..1].iter().copied()).next()?.ok()
-}
-
-fn mapped_layout_candidates(
-    replay_keys: &[ReplayKey],
-    current_language: Language,
-    settings: &Settings,
-    detector: &Detector,
-    profiles: Option<&ResolvedKeyboardProfiles>,
-) -> Vec<(Language, String)> {
-    mapped_layout_candidates_with(current_language, settings, detector, |target_language| {
-        let handle = profiles?.unique_layout(detector.input_profile(target_language)?)?;
-        let layout = HKL(handle as *mut c_void);
-        map_replay_keys_to_layout(replay_keys, layout)
-    })
 }
 
 fn mapped_layout_candidates_with(
@@ -9142,15 +12217,15 @@ where
 }
 
 fn paced_replay_fits_gate(step_count: usize) -> bool {
-    conversion_gate_budget_ms(step_count, true, false, false, true)
+    conversion_gate_budget_ms(step_count, true, true)
         .is_some_and(|total| total <= CORRECTION_GATE_MAX_HOLD_MS)
 }
 
+/// The time a physical replay of `step_count` steps holds the correction gate: paced between text
+/// barriers (Notepad) or sent at once.
 fn conversion_gate_budget_ms(
     step_count: usize,
-    requires_text_barrier: bool,
-    capability_probe: bool,
-    selection_confirmation: bool,
+    paced: bool,
     include_forward_wait: bool,
 ) -> Option<u64> {
     let mut total = if include_forward_wait {
@@ -9158,7 +12233,7 @@ fn conversion_gate_budget_ms(
     } else {
         0
     };
-    if requires_text_barrier {
+    if paced {
         let pacing_ms = u64::try_from(step_count.saturating_sub(1))
             .ok()?
             .checked_mul(NOTEPAD_REPLAY_STEP_DELAY_MS)?;
@@ -9167,17 +12242,6 @@ fn conversion_gate_budget_ms(
             .checked_add(LAYOUT_SWITCH_TIMEOUT_MS)?
             .checked_add(pacing_ms)?
             .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?;
-        if selection_confirmation {
-            total = total.checked_add(UIA_SELECTION_CONFIRM_TIMEOUT_MS)?;
-        }
-    } else if capability_probe {
-        total = total
-            .checked_add(INPUT_SETTLE_AFTER_FORWARD_MS)?
-            .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?
-            .checked_add(UIA_SELECTION_CONFIRM_TIMEOUT_MS)?
-            .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?
-            .checked_add(LAYOUT_SWITCH_TIMEOUT_MS)?
-            .checked_add(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)?;
     } else {
         total = total
             .checked_add(INPUT_SETTLE_AFTER_FORWARD_MS)?
@@ -9185,6 +12249,151 @@ fn conversion_gate_budget_ms(
             .checked_add(REPLAY_COMMIT_MS)?;
     }
     total.checked_add(NOTEPAD_REPLAY_GATE_MARGIN_MS)
+}
+
+/// The time an automatic protected paste needs from the gate: its settle (and a capability
+/// probe's text barrier), one confirmed selection, the least installation of the replacement and
+/// everything after the Ctrl+V. The paste shortens its own waits to what the gate has left and
+/// never sends the Ctrl+V without `PASTE_AFTER_SUBMIT_MS` in hand (`PasteBudget`).
+const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
+    let settle = if capability_probe {
+        INPUT_SETTLE_AFTER_FORWARD_MS + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    } else {
+        NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+    };
+    settle + UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS
+}
+
+/// The steps of a protected paste that reach UI Automation, the clipboard, SendInput and the
+/// keyboard layout, as tests script them.
+#[cfg(test)]
+trait PasteSeam {
+    fn settle(&mut self) -> TextBarrierStatus;
+    fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>);
+    fn begin<'a>(
+        &mut self,
+        text: &str,
+        install_timeout: Duration,
+        brokers: &'a ClipboardBrokers,
+        target_process: u32,
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure>;
+    fn submit(&mut self, requested: usize) -> usize;
+    fn commit(&mut self) -> ReplayAttempt;
+    fn switch_layout(&mut self) -> ReplayAttempt;
+    fn collapse(&mut self) -> SelectionCleanup;
+}
+
+/// The time a protected paste may take: until the gate holding the keys typed after the word lets
+/// them go. Without such a gate (nothing is held) it is unbounded.
+#[derive(Debug, Clone, Copy)]
+struct PasteBudget {
+    deadline: Option<Instant>,
+}
+
+impl PasteBudget {
+    fn remaining(self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    /// Whether a selection attempt may start: its confirmation, the least installation and
+    /// everything after the Ctrl+V still fit. Pause's second attempt is asked again.
+    fn allows_selection(self, now: Instant, patience: PastePatience) -> bool {
+        let needed = patience.confirm_timeout()
+            + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS);
+        self.remaining(now)
+            .is_none_or(|remaining| remaining >= needed)
+    }
+
+    /// How long the installation of the replacement may take: the patience's limit, shortened so
+    /// that everything after the Ctrl+V still fits; none when less than `PASTE_MIN_INSTALL_MS`
+    /// would be left for it.
+    fn install_timeout(self, now: Instant, patience: PastePatience) -> Option<Duration> {
+        let limit = patience.clipboard_install_timeout();
+        let Some(remaining) = self.remaining(now) else {
+            return Some(limit);
+        };
+        let left = remaining.checked_sub(Duration::from_millis(PASTE_AFTER_SUBMIT_MS))?;
+        (left >= Duration::from_millis(PASTE_MIN_INSTALL_MS)).then_some(left.min(limit))
+    }
+
+    /// Whether the Ctrl+V may be sent: everything after it fits before the gate lets the keys go.
+    fn allows_submit(self, now: Instant) -> bool {
+        self.remaining(now)
+            .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
+    }
+
+    /// How long a step may wait: `limit`, shortened so that `reserve`, what the steps after it
+    /// need, still fits before the gate lets the keys go.
+    fn wait_within(self, now: Instant, limit: Duration, reserve: Duration) -> Duration {
+        self.remaining(now).map_or(limit, |remaining| {
+            remaining.saturating_sub(reserve).min(limit)
+        })
+    }
+
+    /// Until when a commit check whose poll ends at `poll_end` waits for the field's late answer:
+    /// `PASTE_COMMIT_LATE_ANSWER_MS` past the poll, and never into `reserve`, what the steps after
+    /// the check need before the gate lets the keys go.
+    fn commit_late_until(self, poll_end: Instant, reserve: Duration) -> Instant {
+        let late = poll_end + Duration::from_millis(PASTE_COMMIT_LATE_ANSWER_MS);
+        self.deadline
+            .and_then(|deadline| deadline.checked_sub(reserve))
+            .map_or(late, |limit| late.min(limit))
+    }
+}
+
+/// What becomes of the user's clipboard once the Ctrl+V was sent: put back at once after the
+/// field showed the replacement, otherwise only after the paste's target read the replacement. A
+/// paste a busy field handles late then gets the replacement, never the user's own clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardAfterPaste {
+    Restore,
+    Defer,
+}
+
+/// A paste's commit check. Until `deadline`, `stop` ends it when the input, the focus or the
+/// layout moved on, and `read` asks the field, by the time it is given, whether it shows the
+/// replacement: its status and whether the field answered at all. A field that does not answer
+/// is busy, perhaps with the paste itself, and answers once it has handled it: the check then
+/// goes on until `late_until`, since a paste counted as failed turns automatic conversion off.
+fn poll_text_commit(
+    deadline: Instant,
+    late_until: Instant,
+    mut stop: impl FnMut() -> Option<ReplayAttempt>,
+    mut read: impl FnMut(Instant) -> (TextBarrierStatus, bool),
+) -> ReplayAttempt {
+    let mut until = deadline;
+    while Instant::now() < until {
+        if let Some(stopped) = stop() {
+            return stopped;
+        }
+        let (status, answered) = read(until);
+        if status == TextBarrierStatus::Match {
+            return ReplayAttempt::Applied;
+        }
+        if !answered {
+            until = until.max(late_until);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    ReplayAttempt::Failed
+}
+
+const fn clipboard_after_paste(commit: ReplayAttempt) -> ClipboardAfterPaste {
+    match commit {
+        ReplayAttempt::Applied => ClipboardAfterPaste::Restore,
+        ReplayAttempt::Cancelled | ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
+            ClipboardAfterPaste::Defer
+        }
+    }
+}
+
+/// Which conversion route made a protected paste: the protected-paste backend, or a capability
+/// probe whose text barrier matched (it records the backend state it found as well).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteRoute {
+    Backend,
+    CapabilityProbe,
 }
 
 fn build_held_replay_inputs(held: &[RawKeyEvent], fence_marker: usize) -> Option<Vec<INPUT>> {
@@ -9211,6 +12420,11 @@ fn build_recovery_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
     if held.is_empty() || held.len() > CORRECTION_GATE_CAPACITY * 2 + 1 {
         return None;
     }
+    build_balanced_replay_inputs(held)
+}
+
+/// Replays `held` and then releases every key it leaves down.
+fn build_balanced_replay_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
     let mut inputs = build_raw_replay_inputs(held, INJECTED_EVENT_MARKER)?;
     // Physical key-ups may have passed through after the gate was cancelled.
     // Balance every remaining down edge, so restoring cannot latch Win/Ctrl.
@@ -9236,12 +12450,22 @@ fn is_keypad_digit_key(virtual_key: u32) -> bool {
         .is_ok_and(|key| (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&key) || key == VK_DECIMAL.0)
 }
 
+/// Pause and Num Lock: the hook reports both as scan code 0x45, so a replay by scan code alone
+/// could produce the other key.
+fn shares_scan_code_with_another_key(virtual_key: u32) -> bool {
+    u16::try_from(virtual_key).is_ok_and(|key| key == VK_PAUSE.0 || key == VK_NUMLOCK.0)
+}
+
 fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<INPUT>> {
     let mut inputs = Vec::with_capacity(held.len() + 2);
     for event in held {
         // A keypad digit goes out as the virtual key it arrived with; as a bare scan code it
         // would arrive as the navigation key that shares it (see build_physical_replay_plan).
-        let by_virtual_key = event.scan_code == 0 || is_keypad_digit_key(event.virtual_key);
+        // Pause and Num Lock share scan code 0x45 as well, Pause without the E1 prefix the
+        // hook cannot report.
+        let by_virtual_key = event.scan_code == 0
+            || is_keypad_digit_key(event.virtual_key)
+            || shares_scan_code_with_another_key(event.virtual_key);
         let mut flags = if by_virtual_key {
             Default::default()
         } else {
@@ -9345,6 +12569,34 @@ struct Modifiers {
 }
 
 impl Modifiers {
+    /// The modifiers the hook found held for an event (`RawKeyEvent::held_modifiers`).
+    const fn from_held(held: u8) -> Self {
+        Self {
+            shift_mask: held & 0b11,
+            control_mask: (held >> 2) & 0b11,
+            alt_mask: (held >> 4) & 0b11,
+            win_mask: (held >> 6) & 0b11,
+        }
+    }
+
+    /// Forgets every modifier the hook found released for an event: its key-up may never have
+    /// reached the worker, as when it went to the secure desktop of Ctrl+Alt+Del or of a UAC
+    /// prompt and the same window has the focus again. A modifier held on either side stays as
+    /// tracked.
+    fn forget_released(&mut self, held: u8) {
+        let held = Self::from_held(held);
+        for (mask, held) in [
+            (&mut self.shift_mask, held.shift_mask),
+            (&mut self.control_mask, held.control_mask),
+            (&mut self.alt_mask, held.alt_mask),
+            (&mut self.win_mask, held.win_mask),
+        ] {
+            if held == 0 {
+                *mask = 0;
+            }
+        }
+    }
+
     fn update(&mut self, virtual_key: u32, key_down: bool, key_up: bool) -> bool {
         let pressed = key_down && !key_up;
         match virtual_key as u16 {
@@ -9405,6 +12657,14 @@ impl Modifiers {
     const fn has_shortcut_modifier(self) -> bool {
         self.control() || self.alt() || self.win_mask != 0
     }
+}
+
+/// Win+Space or Win+Shift+Space, the Windows chords that switch the keyboard layout.
+fn switches_keyboard_layout(virtual_key: u32, modifiers: Modifiers) -> bool {
+    virtual_key == u32::from(VK_SPACE.0)
+        && modifiers.win_mask != 0
+        && !modifiers.control()
+        && !modifiers.alt()
 }
 
 /// Which kind of shortcut ended a word, for the diagnostics log: the editing command, never a
@@ -9549,14 +12809,12 @@ fn show_tray_information(hwnd: HWND, title: impl AsRef<str>, message: impl AsRef
         return;
     };
     let mut data = notify_icon_data(hwnd, icon);
-    data.uFlags = NIF_INFO;
+    data.uFlags = NIF_INFO | NIF_SHOWTIP;
     data.dwInfoFlags = NIIF_INFO;
     set_wide_text(&mut data.szInfoTitle, title.as_ref());
     set_wide_text(&mut data.szInfo, message.as_ref());
-    unsafe {
-        data.Anonymous.uTimeout = 5_000;
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
-    }
+    data.Anonymous.uTimeout = 5_000;
+    let _ = shell_notify_icon(NIM_MODIFY, &data);
 }
 
 const fn privacy_reason_code(reason: Option<PrivacyBlockReason>) -> u8 {
@@ -9569,6 +12827,18 @@ const fn privacy_reason_code(reason: Option<PrivacyBlockReason>) -> u8 {
             PrivacyBlockReason::InspectionUnavailable
             | PrivacyBlockReason::FieldInspectionUnavailable,
         ) => PRIVACY_UNAVAILABLE,
+    }
+}
+
+/// The privacy finding a metric code stands for. Both kinds of unavailable inspection share one
+/// code, read back as the process-wide one.
+const fn privacy_reason_from_code(code: u8) -> Option<PrivacyBlockReason> {
+    match code {
+        PRIVACY_ALLOWED => None,
+        PRIVACY_PASSWORD => Some(PrivacyBlockReason::PasswordField),
+        PRIVACY_EXCLUDED => Some(PrivacyBlockReason::ExcludedProcess),
+        PRIVACY_ELEVATED => Some(PrivacyBlockReason::ElevatedProcess),
+        _ => Some(PrivacyBlockReason::InspectionUnavailable),
     }
 }
 
@@ -9592,6 +12862,8 @@ const fn conversion_failure_label(reason: u8) -> &'static str {
         value if value == ConversionFailureReason::GateDrain as u8 => "gate-drain",
         value if value == ConversionFailureReason::ClipboardEdit as u8 => "clipboard-edit",
         value if value == ConversionFailureReason::InternalFault as u8 => "internal-fault",
+        value if value == ConversionFailureReason::SelectionLeft as u8 => "selection-left",
+        value if value == ConversionFailureReason::LayoutSwitch as u8 => "layout-switch",
         _ => "unknown",
     }
 }
@@ -9666,7 +12938,23 @@ fn tray_tooltip(status: TrayStatus) -> String {
             ],
         ));
     }
+    if status.diagnostic_errors > 0 {
+        tooltip.push_str("; ");
+        tooltip.push_str(&tr_format(
+            "tray.diagnostic_errors",
+            &[("count", &status.diagnostic_errors.to_string())],
+        ));
+    }
     tooltip
+}
+
+/// Diagnostics records that never reached the log, plus failed log rotations: shown in the tray
+/// while diagnostics are on, so a log with gaps is not taken for a complete one.
+fn diagnostic_error_count(metrics: &ObserverMetrics) -> u64 {
+    metrics
+        .dropped_diagnostics
+        .load(Ordering::Relaxed)
+        .saturating_add(metrics.diagnostic_log_errors.load(Ordering::Relaxed))
 }
 
 fn create_indicator_icon(visual: TrayVisual, indicator: LayoutIndicator) -> Result<HICON> {
@@ -9703,10 +12991,9 @@ fn create_indicator_icon(visual: TrayVisual, indicator: LayoutIndicator) -> Resu
         )
     };
     if mask_bitmap.0.is_null() {
-        unsafe {
+        return Err(last_error_then(|| unsafe {
             let _ = DeleteObject(HGDIOBJ(color_bitmap.0));
-        }
-        return Err(Error::from_thread());
+        }));
     }
 
     let icon_info = ICONINFO {
@@ -9723,7 +13010,6 @@ fn create_indicator_icon(visual: TrayVisual, indicator: LayoutIndicator) -> Resu
     icon
 }
 
-#[cfg(test)]
 fn point_from_packed_word(value: WPARAM) -> POINT {
     let packed = value.0 as u32;
     POINT {
@@ -9732,7 +13018,7 @@ fn point_from_packed_word(value: WPARAM) -> POINT {
     }
 }
 
-fn show_tray_menu(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
+fn show_tray_menu(hwnd: HWND, anchor: POINT) -> Result<()> {
     let entered = APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         match state.as_mut() {
@@ -9746,7 +13032,7 @@ fn show_tray_menu(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
     if !entered {
         return Ok(());
     }
-    let result = show_tray_menu_inner(hwnd, interaction_point);
+    let result = show_tray_menu_inner(hwnd, anchor);
     APP_STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.menu_open = false;
@@ -9756,9 +13042,27 @@ fn show_tray_menu(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
     result
 }
 
-fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<()> {
+/// A popup menu, destroyed when it goes out of scope: on every return path.
+struct PopupMenu(HMENU);
+
+impl PopupMenu {
+    fn new() -> Result<Self> {
+        Ok(Self(unsafe { CreatePopupMenu() }?))
+    }
+}
+
+impl Drop for PopupMenu {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyMenu(self.0);
+        }
+    }
+}
+
+fn show_tray_menu_inner(hwnd: HWND, anchor: POINT) -> Result<()> {
     unsafe {
-        let menu: HMENU = CreatePopupMenu()?;
+        let popup = PopupMenu::new()?;
+        let menu = popup.0;
         let snapshot = APP_STATE.with(|slot| {
             let state = slot.borrow();
             let state = state.as_ref()?;
@@ -9774,10 +13078,10 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
                 failures: state.metrics.conversion_failures.load(Ordering::Relaxed),
                 failure_reason: state.metrics.last_failure_reason.load(Ordering::Acquire),
                 backend_status: state.metrics.backend_status.load(Ordering::Acquire),
+                diagnostic_errors: diagnostic_error_count(&state.metrics),
             })
         });
         let Some(status) = snapshot else {
-            DestroyMenu(menu)?;
             return Ok(());
         };
         let auto_flags = MF_STRING
@@ -9791,15 +13095,18 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
         } else {
             tr("menu.auto_off")
         });
-        let retained_count = APP_STATE.with(|slot| {
-            slot.borrow().as_ref().and_then(|state| {
-                state
-                    .metrics
-                    .retained_input
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_ref()
-                    .map(|input| input.events.len())
+        let (retained_count, worker_dead) = APP_STATE.with(|slot| {
+            slot.borrow().as_ref().map_or((None, false), |state| {
+                (
+                    state
+                        .metrics
+                        .retained_input
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                        .map(|input| input.events.len()),
+                    state.metrics.worker_dead.load(Ordering::Acquire),
+                )
             })
         });
         AppendMenuW(
@@ -9814,15 +13121,18 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             &auto_label,
         )?;
         if let Some(count) = retained_count {
-            AppendMenuW(
-                menu,
-                MF_STRING,
-                MENU_RECOVER_INPUT_ID,
-                &HSTRING::from(tr_format(
-                    "menu.recover_input",
-                    &[("count", &count.to_string())],
-                )),
-            )?;
+            // A stopped worker cannot replay anything; only deleting is still possible.
+            if !worker_dead {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    MENU_RECOVER_INPUT_ID,
+                    &HSTRING::from(tr_format(
+                        "menu.recover_input",
+                        &[("count", &count.to_string())],
+                    )),
+                )?;
+            }
             AppendMenuW(
                 menu,
                 MF_STRING,
@@ -9860,25 +13170,17 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
             &HSTRING::from(tr("menu.exit")),
         )?;
 
-        let point = if let Some(point) = interaction_point {
-            point
-        } else {
-            let mut point = POINT::default();
-            GetCursorPos(&mut point)?;
-            point
-        };
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(
             menu,
             ui_localization::popup_menu_style(TPM_RIGHTBUTTON),
-            point.x,
-            point.y,
+            anchor.x,
+            anchor.y,
             Some(0),
             hwnd,
             None,
         );
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        DestroyMenu(menu)?;
         Ok(())
     }
 }
@@ -9886,6 +13188,7 @@ fn show_tray_menu_inner(hwnd: HWND, interaction_point: Option<POINT>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     pub(super) fn test_profiles() -> ResolvedKeyboardProfiles {
         use autokeyboardlayot::profile_resolver::{
@@ -9921,6 +13224,77 @@ mod tests {
             }
         }
         resolve_keyboard_profiles(&mut Fixture(0x0409)).unwrap()
+    }
+
+    /// What a key prints, by set-1 scan code, in the US (0x0409), Russian (0x0419) and Estonian
+    /// (0x0425) layouts of `test_profiles()`. Shift or Caps Lock capitalize a letter; a shifted
+    /// punctuation key prints nothing here.
+    pub(super) fn test_keyboard(key: ReplayKey, layout: usize) -> Option<char> {
+        const KEYS: [(u16, [char; 3]); 45] = [
+            (0x02, ['1', '1', '1']),
+            (0x03, ['2', '2', '2']),
+            (0x04, ['3', '3', '3']),
+            (0x05, ['4', '4', '4']),
+            (0x06, ['5', '5', '5']),
+            (0x07, ['6', '6', '6']),
+            (0x08, ['7', '7', '7']),
+            (0x09, ['8', '8', '8']),
+            (0x0a, ['9', '9', '9']),
+            (0x0b, ['0', '0', '0']),
+            (0x10, ['q', 'й', 'q']),
+            (0x11, ['w', 'ц', 'w']),
+            (0x12, ['e', 'у', 'e']),
+            (0x13, ['r', 'к', 'r']),
+            (0x14, ['t', 'е', 't']),
+            (0x15, ['y', 'н', 'y']),
+            (0x16, ['u', 'г', 'u']),
+            (0x17, ['i', 'ш', 'i']),
+            (0x18, ['o', 'щ', 'o']),
+            (0x19, ['p', 'з', 'p']),
+            (0x1a, ['[', 'х', 'ü']),
+            (0x1b, [']', 'ъ', 'õ']),
+            (0x1e, ['a', 'ф', 'a']),
+            (0x1f, ['s', 'ы', 's']),
+            (0x20, ['d', 'в', 'd']),
+            (0x21, ['f', 'а', 'f']),
+            (0x22, ['g', 'п', 'g']),
+            (0x23, ['h', 'р', 'h']),
+            (0x24, ['j', 'о', 'j']),
+            (0x25, ['k', 'л', 'k']),
+            (0x26, ['l', 'д', 'l']),
+            (0x27, [';', 'ж', 'ö']),
+            (0x28, ['\'', 'э', 'ä']),
+            (0x2c, ['z', 'я', 'z']),
+            (0x2d, ['x', 'ч', 'x']),
+            (0x2e, ['c', 'с', 'c']),
+            (0x2f, ['v', 'м', 'v']),
+            (0x30, ['b', 'и', 'b']),
+            (0x31, ['n', 'т', 'n']),
+            (0x32, ['m', 'ь', 'm']),
+            (0x33, [',', 'б', ',']),
+            (0x34, ['.', 'ю', '.']),
+            (0x35, ['/', '.', '-']),
+            (0x39, [' ', ' ', ' ']),
+            // The keypad's decimal key, with Num Lock on.
+            (0x53, ['.', ',', ',']),
+        ];
+        let column = match layout {
+            0x0409 => 0,
+            0x0419 => 1,
+            0x0425 => 2,
+            _ => return None,
+        };
+        let (_, characters) = KEYS
+            .iter()
+            .find(|(scan_code, _)| *scan_code == key.scan_code)?;
+        let character = characters[column];
+        if key.shift == key.caps_lock {
+            Some(character)
+        } else if character.is_alphabetic() {
+            character.to_uppercase().next()
+        } else {
+            None
+        }
     }
 
     #[test]
@@ -9972,7 +13346,7 @@ mod tests {
                 profile_generation: processor.input_profiles.generation(),
                 order: Vec::new(),
             });
-            processor.apply_profile_refresh(false);
+            processor.apply_profile_refresh(ProfileUpdate::Unchanged);
             assert!(processor.last_boundary.is_some());
             assert!(processor.transpose_cycle.is_some());
             match reset {
@@ -9987,31 +13361,43 @@ mod tests {
     }
 
     #[test]
-    fn rejected_transaction_does_not_publish_its_target_as_the_current_word() {
+    fn a_profile_snapshot_that_aged_out_and_came_back_keeps_the_words() {
+        // A tray menu left open for more than PROFILE_MAX_AGE let the snapshot age out; it comes
+        // back with the same bindings.
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
         let foreground = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0).foreground;
-        let detection = Detection {
-            source_language: Language::English,
-            target_language: Language::Russian,
-            original: "z".into(),
-            replacement: "я".into(),
-            source_score: 0.0,
-            target_score: 1.0,
-        };
-        processor.pending_conversion = Some(PendingConversion {
-            transaction: ConversionTransaction::without_delimiter(&detection).unwrap(),
-            foreground,
-            source_layout: foreground.layout,
-            profile_generation: processor.input_profiles.generation(),
-            space_down_sequence: 7,
+        processor.last_boundary = Some(LastBoundary {
             replay_keys: Vec::new(),
-            forced: true,
-            cycle_order: Vec::new(),
+            delimiter: Some(' '),
+            foreground,
+            epoch: 0,
+            profile_generation: processor.input_profiles.generation(),
         });
-        // A mismatched boundary is rejected before touching the native target.
-        processor.execute_pending_conversion_inner(99);
-        assert!(processor.pending_conversion.is_none());
-        assert!(processor.transpose_cycle.is_none());
+        for character in "hello".chars() {
+            processor.session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                &processor.detector,
+            );
+        }
+        processor.replay_keys = vec![
+            ReplayKey {
+                scan_code: 0x23,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            };
+            5
+        ];
+        processor.apply_profile_refresh(ProfileUpdate::Availability);
+        assert!(processor.last_boundary.is_some());
+        assert_eq!(processor.session.buffered_character_count(), 5);
+        assert_eq!(processor.replay_keys.len(), 5);
+        // Changed bindings make them stale.
+        processor.apply_profile_refresh(ProfileUpdate::Bindings);
+        assert!(processor.last_boundary.is_none());
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert!(processor.replay_keys.is_empty());
     }
 
     #[test]
@@ -10036,7 +13422,7 @@ mod tests {
     #[test]
     fn profile_refresh_preserves_unchanged_words_and_suppresses_only_an_invalidated_tail() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.apply_profile_refresh(true);
+        processor.apply_profile_refresh(ProfileUpdate::Bindings);
         for character in "hello".chars() {
             processor.session.handle(
                 InputEvent::Printable(character),
@@ -10045,9 +13431,9 @@ mod tests {
             );
         }
         assert_eq!(processor.session.buffered_character_count(), 5);
-        processor.apply_profile_refresh(false);
+        processor.apply_profile_refresh(ProfileUpdate::Unchanged);
         assert_eq!(processor.session.buffered_character_count(), 5);
-        processor.apply_profile_refresh(true);
+        processor.apply_profile_refresh(ProfileUpdate::Bindings);
         assert_eq!(processor.session.buffered_character_count(), 0);
         for character in "tail".chars() {
             processor.session.handle(
@@ -10097,6 +13483,11 @@ mod tests {
         pending.profile_generation = processor.input_profiles.generation();
         pending.source_layout = 0xf0020409;
         assert!(!processor.pending_profiles_match(&pending));
+        // Pause starts from whatever layout the field shows after a manual switch, also one of
+        // no enabled language.
+        pending.forced = true;
+        assert!(processor.pending_profiles_match(&pending));
+        pending.forced = false;
         pending.source_layout = 0x0409;
         pending.transaction.target_language = Language::Japanese;
         assert!(!processor.pending_profiles_match(&pending));
@@ -10215,20 +13606,32 @@ mod tests {
         };
         let mut snapshot = test_reload_snapshot("private.exe");
         snapshot.package_source = source;
-        assert!(state.enqueue_configuration(snapshot));
-        assert!(!state.enqueue_configuration(test_reload_snapshot("lost-store.exe")));
+        assert_eq!(
+            state.enqueue_configuration(snapshot),
+            ConfigurationHandoff::Queued
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("lost-store.exe")),
+            ConfigurationHandoff::Refused
+        );
         let mut fork = test_reload_snapshot("fork.exe");
         fork.package_source = PackageSource::Managed {
             generation: 2,
             state_sha256: [2; 32],
         };
-        assert!(!state.enqueue_configuration(fork));
+        assert_eq!(
+            state.enqueue_configuration(fork),
+            ConfigurationHandoff::Refused
+        );
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
         processor.process(receiver.try_recv().unwrap());
         let published = state.publish_acknowledged_configuration().unwrap();
         assert_eq!(published.package_source, source);
         assert_eq!(state.package_source, source);
-        assert!(!state.enqueue_configuration(test_reload_snapshot("lost-store.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("lost-store.exe")),
+            ConfigurationHandoff::Refused
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -10291,17 +13694,64 @@ mod tests {
         );
     }
 
+    /// Presses Pause on "ghbdtn" ("привет" on the Russian layout) typed in the US layout and returns
+    /// the language the processor converts it to, or the reason it ignores the key.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn pause_result(processor: &mut InputProcessor, diagnostics: &Receiver<String>) -> String {
+        let replay_keys = [0x22_u16, 0x23, 0x30, 0x20, 0x14, 0x31]
+            .map(|scan_code| ReplayKey {
+                scan_code,
+                shift: false,
+                caps_lock: false,
+                extended: false,
+            })
+            .to_vec();
+        let foreground = ForegroundContext {
+            layout: 0x0409,
+            ..test_foreground()
+        };
+        diagnostics.try_iter().for_each(drop);
+        processor.advance_layout_cycle(
+            replay_keys,
+            Some(' '),
+            foreground,
+            0x0409,
+            Language::English,
+            "ghbdtn".to_owned(),
+            41,
+            None,
+        );
+        diagnostics
+            .try_iter()
+            .find_map(|line| {
+                let field = |name: &str| {
+                    line.split(' ')
+                        .find_map(|field| field.strip_prefix(name).map(str::to_owned))
+                };
+                if line.starts_with("event=candidate ") {
+                    field("target=")
+                } else if line.starts_with("event=hotkey ") {
+                    field("reason=")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+
     // Requires the legacy-bundled RU/ET data; the English-only base variant omits it.
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn worker_dictionary_snapshot_follows_validated_selection_and_reload() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        let (mut processor, diagnostics) = processor_with_diagnostics();
+        processor.test_keyboard = Some(test_keyboard);
         assert!(
             processor
                 .detector
                 .detect("ghbdtn", Language::English)
                 .is_some()
         );
+        assert_eq!(pause_result(&mut processor, &diagnostics), "ru-RU");
         let mut snapshot = test_reload_snapshot("private.exe");
         snapshot
             .settings
@@ -10314,16 +13764,9 @@ mod tests {
                 .detect("ghbdtn", Language::English)
                 .is_none()
         );
-        assert!(
-            processor
-                .detector
-                .force_mapped_candidates(
-                    "ghbdtn",
-                    Language::English,
-                    &[(Language::Russian, "привет".to_owned())]
-                )
-                .is_none()
-        );
+        // Pause cycles only through the enabled languages: the Estonian reading of the keys is
+        // the typed text itself.
+        assert_eq!(pause_result(&mut processor, &diagnostics), "identical");
         processor.apply_configuration_reload(Err(std::io::Error::other("invalid configuration")));
         assert!(
             processor
@@ -10331,10 +13774,16 @@ mod tests {
                 .detect("ghbdtn", Language::English)
                 .is_none()
         );
-        for selected in [vec!["ru-RU"], vec!["de-DE"], vec!["en", "ru-RU"]] {
+        // Pause needs two enabled languages with a layout, the typed one among them.
+        for (selected, pause) in [
+            (vec!["ru-RU"], "single-layout"),
+            (vec!["de-DE"], "single-layout"),
+            (vec!["en", "ru-RU"], "single-layout"),
+            (vec!["ru-RU", "et-EE"], "unsupported-layout"),
+        ] {
             let mut snapshot = test_reload_snapshot("private.exe");
             snapshot.settings.enabled_input_packs = selected
-                .into_iter()
+                .iter()
                 .map(|id| autokeyboardlayot::PackId::parse(id).unwrap())
                 .collect();
             snapshot.dictionaries = dictionary_snapshot(&snapshot.settings);
@@ -10360,6 +13809,11 @@ mod tests {
                     .is_none()
             );
             assert!(processor.exclusion_policy.is_excluded("private.exe"));
+            assert_eq!(
+                pause_result(&mut processor, &diagnostics),
+                pause,
+                "{selected:?}"
+            );
         }
         processor.apply_configuration_reload(Ok(test_reload_snapshot("private.exe")));
         assert!(
@@ -10368,6 +13822,7 @@ mod tests {
                 .detect("ghbdtn", Language::English)
                 .is_some()
         );
+        assert_eq!(pause_result(&mut processor, &diagnostics), "ru-RU");
     }
 
     #[test]
@@ -10378,12 +13833,18 @@ mod tests {
             if pending {
                 let mut snapshot = test_reload_snapshot("private.exe");
                 snapshot.sources = ConfigurationSources::UNIFIED;
-                assert!(state.enqueue_configuration(snapshot));
+                assert_eq!(
+                    state.enqueue_configuration(snapshot),
+                    ConfigurationHandoff::Queued
+                );
             } else {
                 state.configuration_sources = ConfigurationSources::UNIFIED;
             }
             let previous_revision = state.next_configuration_revision;
-            assert!(!state.enqueue_configuration(RuntimeConfiguration::default()));
+            assert_eq!(
+                state.enqueue_configuration(RuntimeConfiguration::default()),
+                ConfigurationHandoff::Refused
+            );
             assert_eq!(state.next_configuration_revision, previous_revision);
             assert_eq!(
                 state.metrics.configuration_pending.load(Ordering::Acquire),
@@ -10404,7 +13865,10 @@ mod tests {
     fn input_overflow_does_not_cancel_a_queued_configuration() {
         let (mut state, receiver) = test_gate_state(1);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Queued
+        );
         let queued_epoch = state.metrics.input_epoch.load(Ordering::Acquire);
         assert!(!state.enqueue(RawInputEvent::Mouse));
         assert!(state.metrics.input_epoch.load(Ordering::Acquire) > queued_epoch);
@@ -10427,8 +13891,14 @@ mod tests {
     fn a_failed_newer_reload_keeps_the_previous_pending_snapshot() {
         let (mut state, receiver) = test_gate_state(1);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("first.exe")));
-        assert!(!state.enqueue_configuration(test_reload_snapshot("second.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("first.exe")),
+            ConfigurationHandoff::Queued
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy
+        );
         assert!(state.metrics.configuration_pending.load(Ordering::Acquire));
         processor.process(receiver.try_recv().unwrap());
         let acknowledged = state.take_acknowledged_configuration().unwrap();
@@ -10441,22 +13911,46 @@ mod tests {
         let (mut state, receiver) = test_gate_state(1);
         drop(receiver);
         let original = state.settings.clone();
-        assert!(!state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Refused
+        );
         assert_eq!(state.settings, original);
         assert!(state.pending_configuration.is_none());
         assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
     }
 
     #[test]
-    fn rapid_reloads_require_latest_ack_and_bound_outstanding_snapshots() {
+    fn rapid_reloads_wait_for_the_pending_one_and_old_snapshots_never_apply() {
         let (mut state, receiver) = test_gate_state(4);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("first.exe")));
-        assert!(state.enqueue_configuration(test_reload_snapshot("second.exe")));
-        assert!(!state.enqueue_configuration(test_reload_snapshot("third.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("first.exe")),
+            ConfigurationHandoff::Queued
+        );
+        // One snapshot at a time: the next one waits until this one is published or dropped.
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy
+        );
         let first = receiver.try_recv().unwrap();
         processor.process(first.clone());
-        assert!(state.take_acknowledged_configuration().is_none());
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy,
+            "acknowledged but not published yet"
+        );
+        assert!(
+            state
+                .publish_acknowledged_configuration()
+                .unwrap()
+                .process_exclusions
+                .is_excluded("first.exe")
+        );
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Queued
+        );
         processor.process(receiver.try_recv().unwrap());
         assert!(
             state
@@ -10472,10 +13966,59 @@ mod tests {
     }
 
     #[test]
+    fn reloads_the_worker_rejected_do_not_keep_later_ones_busy() {
+        let (mut state, _receiver) = test_gate_state(4);
+        for (revision, program) in [(1, "first.exe"), (2, "second.exe")] {
+            assert_eq!(
+                state.enqueue_configuration(test_reload_snapshot(program)),
+                ConfigurationHandoff::Queued
+            );
+            // The worker panicked applying it (see reject_faulted_configuration).
+            state
+                .metrics
+                .configuration_rejected
+                .store(revision, Ordering::Release);
+            assert!(state.drop_rejected_configuration());
+        }
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("third.exe")),
+            ConfigurationHandoff::Queued
+        );
+    }
+
+    #[test]
+    fn a_reload_never_replaces_one_the_worker_runs_but_the_ui_has_not_published() {
+        let (mut state, receiver) = test_gate_state(4);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("first.exe")),
+            ConfigurationHandoff::Queued
+        );
+        processor.process(receiver.try_recv().unwrap());
+        assert_eq!(state.metrics.configuration_ack.load(Ordering::Acquire), 1);
+        // Replacing it now would lose it: were the newer one rejected, the UI would keep the
+        // settings before both while the worker runs the first.
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("second.exe")),
+            ConfigurationHandoff::Busy
+        );
+        assert!(
+            state
+                .publish_acknowledged_configuration()
+                .unwrap()
+                .process_exclusions
+                .is_excluded("first.exe")
+        );
+    }
+
+    #[test]
     fn pending_configuration_passes_hotkeys_and_suppresses_worker_buffering() {
         let (mut state, receiver) = test_gate_state(2);
         let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
-        assert!(state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Queued
+        );
         assert_eq!(
             contextual_hotkey_action(&state.metrics, WM_KEYDOWN, VK_PAUSE.0, 0),
             UndoHotkeyAction::PassThrough
@@ -10505,11 +14048,73 @@ mod tests {
     fn an_active_gate_prevents_configuration_handoff_without_losing_held_state() {
         let (mut state, receiver) = test_gate_state(2);
         state.correction_gate.activate(9);
-        assert!(!state.enqueue_configuration(test_reload_snapshot("new-policy.exe")));
+        assert_eq!(
+            state.enqueue_configuration(test_reload_snapshot("new-policy.exe")),
+            ConfigurationHandoff::Busy
+        );
         assert!(state.correction_gate.active);
         assert_eq!(state.correction_gate.token, 9);
         assert!(receiver.try_recv().is_err());
         assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_configuration_the_worker_cannot_take_yet_is_handed_over_on_a_later_tick() {
+        // Apply in the settings while a correction gate holds keys: nothing to report, and the
+        // newest snapshot reaches the worker once the gate is over.
+        let (mut state, receiver) = test_gate_state(2);
+        state.correction_gate.activate(9);
+        let loaded = |name: &str| Some(Ok(test_reload_snapshot(name)));
+        assert_eq!(state.hand_off_configuration(loaded("first.exe")), None);
+        assert_eq!(state.hand_off_configuration(None), None);
+        // A newer load replaces the deferred snapshot.
+        assert_eq!(state.hand_off_configuration(loaded("second.exe")), None);
+        assert!(receiver.try_recv().is_err());
+        state.correction_gate.active = false;
+        assert_eq!(state.hand_off_configuration(None), None);
+        assert!(state.deferred_configuration.is_none());
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.process(receiver.try_recv().expect("the deferred reload"));
+        let published = state
+            .publish_acknowledged_configuration()
+            .expect("published");
+        assert!(published.process_exclusions.is_excluded("second.exe"));
+        assert!(!published.process_exclusions.is_excluded("first.exe"));
+        assert!(receiver.try_recv().is_err());
+        // Nothing deferred, nothing loaded: nothing happens.
+        assert_eq!(state.hand_off_configuration(None), None);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_a_failed_read_is_a_read_error_and_a_refused_snapshot_an_apply_error() {
+        let (mut state, receiver) = test_gate_state(2);
+        state.correction_gate.activate(9);
+        assert_eq!(
+            state.hand_off_configuration(Some(Ok(test_reload_snapshot("first.exe")))),
+            None
+        );
+        // The files changed again and cannot be read: the deferred snapshot is out of date.
+        let failed = std::io::Error::other("unreadable");
+        assert_eq!(
+            state.hand_off_configuration(Some(Err(failed))),
+            Some(tr_format("error.read_config", &[("error", "unreadable")]))
+        );
+        assert!(state.deferred_configuration.is_none());
+        state.correction_gate.active = false;
+        assert_eq!(state.hand_off_configuration(None), None);
+        assert!(receiver.try_recv().is_err());
+        // A worker that stopped for good can never take a configuration.
+        state.metrics.worker_dead.store(true, Ordering::Release);
+        assert_eq!(
+            state.hand_off_configuration(Some(Ok(test_reload_snapshot("second.exe")))),
+            Some(tr_format(
+                "error.apply_config",
+                &[("error", "configuration_handoff_unavailable")]
+            ))
+        );
+        assert!(state.deferred_configuration.is_none());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -10598,6 +14203,8 @@ mod tests {
             sequence,
             drain_token,
             hotkey_trigger: false,
+            repeat: false,
+            held_modifiers: 0,
         }
     }
 
@@ -10624,10 +14231,17 @@ mod tests {
             ),
             package_source: PackageSource::LegacyBootstrap,
             pending_configuration: None,
+            deferred_configuration: None,
             configuration_loader: None,
             lexicon_candidate: Arc::new(Mutex::new(None)),
+            lexicon_saves: LexiconSaves::new(),
             diagnostic_sender: None,
             diagnostic_worker: None,
+            pending_key_releases: Vec::new(),
+            pending_held_replay: Vec::new(),
+            pending_hand_back: None,
+            announced_clipboard_failures: 0,
+            typed_input: 0,
         };
         (state, receiver)
     }
@@ -10907,15 +14521,29 @@ mod tests {
         );
     }
 
-    fn scripted_polls(polls: Vec<SelectionPoll>) -> impl FnMut() -> SelectionPoll {
-        let mut polls = std::collections::VecDeque::from(polls);
-        move || polls.pop_front().unwrap_or(SelectionPoll::Unreadable)
+    /// The polls of `polls` in order, and a clock that runs out once every one has been read:
+    /// the outcome never depends on how fast the test runs. A poll after the clock ran out fails
+    /// the test.
+    fn scripted_polls(
+        polls: Vec<SelectionPoll>,
+    ) -> (impl FnMut() -> bool, impl FnMut() -> SelectionPoll) {
+        let polls = std::rc::Rc::new(RefCell::new(VecDeque::from(polls)));
+        let script = std::rc::Rc::clone(&polls);
+        (
+            move || script.borrow().is_empty(),
+            move || {
+                polls
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("polled after the time for confirmation ran out")
+            },
+        )
     }
 
     #[test]
     fn a_confirmed_selection_is_kept_and_every_other_outcome_collapses_it_exactly_once() {
         let text = |value: &str| SelectionPoll::Text(value.to_owned());
-        // (path, scripted polls; an exhausted script reads as unreadable, expected status, collapses)
+        // (path, scripted polls; the time runs out when the script does, expected status, collapses)
         let cases = [
             (
                 "match at once",
@@ -10972,15 +14600,25 @@ mod tests {
         ];
         for (path, polls, expected, collapses) in cases {
             let collapsed = Cell::new(0);
-            let status = confirm_selection(
-                Duration::from_millis(40),
-                scripted_polls(polls),
+            let (expired, poll) = scripted_polls(polls);
+            let (status, cleanup) = confirm_selection(
+                expired,
+                poll,
                 |actual| actual == "ghbdtn",
-                || thread::sleep(Duration::from_millis(1)),
-                || collapsed.set(collapsed.get() + 1),
+                || {},
+                || {
+                    collapsed.set(collapsed.get() + 1);
+                    SelectionCleanup::Unverified
+                },
             );
             assert_eq!(status, expected, "{path}");
             assert_eq!(collapsed.get(), collapses, "{path}: collapses");
+            // The result of the collapse is passed on as it was found.
+            assert_eq!(
+                cleanup,
+                (collapses == 1).then_some(SelectionCleanup::Unverified),
+                "{path}: cleanup"
+            );
         }
     }
 
@@ -11022,38 +14660,112 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_selects_again_only_while_another_attempt_fits() {
+        // Pause in a program on the capability probe: the gate it armed lets the keys go after
+        // its longest hold, and its whole patience fits in it.
+        assert!(
+            INPUT_SETTLE_AFTER_FORWARD_MS
+                + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+                + u64::from(PastePatience::Manual.attempts())
+                    * UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS
+                + PASTE_MIN_INSTALL_MS
+                + PASTE_AFTER_SUBMIT_MS
+                <= CORRECTION_GATE_MAX_HOLD_MS
+        );
+        let armed = Instant::now();
+        let budget = PasteBudget {
+            deadline: Some(armed + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS)),
+        };
+        // The settle step took 38 ms and the barrier matched at 165 ms: the selection starts.
+        let selecting = armed + Duration::from_millis(203);
+        assert!(budget.allows_selection(selecting, PastePatience::Manual));
+        // The field did not show it; a second attempt would no longer leave the rest its time.
+        let not_shown = SelectionAttempt {
+            status: TextBarrierStatus::Mismatch,
+            confirmation: Some(SelectionConfirmation::NotShown),
+            cleanup: Some(SelectionCleanup::Collapsed),
+        };
+        let after_first =
+            selecting + Duration::from_millis(UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS);
+        let mut attempts = 0;
+        let (result, ran) = retry_unshown_selection(
+            PastePatience::Manual.attempts(),
+            || budget.allows_selection(after_first, PastePatience::Manual),
+            |_| {
+                attempts += 1;
+                not_shown
+            },
+        );
+        assert_eq!((result, ran, attempts), (not_shown, 1, 1));
+        // With time to spare it selects again.
+        let (_, ran) =
+            retry_unshown_selection(PastePatience::Manual.attempts(), || true, |_| not_shown);
+        assert_eq!(ran, 2);
+    }
+
+    #[test]
     fn only_a_selection_the_field_did_not_show_is_tried_again() {
         use SelectionConfirmation::{Confirmed, NotShown, OtherText, Unreadable};
-        let run =
-            |attempts: u32, script: Vec<(TextBarrierStatus, Option<SelectionConfirmation>)>| {
-                let mut script = std::collections::VecDeque::from(script);
-                retry_unshown_selection(attempts, || {
+        let run = |attempts: u32, script: Vec<SelectionAttempt>| {
+            let mut script = std::collections::VecDeque::from(script);
+            let mut earlier = Vec::new();
+            let result = retry_unshown_selection(
+                attempts,
+                || true,
+                |earlier_attempt| {
+                    earlier.push(earlier_attempt);
                     script.pop_front().expect("no more attempts than scripted")
-                })
-            };
-        let not_shown = (TextBarrierStatus::Mismatch, Some(NotShown));
-        let confirmed = (TextBarrierStatus::Match, Some(Confirmed));
+                },
+            );
+            // Every attempt after the first is told that an earlier one ran.
+            assert!(
+                earlier
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| *value == (index > 0))
+            );
+            result
+        };
+        let attempt = |status, confirmation, cleanup| SelectionAttempt {
+            status,
+            confirmation,
+            cleanup,
+        };
+        let not_shown = attempt(
+            TextBarrierStatus::Mismatch,
+            Some(NotShown),
+            Some(SelectionCleanup::Collapsed),
+        );
+        let confirmed = attempt(TextBarrierStatus::Match, Some(Confirmed), None);
         // A second selection that the field shows is used.
-        assert_eq!(
-            run(2, vec![not_shown, confirmed]),
-            (TextBarrierStatus::Match, 2)
-        );
+        assert_eq!(run(2, vec![not_shown, confirmed]), (confirmed, 2));
         // Two unshown selections give up as before.
-        assert_eq!(
-            run(2, vec![not_shown, not_shown]),
-            (TextBarrierStatus::Mismatch, 2)
-        );
+        assert_eq!(run(2, vec![not_shown, not_shown]), (not_shown, 2));
         // An automatic conversion looks once.
-        assert_eq!(run(1, vec![not_shown]), (TextBarrierStatus::Mismatch, 1));
-        // Other text, unreadable selections and text that never matched are not retried.
+        assert_eq!(run(1, vec![not_shown]), (not_shown, 1));
+        // Other text, unreadable selections, text that never matched, and an unshown selection
+        // that could not be collapsed are not retried.
         for once in [
-            (TextBarrierStatus::Mismatch, Some(OtherText)),
-            (TextBarrierStatus::Unavailable, Some(Unreadable)),
-            (TextBarrierStatus::Mismatch, None),
-            (TextBarrierStatus::Unavailable, None),
+            attempt(
+                TextBarrierStatus::Mismatch,
+                Some(OtherText),
+                Some(SelectionCleanup::Collapsed),
+            ),
+            attempt(
+                TextBarrierStatus::Unavailable,
+                Some(Unreadable),
+                Some(SelectionCleanup::Collapsed),
+            ),
+            attempt(TextBarrierStatus::Mismatch, None, None),
+            attempt(TextBarrierStatus::Unavailable, None, None),
+            attempt(
+                TextBarrierStatus::Mismatch,
+                Some(NotShown),
+                Some(SelectionCleanup::Unverified),
+            ),
             confirmed,
         ] {
-            assert_eq!(run(2, vec![once]), (once.0, 1), "{once:?}");
+            assert_eq!(run(2, vec![once]), (once, 1), "{once:?}");
         }
     }
 
@@ -11072,7 +14784,7 @@ mod tests {
         );
         assert!(
             format_text_barrier_report(TextBarrierReport::default())
-                .ends_with(",confirm=None,attempts=0")
+                .ends_with(",confirm=None,attempts=0,cleanup=None")
         );
     }
 
@@ -11081,7 +14793,7 @@ mod tests {
         let (mut processor, receiver) = processor_with_diagnostics();
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 42)
+                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 42, PasteRoute::Backend)
                 .is_none()
         );
         let lines: Vec<String> = receiver
@@ -11103,13 +14815,17 @@ mod tests {
         let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 7)
+                .apply_paste_attempt_result(TextEditAttempt::Cancelled, 7, PasteRoute::Backend)
                 .is_none()
         );
         assert!(metrics.auto_enabled.load(Ordering::Acquire));
         assert!(
             processor
-                .apply_paste_attempt_result(TextEditAttempt::Failed, 8)
+                .apply_paste_attempt_result(
+                    TextEditAttempt::Failed(ConversionFailureReason::ClipboardEdit),
+                    8,
+                    PasteRoute::Backend
+                )
                 .is_none()
         );
         assert!(!metrics.auto_enabled.load(Ordering::Acquire));
@@ -11153,11 +14869,11 @@ mod tests {
         );
         assert_eq!(
             protected_paste_outcome(false, true),
-            TextEditAttempt::Failed
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
         );
         assert_eq!(
             protected_paste_outcome(false, false),
-            TextEditAttempt::Failed
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
         );
         // Restoring the user's clipboard waits three times as long as installing the temporary text.
         assert_eq!(CLIPBOARD_RESTORE_OPEN_RETRIES, 3 * CLIPBOARD_OPEN_RETRIES);
@@ -11173,28 +14889,33 @@ mod tests {
         metrics.auto_enabled.store(true, Ordering::Release);
         let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
         assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::Applied, 5),
+            processor.apply_paste_attempt_result(TextEditAttempt::Applied, 5, PasteRoute::Backend),
+            Some(EditStrategy::ProtectedPaste)
+        );
+        // The clipboard is counted by the paste (every_paste_that_could_not_give_the_…).
+        assert_eq!(
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::AppliedClipboardNotRestored,
+                6,
+                PasteRoute::Backend
+            ),
             Some(EditStrategy::ProtectedPaste)
         );
         assert_eq!(
-            metrics.clipboard_restore_failures.load(Ordering::Acquire),
-            0
-        );
-        assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::AppliedClipboardNotRestored, 6),
-            Some(EditStrategy::ProtectedPaste)
-        );
-        assert_eq!(
-            metrics.clipboard_restore_failures.load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::Cancelled, 7),
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::Cancelled,
+                7,
+                PasteRoute::Backend
+            ),
             None
         );
         assert!(metrics.auto_enabled.load(Ordering::Acquire));
         assert_eq!(
-            processor.apply_paste_attempt_result(TextEditAttempt::Failed, 8),
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::Failed(ConversionFailureReason::ClipboardEdit),
+                8,
+                PasteRoute::Backend
+            ),
             None
         );
         assert!(!metrics.auto_enabled.load(Ordering::Acquire));
@@ -11254,17 +14975,27 @@ mod tests {
     }
 
     #[test]
-    fn hook_silence_is_measured_from_the_last_callback_or_installation() {
-        touch_hook_activity();
-        assert!(hook_silence() < Duration::from_secs(2));
-        let tick = unsafe { GetTickCount64() };
-        HOOK_ACTIVITY_MS.store(tick.saturating_sub(10_000), Ordering::Relaxed);
+    fn each_hook_s_silence_is_measured_from_its_own_callbacks() {
+        let ten_seconds_ago = || unsafe { GetTickCount64() }.saturating_sub(10_000);
+        let about_ten_seconds = |silence: Duration| {
+            silence >= Duration::from_secs(10) && silence < Duration::from_secs(12)
+        };
+        // A keyboard callback (code < 0: passed on untouched) refreshes the keyboard hook's mark
+        // only.
+        KEYBOARD_HOOK_ACTIVITY_MS.store(ten_seconds_ago(), Ordering::Relaxed);
+        MOUSE_HOOK_ACTIVITY_MS.store(ten_seconds_ago(), Ordering::Relaxed);
+        unsafe { keyboard_hook_proc(-1, WPARAM(0), LPARAM(0)) };
         let silence = hook_silence();
-        assert!(
-            silence >= Duration::from_secs(10) && silence < Duration::from_secs(12),
-            "{silence:?}"
-        );
-        touch_hook_activity();
+        assert!(silence.keyboard < Duration::from_secs(2), "{silence:?}");
+        assert!(about_ten_seconds(silence.mouse), "{silence:?}");
+        // And a mouse callback the mouse hook's.
+        KEYBOARD_HOOK_ACTIVITY_MS.store(ten_seconds_ago(), Ordering::Relaxed);
+        unsafe { mouse_hook_proc(-1, WPARAM(0), LPARAM(0)) };
+        let silence = hook_silence();
+        assert!(about_ten_seconds(silence.keyboard), "{silence:?}");
+        assert!(silence.mouse < Duration::from_secs(2), "{silence:?}");
+        // The pointer's position can be read on the test's desktop or not at all.
+        let _ = cursor_position();
     }
 
     #[test]
@@ -11276,6 +15007,42 @@ mod tests {
         }
         let _ = input_desktop_is_default();
         let _ = foreground_privilege();
+    }
+
+    #[test]
+    fn the_foreground_privilege_compares_the_foreground_process_with_the_agent() {
+        use ForegroundPrivilege::{Higher, NotHigher, Unknown};
+        const LOW: u32 = 0x1000;
+        const MEDIUM: u32 = 0x2000;
+        const HIGH: u32 = 0x3000;
+        // Process 10 is the agent at medium integrity, 20 an elevated program, 30 a process whose
+        // token cannot be read, and every other one runs at low integrity.
+        let level = |process: u32| match process {
+            10 => Some(MEDIUM),
+            20 => Some(HIGH),
+            30 => None,
+            _ => Some(LOW),
+        };
+        assert_eq!(
+            foreground_privilege_of(None, 10, level),
+            ForegroundPrivilege::None
+        );
+        assert_eq!(foreground_privilege_of(Some(20), 10, level), Higher);
+        assert_eq!(foreground_privilege_of(Some(10), 10, level), NotHigher);
+        assert_eq!(foreground_privilege_of(Some(40), 10, level), NotHigher);
+        assert_eq!(foreground_privilege_of(Some(30), 10, level), Unknown);
+        // An agent that cannot read its own level knows nothing either.
+        assert_eq!(foreground_privilege_of(Some(40), 30, level), Unknown);
+        // The real lookup: the agent is never above itself, and the idle process cannot be opened.
+        let agent = unsafe { GetCurrentProcessId() };
+        assert_eq!(
+            foreground_privilege_of(Some(agent), agent, process_integrity_level),
+            NotHigher
+        );
+        assert_eq!(
+            foreground_privilege_of(Some(0), agent, process_integrity_level),
+            Unknown
+        );
     }
 
     #[test]
@@ -11364,8 +15131,12 @@ mod tests {
             worker_finished: true,
             ..all
         };
-        assert_eq!(shutdown_blockers(&finished).len(), 5);
-        assert!(!shutdown_blockers(&finished).contains(&"worker-busy"));
+        // A finished worker can neither be busy, acknowledge the pending reload nor recover the
+        // held keys.
+        assert_eq!(
+            shutdown_blockers(&finished),
+            ["correction-gate", "undo-hotkey", "hotkey-release"]
+        );
         let idle = ShutdownFacts {
             correction_gate_active: false,
             retained_input: false,
@@ -11393,14 +15164,19 @@ mod tests {
     }
 
     #[test]
-    fn a_later_implicit_close_keeps_the_explicit_exit_mark() {
+    fn an_implicit_close_never_sets_the_explicit_exit_mark_and_never_clears_it() {
         EXPLICIT_SHUTDOWN.store(false, Ordering::Release);
-        for explicit in [true, false] {
+        // Accepted every time: an installer's close first, then the tray menu Exit, then another
+        // close. Only the tray menu sets the mark, and nothing clears it.
+        for (explicit, marked) in [(false, false), (true, true), (false, true)] {
             let (state, _receiver) = test_gate_state(4);
             APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
             request_shutdown(HWND::default(), explicit);
-            // Accepted both times; only the tray menu sets the mark and nothing clears it.
-            assert!(EXPLICIT_SHUTDOWN.load(Ordering::Acquire));
+            assert_eq!(
+                EXPLICIT_SHUTDOWN.load(Ordering::Acquire),
+                marked,
+                "explicit={explicit}"
+            );
             drop(take_app_state());
         }
         EXPLICIT_SHUTDOWN.store(false, Ordering::Release);
@@ -11473,6 +15249,10 @@ mod tests {
             events: vec![retained_key],
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+            recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         assert!(!state.request_shutdown());
         assert_eq!(
@@ -11562,8 +15342,19 @@ mod tests {
             .held
             .push(test_raw_key(WM_KEYUP, VK_LCONTROL, 0, 0));
         state.break_correction_gate_fail_open(GateFailureCause::Deadline);
+        // The Ctrl key-down reached the application before the gate, so its key-up is delivered
+        // rather than retained; only the typed key waits for recovery.
         let retained = state.metrics.retained_input.lock().unwrap();
-        assert_eq!(retained.as_ref().unwrap().events.len(), 2);
+        assert_eq!(retained.as_ref().unwrap().events.len(), 1);
+        assert_eq!(
+            retained.as_ref().unwrap().events[0].virtual_key,
+            u32::from(VIRTUAL_KEY(0x47).0)
+        );
+        assert_eq!(state.pending_key_releases.len(), 1);
+        assert_eq!(
+            state.pending_key_releases[0].virtual_key,
+            u32::from(VK_LCONTROL.0)
+        );
         assert!(!state.correction_gate.active);
         assert!(!state.metrics.auto_enabled.load(Ordering::Acquire));
         assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 1);
@@ -11582,6 +15373,10 @@ mod tests {
             events: vec![key],
             delivery_uncertain: false,
             expires_at: start + lifetime,
+            recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         metrics.recovery_armed.store(true, Ordering::Release);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
@@ -11619,6 +15414,10 @@ mod tests {
             events: vec![key],
             delivery_uncertain: false,
             expires_at: start + lifetime,
+            recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
         });
         let expiry = || {
             metrics
@@ -11788,7 +15587,8 @@ mod tests {
         let (mut state, _receiver) = test_gate_state(8);
         state.correction_gate.activate(10);
         let first = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
-        let last = test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x48), 0, 0);
+        // A key-down: a lone key-up of a key pressed before the gate would be delivered instead.
+        let last = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0);
         state.correction_gate.held.push(last);
         state.retain_failed_drain(10, vec![first], 1);
         let retained = state.metrics.retained_input.lock().unwrap();
@@ -11804,7 +15604,8 @@ mod tests {
         let (mut state, _receiver) = test_gate_state(8);
         state.correction_gate.activate(10);
         let first = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
-        let last = test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x48), 0, 0);
+        // A key-down: a lone key-up of a key pressed before the gate would be delivered instead.
+        let last = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0);
         state.correction_gate.held.push(last);
         state.break_correction_gate_fail_open(GateFailureCause::Mouse);
         state.retain_failed_drain(10, vec![first], 0);
@@ -11967,7 +15768,7 @@ mod tests {
     }
 
     #[test]
-    fn tray_glyph_renderer_changes_pixels() {
+    fn the_tray_status_selects_the_icon_visual() {
         let initial = TrayStatus::initial(LayoutIndicator::English);
         assert_eq!(tray_visual_state(initial), TrayVisual::Disabled);
         let active = TrayStatus {
@@ -12024,12 +15825,506 @@ mod tests {
         }
     }
 
+    /// The color pixels (top-down, 0xAARRGGBB) and the mask bytes of a 32×32 icon.
+    fn icon_rasters(icon: HICON) -> (Vec<u32>, Vec<u8>) {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetBitmapBits, GetDC, GetDIBits,
+            ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
+        let mut info = ICONINFO::default();
+        unsafe { GetIconInfo(icon, &mut info) }.expect("icon info");
+        let mut color = vec![0u32; 32 * 32];
+        let mut header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: 32,
+                biHeight: -32,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut mask = vec![0u8; 32 * 32 / 8];
+        unsafe {
+            let screen = GetDC(None);
+            let rows = GetDIBits(
+                screen,
+                info.hbmColor,
+                0,
+                32,
+                Some(color.as_mut_ptr().cast()),
+                &mut header,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(None, screen);
+            assert_eq!(rows, 32, "color rows");
+            // A monochrome bitmap's rows are padded to 16 bits; 32 pixels are four bytes.
+            let read = GetBitmapBits(info.hbmMask, mask.len() as i32, mask.as_mut_ptr().cast());
+            assert_eq!(read, mask.len() as i32, "mask bytes");
+            let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+            let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+        }
+        (color, mask)
+    }
+
+    #[test]
+    fn the_tray_icon_carries_the_rendered_pixels_and_a_mask_that_matches_them() {
+        let mut rasters = Vec::new();
+        for (visual, indicator) in [
+            (TrayVisual::Active, LayoutIndicator::English),
+            (TrayVisual::Disabled, LayoutIndicator::English),
+            (TrayVisual::SafetyPaused, LayoutIndicator::Russian),
+        ] {
+            let expected = tray_visual::pixels(visual, indicator.icon_text());
+            let icon = create_indicator_icon(visual, indicator).expect("icon");
+            let (color, mask) = icon_rasters(icon);
+            unsafe {
+                DestroyIcon(icon).expect("destroy icon");
+            }
+            let case = format!("{visual:?} {indicator:?}");
+            assert_eq!(color, expected, "{case}");
+            // A set mask bit is a transparent pixel: exactly those whose alpha is zero. The badge
+            // is opaque, so a set bit would punch a hole into it.
+            for (index, pixel) in expected.iter().enumerate() {
+                let transparent = mask[index / 8] & (0x80 >> (index % 8)) != 0;
+                assert_eq!(transparent, pixel >> 24 == 0, "{case} pixel {index}");
+            }
+            rasters.push(color);
+        }
+        // The mode and the layout show in the pixels.
+        assert_ne!(rasters[0], rasters[1]);
+        assert_ne!(rasters[1], rasters[2]);
+    }
+
+    /// One call to the scripted notification area: the message, its flags, the icon image, the
+    /// tooltip and the answer.
+    #[derive(Debug, Clone)]
+    struct ShellCall {
+        message: NOTIFY_ICON_MESSAGE,
+        flags: windows::Win32::UI::Shell::NOTIFY_ICON_DATA_FLAGS,
+        icon: usize,
+        tip: String,
+        answer: bool,
+    }
+
+    /// A notification area for the tray code of the calling thread. It records every call, keeps
+    /// the ids it shows, fails calls on request, and can run a message in the middle of a call.
+    #[derive(Default)]
+    struct ScriptedShell {
+        calls: Vec<ShellCall>,
+        icons: std::collections::BTreeSet<u32>,
+        /// The next calls of these messages fail, in order, with these errors.
+        failures: VecDeque<(NOTIFY_ICON_MESSAGE, windows::Win32::Foundation::WIN32_ERROR)>,
+        /// Runs inside the next call of the message, like a message that the call dispatches.
+        during: Option<(NOTIFY_ICON_MESSAGE, Box<dyn FnOnce()>)>,
+        /// Passes every call on to the real notification area and records its answer.
+        real: bool,
+    }
+
+    thread_local! {
+        static SCRIPTED_SHELL: RefCell<Option<ScriptedShell>> = const { RefCell::new(None) };
+    }
+
+    fn wide_text(buffer: &[u16]) -> String {
+        let length = buffer
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..length])
+    }
+
+    /// The scripted notification area's answer, or `None` when the thread uses the real one.
+    pub(super) fn scripted_shell_call(
+        message: NOTIFY_ICON_MESSAGE,
+        data: &NOTIFYICONDATAW,
+    ) -> Option<bool> {
+        let (real, failure, during) = SCRIPTED_SHELL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let shell = slot.as_mut()?;
+            let during = shell
+                .during
+                .take_if(|(expected, _)| *expected == message)
+                .map(|(_, run)| run);
+            let failure = shell
+                .failures
+                .iter()
+                .position(|(failing, _)| *failing == message)
+                .and_then(|index| shell.failures.remove(index))
+                .map(|(_, error)| error);
+            Some((shell.real, failure, during))
+        })?;
+        // The real shell may dispatch messages that call it again: no borrow is held meanwhile.
+        let answer = failure.is_none()
+            && if real {
+                unsafe { Shell_NotifyIconW(message, data) }.as_bool()
+            } else {
+                scripted_shell(|shell| match message {
+                    NIM_ADD => shell.icons.insert(data.uID),
+                    NIM_DELETE => shell.icons.remove(&data.uID),
+                    _ => shell.icons.contains(&data.uID),
+                })
+            };
+        scripted_shell(|shell| {
+            shell.calls.push(ShellCall {
+                message,
+                flags: data.uFlags,
+                icon: data.hIcon.0 as usize,
+                tip: wide_text(&data.szTip),
+                answer,
+            });
+        });
+        // A message dispatched during the call runs with the shell released: it may call it.
+        if let Some(during) = during {
+            during();
+        }
+        if let Some(error) = failure {
+            unsafe { windows::Win32::Foundation::SetLastError(error) };
+        }
+        Some(answer)
+    }
+
+    /// Runs `body` with `shell` as this thread's notification area, and gives the shell back.
+    fn with_scripted_shell<T>(
+        shell: ScriptedShell,
+        body: impl FnOnce() -> T,
+    ) -> (T, ScriptedShell) {
+        SCRIPTED_SHELL.with(|slot| *slot.borrow_mut() = Some(shell));
+        let result = body();
+        let shell = SCRIPTED_SHELL
+            .with(|slot| slot.borrow_mut().take())
+            .expect("scripted shell");
+        (result, shell)
+    }
+
+    #[test]
+    fn a_failed_call_reports_its_own_error_and_not_the_cleanup_s() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, SetLastError};
+        unsafe { SetLastError(ERROR_TIMEOUT) };
+        let error = last_error_then(|| unsafe { SetLastError(ERROR_ACCESS_DENIED) });
+        assert_eq!(error.code(), ERROR_TIMEOUT.to_hresult());
+        // The shell refuses the icon's version, and deleting the half-added icon leaves another
+        // error behind: the registration reports the refusal, and no icon is left.
+        let shell = ScriptedShell {
+            failures: VecDeque::from([(NIM_SETVERSION, ERROR_TIMEOUT)]),
+            during: Some((
+                NIM_DELETE,
+                Box::new(|| unsafe { SetLastError(ERROR_ACCESS_DENIED) }),
+            )),
+            ..ScriptedShell::default()
+        };
+        let (added, shell) = with_scripted_shell(shell, || {
+            TrayIcon::add(
+                HWND::default(),
+                TrayStatus::initial(LayoutIndicator::English),
+            )
+            .map(|tray| tray.icon)
+        });
+        assert_eq!(
+            added.err().map(|error| error.code()),
+            Some(ERROR_TIMEOUT.to_hresult())
+        );
+        assert!(shell.icons.is_empty());
+        let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
+        assert_eq!(messages, [NIM_ADD, NIM_SETVERSION, NIM_DELETE]);
+    }
+
+    #[test]
+    fn every_icon_call_asks_the_shell_for_the_standard_tooltip() {
+        let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            let mut tray = TrayIcon::add(
+                HWND::default(),
+                TrayStatus::initial(LayoutIndicator::English),
+            )
+            .expect("add");
+            let status = TrayStatus {
+                auto_enabled: true,
+                ..TrayStatus::initial(LayoutIndicator::Russian)
+            };
+            tray.update(status).expect("update");
+            // A balloon is a modify call too.
+            let (mut state, _receiver) = test_gate_state(1);
+            state.tray = Some(tray);
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            show_tray_information(HWND::default(), "AutoKeyboardLayot", "notice");
+            drop(take_app_state());
+        });
+        let calls: Vec<_> = shell
+            .calls
+            .iter()
+            .filter(|call| [NIM_ADD, NIM_MODIFY].contains(&call.message))
+            .map(|call| (call.message, call.flags.contains(NIF_SHOWTIP)))
+            .collect();
+        assert_eq!(
+            calls,
+            [(NIM_ADD, true), (NIM_MODIFY, true), (NIM_MODIFY, true)]
+        );
+    }
+
+    #[test]
+    fn a_re_added_icon_shows_the_last_status_and_announces_no_old_failure() {
+        // A conversion failed and paused automatic conversion, which the tray announced once.
+        // Explorer restarts: the new icon shows the failure in its tooltip, and the next refresh
+        // has nothing to announce.
+        let (state, _receiver) = test_gate_state(1);
+        state.metrics.auto_enabled.store(false, Ordering::Release);
+        state
+            .metrics
+            .conversion_failures
+            .store(1, Ordering::Release);
+        state
+            .metrics
+            .last_failure_reason
+            .store(ConversionFailureReason::TextCommit as u8, Ordering::Release);
+        let indicator = LayoutIndicator::English;
+        let start = Instant::now();
+        let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            update_tray(indicator, start);
+            recreate_tray(HWND::default());
+            update_tray(indicator, start + Duration::from_secs(1));
+            drop(take_app_state());
+        });
+        let balloons = shell
+            .calls
+            .iter()
+            .filter(|call| call.flags.contains(NIF_INFO))
+            .count();
+        assert_eq!(balloons, 1, "{:?}", shell.calls);
+        let added: Vec<_> = shell
+            .calls
+            .iter()
+            .filter(|call| call.message == NIM_ADD)
+            .map(|call| call.tip.as_str())
+            .collect();
+        assert_eq!(added.len(), 2);
+        assert!(!added[0].contains("conversion failures"), "{}", added[0]);
+        assert!(added[1].contains("conversion failures: 1"), "{}", added[1]);
+    }
+
+    /// Runs `body` with this thread's scripted notification area.
+    fn scripted_shell<T>(body: impl FnOnce(&mut ScriptedShell) -> T) -> T {
+        SCRIPTED_SHELL.with(|slot| body(slot.borrow_mut().as_mut().expect("scripted shell")))
+    }
+
+    fn icon_exists(icon: usize) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
+        let mut info = ICONINFO::default();
+        let exists = unsafe { GetIconInfo(HICON(icon as *mut c_void), &mut info) }.is_ok();
+        if exists {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+                let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+            }
+        }
+        exists
+    }
+
+    #[test]
+    fn an_icon_added_again_during_an_update_stays_in_the_shell() {
+        // Explorer restarts while an update's shell call runs, and the new taskbar's message adds
+        // the icon again in the middle of it. The updated, stale icon must not delete the new
+        // one, which the shell knows by the same id.
+        let (state, _receiver) = test_gate_state(1);
+        let indicator = LayoutIndicator::English;
+        let ((shown, stored), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            scripted_shell(|shell| {
+                shell.during = Some((
+                    NIM_MODIFY,
+                    Box::new(|| {
+                        scripted_shell(|shell| shell.icons.clear());
+                        recreate_tray(HWND::default());
+                    }),
+                ));
+            });
+            update_tray(indicator, Instant::now());
+            let shown = scripted_shell(|shell| shell.icons.contains(&TRAY_ID));
+            let stored = APP_STATE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|state| state.tray.as_ref())
+                    .map(|tray| tray.icon.0 as usize)
+            });
+            drop(take_app_state());
+            (shown, stored)
+        });
+        let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
+        assert_eq!(
+            messages,
+            [
+                NIM_ADD,
+                NIM_SETVERSION,
+                NIM_MODIFY,
+                NIM_ADD,
+                NIM_SETVERSION,
+                NIM_DELETE
+            ],
+            "only the final teardown deletes"
+        );
+        assert!(shown, "the new icon was deleted");
+        // The state keeps the new icon, and the stale one's image is destroyed.
+        assert_eq!(stored, Some(shell.calls[3].icon));
+        assert!(!icon_exists(shell.calls[2].icon));
+    }
+
+    #[test]
+    fn an_icon_added_while_another_is_stored_gives_up_its_image_only() {
+        // An addition that finds an icon stored already (a nested addition won) keeps that one:
+        // the shell shows one icon per id, and deleting the extra one would remove it.
+        let (state, _receiver) = test_gate_state(1);
+        let indicator = LayoutIndicator::English;
+        let ((), shell) = with_scripted_shell(ScriptedShell::default(), || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            // A restarted shell shows nothing yet, so the second addition succeeds.
+            scripted_shell(|shell| shell.icons.clear());
+            assert!(add_tray(HWND::default(), TrayStatus::initial(indicator)));
+            assert!(scripted_shell(|shell| shell.icons.contains(&TRAY_ID)));
+            drop(take_app_state());
+        });
+        let added: Vec<_> = shell
+            .calls
+            .iter()
+            .filter(|call| call.message == NIM_ADD)
+            .map(|call| call.icon)
+            .collect();
+        assert_eq!(added.len(), 2);
+        assert!(!icon_exists(added[1]), "the extra icon's image leaked");
+        let deletes = shell
+            .calls
+            .iter()
+            .filter(|call| call.message == NIM_DELETE)
+            .count();
+        assert_eq!(deletes, 1, "only the final teardown deletes");
+    }
+
+    #[test]
+    fn an_icon_the_shell_refuses_is_added_by_a_later_retry() {
+        use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        // The agent starts before the taskbar exists: the shell refuses the icon, and the agent
+        // goes on without it until a later timer tick adds it.
+        let (state, _receiver) = test_gate_state(1);
+        let shell = ScriptedShell {
+            failures: VecDeque::from([(NIM_ADD, ERROR_FILE_NOT_FOUND)]),
+            ..ScriptedShell::default()
+        };
+        let stored = || APP_STATE.with(|slot| slot.borrow().as_ref().unwrap().tray.is_some());
+        let ((), shell) = with_scripted_shell(shell, || {
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            assert!(!add_tray(
+                HWND::default(),
+                TrayStatus::initial(LayoutIndicator::English)
+            ));
+            assert!(!stored());
+            // Not due yet: nothing is tried.
+            retry_tray(HWND::default());
+            assert_eq!(scripted_shell(|shell| shell.calls.len()), 1);
+            UI_GUARDS.with(|guards| {
+                guards
+                    .borrow_mut()
+                    .tray_retry
+                    .as_mut()
+                    .expect("retry")
+                    .next_attempt = Instant::now();
+            });
+            retry_tray(HWND::default());
+            assert!(stored());
+            assert!(UI_GUARDS.with(|guards| guards.borrow().tray_retry.is_none()));
+            drop(take_app_state());
+        });
+        let messages: Vec<_> = shell.calls.iter().map(|call| call.message).collect();
+        assert_eq!(messages, [NIM_ADD, NIM_ADD, NIM_SETVERSION, NIM_DELETE]);
+    }
+
+    /// A window of the calling thread with the agent's window procedure. It goes with the thread.
+    fn agent_procedure_window() -> HWND {
+        let module = unsafe { GetModuleHandleW(None).expect("module") };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: w!("AutoKeyboardLayotProcedureTest"),
+            ..Default::default()
+        };
+        // A second registration fails harmlessly: the class is the same.
+        unsafe { RegisterClassW(&class) };
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("AutoKeyboardLayotProcedureTest"),
+                w!("AutoKeyboardLayot procedure test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+            .expect("window")
+        }
+    }
+
+    /// Takes a WM_QUIT waiting in this thread's queue; true when there was one.
+    fn take_quit_message() -> bool {
+        let mut message = MSG::default();
+        unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) }.as_bool()
+    }
+
+    #[test]
+    fn a_failed_start_leaves_no_quit_message_for_the_error_dialog() {
+        // Destroying the agent's window posts WM_QUIT for its message loop.
+        let window = agent_procedure_window();
+        unsafe { DestroyWindow(window).expect("destroy window") };
+        assert!(take_quit_message());
+        // A failed start never ran that loop: it takes the message back, so the dialog that main
+        // shows next is not closed by it.
+        abandon_startup(agent_procedure_window());
+        assert!(!take_quit_message());
+    }
+
     #[test]
     fn right_click_opens_menu_and_left_click_opens_settings() {
-        assert_eq!(tray_interaction(WM_CONTEXTMENU), TrayInteraction::QuickMenu);
-        assert_eq!(tray_interaction(NIN_KEYSELECT), TrayInteraction::Settings);
-        assert_eq!(tray_interaction(NIN_SELECT), TrayInteraction::Settings);
-        assert_eq!(tray_interaction(WM_TIMER), TrayInteraction::Ignore);
+        // The menu opens where the shell says: the icon's place on a monitor left of the primary
+        // one, as for the menu key, never wherever the pointer happens to be.
+        let anchor = WPARAM((usize::from(860u16) << 16) | usize::from((-120i16) as u16));
+        assert_eq!(
+            tray_interaction(WM_CONTEXTMENU, anchor),
+            TrayInteraction::QuickMenu(POINT { x: -120, y: 860 })
+        );
+        assert_eq!(
+            tray_interaction(NIN_KEYSELECT, anchor),
+            TrayInteraction::Settings
+        );
+        assert_eq!(
+            tray_interaction(NIN_SELECT, anchor),
+            TrayInteraction::Settings
+        );
+        assert_eq!(tray_interaction(WM_TIMER, anchor), TrayInteraction::Ignore);
+    }
+
+    #[test]
+    fn the_tray_menu_is_destroyed_on_every_return() {
+        use windows::Win32::System::Threading::{
+            GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::IsMenu;
+        let menu = PopupMenu::new().expect("menu");
+        let handle = menu.0;
+        assert!(unsafe { IsMenu(handle) }.as_bool());
+        drop(menu);
+        assert!(!unsafe { IsMenu(handle) }.as_bool());
+        // Without the agent's state (it is stopping) the menu returns early, leaving nothing.
+        let objects = || unsafe { GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) };
+        let before = objects();
+        show_tray_menu_inner(HWND::default(), POINT::default()).expect("early return");
+        assert_eq!(objects(), before);
     }
 
     #[test]
@@ -12066,6 +16361,7 @@ mod tests {
             failures: 0,
             failure_reason: ConversionFailureReason::None as u8,
             backend_status: BACKEND_CAPABILITY_UNSUPPORTED,
+            diagnostic_errors: 0,
         });
         let active = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
@@ -12079,6 +16375,7 @@ mod tests {
             failures: 0,
             failure_reason: ConversionFailureReason::None as u8,
             backend_status: BACKEND_PROTECTED_PASTE,
+            diagnostic_errors: 0,
         });
         let failed = tray_tooltip(TrayStatus {
             indicator: LayoutIndicator::English,
@@ -12092,6 +16389,7 @@ mod tests {
             failures: 1,
             failure_reason: ConversionFailureReason::TextCommit as u8,
             backend_status: BACKEND_PHYSICAL_REPLAY,
+            diagnostic_errors: 2,
         });
         assert!(paused.contains("privacy paused (password)"));
         assert!(!active.contains("privacy paused"));
@@ -12104,6 +16402,8 @@ mod tests {
         assert!(active.contains("backend: uia-paste"));
         assert!(failed.contains("backend: physical-replay"));
         assert!(failed.contains("conversion failures: 1 (last: text-commit)"));
+        assert!(failed.ends_with("; log errors: 2"));
+        assert!(!active.contains("log errors"));
         assert_eq!(
             conversion_failure_label(ConversionFailureReason::ClipboardEdit as u8),
             "clipboard-edit"
@@ -12120,6 +16420,94 @@ mod tests {
         assert_eq!(String::from_utf16(&complete[..3]).unwrap(), "A😀");
         assert_eq!(complete[3], 0);
         set_wide_text(&mut [0u16; 0], "text");
+    }
+
+    #[test]
+    fn a_full_diagnostics_log_is_moved_aside_over_the_previous_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostics.log");
+        let rotated = directory.path().join("diagnostics.1.log");
+        fs::write(&rotated, "previous rotated log\r\n").unwrap();
+        // Each line is 30 bytes: a 13-digit timestamp, a space, the record and CR LF.
+        for index in 0..4 {
+            assert_eq!(
+                append_diagnostic_record(&path, &format!("event=test n={index}"), 64).unwrap(),
+                DiagnosticAppend::Appended
+            );
+        }
+        let rotated_text = fs::read_to_string(&rotated).unwrap();
+        let active_text = fs::read_to_string(&path).unwrap();
+        assert!(!rotated_text.contains("previous rotated log"));
+        assert!(rotated_text.contains("n=0") && rotated_text.contains("n=1"));
+        assert!(active_text.contains("n=2") && active_text.contains("n=3"));
+        assert!(!active_text.contains("n=1"));
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_moved_aside_keeps_taking_records_within_twice_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostics.log");
+        // A directory where the rotated log belongs makes every move fail, as a viewer that
+        // holds the log open without sharing delete access does.
+        fs::create_dir_all(directory.path().join("diagnostics.1.log").join("blocker")).unwrap();
+        let mut outcomes = Vec::new();
+        for index in 0..6 {
+            outcomes.push(
+                append_diagnostic_record(&path, &format!("event=test n={index}"), 64).unwrap(),
+            );
+            assert!(fs::metadata(&path).unwrap().len() <= 128);
+        }
+        assert_eq!(
+            outcomes,
+            [
+                DiagnosticAppend::Appended,
+                DiagnosticAppend::Appended,
+                DiagnosticAppend::AppendedPastLimit,
+                DiagnosticAppend::AppendedPastLimit,
+                DiagnosticAppend::Restarted,
+                DiagnosticAppend::Appended,
+            ]
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("n=4") && text.contains("n=5"));
+        assert!(!text.contains("n=3"));
+    }
+
+    #[test]
+    fn the_diagnostics_writer_counts_what_it_could_not_write_for_the_tray() {
+        let metrics = ObserverMetrics::default();
+        let directory = tempfile::tempdir().unwrap();
+        // The log's directory is a file: no record can be written.
+        let blocked = directory.path().join("blocked");
+        fs::write(&blocked, "").unwrap();
+        let (sender, receiver) = sync_channel(4);
+        sender.send("event=test n=1".to_owned()).unwrap();
+        sender.send("event=test n=2".to_owned()).unwrap();
+        drop(sender);
+        diagnostic_worker(receiver, Some(blocked.join("diagnostics.log")), &metrics);
+        assert_eq!(metrics.diagnostic_log_errors.load(Ordering::Relaxed), 2);
+
+        // A full log that cannot be moved aside still takes the record, and the failed move is
+        // counted.
+        let path = directory.path().join("diagnostics.log");
+        fs::write(&path, vec![b'x'; DIAGNOSTIC_LOG_MAX_BYTES as usize]).unwrap();
+        fs::create_dir_all(directory.path().join("diagnostics.1.log").join("blocker")).unwrap();
+        let (sender, receiver) = sync_channel(1);
+        sender.send("event=test n=3".to_owned()).unwrap();
+        drop(sender);
+        diagnostic_worker(receiver, Some(path.clone()), &metrics);
+        assert_eq!(metrics.diagnostic_log_errors.load(Ordering::Relaxed), 3);
+        assert!(fs::read_to_string(&path).unwrap().contains("n=3"));
+
+        // Without a log path every record is lost.
+        let (sender, receiver) = sync_channel(1);
+        sender.send("event=test n=4".to_owned()).unwrap();
+        drop(sender);
+        diagnostic_worker(receiver, None, &metrics);
+        assert_eq!(metrics.diagnostic_log_errors.load(Ordering::Relaxed), 4);
+
+        metrics.dropped_diagnostics.store(5, Ordering::Relaxed);
+        assert_eq!(diagnostic_error_count(&metrics), 9);
     }
 
     #[test]
@@ -12158,18 +16546,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn protected_clipboard_round_trip_when_explicitly_enabled() {
-        if std::env::var_os("AUTOKEYBOARDLAYOT_CLIPBOARD_PROBE").is_none() {
-            return;
-        }
-        let _com = PrivacyGuard::new();
+    /// An invisible window owned by this thread, to open the clipboard with.
+    fn clipboard_test_window(title: PCWSTR) -> HWND {
         let module = unsafe { GetModuleHandleW(None).expect("module") };
-        let window = unsafe {
+        unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("STATIC"),
-                w!("AutoKeyboardLayot clipboard probe"),
+                title,
                 WINDOW_STYLE(0),
                 0,
                 0,
@@ -12180,14 +16564,44 @@ mod tests {
                 Some(HINSTANCE(module.0)),
                 None,
             )
-            .expect("probe window")
-        };
-        let original_formats = test_clipboard_formats(window).expect("clipboard formats");
-        let original_text = test_clipboard_unicode(window);
+            .expect("clipboard test window")
+        }
+    }
 
+    /// Puts `text` on the clipboard, owned by `owner`.
+    fn put_test_clipboard_text(owner: HWND, text: &str) {
+        let _open = ClipboardOpenGuard::open(owner, CLIPBOARD_OPEN_RETRIES).expect("open");
+        unsafe { EmptyClipboard() }.expect("empty");
+        let mut data = global_utf16(text).expect("text");
+        assert!(data.transfer(u32::from(CF_UNICODETEXT.0)));
+    }
+
+    fn sorted(mut formats: Vec<u32>) -> Vec<u32> {
+        formats.sort_unstable();
+        formats.dedup();
+        formats
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn protected_clipboard_round_trip_on_the_real_clipboard() {
+        let _com = PrivacyGuard::new();
+        // The clipboard's owner must answer when the clipboard is emptied; this thread waits for
+        // the broker meanwhile, so the original comes from a window that is gone by then.
+        let source = clipboard_test_window(w!("AutoKeyboardLayot clipboard source"));
+        put_test_clipboard_text(source, "akl-original");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot clipboard probe"));
+        let original_formats = test_clipboard_formats(window).expect("clipboard formats");
+
+        let brokers = ClipboardBrokers::default();
         let mut transaction = ProtectedClipboard::begin(
             "akl-clipboard-probe",
             Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            unsafe { GetCurrentProcessId() },
         )
         .expect("protected clipboard transaction");
         assert!(transaction.is_current());
@@ -12195,22 +16609,175 @@ mod tests {
             test_clipboard_unicode(window).as_deref(),
             Some("akl-clipboard-probe")
         );
+        let opt_outs = clipboard_opt_out_formats().expect("opt-out formats");
         let temporary_formats = test_clipboard_formats(window).expect("temporary formats");
-        for name in [
-            w!("ExcludeClipboardContentFromMonitorProcessing"),
-            w!("CanIncludeInClipboardHistory"),
-            w!("CanUploadToCloudClipboard"),
-        ] {
-            let format = unsafe { RegisterClipboardFormatW(name) };
-            assert!(format != 0 && temporary_formats.contains(&format));
+        for format in opt_outs {
+            assert!(temporary_formats.contains(&format));
         }
 
         assert!(transaction.restore());
-        assert_eq!(test_clipboard_formats(window), Some(original_formats));
-        assert_eq!(test_clipboard_unicode(window), original_text);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-original")
+        );
+        // The user's item comes back with the opt-outs it lacked, and nothing else.
+        let mut expected = original_formats.clone();
+        expected.extend(opt_outs);
+        assert_eq!(
+            sorted(test_clipboard_formats(window).expect("restored formats")),
+            sorted(expected)
+        );
+        drop(transaction);
+        assert!(brokers.reap().is_empty());
         unsafe {
             DestroyWindow(window).expect("destroy probe window");
         }
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn the_real_clipboard_is_not_replaced_once_it_changed_since_the_copy() {
+        let source = clipboard_test_window(w!("AutoKeyboardLayot changed source"));
+        put_test_clipboard_text(source, "akl-newer");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot changed probe"));
+        let owner = clipboard_test_window(w!("AutoKeyboardLayot changed owner"));
+        // The copy was taken before another program wrote: its sequence is an older one.
+        let stale = unsafe { GetClipboardSequenceNumber() }.wrapping_sub(1);
+        let cancelled = AtomicBool::new(false);
+        assert_eq!(
+            install_protected_clipboard(owner, "akl-replacement", stale, &cancelled),
+            InstallOutcome::Untouched(BrokerFailure::Changed)
+        );
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("akl-newer"));
+        // A worker that stopped waiting is not served either, whatever the sequence.
+        cancelled.store(true, Ordering::Release);
+        let current = unsafe { GetClipboardSequenceNumber() };
+        assert_eq!(
+            install_protected_clipboard(owner, "akl-replacement", current, &cancelled),
+            InstallOutcome::Untouched(BrokerFailure::Cancelled)
+        );
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("akl-newer"));
+        unsafe {
+            DestroyWindow(owner).expect("destroy owner window");
+            DestroyWindow(window).expect("destroy probe window");
+        }
+    }
+
+    const DELAYED_TEXT: &str = "akl-delayed-original";
+
+    unsafe extern "system" fn delayed_render_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_RENDERALLFORMATS, WM_RENDERFORMAT};
+        let render = || {
+            if let Some(mut data) = global_utf16(DELAYED_TEXT) {
+                let _ = data.transfer(u32::from(CF_UNICODETEXT.0));
+            }
+        };
+        match message {
+            WM_RENDERFORMAT => {
+                render();
+                LRESULT(0)
+            }
+            WM_RENDERALLFORMATS => {
+                if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
+                    if unsafe { GetClipboardOwner().ok() } == Some(hwnd) {
+                        render();
+                    }
+                    let _ = unsafe { CloseClipboard() };
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn delayed_rendered_clipboard_content_survives_a_protected_paste() {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+        // Programs such as Excel or browsers put formats on the clipboard that they render only
+        // when asked. Rendering them for the copy must not count as a change of the clipboard,
+        // or no paste could ever replace such content.
+        let (ready_sender, ready) = sync_channel::<u32>(1);
+        let owner = thread::spawn(move || {
+            let module = unsafe { GetModuleHandleW(None).expect("module") };
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(delayed_render_procedure),
+                hInstance: HINSTANCE(module.0),
+                lpszClassName: w!("AutoKeyboardLayotDelayedRenderTest"),
+                ..Default::default()
+            };
+            unsafe { RegisterClassW(&class) };
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("AutoKeyboardLayotDelayedRenderTest"),
+                    w!("AutoKeyboardLayot delayed render test"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    Some(HINSTANCE(module.0)),
+                    None,
+                )
+                .expect("owner window")
+            };
+            {
+                let _open = ClipboardOpenGuard::open(window, CLIPBOARD_OPEN_RETRIES).expect("open");
+                unsafe { EmptyClipboard() }.expect("empty");
+                // Without data the call returns no handle even when it succeeds.
+                let _ = unsafe { SetClipboardData(u32::from(CF_UNICODETEXT.0), None) };
+            }
+            let _ = ready_sender.send(unsafe { GetCurrentThreadId() });
+            let mut message = MSG::default();
+            while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+                unsafe {
+                    DispatchMessageW(&message);
+                }
+            }
+            unsafe {
+                let _ = DestroyWindow(window);
+            }
+        });
+        let owner_thread = ready.recv().expect("owner ready");
+
+        let _com = PrivacyGuard::new();
+        let window = clipboard_test_window(w!("AutoKeyboardLayot delayed render probe"));
+        let brokers = ClipboardBrokers::default();
+        let mut transaction = ProtectedClipboard::begin(
+            "akl-delayed-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            unsafe { GetCurrentProcessId() },
+        )
+        .expect("the replacement goes over delayed-rendered content");
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-delayed-probe")
+        );
+        assert!(transaction.restore());
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some(DELAYED_TEXT)
+        );
+        drop(transaction);
+        unsafe {
+            PostThreadMessageW(owner_thread, WM_QUIT, WPARAM(0), LPARAM(0))
+                .expect("stop the owner");
+            DestroyWindow(window).expect("destroy probe window");
+        }
+        owner.join().expect("owner thread");
     }
 
     #[test]
@@ -12517,30 +17084,62 @@ mod tests {
         assert!(paced_replay_fits_gate(plan.step_ends.len()));
         assert!(!paced_replay_fits_gate(135));
         assert_eq!(
-            conversion_gate_budget_ms(plan.step_ends.len(), true, false, true, false),
+            conversion_gate_budget_ms(plan.step_ends.len(), true, true),
             Some(1_187)
         );
         assert_eq!(
-            conversion_gate_budget_ms(14, true, false, true, false),
-            Some(839)
+            conversion_gate_budget_ms(plan.step_ends.len(), true, false),
+            Some(1_137)
         );
-        assert_eq!(
-            conversion_gate_budget_ms(14, false, true, true, false),
-            Some(985)
-        );
+        assert_eq!(conversion_gate_budget_ms(14, false, false), Some(535));
+        // A protected paste is budgeted from its own waits, not as a paced replay: settle,
+        // selection, the least installation and everything after the Ctrl+V.
+        assert_eq!(paste_gate_budget_ms(false), 1_000);
+        assert_eq!(paste_gate_budget_ms(true), 1_035);
+        assert!(paste_gate_budget_ms(true) <= CORRECTION_GATE_MAX_HOLD_MS);
 
+        // The handoff is judged at a fixed instant, so it fits exactly when the budget does.
+        let now = Instant::now();
         let mut gate = CorrectionGate::default();
         gate.activate(10);
         gate.awaiting_worker_ack = true;
-        assert!(gate.prepare_handoff_budget(10, 839));
-        gate.deadline = Instant::now() + Duration::from_millis(838);
-        assert!(!gate.handoff(10, 20));
+        assert!(
+            gate.prepare_handoff_budget(10, 839, Instant::now())
+                .is_some()
+        );
+        gate.deadline = now + Duration::from_millis(838);
+        assert!(!gate.handoff(10, 20, now));
 
         gate.activate(10);
         gate.awaiting_worker_ack = true;
-        assert!(gate.prepare_handoff_budget(10, 789));
-        gate.deadline = Instant::now() + Duration::from_millis(850);
-        assert!(gate.handoff(10, 20));
+        assert!(
+            gate.prepare_handoff_budget(10, 789, Instant::now())
+                .is_some()
+        );
+        gate.deadline = now + Duration::from_millis(789);
+        assert!(gate.handoff(10, 20, now));
+    }
+
+    #[test]
+    fn a_handed_over_gate_gives_its_conversion_what_it_has_left() {
+        // The UI thread answers what the gate has left, when that covers the conversion.
+        let now = Instant::now();
+        let mut gate = CorrectionGate::default();
+        gate.activate(10);
+        gate.awaiting_worker_ack = true;
+        gate.deadline = now + Duration::from_millis(900);
+        assert_eq!(gate.prepare_handoff_budget(10, 901, now), None);
+        assert_eq!(gate.prepare_handoff_budget(10, 800, now), Some(900));
+        assert_eq!(gate.handoff_budget_ms, 800);
+        // The worker counts it from before it asked.
+        let asked_at = Instant::now();
+        assert_eq!(
+            handed_over_gate_deadline(true, asked_at, 1_080, 770),
+            Some(asked_at + Duration::from_millis(1_080))
+        );
+        assert_eq!(handed_over_gate_deadline(true, asked_at, 0, 770), None);
+        assert_eq!(handed_over_gate_deadline(true, asked_at, 769, 770), None);
+        assert_eq!(handed_over_gate_deadline(false, asked_at, 1_080, 770), None);
     }
 
     #[test]
@@ -12572,6 +17171,8 @@ mod tests {
             sequence: 0,
             drain_token: 0,
             hotkey_trigger: false,
+            repeat: false,
+            held_modifiers: 0,
         };
         let up = RawKeyEvent {
             message: WM_KEYUP,
@@ -12650,9 +17251,13 @@ mod tests {
         gate.held
             .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0));
         let deadline = gate.deadline;
+        let now = deadline - Duration::from_secs(1);
 
-        assert!(gate.prepare_handoff_budget(10, 100));
-        assert!(gate.handoff(10, 20));
+        assert!(
+            gate.prepare_handoff_budget(10, 100, Instant::now())
+                .is_some()
+        );
+        assert!(gate.handoff(10, 20, now));
         assert!(gate.active);
         assert_eq!(gate.token, 20);
         assert_eq!(gate.fence_marker, GATE_FENCE_MARKER_BASE | 20);
@@ -12661,7 +17266,7 @@ mod tests {
         assert_eq!(gate.current_drain_count, 0);
         assert!(!gate.awaiting_worker_ack);
         assert_eq!(gate.deadline, deadline);
-        assert!(!gate.handoff(10, 30));
+        assert!(!gate.handoff(10, 30, now));
     }
 
     #[test]
@@ -12674,9 +17279,13 @@ mod tests {
         gate.drain_in_flight = false;
         gate.awaiting_worker_ack = true;
         assert!(!gate.can_start_drain(10));
-        assert!(gate.prepare_handoff_budget(10, 200));
-        gate.deadline = Instant::now() + Duration::from_millis(199);
-        assert!(!gate.handoff(10, 20));
+        assert!(
+            gate.prepare_handoff_budget(10, 200, Instant::now())
+                .is_some()
+        );
+        let now = Instant::now();
+        gate.deadline = now + Duration::from_millis(199);
+        assert!(!gate.handoff(10, 20, now));
         assert_eq!(gate.token, 10);
     }
 
@@ -12689,6 +17298,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "legacy-bundled-input"),
+        ignore = "the keys spell \"привет\" in Russian, and the modular base has no Russian dictionary"
+    )]
     fn drained_space_down_defers_candidate_until_fence_ack() {
         let metrics = Arc::new(ObserverMetrics::default());
         metrics.auto_enabled.store(true, Ordering::Release);
@@ -12721,20 +17334,9 @@ mod tests {
                 extended: false,
             });
         }
-        // The mapped-candidate path needs real installed layouts for the resolved
-        // handles; test_profiles() supplies synthetic handles, so only assert on a
-        // machine that can actually map the replay keys to the target layout.
-        if mapped_layout_candidates(
-            &processor.replay_keys,
-            Language::English,
-            &processor.settings,
-            &processor.detector,
-            processor.resolved_profiles(),
-        )
-        .is_empty()
-        {
-            return;
-        }
+        // test_profiles() supplies synthetic layout handles; the test keyboard maps the replay
+        // keys in them.
+        processor.test_keyboard = Some(test_keyboard);
         let event = RawKeyEvent {
             foreground,
             ..test_raw_key(WM_KEYDOWN, VK_SPACE, 40, 7)
@@ -12750,6 +17352,350 @@ mod tests {
                 boundary_sequence: 40,
             })
         );
+    }
+
+    /// A processor typing in an allowed field of an editor whose foreground layout is `layout`,
+    /// with the test keyboard and automatic conversion on.
+    fn processor_typing_in(layout: usize) -> (InputProcessor, ForegroundContext) {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(metrics, 0);
+        let foreground = ForegroundContext {
+            layout,
+            ..test_foreground()
+        };
+        processor.test_keyboard = Some(test_keyboard);
+        processor.last_foreground = Some(foreground_identity_key(foreground));
+        processor.last_layout = Some(foreground.layout);
+        processor.foreground_override = Some(foreground);
+        processor.process_override = Some((Some(EDITOR.to_owned()), Some(0x2000)));
+        processor.current_integrity_level = Some(0x2000);
+        processor.privacy_probe = Some(answering_probe(None));
+        processor.privacy_needs_check = true;
+        (processor, foreground)
+    }
+
+    /// Types the keys with these scan codes.
+    fn type_keys(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        scan_codes: &[u32],
+    ) {
+        for (index, &scan_code) in scan_codes.iter().enumerate() {
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                foreground,
+                ..letter(0x41, index as u64 + 1)
+            });
+        }
+    }
+
+    /// A Space; a drained one (`drain_token` other than 0) defers the edit.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn space_key(foreground: ForegroundContext, sequence: u64, drain_token: u64) -> RawKeyEvent {
+        RawKeyEvent {
+            scan_code: 0x39,
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_SPACE, sequence, drain_token)
+        }
+    }
+
+    /// Types the keys with these scan codes, then a drained Space that defers the edit.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn type_keys_and_drained_space(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        scan_codes: &[u32],
+    ) {
+        type_keys(processor, foreground, scan_codes);
+        processor.process_key(space_key(foreground, scan_codes.len() as u64 + 1, 9));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_key_that_prints_a_letter_of_a_target_layout_continues_the_word() {
+        // Russian typed with the Estonian layout active: the comma key prints "б" in Russian, so
+        // ",skj" is one word, "было".
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x33, 0x1f, 0x25, 0x24]);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, ",skj");
+        assert_eq!(pending.transaction.replacement, "было");
+        assert_eq!(pending.transaction.target_language, Language::Russian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_keypad_period_ends_the_word_where_the_target_layouts_print_a_comma() {
+        // The offline table reads "." as the Russian "ю", the key of the main row. The keypad's
+        // "." prints "," in the Russian and Estonian layouts: after "ghbdtn" it ends the word
+        // instead of joining it, where the word's Russian reading would be "привет,".
+        for (scan_code, virtual_key, continues) in
+            // VK_OEM_PERIOD, then the keypad's VK_DECIMAL.
+            [(0x34, VIRTUAL_KEY(0xbe), true), (0x53, VK_DECIMAL, false)]
+        {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            type_keys(
+                &mut processor,
+                foreground,
+                &[0x22, 0x23, 0x30, 0x20, 0x14, 0x31],
+            );
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                foreground,
+                ..test_raw_key(WM_KEYDOWN, virtual_key, 7, 0)
+            });
+            let typed = if continues { 7 } else { 0 };
+            assert_eq!(
+                processor.session.buffered_character_count(),
+                typed,
+                "{scan_code:#x}"
+            );
+            assert_eq!(processor.replay_keys.len(), typed, "{scan_code:#x}");
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn backspace_resumes_a_word_with_a_key_that_prints_a_letter_of_a_target_layout() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x33, 0x1f, 0x25, 0x24]);
+        let last = processor.last_boundary.take();
+        let backspace = RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 6, 0)
+        };
+        assert!(processor.erase_or_resume_word(last, backspace, Some(Language::Estonian)));
+        assert_eq!(processor.session.buffered_character_count(), 4);
+        assert_eq!(processor.replay_keys.len(), 4);
+    }
+
+    #[test]
+    fn the_hook_counts_the_edge_of_its_own_modifier_key() {
+        // No modifier key is physically held while the tests run; the asynchronous key state
+        // does not show the event's own edge yet, so the hook adds it.
+        assert_eq!(held_modifiers_for_event(0x41, true, false), 0);
+        assert_eq!(
+            held_modifiers_for_event(VK_LSHIFT.0, true, false),
+            held_keys(&[VK_LSHIFT])
+        );
+        assert_eq!(
+            held_modifiers_for_event(VK_RCONTROL.0, true, false),
+            held_keys(&[VK_RCONTROL])
+        );
+        assert_eq!(held_modifiers_for_event(VK_LSHIFT.0, false, true), 0);
+        assert_eq!(held_modifiers_for_event(VK_RWIN.0, false, true), 0);
+    }
+
+    #[test]
+    fn the_hooks_held_modifiers_become_the_tracked_ones() {
+        let none = Modifiers::from_held(0);
+        assert!(!none.shift() && !none.has_shortcut_modifier());
+        let shift = Modifiers::from_held(held_keys(&[VK_RSHIFT]));
+        assert!(shift.shift() && !shift.has_shortcut_modifier());
+        // Each side is tracked apart: letting one Shift go keeps the other held.
+        let mut both = Modifiers::from_held(held_keys(&[VK_LSHIFT, VK_RSHIFT]));
+        both.update(u32::from(VK_LSHIFT.0), false, true);
+        assert!(both.shift());
+        both.update(u32::from(VK_RSHIFT.0), false, true);
+        assert!(!both.shift());
+        for key in [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LMENU,
+            VK_RMENU,
+            VK_LWIN,
+            VK_RWIN,
+        ] {
+            let modifiers = Modifiers::from_held(held_keys(&[key]));
+            assert!(
+                modifiers.has_shortcut_modifier() && !modifiers.shift(),
+                "{key:?}"
+            );
+        }
+        let alt_control = Modifiers::from_held(held_keys(&[VK_RMENU, VK_LCONTROL]));
+        assert!(alt_control.alt() && alt_control.control());
+    }
+
+    #[test]
+    fn modifiers_held_across_a_focus_change_come_from_the_key_event() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        // Shift+Tab moves the focus while Shift stays held: the worker saw Shift go down, and
+        // the next key in the other field still has it held.
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2a,
+            held_modifiers: held_keys(&[VK_LSHIFT]),
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LSHIFT, 1, 0)
+        });
+        let field = ForegroundContext {
+            focus: 9,
+            ..foreground
+        };
+        processor.foreground_override = Some(field);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x30,
+            held_modifiers: held_keys(&[VK_LSHIFT]),
+            foreground: field,
+            ..letter(0x42, 2)
+        });
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        assert!(
+            processor.replay_keys[0].shift,
+            "B was typed with Shift held"
+        );
+        // Ctrl held across a switch makes the next key a shortcut, not a typed letter.
+        let other = ForegroundContext {
+            focus: 10,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2f,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            foreground: other,
+            ..letter(0x56, 3)
+        });
+        assert_eq!(processor.last_word_reset, "shortcut");
+        assert_eq!(processor.session.buffered_character_count(), 0);
+    }
+
+    #[test]
+    fn modifiers_released_on_the_secure_desktop_are_forgotten_in_the_same_window() {
+        // Ctrl+Alt+Del: the worker sees Ctrl and Alt go down, then the secure desktop takes the
+        // keys, and their key-ups never come here.
+        let press_control_alt = |processor: &mut InputProcessor, foreground| {
+            for (sequence, key, held) in [
+                (1, VK_LCONTROL, held_keys(&[VK_LCONTROL])),
+                (2, VK_LMENU, held_keys(&[VK_LCONTROL, VK_LMENU])),
+            ] {
+                processor.process_key(RawKeyEvent {
+                    held_modifiers: held,
+                    foreground,
+                    ..test_raw_key(WM_KEYDOWN, key, sequence, 0)
+                });
+            }
+        };
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        press_control_alt(&mut processor, foreground);
+        // Cancel returns to the same window with every key released: the letter is typed.
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x30,
+            foreground,
+            ..letter(0x42, 3)
+        });
+        assert!(!processor.modifiers.has_shortcut_modifier());
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        // A modifier still held stays: Ctrl kept down makes a shortcut, without the Alt let go.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        press_control_alt(&mut processor, foreground);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2e,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            foreground,
+            ..letter(0x43, 3)
+        });
+        assert_eq!(processor.last_word_reset, "shortcut");
+        assert!(processor.modifiers.control() && !processor.modifiers.alt());
+    }
+
+    #[test]
+    fn modifiers_held_into_a_new_input_epoch_come_from_the_key_event() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys(&mut processor, foreground, &[0x22]);
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x2a,
+            held_modifiers: held_keys(&[VK_LSHIFT]),
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LSHIFT, 2, 0)
+        });
+        // A settings Apply starts a new input epoch while Shift stays held.
+        let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.process(QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(RawKeyEvent {
+                scan_code: 0x30,
+                held_modifiers: held_keys(&[VK_LSHIFT]),
+                foreground,
+                ..letter(0x42, 3)
+            }),
+            configuration: None,
+        });
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        assert!(
+            processor.replay_keys[0].shift,
+            "B was typed with Shift held"
+        );
+    }
+
+    /// Presses and releases `keys` in order, each event with the modifiers held at that moment.
+    fn press_chord(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        keys: &[(VIRTUAL_KEY, u32)],
+        sequence: u64,
+    ) {
+        let modifier_keys: Vec<VIRTUAL_KEY> = keys
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| PHYSICAL_MODIFIER_KEYS.contains(key))
+            .collect();
+        let mut held = Vec::new();
+        let edges = keys
+            .iter()
+            .map(|key| (key, WM_KEYDOWN))
+            .chain(keys.iter().rev().map(|key| (key, WM_KEYUP)));
+        for (index, (&(key, scan_code), message)) in edges.enumerate() {
+            if modifier_keys.contains(&key) {
+                if message == WM_KEYDOWN {
+                    held.push(key);
+                } else {
+                    held.retain(|other| *other != key);
+                }
+            }
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                held_modifiers: held_keys(&held),
+                foreground,
+                ..test_raw_key(message, key, sequence + index as u64, 0)
+            });
+        }
+    }
+
+    #[test]
+    fn a_layout_chord_keeps_the_word_for_pause() {
+        for chord in [
+            &[(VK_LWIN, 0x5b), (VK_SPACE, 0x39)][..],
+            &[(VK_LWIN, 0x5b), (VK_LSHIFT, 0x2a), (VK_SPACE, 0x39)],
+            &[(VK_LMENU, 0x38), (VK_LSHIFT, 0x2a)],
+        ] {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            press_chord(&mut processor, foreground, chord, 7);
+            assert_eq!(
+                processor.replay_keys.len(),
+                6,
+                "{chord:?}: the word is kept"
+            );
+            // The next key shows the Russian layout: the word typed so far stays for Pause, read
+            // in the layout it was typed in.
+            let russian = ForegroundContext {
+                layout: 0x0419,
+                ..foreground
+            };
+            processor.foreground_override = Some(russian);
+            press_chord(&mut processor, russian, &[(VK_LSHIFT, 0x2a)], 20);
+            let kept = processor
+                .last_boundary
+                .as_ref()
+                .unwrap_or_else(|| panic!("{chord:?}: no word for Pause"));
+            assert_eq!(kept.replay_keys.len(), 6, "{chord:?}");
+            assert_eq!(kept.foreground.layout, 0x0409, "{chord:?}");
+        }
     }
 
     #[test]
@@ -12781,10 +17727,30 @@ mod tests {
 
     #[test]
     fn auto_mode_has_one_shared_atomic_source_of_truth() {
-        let metrics = Arc::new(ObserverMetrics::default());
-        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
-        metrics.auto_enabled.store(true, Ordering::Release);
-        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        // The tray menu's toggle writes the one value that the worker and the window's gate
+        // requests read: nothing keeps a copy of its own.
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        metrics.auto_enabled.store(false, Ordering::Release);
+        let processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let space = |epoch| QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(test_raw_key(WM_KEYDOWN, VK_SPACE, 1, 0)),
+            configuration: None,
+        };
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        for enabled in [true, false] {
+            toggle_auto_enabled();
+            // The toggle makes queued events stale; a new one is judged by the mode alone.
+            let current = space(metrics.input_epoch.load(Ordering::Acquire));
+            assert_eq!(
+                processor.gate_bypass_reason(&current) == "automatic-off",
+                !enabled
+            );
+            assert_eq!(gate_request_enabled(&metrics, 0), enabled);
+        }
+        drop(take_app_state());
     }
 
     #[test]
@@ -12847,15 +17813,31 @@ mod tests {
 
     #[test]
     fn win_space_never_arms_or_holds_the_decision_gate() {
-        assert!(!should_arm_space_decision_gate(
-            false,
-            true,
-            VK_SPACE.0,
-            true,
-            PRIVACY_ALLOWED,
-            false,
-            false,
-        ));
+        // The hook asks for the generic Ctrl and Alt keys, and for each Windows key: there is no
+        // generic one. Shift is part of typing.
+        for (held_key, arms) in [
+            (None, true),
+            (Some(VK_SHIFT), true),
+            (Some(VK_LWIN), false),
+            (Some(VK_RWIN), false),
+            (Some(VK_CONTROL), false),
+            (Some(VK_MENU), false),
+        ] {
+            let released = shortcut_modifiers_released_by(|key| Some(key) == held_key);
+            assert_eq!(
+                should_arm_space_decision_gate(
+                    false,
+                    true,
+                    VK_SPACE.0,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    released,
+                ),
+                arms,
+                "{held_key:?}"
+            );
+        }
     }
 
     #[test]
@@ -13233,53 +18215,12 @@ mod tests {
         }
     }
 
-    fn type_token_character(processor: &mut InputProcessor, event: InputEvent) {
-        let buffered_before = processor.session.buffered_character_count();
-        let keys = processor.take_manual_token_keys(event, true, buffered_before);
-        let action = processor
-            .session
-            .handle(event, Some(Language::English), &processor.detector);
-        if matches!(action, SessionAction::Reset(_)) {
-            processor.replay_keys.clear();
-        }
-        if matches!(event, InputEvent::Printable(_))
-            && processor.session.buffered_character_count() == buffered_before + 1
-        {
-            processor.replay_keys.push(ReplayKey {
-                scan_code: 0x22,
-                shift: false,
-                caps_lock: false,
-                extended: false,
-            });
-        }
-        if let Some(keys) = keys {
-            processor.extend_manual_token(
-                keys,
-                Some(ReplayKey {
-                    scan_code: 0x07,
-                    shift: false,
-                    caps_lock: false,
-                    extended: false,
-                }),
-            );
-        }
-    }
-
     #[test]
     fn digit_keeps_the_token_for_manual_conversion_only() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.set_privacy_reason(None);
-        // "ШЗм6" typed in the Russian layout for "IPv6"; tested with Latin
-        // letters because only the key sequence matters here.
-        for event in [
-            InputEvent::Printable('i'),
-            InputEvent::Printable('p'),
-            InputEvent::Printable('v'),
-            InputEvent::UnsupportedInput,
-            InputEvent::Printable('x'),
-        ] {
-            type_token_character(&mut processor, event);
-        }
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        // "ШЗм6" typed in the Russian layout for "IPv6"; typed here as Latin letters because only
+        // the key sequence matters.
+        type_keys(&mut processor, foreground, &[0x17, 0x19, 0x2f, 0x07, 0x2d]);
         assert_eq!(processor.replay_keys.len(), 5);
         assert_eq!(processor.session.buffered_character_count(), 0);
         // Automatic conversion stays suppressed for the token.
@@ -13299,8 +18240,7 @@ mod tests {
         assert!(!processor.session.is_suppressed());
 
         // A token may also start with the unsupported character.
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
-        type_token_character(&mut processor, InputEvent::Printable('t'));
+        type_keys(&mut processor, foreground, &[0x07, 0x14]);
         assert_eq!(processor.replay_keys.len(), 2);
         assert!(
             processor
@@ -13352,27 +18292,145 @@ mod tests {
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
-    fn a_finished_word_counts_as_the_target_language_only_when_a_conversion_is_attempted() {
-        // (automatic conversion on, delimiter, language the next words see)
-        let cases = [
-            (true, Some(' '), Language::Russian),
-            (false, Some(' '), Language::English),
-            (true, None, Language::English),
-            (false, None, Language::English),
-        ];
-        for (automatic, delimiter, expected) in cases {
+    fn a_finished_word_counts_as_typed_until_its_conversion_is_applied() {
+        // (automatic conversion on, delimiter)
+        for (automatic, delimiter) in [
+            (true, Some(' ')),
+            (false, Some(' ')),
+            (true, None),
+            (false, None),
+        ] {
             let metrics = Arc::new(ObserverMetrics::default());
             metrics.auto_enabled.store(automatic, Ordering::Release);
             let mut processor = InputProcessor::new(metrics, 0);
             processor.set_privacy_reason(None);
+            processor.settings.conversion_sound = false;
+            processor.settings.offer_dictionary_after_forced_conversion = false;
             type_wrong_layout_word(&mut processor);
             let conversion = processor.handle_boundary(Some(Language::English), delimiter, false);
             assert_eq!(conversion.is_some(), delimiter.is_some());
             assert_eq!(
                 processor.recent_languages,
-                [expected],
+                [Language::English],
                 "automatic={automatic} delimiter={delimiter:?}"
             );
+            // Only an applied automatic conversion makes the word count as Russian.
+            let Some((transaction, replay_keys)) = conversion else {
+                continue;
+            };
+            for (forced, expected) in [(true, Language::English), (false, Language::Russian)] {
+                let pending = PendingConversion {
+                    transaction: transaction.clone(),
+                    foreground: test_foreground(),
+                    source_layout: 0x0409,
+                    profile_generation: processor.input_profiles.generation(),
+                    space_down_sequence: 1,
+                    replay_keys: replay_keys.clone(),
+                    forced,
+                    cycle_order: Vec::new(),
+                };
+                processor.finish_applied_conversion(
+                    pending,
+                    1,
+                    HKL(0x0419 as *mut c_void),
+                    EditStrategy::ProtectedPaste,
+                );
+                assert_eq!(processor.recent_languages, [expected], "forced={forced}");
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn an_undone_automatic_conversion_counts_as_typed_again() {
+        // "ghbdtn" converted to Russian by itself, then undone with Pause: the following words
+        // see an English word again.
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.set_privacy_reason(None);
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        processor.remember_word_language(Language::Estonian);
+        type_wrong_layout_word(&mut processor);
+        let (transaction, replay_keys) = processor
+            .handle_boundary(Some(Language::English), Some(' '), false)
+            .expect("a conversion");
+        processor.finish_applied_conversion(
+            PendingConversion {
+                transaction,
+                foreground: test_foreground(),
+                source_layout: 0x0409,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 1,
+                replay_keys,
+                forced: false,
+                cycle_order: Vec::new(),
+            },
+            1,
+            HKL(0x0419 as *mut c_void),
+            EditStrategy::ProtectedPaste,
+        );
+        assert_eq!(
+            processor.recent_languages,
+            [Language::Estonian, Language::Russian]
+        );
+        let record = processor.undo_record.take().expect("an undo");
+        processor.finish_applied_undo(&record);
+        assert_eq!(
+            processor.recent_languages,
+            [Language::Estonian, Language::English]
+        );
+        // A last entry in another language than the conversion's target is another word's.
+        processor.remember_word_language(Language::Estonian);
+        processor.finish_applied_undo(&record);
+        assert_eq!(
+            processor.recent_languages,
+            [Language::Estonian, Language::English, Language::Estonian]
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_suppressed_token_leaves_the_recent_word_languages_alone() {
+        // "123" is a token for Pause only: no language of a word follows from it.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys(&mut processor, foreground, &[0x02, 0x03, 0x04]);
+        assert!(processor.session.is_suppressed());
+        assert_eq!(processor.replay_keys.len(), 3);
+        processor.process_key(space_key(foreground, 4, 0));
+        assert!(processor.recent_languages.is_empty());
+        // A word that is not converted does count as typed.
+        type_keys(&mut processor, foreground, &[0x23, 0x12, 0x26, 0x26, 0x18]);
+        processor.process_key(space_key(foreground, 10, 0));
+        assert_eq!(processor.recent_languages, [Language::English]);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_whose_conversion_is_not_applied_counts_as_typed() {
+        // "ghbdtn", "привет" in Russian, ended by a Space with Shift held, with Caps Lock changed
+        // since the word, deferred by the gate, or handled at once by a conversion that cannot
+        // reach the field here.
+        for case in ["shift", "caps", "deferred", "unapplied"] {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            let mut space = space_key(foreground, 7, 0);
+            match case {
+                "shift" => {
+                    processor
+                        .modifiers
+                        .update(u32::from(VK_LSHIFT.0), true, false);
+                }
+                "caps" => space.caps_lock = true,
+                "deferred" => space.drain_token = 9,
+                _ => {}
+            }
+            processor.process_key(space);
+            assert_eq!(
+                processor.pending_conversion.is_some(),
+                case == "deferred",
+                "{case}"
+            );
+            assert_eq!(processor.recent_languages, [Language::English], "{case}");
         }
     }
 
@@ -13405,24 +18463,17 @@ mod tests {
 
     #[test]
     fn text_after_a_shortcut_is_a_manual_token_only() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.set_privacy_reason(None);
+        let (mut processor, foreground) = processor_typing_in(0x0409);
         // Ctrl+C in a terminal: the shortcut suppresses the session and pauses
         // privacy until the next key rechecks it.
-        processor.last_word_reset = "shortcut";
-        processor
-            .session
-            .handle(InputEvent::Shortcut, None, &processor.detector);
-        processor.mark_privacy_dirty(true);
+        press_chord(
+            &mut processor,
+            foreground,
+            &[(VK_LCONTROL, 0x1d), (VIRTUAL_KEY(0x43), 0x2e)],
+            1,
+        );
         assert_eq!(processor.last_word_reset, "shortcut");
-        processor.set_privacy_reason(None);
-        for event in [
-            InputEvent::Printable('g'),
-            InputEvent::Printable('b'),
-            InputEvent::UnsupportedInput,
-        ] {
-            type_token_character(&mut processor, event);
-        }
+        type_keys(&mut processor, foreground, &[0x22, 0x30, 0x07]);
         assert_eq!(processor.replay_keys.len(), 3);
         assert!(processor.session.is_suppressed());
         assert!(!processor.manual_token_start_known);
@@ -13443,33 +18494,32 @@ mod tests {
 
         // Other suppression causes still do not start a token.
         processor.last_word_reset = "external-input";
-        type_token_character(&mut processor, InputEvent::Printable('a'));
+        type_keys(&mut processor, foreground, &[0x1e]);
         assert!(processor.replay_keys.is_empty());
     }
 
     #[test]
     fn manual_token_never_starts_inside_unknown_text_and_is_bounded() {
-        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
-        processor.set_privacy_reason(None);
+        let (mut processor, foreground) = processor_typing_in(0x0409);
         // After navigation the caret position inside the text is unknown.
-        processor
-            .session
-            .handle(InputEvent::Navigation, None, &processor.detector);
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
-        type_token_character(&mut processor, InputEvent::Printable('a'));
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x4b,
+            extended: true,
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LEFT, 1, 0)
+        });
+        type_keys(&mut processor, foreground, &[0x07, 0x1e]);
         assert!(processor.replay_keys.is_empty());
         // A key without a replay form, or an overlong token, discards it.
         processor.session.clear();
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        type_keys(&mut processor, foreground, &[0x07]);
         let keys = processor.take_manual_token_keys(InputEvent::UnsupportedInput, true, 0);
         processor.extend_manual_token(keys.unwrap(), None);
         assert!(processor.replay_keys.is_empty());
         processor.session.clear();
-        for _ in 0..MANUAL_TOKEN_MAX_KEYS {
-            type_token_character(&mut processor, InputEvent::UnsupportedInput);
-        }
+        type_keys(&mut processor, foreground, &[0x07; MANUAL_TOKEN_MAX_KEYS]);
         assert_eq!(processor.replay_keys.len(), MANUAL_TOKEN_MAX_KEYS);
-        type_token_character(&mut processor, InputEvent::UnsupportedInput);
+        type_keys(&mut processor, foreground, &[0x07]);
         assert!(processor.replay_keys.is_empty());
         // Non-printable keys never extend a token.
         assert!(
@@ -13525,6 +18575,9 @@ mod tests {
         ));
         assert_eq!(processor.session.buffered_character_count(), 6);
         assert_eq!(processor.replay_keys.len(), 6);
+        assert!(processor.manual_only_word);
+        // A check of the field that passes meanwhile does not make it automatic either.
+        apply(&mut processor, None, true);
         assert!(processor.manual_only_word);
         // Retyping the delimiter does not re-trigger automatic conversion.
         assert!(
@@ -13719,13 +18772,13 @@ mod tests {
     }
 
     #[test]
-    fn a_late_provider_answer_keeps_a_good_verdict_for_two_seconds() {
+    fn a_late_provider_answer_keeps_a_good_verdict_for_five_seconds() {
         let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
         let start = Instant::now();
         let good = settle(&mut processor, None, "provider", start);
         assert_eq!((good.reason, good.source), (None, "provider"));
         assert_eq!(good.recent_ok_age, None);
-        for milliseconds in [0, 120, 400, 1_999] {
+        for milliseconds in [0, 120, 400, 1_999, 4_999] {
             let age = Duration::from_millis(milliseconds);
             let verdict = settle(&mut processor, FIELD_FAILURE, "provider", start + age);
             assert_eq!(verdict.reason, None, "{milliseconds} ms after a good check");
@@ -13746,20 +18799,109 @@ mod tests {
             (FIELD_FAILURE, "provider")
         );
         settle(&mut processor, None, "provider", at(10));
-        // Two seconds after the good check the window is over.
-        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", at(2_010));
+        // Five seconds after the good check the window is over.
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", at(5_010));
         assert_eq!(verdict.reason, FIELD_FAILURE);
         assert_eq!(verdict.recent_ok_age, None);
-        // A failure never renews the good check: leaning on it for 1.5 s must not extend it.
-        settle(&mut processor, None, "provider", at(3_000));
+        // A failure never renews the good check: leaning on it for 3 s must not extend it.
+        settle(&mut processor, None, "provider", at(6_000));
         assert_eq!(
-            settle(&mut processor, FIELD_FAILURE, "provider", at(4_500)).reason,
+            settle(&mut processor, FIELD_FAILURE, "provider", at(9_000)).reason,
             None
         );
         assert_eq!(
-            settle(&mut processor, FIELD_FAILURE, "provider", at(5_100)).reason,
+            settle(&mut processor, FIELD_FAILURE, "provider", at(11_100)).reason,
             FIELD_FAILURE
         );
+    }
+
+    #[test]
+    fn a_conversion_in_the_same_field_counts_the_good_check_from_then() {
+        let foreground = recent_ok_foreground();
+        let processor_with_old_check = || {
+            let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+            processor.metrics.input_epoch.store(5, Ordering::Release);
+            let long_ago = Instant::now() - Duration::from_millis(PRIVACY_RECENT_OK_MS + 1_000);
+            settle(&mut processor, None, "provider", long_ago);
+            processor
+        };
+        // The good check is too old: a failure now stands.
+        let mut processor = processor_with_old_check();
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", Instant::now());
+        assert_eq!(verdict.reason, FIELD_FAILURE);
+        // An edit in the same field since: the failure leans on it.
+        let mut processor = processor_with_old_check();
+        processor.renew_recent_privacy_ok(ForegroundContext {
+            layout: foreground.layout + 1,
+            ..foreground
+        });
+        let verdict = settle(&mut processor, FIELD_FAILURE, "provider", Instant::now());
+        assert_eq!((verdict.reason, verdict.source), (None, "recent-ok"));
+        // An edit elsewhere, or in another input epoch, renews nothing; nor does an edit create a
+        // good check where none was.
+        for (edited, epoch) in [
+            (
+                ForegroundContext {
+                    focus: foreground.focus + 1,
+                    ..foreground
+                },
+                5,
+            ),
+            (foreground, 6),
+        ] {
+            let mut processor = processor_with_old_check();
+            processor
+                .metrics
+                .input_epoch
+                .store(epoch, Ordering::Release);
+            processor.renew_recent_privacy_ok(edited);
+            processor.metrics.input_epoch.store(5, Ordering::Release);
+            let verdict = settle(&mut processor, FIELD_FAILURE, "provider", Instant::now());
+            assert_eq!(verdict.reason, FIELD_FAILURE, "{edited:?} epoch {epoch}");
+        }
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.metrics.input_epoch.store(5, Ordering::Release);
+        processor.renew_recent_privacy_ok(foreground);
+        assert!(processor.recent_privacy_ok.is_none());
+    }
+
+    #[test]
+    fn an_applied_conversion_renews_the_good_check_of_its_field() {
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        processor.metrics.input_epoch.store(5, Ordering::Release);
+        let long_ago = Instant::now() - Duration::from_millis(PRIVACY_RECENT_OK_MS + 1_000);
+        settle(&mut processor, None, "provider", long_ago);
+        let edit = |erase_characters, insert_text: &str| autokeyboardlayot::conversion::TextEdit {
+            erase_characters,
+            insert_text: insert_text.to_owned(),
+        };
+        processor.finish_applied_conversion(
+            PendingConversion {
+                transaction: ConversionTransaction {
+                    source_language: Language::English,
+                    target_language: Language::Russian,
+                    original: "ghbdtn".to_owned(),
+                    replacement: "привет".to_owned(),
+                    delimiter: Some(' '),
+                    forward: edit(7, "привет "),
+                    undo: edit(7, "ghbdtn "),
+                },
+                foreground: recent_ok_foreground(),
+                source_layout: 0x0409,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 1,
+                replay_keys: Vec::new(),
+                forced: false,
+                cycle_order: Vec::new(),
+            },
+            1,
+            HKL(0x0419 as *mut c_void),
+            EditStrategy::PhysicalReplay,
+        );
+        let renewed = processor.recent_privacy_ok.expect("the good check");
+        assert!(renewed.at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -13986,6 +19128,68 @@ mod tests {
     }
 
     #[test]
+    fn a_word_begun_while_the_field_could_not_be_checked_becomes_automatic_once_it_passes() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        // The terminal's field did not answer: the word is kept, for Pause only.
+        processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
+        type_letters(&mut processor, "hello");
+        assert!(processor.manual_only_word);
+        // A check of the same field passes before the word ends.
+        apply(&mut processor, None, true);
+        assert!(!processor.manual_only_word);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = word_lines(&receiver);
+        assert!(
+            !lines.iter().any(|line| line.contains("result=manual-only")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_passed_check_of_the_same_field_lifts_the_manual_only_mark() {
+        // The check was for another context: the word is not promoted (it is dropped).
+        let (mut processor, _receiver) = processor_with_diagnostics();
+        processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
+        type_letters(&mut processor, "hello");
+        apply(&mut processor, None, false);
+        assert!(
+            processor
+                .handle_boundary(Some(Language::English), Some(' '), false)
+                .is_none()
+        );
+        // A word resumed by erasing its delimiter stays manual-only whatever the checks say.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        type_letters(&mut processor, "hello");
+        processor.manual_only_word = true;
+        apply(&mut processor, None, true);
+        assert!(processor.manual_only_word);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = word_lines(&receiver);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("result=manual-only cause=resumed")),
+            "{lines:?}"
+        );
+        // A failure the recent-good rule softens is no check of the field.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        apply(&mut processor, None, true);
+        processor.set_privacy_reason_with_manual_exception(FIELD_FAILURE, true);
+        type_letters(&mut processor, "hello");
+        apply(&mut processor, FIELD_FAILURE, true);
+        assert!(processor.privacy_reason.is_none());
+        assert!(processor.manual_only_word);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = word_lines(&receiver);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("result=manual-only cause=field-check")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn a_late_answer_after_a_good_check_leaves_the_state_and_the_word_alone() {
         let (mut processor, receiver) = processor_with_diagnostics();
         apply(&mut processor, None, true);
@@ -14037,21 +19241,15 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_without_a_good_check_stands_and_is_logged_as_it_was() {
+    fn a_failure_without_a_good_check_stands_and_leaves_no_line() {
         let (mut processor, receiver) = processor_with_diagnostics();
         type_letters(&mut processor, "hel");
         apply(&mut processor, FIELD_FAILURE, true);
         assert_eq!(processor.privacy_reason, FIELD_FAILURE);
         assert!(processor.session.is_suppressed());
+        // The owner's decision: a check that blocks the field is not written.
         let lines = probe_lines(&receiver);
-        let line = lines.last().expect("the failure is logged");
-        assert!(
-            line.contains("result=Some(FieldInspectionUnavailable)"),
-            "{line}"
-        );
-        assert!(line.contains("source=provider"), "{line}");
-        assert!(line.contains("trigger=typing"), "{line}");
-        assert!(!line.contains("age_ms"), "{line}");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     #[test]
@@ -14066,8 +19264,7 @@ mod tests {
         );
         assert!(processor.session.is_suppressed());
         let lines = probe_lines(&receiver);
-        let line = lines.last().expect("the change is logged");
-        assert!(line.contains("source=context-changed"), "{line}");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     fn processor_with_diagnostics() -> (InputProcessor, Receiver<String>) {
@@ -14147,6 +19344,11 @@ mod tests {
             prepare(&mut processor);
             processor.handle_boundary(language, Some(' '), false);
             let lines = word_lines(&receiver);
+            // The owner's decision: nothing is written about a word in a blocked field.
+            if expected == "privacy" {
+                assert!(lines.is_empty(), "{lines:?}");
+                continue;
+            }
             assert_eq!(lines.len(), 1, "{expected}: {lines:?}");
             assert!(
                 lines[0].contains(&format!("result={expected}")),
@@ -14393,10 +19595,10 @@ mod tests {
     fn a_shortcut_remembers_the_last_word() {
         let mut processor = processor_at_the_test_target();
         processor.last_boundary = Some(test_last_boundary(&processor, 6));
-        processor
-            .modifiers
-            .update(u32::from(VK_CONTROL.0), true, false);
-        processor.process_key(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x43), 41, 0));
+        processor.process_key(RawKeyEvent {
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x43), 41, 0)
+        });
         let word = remembered_entry(&processor)
             .word
             .as_ref()
@@ -14536,6 +19738,19 @@ mod tests {
         modifiers
     }
 
+    /// `RawKeyEvent::held_modifiers` for these physical modifier keys held.
+    fn held_keys(keys: &[VIRTUAL_KEY]) -> u8 {
+        keys.iter()
+            .map(|key| {
+                let bit = PHYSICAL_MODIFIER_KEYS
+                    .iter()
+                    .position(|candidate| candidate == key)
+                    .expect("a left or right modifier key");
+                1 << bit
+            })
+            .fold(0, |held, bit| held | bit)
+    }
+
     #[test]
     fn a_shortcut_is_logged_by_its_editing_command_only() {
         let control = held_modifiers(&[VK_CONTROL]);
@@ -14567,11 +19782,16 @@ mod tests {
     #[test]
     fn a_word_ended_by_a_shortcut_leaves_its_kind_in_the_log() {
         let (mut processor, receiver) = processor_with_diagnostics();
-        let event = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x56), 7, 0);
+        let event = RawKeyEvent {
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x56), 7, 0)
+        };
         processor.last_foreground = Some(foreground_identity_key(event.foreground));
         processor.last_layout = Some(event.foreground.layout);
         processor.last_process_id = Some(event.foreground.process_id);
-        processor.modifiers = held_modifiers(&[VK_CONTROL]);
+        // A field already checked and allowed, as after typing in it; in one never checked the
+        // shortcut is not written (see a_shortcut_in_a_field_found_to_be_a_password_field_…).
+        processor.privacy_needs_check = false;
         processor.process_key(event);
         let lines: Vec<String> = receiver
             .try_iter()
@@ -14642,6 +19862,7 @@ mod tests {
                 .iter()
                 .any(|record| record.starts_with("event=word "))
         );
+        assert_no_record_contains(&records, &["ghbdtn", "привет"]);
     }
 
     #[test]
@@ -14762,5 +19983,6775 @@ mod tests {
         let image = process_image_name(process_id).expect("current process image should resolve");
         assert!(!image.is_empty());
         assert!(process_integrity_level(process_id).is_some());
+    }
+
+    fn key_with_repeat(message: u32, virtual_key: VIRTUAL_KEY, repeat: bool) -> RawKeyEvent {
+        RawKeyEvent {
+            repeat,
+            ..test_raw_key(message, virtual_key, 0, 0)
+        }
+    }
+
+    fn virtual_keys(events: &[RawKeyEvent]) -> Vec<(u32, u32)> {
+        events
+            .iter()
+            .map(|event| (event.message, event.virtual_key))
+            .collect()
+    }
+
+    #[test]
+    fn key_ups_of_keys_pressed_before_the_gate_are_delivered_not_retained() {
+        let a = VIRTUAL_KEY(0x41);
+        let g = VIRTUAL_KEY(0x47);
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYDOWN, g, 0, 0),
+            test_raw_key(WM_KEYUP, VK_LCONTROL, 0, 0),
+        ]);
+        assert_eq!(virtual_keys(&retained), [(WM_KEYDOWN, u32::from(g.0))]);
+        assert_eq!(
+            virtual_keys(&releases),
+            [(WM_KEYUP, u32::from(VK_LCONTROL.0))]
+        );
+
+        // A key typed completely while the gate held it stays retained as a whole.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYDOWN, a, 0, 0),
+            test_raw_key(WM_KEYUP, a, 0, 0),
+        ]);
+        assert_eq!(retained.len(), 2);
+        assert!(releases.is_empty());
+
+        // Released, then pressed again: the first key-up leaves, the new press stays.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYUP, a, 0, 0),
+            test_raw_key(WM_KEYDOWN, a, 0, 0),
+        ]);
+        assert_eq!(virtual_keys(&retained), [(WM_KEYDOWN, u32::from(a.0))]);
+        assert_eq!(virtual_keys(&releases), [(WM_KEYUP, u32::from(a.0))]);
+
+        // Auto-repeats of a key pressed before the gate do not make its key-up retained.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            key_with_repeat(WM_KEYDOWN, a, true),
+            key_with_repeat(WM_KEYDOWN, a, true),
+            test_raw_key(WM_KEYUP, a, 0, 0),
+        ]);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(virtual_keys(&releases), [(WM_KEYUP, u32::from(a.0))]);
+
+        // A fresh press followed by repeats owns its key-up.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            key_with_repeat(WM_KEYDOWN, a, false),
+            key_with_repeat(WM_KEYDOWN, a, true),
+            test_raw_key(WM_KEYUP, a, 0, 0),
+        ]);
+        assert_eq!(retained.len(), 3);
+        assert!(releases.is_empty());
+    }
+
+    #[test]
+    fn a_gate_that_held_only_key_ups_retains_nothing_and_keeps_conversion_on() {
+        let (mut state, receiver) = test_gate_state(8);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYUP, VK_SPACE, 0, 0));
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0));
+        state.break_correction_gate_fail_open(GateFailureCause::Mouse);
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&state.metrics));
+        assert!(state.metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 0);
+        assert_eq!(
+            virtual_keys(&state.pending_key_releases),
+            [
+                (WM_KEYUP, u32::from(VK_SPACE.0)),
+                (WM_KEYUP, u32::from(VK_LSHIFT.0))
+            ]
+        );
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+        );
+        assert!(state.decline_reasons().is_empty());
+    }
+
+    #[test]
+    fn a_held_edge_of_the_same_key_decides_whether_a_gated_key_down_repeats() {
+        let down = test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0);
+        let other = test_raw_key(WM_KEYUP, VK_RSHIFT, 0, 0);
+        // No held edge of the key: the system's key state answers.
+        assert!(gated_key_down_repeats(&[other], &down, || true));
+        assert!(!gated_key_down_repeats(&[other], &down, || false));
+        // Released in the gate: the swallowed key-up never reached the system's key state.
+        let released = [test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0), other];
+        assert!(!gated_key_down_repeats(&released, &down, || true));
+        // Pressed in the gate: neither did the swallowed key-down.
+        let pressed = [released[0], down, other];
+        assert!(gated_key_down_repeats(&pressed, &down, || false));
+    }
+
+    #[test]
+    fn a_key_down_after_a_key_up_of_the_same_key_owns_the_next_key_up() {
+        // A key-down marked as a repeat after the key was released in `events` is a new press.
+        let (retained, releases) = split_delivered_key_releases(vec![
+            test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0),
+            key_with_repeat(WM_KEYDOWN, VK_LSHIFT, true),
+            test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0),
+        ]);
+        assert_eq!(
+            virtual_keys(&retained),
+            [
+                (WM_KEYDOWN, u32::from(VK_LSHIFT.0)),
+                (WM_KEYUP, u32::from(VK_LSHIFT.0))
+            ]
+        );
+        assert_eq!(
+            virtual_keys(&releases),
+            [(WM_KEYUP, u32::from(VK_LSHIFT.0))]
+        );
+    }
+
+    #[test]
+    fn shift_released_and_pressed_again_in_the_gate_is_recovered_balanced() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let shift = u32::from(VK_LSHIFT.0);
+        state.correction_gate.activate(10);
+        // Shift went down before the gate. The gate swallows its key-up, so the system's key
+        // state shows it down for the rest of the gate.
+        for (message, key) in [
+            (WM_KEYUP, VK_LSHIFT),
+            (WM_KEYDOWN, VK_LSHIFT),
+            (WM_KEYDOWN, VIRTUAL_KEY(0x41)),
+            (WM_KEYUP, VIRTUAL_KEY(0x41)),
+            (WM_KEYUP, VK_LSHIFT),
+            (WM_KEYDOWN, VIRTUAL_KEY(0x42)),
+            (WM_KEYUP, VIRTUAL_KEY(0x42)),
+        ] {
+            let mut raw = test_raw_key(message, key, 0, 0);
+            if message == WM_KEYDOWN {
+                raw.repeat =
+                    gated_key_down_repeats(&state.correction_gate.held, &raw, || key == VK_LSHIFT);
+            }
+            assert!(state.hold_gated_edge(raw));
+        }
+        state.break_correction_gate_fail_open(GateFailureCause::Deadline);
+        assert_eq!(
+            virtual_keys(&state.pending_key_releases),
+            [(WM_KEYUP, shift)]
+        );
+        let retained = state.metrics.retained_input.lock().unwrap().take().unwrap();
+        // "Ab": Shift goes up between the letters, and recovery leaves nothing down.
+        assert_eq!(
+            virtual_keys(&retained.events),
+            [
+                (WM_KEYDOWN, shift),
+                (WM_KEYDOWN, 0x41),
+                (WM_KEYUP, 0x41),
+                (WM_KEYUP, shift),
+                (WM_KEYDOWN, 0x42),
+                (WM_KEYUP, 0x42)
+            ]
+        );
+        assert_eq!(
+            build_recovery_inputs(&retained.events).unwrap().len(),
+            retained.events.len()
+        );
+    }
+
+    #[test]
+    fn a_newer_physical_edge_of_a_key_cancels_its_queued_key_up() {
+        let mut pending = vec![
+            test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0),
+            test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x41), 0, 0),
+        ];
+        cancel_superseded_key_release(&mut pending, &test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0));
+        assert_eq!(virtual_keys(&pending), [(WM_KEYUP, 0x41)]);
+        cancel_superseded_key_release(&mut pending, &test_raw_key(WM_KEYUP, VK_RSHIFT, 0, 0));
+        assert_eq!(pending.len(), 1, "another key cancels nothing");
+    }
+
+    #[test]
+    fn confirming_the_deletion_leaves_keys_the_worker_is_sending_alone() {
+        let (mut state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let mut record = stalled_record(Instant::now());
+        record.recovering = true;
+        *metrics.retained_input.lock().unwrap() = Some(record);
+        // The worker began typing them while the question was open.
+        assert!(!discard_confirmed_retained_input(&mut state));
+        assert!(metrics.retained_input.lock().unwrap().is_some());
+        // A recovery that did not finish hands the record back for another attempt or deletion.
+        metrics
+            .retained_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .recovering = false;
+        assert!(discard_confirmed_retained_input(&mut state));
+        assert!(!has_retained_input(&metrics));
+        assert!(!discard_confirmed_retained_input(&mut state));
+    }
+
+    #[test]
+    fn deleting_retained_input_still_releases_keys_pressed_before_the_gate() {
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        let up = test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x41), 0, 0);
+        let down = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x42), 0, 0);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: up.foreground,
+            events: vec![up, down],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+            recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
+        });
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(HWND::default(), start + lifetime);
+        let state = take_app_state().unwrap();
+        assert!(!has_retained_input(&metrics));
+        assert_eq!(
+            virtual_keys(&state.pending_key_releases),
+            [(WM_KEYUP, 0x41)]
+        );
+    }
+
+    #[test]
+    fn an_engine_fault_hands_held_keys_back_unchanged_to_the_same_target() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let target = test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground;
+        state.correction_gate.activate(10);
+        state.correction_gate.origin = Some(target);
+        let held = [
+            test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0),
+            test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x47), 0, 0),
+            test_raw_key(WM_KEYUP, VK_LCONTROL, 0, 0),
+        ];
+        state.correction_gate.held.extend(held);
+        state.record_engine_fault_with_target(Some(target));
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&state.metrics));
+        assert_eq!(
+            virtual_keys(&state.pending_held_replay),
+            virtual_keys(&held)
+        );
+        assert!(state.pending_key_releases.is_empty());
+        assert_eq!(
+            state.metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::InternalFault as u8
+        );
+    }
+
+    #[test]
+    fn a_worker_that_stopped_leaves_no_recovery_armed() {
+        for worker_dead in [false, true] {
+            let (mut state, _receiver) = test_gate_state(8);
+            state.metrics.recovery_armed.store(true, Ordering::Release);
+            state
+                .metrics
+                .worker_dead
+                .store(worker_dead, Ordering::Release);
+            state.record_engine_fault_with_target(None);
+            // Only a living worker can still carry out the recovery Pause would ask for.
+            assert_eq!(
+                state.metrics.recovery_armed.load(Ordering::Acquire),
+                !worker_dead
+            );
+        }
+    }
+
+    #[test]
+    fn an_engine_fault_keeps_held_keys_for_recovery_when_the_target_changed() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let origin = test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground;
+        let elsewhere = ForegroundContext {
+            hwnd: 9,
+            focus: 9,
+            ..origin
+        };
+        state.correction_gate.activate(10);
+        state.correction_gate.origin = Some(origin);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.record_engine_fault_with_target(Some(elsewhere));
+        assert!(has_retained_input(&state.metrics));
+        assert!(state.pending_held_replay.is_empty());
+        // The fault's own pause is recorded, not a gate drain that policy D1 would lift.
+        assert_eq!(
+            state.metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::InternalFault as u8
+        );
+        assert_eq!(state.metrics.conversion_failures.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_stopped_worker_offers_no_recovery_and_drops_its_pending_reload() {
+        let (mut state, _receiver) = test_gate_state(4);
+        state.metrics.worker_dead.store(true, Ordering::Release);
+        state.pending_configuration = Some(ConfigurationReload {
+            revision: 3,
+            snapshot: RuntimeConfiguration::default(),
+        });
+        state
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        state.record_engine_fault_with_target(None);
+        assert!(state.pending_configuration.is_none());
+        assert!(!state.metrics.configuration_pending.load(Ordering::Acquire));
+
+        let key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        *state.metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+            recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
+        });
+        let metrics = Arc::clone(&state.metrics);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        arm_input_recovery(HWND::default());
+        drop(take_app_state());
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_hook_reinstall_queues_the_recovery_in_the_current_epoch() {
+        let (mut state, receiver) = test_gate_state(8);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.invalidate_for_hook_reinstall();
+        let epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        let recovery = receiver
+            .try_iter()
+            .find(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+            .expect("the held keys are handed back automatically");
+        assert_eq!(
+            recovery.epoch, epoch,
+            "the worker must not drop it as stale"
+        );
+    }
+
+    #[test]
+    fn the_lifetime_timer_leaves_keys_alone_while_the_worker_sends_them() {
+        let (state, _receiver) = test_gate_state(4);
+        let metrics = Arc::clone(&state.metrics);
+        let key = test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 10,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+            recovering: false,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
+        });
+        assert!(!begin_retained_recovery(&metrics, 11));
+        assert!(begin_retained_recovery(&metrics, 10));
+        assert!(
+            !begin_retained_recovery(&metrics, 10),
+            "one recovery at a time"
+        );
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(HWND::default(), start + lifetime);
+        assert!(has_retained_input(&metrics), "not deleted while being sent");
+        // An incomplete send keeps the record for another attempt, marked uncertain.
+        finish_retained_recovery(&metrics, 10, 1, 2);
+        {
+            let retained = metrics.retained_input.lock().unwrap();
+            let input = retained.as_ref().unwrap();
+            assert!(!input.recovering);
+            assert!(input.delivery_uncertain);
+        }
+        assert!(begin_retained_recovery(&metrics, 10));
+        finish_retained_recovery(&metrics, 10, 2, 2);
+        assert!(!has_retained_input(&metrics));
+        // A worker that died while sending does not keep the keys forever.
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 12,
+            foreground: key.foreground,
+            events: vec![key],
+            delivery_uncertain: false,
+            expires_at: start + lifetime,
+            recovering: true,
+            retained_at: Instant::now(),
+            auto_recover: false,
+            input_mark: 0,
+        });
+        expire_retained_input(HWND::default(), start + lifetime + RETAINED_RECOVERY_GRACE);
+        assert!(!has_retained_input(&metrics));
+        drop(take_app_state());
+    }
+
+    #[test]
+    fn a_finished_worker_with_a_pending_reload_does_not_block_exit() {
+        let facts = ShutdownFacts {
+            correction_gate_active: false,
+            retained_input: false,
+            worker_busy: false,
+            worker_finished: true,
+            configuration_pending: true,
+            undo_hotkey_active: false,
+            hotkey_waiting_for_release: false,
+        };
+        assert!(shutdown_blockers(&facts).is_empty());
+        assert_eq!(
+            shutdown_blockers(&ShutdownFacts {
+                worker_finished: false,
+                ..facts
+            }),
+            ["configuration-pending"]
+        );
+    }
+
+    #[test]
+    fn a_reload_that_panicked_is_rejected_and_the_ui_stops_waiting_for_it() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.reject_faulted_configuration();
+        assert_eq!(metrics.configuration_rejected.load(Ordering::Acquire), 0);
+        processor.applying_configuration = Some(5);
+        processor.reject_faulted_configuration();
+        assert_eq!(metrics.configuration_rejected.load(Ordering::Acquire), 5);
+        assert_eq!(processor.configuration_revision, 5);
+        assert!(processor.applying_configuration.is_none());
+
+        let (mut state, _receiver) = test_gate_state(4);
+        state.metrics = Arc::clone(&metrics);
+        state.pending_configuration = Some(ConfigurationReload {
+            revision: 5,
+            snapshot: RuntimeConfiguration::default(),
+        });
+        metrics.configuration_pending.store(true, Ordering::Release);
+        assert!(state.drop_rejected_configuration());
+        assert!(state.pending_configuration.is_none());
+        assert!(!metrics.configuration_pending.load(Ordering::Acquire));
+        assert!(!state.drop_rejected_configuration());
+    }
+
+    #[test]
+    fn a_recovery_request_is_handled_after_the_epoch_moved_and_while_a_reload_is_pending() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let (sender, diagnostics) = sync_channel(16);
+        processor.diagnostic_sender = Some(sender);
+        metrics.diagnostics_enabled.store(true, Ordering::Release);
+        // The paste of its gate may have left the word selected: the worker answers without
+        // sending anything.
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(Instant::now()));
+        metrics.selection_left_token.store(10, Ordering::Release);
+        let mut request = |epoch| {
+            processor.process_event(QueuedInputEvent {
+                epoch,
+                captured_at: Instant::now(),
+                event: RawInputEvent::RecoverInput {
+                    sequence: 0,
+                    explicit: false,
+                },
+                configuration: None,
+            });
+            diagnostics
+                .try_iter()
+                .any(|line| line.contains("result=retained reason=selection-left"))
+        };
+        // A configuration was published after the request was queued.
+        let queued_epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        assert!(request(queued_epoch));
+        metrics.configuration_pending.store(true, Ordering::Release);
+        assert!(request(metrics.input_epoch.load(Ordering::Acquire)));
+        assert_eq!(
+            processor.last_input_epoch,
+            metrics.input_epoch.load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn a_recovery_leaves_the_word_at_the_caret_suppressed_until_the_next_boundary() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.finish_recovery(10, true, 2, 2);
+        assert!(processor.session.is_suppressed());
+        // The epoch reset of an automatic resume keeps it suppressed.
+        let epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.reset_for_epoch(epoch);
+        assert!(processor.session.is_suppressed());
+        // A later reset without a recovery clears the session as usual.
+        let epoch = metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.reset_for_epoch(epoch);
+        assert!(!processor.session.is_suppressed());
+    }
+
+    #[test]
+    fn the_word_a_recovery_left_ends_at_punctuation_a_click_and_a_focus_change() {
+        type EndWord = fn(&mut InputProcessor, ForegroundContext);
+        let endings: [(&str, EndWord); 3] = [
+            ("punctuation", |processor, foreground| {
+                // "/", which no target layout reads as a letter.
+                processor.process_key(RawKeyEvent {
+                    scan_code: 0x35,
+                    foreground,
+                    ..letter(0xbf, 1)
+                });
+            }),
+            ("click", |processor, _| {
+                processor.process_event(QueuedInputEvent {
+                    epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+                    captured_at: Instant::now(),
+                    event: RawInputEvent::Mouse,
+                    configuration: None,
+                });
+            }),
+            ("focus", |processor, foreground| {
+                let elsewhere = ForegroundContext {
+                    hwnd: foreground.hwnd + 8,
+                    focus: foreground.focus + 8,
+                    ..foreground
+                };
+                processor.foreground_override = Some(elsewhere);
+                processor.process_key(RawKeyEvent {
+                    scan_code: 0x1e,
+                    foreground: elsewhere,
+                    ..letter(0x41, 1)
+                });
+            }),
+        ];
+        for (ending, end_word) in endings {
+            let (mut processor, foreground) = processor_typing_in(0x0409);
+            // An explicit recovery: the input epoch stays.
+            processor.finish_recovery(10, true, 2, 2);
+            end_word(&mut processor, foreground);
+            assert!(!processor.recovered_mid_word, "{ending}");
+            // Turning automatic conversion back on later must not suppress the next word.
+            let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            processor.reset_for_epoch(epoch);
+            assert!(!processor.session.is_suppressed(), "{ending}");
+        }
+    }
+
+    #[test]
+    fn an_edit_that_failed_because_of_the_abort_keeps_conversion_paused() {
+        let paused_by_abort = |metrics: &ObserverMetrics| {
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.safety_paused.store(true, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(ConversionFailureReason::GateDrain as u8, Ordering::Release);
+            metrics.cancelled_gate_token.store(7, Ordering::Release);
+        };
+        let metrics = Arc::new(ObserverMetrics::default());
+        paused_by_abort(&metrics);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.record_conversion_failure(ConversionFailureReason::PhysicalEdit);
+        processor.resume_after_recovered_abort(Instant::now());
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+
+        // Without a failed edit the same abort resumes.
+        let metrics = Arc::new(ObserverMetrics::default());
+        paused_by_abort(&metrics);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.resume_after_recovered_abort(Instant::now());
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_injected_click_ends_the_gate_like_a_physical_one() {
+        for injected in [false, true] {
+            let (mut state, receiver) = test_gate_state(8);
+            state.correction_gate.activate(10);
+            state
+                .correction_gate
+                .held
+                .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+            observe_mouse_button(&mut state, injected);
+            assert!(!state.correction_gate.active, "injected={injected}");
+            assert!(has_retained_input(&state.metrics));
+            let expected = |event: &RawInputEvent| {
+                if injected {
+                    matches!(event, RawInputEvent::ExternalInjection)
+                } else {
+                    matches!(event, RawInputEvent::Mouse)
+                }
+            };
+            assert!(receiver.try_iter().any(|queued| expected(&queued.event)));
+        }
+    }
+
+    #[test]
+    fn an_unanswered_gate_acknowledgement_is_no_refusal() {
+        assert_eq!(gate_ack_outcome(true, 1, false), GateAckOutcome::Accepted);
+        assert_eq!(gate_ack_outcome(true, 0, false), GateAckOutcome::Refused);
+        assert_eq!(gate_ack_outcome(false, 0, true), GateAckOutcome::Unanswered);
+        assert_eq!(gate_ack_outcome(false, 0, false), GateAckOutcome::Refused);
+        assert!(fail_open_after_ack(GateAckOutcome::Refused));
+        assert!(!fail_open_after_ack(GateAckOutcome::Unanswered));
+        assert!(!fail_open_after_ack(GateAckOutcome::Accepted));
+    }
+
+    #[test]
+    fn key_ups_released_after_a_conversion_never_end_its_undo() {
+        let rollover = [
+            test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x4e), 0, 0),
+            test_raw_key(WM_KEYUP, VK_SPACE, 0, 0),
+        ];
+        assert!(!held_tail_invalidates_undo(&rollover));
+        let modifier = [test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0)];
+        assert!(!held_tail_invalidates_undo(&modifier));
+        let typed = [
+            test_raw_key(WM_KEYDOWN, VK_LSHIFT, 0, 0),
+            test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x41), 0, 0),
+        ];
+        assert!(held_tail_invalidates_undo(&typed));
+    }
+
+    #[test]
+    fn held_pause_and_num_lock_are_replayed_as_their_virtual_keys() {
+        let pause = RawKeyEvent {
+            scan_code: 0x45,
+            ..test_raw_key(WM_KEYDOWN, VK_PAUSE, 0, 0)
+        };
+        let num_lock = RawKeyEvent {
+            scan_code: 0x45,
+            extended: true,
+            ..test_raw_key(WM_KEYDOWN, VK_NUMLOCK, 0, 0)
+        };
+        let inputs = build_raw_replay_inputs(&[pause, num_lock], INJECTED_EVENT_MARKER).unwrap();
+        for (input, key) in inputs.iter().zip([VK_PAUSE, VK_NUMLOCK]) {
+            let keyboard = unsafe { input.Anonymous.ki };
+            assert_eq!(keyboard.wVk, key);
+            assert_eq!(keyboard.dwFlags & KEYEVENTF_SCANCODE, Default::default());
+        }
+    }
+
+    #[test]
+    fn a_hotkey_on_a_modifier_key_up_still_reports_the_key_up_during_recovery() {
+        let raw = RawKeyEvent {
+            hotkey_trigger: true,
+            ..test_raw_key(WM_KEYUP, VK_LCONTROL, 9, 0)
+        };
+        let (key, recovery) = retained_hotkey_events(raw, true, true);
+        assert!(matches!(
+            key,
+            Some(RawInputEvent::Key(RawKeyEvent {
+                hotkey_trigger: false,
+                message: WM_KEYUP,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            recovery,
+            Some(RawInputEvent::RecoverInput {
+                sequence: 9,
+                explicit: true
+            })
+        ));
+        let (key, recovery) = retained_hotkey_events(raw, false, false);
+        assert!(key.is_none());
+        assert!(recovery.is_none());
+    }
+
+    #[test]
+    fn the_gate_timer_retains_held_keys_and_closes_an_empty_gate() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_correction_gate();
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert_eq!(
+            metrics
+                .retained_input
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|input| input.events.len()),
+            Some(1)
+        );
+
+        let (mut state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(11);
+        state.correction_gate.awaiting_worker_ack = true;
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_correction_gate();
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&metrics));
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+
+        // Waiting for the worker does not make held keys disposable: they are retained.
+        let (mut state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(12);
+        state.correction_gate.awaiting_worker_ack = true;
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_correction_gate();
+        drop(take_app_state());
+        assert!(has_retained_input(&metrics));
+    }
+
+    #[test]
+    fn a_late_drain_acknowledgement_with_held_keys_breaks_the_gate() {
+        let (mut state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(10);
+        state.correction_gate.awaiting_worker_ack = true;
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        state.correction_gate.deadline = Instant::now() - Duration::from_millis(1);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        assert!(!acknowledge_correction_gate_drain(10, 0));
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(has_retained_input(&metrics));
+        assert!(receiver.try_iter().any(|queued| matches!(
+            queued.event,
+            RawInputEvent::RecoverInput {
+                explicit: false,
+                ..
+            }
+        )));
+
+        // In time and with nothing left to replay, the acknowledgement closes the gate.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.correction_gate.activate(12);
+        state.correction_gate.awaiting_worker_ack = true;
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        assert!(acknowledge_correction_gate_drain(12, 0));
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(!has_retained_input(&state.metrics));
+    }
+
+    #[test]
+    fn an_edge_beyond_a_full_gate_joins_the_retained_input() {
+        let (mut state, _receiver) = test_gate_state(8);
+        assert!(!state.hold_gated_edge(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0)));
+        state.correction_gate.activate(10);
+        for _ in 0..CORRECTION_GATE_CAPACITY {
+            assert!(state.hold_gated_edge(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0)));
+        }
+        assert!(state.correction_gate.active);
+        assert!(state.hold_gated_edge(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x48), 0, 0)));
+        assert!(!state.correction_gate.active);
+        let retained = state.metrics.retained_input.lock().unwrap();
+        let events = &retained.as_ref().unwrap().events;
+        assert_eq!(events.len(), CORRECTION_GATE_CAPACITY + 1);
+        assert_eq!(events.last().unwrap().virtual_key, 0x48);
+    }
+
+    #[test]
+    fn held_keys_come_back_automatically_only_after_the_four_recoverable_causes() {
+        use GateFailureCause::*;
+        for cause in [
+            Deadline,
+            Capacity,
+            FocusChanged,
+            Mouse,
+            ExternalInjection,
+            WorkerQueue,
+            ReplaySubmit,
+            WorkerAck,
+            DownstreamHook,
+            InternalFault,
+            HookReinstall,
+            SelectionLeft,
+        ] {
+            let (mut state, receiver) = test_gate_state(8);
+            state.correction_gate.activate(10);
+            state
+                .correction_gate
+                .held
+                .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+            state.break_correction_gate(cause, None);
+            if cause != InternalFault {
+                let retained = state.metrics.retained_input.lock().unwrap().clone();
+                assert_eq!(
+                    retained.map(|input| input.auto_recover),
+                    Some(matches!(
+                        cause,
+                        Deadline | Capacity | WorkerQueue | HookReinstall
+                    )),
+                    "{cause:?}"
+                );
+            }
+            let recovers = receiver.try_iter().any(|queued| {
+                matches!(
+                    queued.event,
+                    RawInputEvent::RecoverInput {
+                        explicit: false,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(
+                recovers,
+                matches!(cause, Deadline | Capacity | WorkerQueue | HookReinstall),
+                "{cause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gate_release_request_posts_exactly_one_message_with_its_token() {
+        let module = unsafe { GetModuleHandleW(None) }.unwrap();
+        // An invisible window owned by this thread, so that its queue can be inspected.
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("AutoKeyboardLayot gate release test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+        }
+        .unwrap();
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), window.0 as usize);
+        processor.request_gate_release(77);
+        let mut message = MSG::default();
+        let take = |message: &mut MSG| unsafe {
+            PeekMessageW(
+                message,
+                Some(window),
+                GATE_RELEASE_MESSAGE,
+                GATE_RELEASE_MESSAGE,
+                PM_REMOVE,
+            )
+            .as_bool()
+        };
+        assert!(take(&mut message));
+        assert_eq!(message.wParam.0, 77);
+        assert!(!take(&mut message), "exactly one release request");
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        // A window that is gone cannot release the gate: the request fails it open instead.
+        unsafe { DestroyWindow(window) }.unwrap();
+        processor.request_gate_release(78);
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::GateDrain as u8
+        );
+    }
+
+    const EDITOR: &str = r"C:\Program Files\Editor\editor.exe";
+
+    const KEEPASS: &str = r"C:\Program Files\KeePass\KeePass.exe";
+
+    fn assert_no_record_contains(records: &[String], texts: &[&str]) {
+        for record in records {
+            for text in texts {
+                assert!(!record.contains(text), "{text:?} in {record}");
+            }
+        }
+    }
+
+    /// The input target of `test_raw_key`.
+    fn test_foreground() -> ForegroundContext {
+        test_raw_key(WM_KEYDOWN, VK_SPACE, 0, 0).foreground
+    }
+
+    fn letter(virtual_key: u16, sequence: u64) -> RawKeyEvent {
+        test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(virtual_key), sequence, 0)
+    }
+
+    /// A key event queued `waited` ago, so the worker would note a slow queue.
+    fn queued_key(
+        processor: &InputProcessor,
+        event: RawKeyEvent,
+        waited: Duration,
+    ) -> QueuedInputEvent {
+        QueuedInputEvent {
+            epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+            captured_at: Instant::now() - waited,
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        }
+    }
+
+    type TestProbe = BoundedProbe<(ForegroundContext, u64, u64), Option<PrivacyBlockReason>>;
+
+    /// A privacy probe whose provider answers every request with `answer` at once.
+    fn answering_probe(answer: Option<PrivacyBlockReason>) -> TestProbe {
+        BoundedProbe::spawn("test-privacy", move || move |_| answer).unwrap()
+    }
+
+    /// A privacy probe whose provider waits for a message on `gate` (or for its sender to be
+    /// dropped) before each answer. The n-th request it handles is answered with `answer(n)`.
+    fn gated_probe(
+        gate: Receiver<()>,
+        answer: impl Fn(usize) -> Option<PrivacyBlockReason> + Send + 'static,
+    ) -> TestProbe {
+        BoundedProbe::spawn("test-privacy-gated", move || {
+            let mut handled = 0;
+            move |_| {
+                let _ = gate.recv();
+                handled += 1;
+                answer(handled)
+            }
+        })
+        .unwrap()
+    }
+
+    /// A processor with diagnostics whose input target, `test_raw_key`'s, has the focus, in a
+    /// process with `image` at the agent's own integrity level, and whose privacy provider
+    /// answers `answer`.
+    fn processor_in_field(
+        image: &str,
+        answer: Option<PrivacyBlockReason>,
+    ) -> (InputProcessor, Receiver<String>) {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor.foreground_override = Some(test_foreground());
+        processor.process_override = Some((Some(image.to_owned()), Some(0x2000)));
+        processor.current_integrity_level = Some(0x2000);
+        processor.privacy_probe = Some(answering_probe(answer));
+        processor.privacy_needs_check = true;
+        (processor, receiver)
+    }
+
+    #[test]
+    fn a_terminal_word_begun_before_its_field_passed_a_check_is_automatic_again() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        processor.process_override = Some((
+            Some(r"C:\Program Files\WindowsApps\Terminal\WindowsTerminal.exe".to_owned()),
+            Some(0x2000),
+        ));
+        processor.settings.manual_terminal_uia_fallback = true;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        // The field does not answer the first check, and passes the next one.
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-terminal", move || {
+                move |_| (counted.fetch_add(1, Ordering::SeqCst) == 0).then_some(FIELD_FAILURE)?
+            })
+            .unwrap(),
+        );
+        // "ghbdtn": the first letter meets the unanswered check, and the word is kept for Pause
+        // only.
+        type_keys(&mut processor, foreground, &[0x22]);
+        assert!(processor.manual_only_word);
+        assert_eq!(processor.session.buffered_character_count(), 1);
+        // A periodic check of the same field passes while the word is typed.
+        processor.privacy_needs_check = true;
+        type_keys(&mut processor, foreground, &[0x23, 0x30, 0x20, 0x14, 0x31]);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(processor.privacy_reason.is_none());
+        assert!(!processor.manual_only_word);
+        assert_eq!(processor.session.buffered_character_count(), 6);
+    }
+
+    #[test]
+    fn typing_in_a_password_field_leaves_no_line_once_the_field_is_known() {
+        let (mut processor, receiver) =
+            processor_in_field(EDITOR, Some(PrivacyBlockReason::PasswordField));
+        processor.process_key(letter(0x53, 1));
+        // Only the program the window belongs to; the check that found the password field is
+        // not written.
+        let first: Vec<String> = receiver.try_iter().collect();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].starts_with("event=context "), "{first:?}");
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::PasswordField)
+        );
+        // Every further key, slow in the queue or not, and the word's end leave nothing.
+        for (index, key) in [0x45u16, 0x43, 0x52, 0x45, 0x54].into_iter().enumerate() {
+            let event = letter(key, index as u64 + 2);
+            let queued = queued_key(&processor, event, Duration::from_millis(100));
+            processor.process(queued);
+        }
+        assert_eq!(processor.last_word_reset, "privacy");
+        let space = test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0);
+        let queued = queued_key(&processor, space, Duration::from_millis(100));
+        processor.process(queued);
+        let typed: Vec<String> = receiver.try_iter().collect();
+        assert!(typed.is_empty(), "{typed:?}");
+    }
+
+    #[test]
+    fn typing_in_an_excluded_program_leaves_no_line_at_all() {
+        let (mut processor, receiver) = processor_in_field(KEEPASS, None);
+        for (index, key) in [0x53u16, 0x45, 0x43].into_iter().enumerate() {
+            processor.process_key(letter(key, index as u64 + 1));
+        }
+        processor.process_key(test_raw_key(WM_KEYDOWN, VK_SPACE, 4, 0));
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(records.is_empty(), "{records:?}");
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::ExcludedProcess)
+        );
+    }
+
+    #[test]
+    fn the_first_keys_in_an_excluded_program_block_it_at_once_and_leave_no_line() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        let (sender, receiver) = sync_channel(64);
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        // A word begun in the editor, discarded by the switch.
+        type_keys(&mut processor, foreground, &[0x1e, 0x1f]);
+        assert_eq!(processor.session.buffered_character_count(), 2);
+        let _ = receiver.try_iter().count();
+        let keepass = ForegroundContext {
+            hwnd: 50,
+            focus: 50,
+            process_id: 60,
+            ..foreground
+        };
+        processor.foreground_override = Some(keepass);
+        processor.process_override = Some((Some(KEEPASS.to_owned()), Some(0x2000)));
+        // Ctrl+V and keys that type nothing, each slow in the queue.
+        let control = held_keys(&[VK_LCONTROL]);
+        let blocked = privacy_reason_code(Some(PrivacyBlockReason::ExcludedProcess));
+        for event in [
+            RawKeyEvent {
+                held_modifiers: control,
+                ..test_raw_key(WM_KEYDOWN, VK_LCONTROL, 3, 0)
+            },
+            RawKeyEvent {
+                scan_code: 0x2f,
+                held_modifiers: control,
+                ..letter(0x56, 4)
+            },
+            test_raw_key(WM_KEYUP, VK_LCONTROL, 5, 0),
+            test_raw_key(WM_KEYDOWN, VK_BACK, 6, 0),
+            test_raw_key(WM_KEYDOWN, VK_SPACE, 7, 0),
+        ] {
+            let event = RawKeyEvent {
+                foreground: keepass,
+                ..event
+            };
+            processor.process(queued_key(&processor, event, Duration::from_millis(100)));
+            // Blocked from the first key on, for the hooks as well: a Space arms no gate there.
+            assert_eq!(
+                processor.privacy_reason,
+                Some(PrivacyBlockReason::ExcludedProcess)
+            );
+            assert_eq!(hook_privacy_reason(&processor.metrics, 60), blocked);
+        }
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    #[test]
+    fn a_shortcut_in_a_field_found_to_be_a_password_field_leaves_no_line() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        // The user name is fine; the field Tab moves to in the same window is a password field.
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-password-next", || {
+                let mut handled = 0;
+                move |_: (ForegroundContext, u64, u64)| {
+                    handled += 1;
+                    (handled > 1).then_some(PrivacyBlockReason::PasswordField)
+                }
+            })
+            .unwrap(),
+        );
+        processor.process_key(letter(0x41, 1));
+        assert!(processor.privacy_reason.is_none());
+        processor.process_key(test_raw_key(WM_KEYDOWN, VK_TAB, 2, 0));
+        let _ = receiver.try_iter().count();
+        let control = held_keys(&[VK_LCONTROL]);
+        for event in [
+            RawKeyEvent {
+                held_modifiers: control,
+                ..test_raw_key(WM_KEYDOWN, VK_LCONTROL, 3, 0)
+            },
+            RawKeyEvent {
+                scan_code: 0x2f,
+                held_modifiers: control,
+                ..letter(0x56, 4)
+            },
+        ] {
+            processor.process(queued_key(&processor, event, Duration::from_millis(100)));
+        }
+        assert!(processor.privacy_reason.is_some());
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(records.is_empty(), "{records:?}");
+    }
+
+    #[test]
+    fn the_hooks_take_a_privacy_verdict_only_for_the_process_it_belongs_to() {
+        let metrics = ObserverMetrics::default();
+        metrics
+            .privacy_reason
+            .store(PRIVACY_ALLOWED, Ordering::Release);
+        metrics.privacy_process_id.store(3, Ordering::Release);
+        assert_eq!(hook_privacy_reason(&metrics, 3), PRIVACY_ALLOWED);
+        // A program the worker has not seen yet may be excluded: its first Space arms no gate.
+        assert_eq!(hook_privacy_reason(&metrics, 4), PRIVACY_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_reload_that_excludes_the_program_in_use_blocks_it_at_once() {
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.process_key(letter(0x41, 1));
+        assert!(processor.privacy_reason.is_none());
+        processor.apply_configuration_reload(Ok(test_reload_snapshot("editor.exe")));
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::ExcludedProcess)
+        );
+        assert_eq!(
+            hook_privacy_reason(&processor.metrics, test_foreground().process_id),
+            privacy_reason_code(Some(PrivacyBlockReason::ExcludedProcess))
+        );
+    }
+
+    #[test]
+    fn the_privacy_check_of_a_key_tells_an_allowed_field_from_a_blocked_one() {
+        for (image, integrity, answer, blocked) in [
+            (EDITOR, Some(0x2000), None, false),
+            (
+                EDITOR,
+                Some(0x2000),
+                Some(PrivacyBlockReason::PasswordField),
+                true,
+            ),
+            (
+                EDITOR,
+                Some(0x2000),
+                Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                true,
+            ),
+            (KEEPASS, Some(0x2000), None, true),
+            // An elevated program, and one whose integrity cannot be read.
+            (EDITOR, Some(0x3000), None, true),
+            (EDITOR, None, None, true),
+        ] {
+            let (mut processor, _receiver) = processor_in_field(image, answer);
+            processor.process_override = Some((Some(image.to_owned()), integrity));
+            processor.process_key(letter(0x41, 1));
+            let case = format!("{image} {integrity:?} {answer:?}");
+            assert_eq!(processor.privacy_reason.is_some(), blocked, "{case}");
+            assert_eq!(processor.last_word_reset == "privacy", blocked, "{case}");
+            // An allowed key goes on to the word (here a key the test layout cannot type).
+            assert!(!blocked || processor.session.is_suppressed(), "{case}");
+        }
+    }
+
+    #[test]
+    fn every_failed_privacy_check_blocks_the_field() {
+        let unavailable = Some(PrivacyBlockReason::InspectionUnavailable);
+        let mut sources = Vec::new();
+        for failure in [
+            ProbeFailure::Timeout,
+            ProbeFailure::Busy,
+            ProbeFailure::Disconnected,
+            ProbeFailure::Expired,
+        ] {
+            let (reason, source) = probe_verdict(Err(failure));
+            assert_eq!(reason, unavailable, "{failure:?}");
+            sources.push(source);
+        }
+        sources.sort_unstable();
+        sources.dedup();
+        assert_eq!(sources.len(), 4, "each failure names itself");
+        assert_eq!(probe_verdict(Ok(None)), (None, "provider"));
+        assert_eq!(
+            probe_verdict(Ok(Some(PrivacyBlockReason::PasswordField))),
+            (Some(PrivacyBlockReason::PasswordField), "provider")
+        );
+
+        // Through the key: a provider that does not answer in time, one that is gone, and no
+        // provider at all.
+        let (gate, waiting) = sync_channel::<()>(1);
+        let gone: TestProbe = BoundedProbe::spawn("test-privacy-gone", || {
+            |_: (ForegroundContext, u64, u64)| -> Option<PrivacyBlockReason> {
+                panic!("the provider is gone")
+            }
+        })
+        .unwrap();
+        for (case, probe) in [
+            ("timeout", Some(gated_probe(waiting, |_| None))),
+            ("disconnected", Some(gone)),
+            ("missing", None),
+        ] {
+            let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+            processor.privacy_probe = probe;
+            processor.process_key(letter(0x41, 1));
+            assert_eq!(processor.privacy_reason, unavailable, "{case}");
+            assert_eq!(processor.last_word_reset, "privacy", "{case}");
+            assert!(processor.session.is_suppressed(), "{case}");
+        }
+        drop(gate);
+
+        // A reply for another input target never authorizes this one.
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.foreground_override = Some(ForegroundContext {
+            focus: 99,
+            ..test_foreground()
+        });
+        processor.evaluate_privacy(test_foreground(), ProbeTrigger::Typing);
+        assert_eq!(processor.privacy_reason, unavailable);
+    }
+
+    #[test]
+    fn a_pause_check_holds_only_for_the_input_target_and_epoch_it_began_with() {
+        let foreground = test_foreground();
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        assert!(processor.forced_privacy_allows(foreground));
+        // Another control has the focus.
+        processor.foreground_override = Some(ForegroundContext {
+            focus: 99,
+            ..foreground
+        });
+        assert!(!processor.forced_privacy_allows(foreground));
+        // The input epoch moves on while the field is checked.
+        processor.foreground_override = Some(foreground);
+        let metrics = Arc::clone(&processor.metrics);
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-epoch", move || {
+                move |_: (ForegroundContext, u64, u64)| {
+                    metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+                    None
+                }
+            })
+            .unwrap(),
+        );
+        assert!(!processor.forced_privacy_allows(foreground));
+    }
+
+    #[test]
+    fn an_answer_requested_before_tab_never_decides_the_field_after_it() {
+        // The provider answers the first field (before Tab) as an ordinary one and every later
+        // one as a password field, each only when the test lets it.
+        let (release, gate) = sync_channel::<()>(4);
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.privacy_probe = Some(gated_probe(gate, |handled| {
+            (handled > 1).then_some(PrivacyBlockReason::PasswordField)
+        }));
+        processor.process_key(letter(0x41, 1));
+        assert_eq!(
+            processor.privacy_reason,
+            Some(PrivacyBlockReason::InspectionUnavailable),
+            "no answer in time"
+        );
+        // The answer for the field before Tab arrives late, and Tab moves to the password field.
+        release.send(()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        processor.process_key(test_raw_key(WM_KEYDOWN, VK_TAB, 2, 0));
+        processor.process_key(letter(0x42, 3));
+        assert!(processor.privacy_reason.is_some());
+        assert_eq!(processor.last_word_reset, "privacy");
+        drop(release);
+    }
+
+    #[test]
+    fn navigation_keys_ask_for_a_fresh_privacy_check_even_when_the_word_goes_on() {
+        // Down may move from a user name to a password field of the same window (a web form).
+        for key in [
+            VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_HOME, VK_END, VK_PRIOR, VK_NEXT,
+        ] {
+            let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+            processor.settings.suppress_after_left = false;
+            processor.settings.suppress_after_right = false;
+            processor.settings.suppress_after_up = false;
+            processor.settings.suppress_after_down = false;
+            processor.settings.suppress_after_home_end = false;
+            processor.process_key(letter(0x41, 1));
+            assert!(!processor.privacy_needs_check, "{key:?}");
+            processor.recent_privacy_ok = Some(RecentPrivacyOk {
+                foreground: test_foreground(),
+                epoch: 0,
+                at: Instant::now(),
+            });
+            let generation = processor.privacy_generation;
+            processor.process_key(test_raw_key(WM_KEYDOWN, key, 2, 0));
+            assert!(processor.privacy_needs_check, "{key:?}");
+            assert!(processor.recent_privacy_ok.is_none(), "{key:?}");
+            assert_ne!(processor.privacy_generation, generation, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn keys_that_can_move_the_focus_within_a_window_ask_for_a_fresh_privacy_check() {
+        // Esc, F1, F6, F24 and the menu key; Tab, Shift+Tab and Enter; Ctrl+Tab and an Alt
+        // accelerator.
+        let none: &[VIRTUAL_KEY] = &[];
+        for (modifiers, key) in [
+            (none, VK_ESCAPE),
+            (none, VK_APPS),
+            (none, VK_F1),
+            (none, VIRTUAL_KEY(0x75)),
+            (none, VK_F24),
+            (none, VK_TAB),
+            (&[VK_LSHIFT][..], VK_TAB),
+            (none, VK_RETURN),
+            (&[VK_LCONTROL][..], VK_TAB),
+            (&[VK_LMENU][..], VIRTUAL_KEY(0x46)),
+        ] {
+            let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+            processor.process_key(letter(0x41, 1));
+            assert!(processor.privacy_reason.is_none(), "{key:?}");
+            assert!(!processor.privacy_needs_check, "{key:?}");
+            processor.recent_privacy_ok = Some(RecentPrivacyOk {
+                foreground: test_foreground(),
+                epoch: 0,
+                at: Instant::now(),
+            });
+            let generation = processor.privacy_generation;
+            processor.modifiers = held_modifiers(modifiers);
+            processor.process_key(RawKeyEvent {
+                held_modifiers: held_keys(modifiers),
+                ..test_raw_key(WM_KEYDOWN, key, 2, 0)
+            });
+            assert!(processor.privacy_needs_check, "{key:?}");
+            assert!(processor.recent_privacy_ok.is_none(), "{key:?}");
+            assert_ne!(processor.privacy_generation, generation, "{key:?}");
+        }
+        for typing in [VK_SPACE.0, 0x41, VK_LEFT.0, VK_BACK.0] {
+            assert!(!may_move_focus_within_window(typing), "{typing:#x}");
+        }
+    }
+
+    #[test]
+    fn a_slow_keyboard_hook_is_not_logged_while_privacy_blocks_the_field() {
+        assert!(slow_hook_may_be_logged("keyboard", PRIVACY_ALLOWED));
+        assert!(slow_hook_may_be_logged("mouse", PRIVACY_PASSWORD));
+        for blocked in [
+            PRIVACY_PASSWORD,
+            PRIVACY_EXCLUDED,
+            PRIVACY_UNAVAILABLE,
+            PRIVACY_ELEVATED,
+        ] {
+            assert!(!slow_hook_may_be_logged("keyboard", blocked), "{blocked}");
+        }
+    }
+
+    #[test]
+    fn a_new_window_reads_its_process_again_even_with_the_same_process_id() {
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.process_key(letter(0x41, 1));
+        assert!(processor.process_reason.is_none());
+        // The program closes, and another one gets its process ID and a new window.
+        processor.process_override = Some((Some(KEEPASS.to_owned()), Some(0x2000)));
+        let moved = ForegroundContext {
+            hwnd: 50,
+            focus: 50,
+            ..test_foreground()
+        };
+        processor.foreground_override = Some(moved);
+        let mut event = letter(0x42, 2);
+        event.foreground = moved;
+        processor.process_key(event);
+        assert_eq!(
+            processor.process_reason,
+            Some(PrivacyBlockReason::ExcludedProcess)
+        );
+        assert_eq!(processor.last_word_reset, "privacy");
+    }
+
+    #[test]
+    fn a_pending_configuration_drops_the_word_in_an_allowed_field() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        processor
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        let queued = queued_key(&processor, letter(0x4c, 1), Duration::ZERO);
+        processor.process(queued);
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert!(processor.replay_keys.is_empty());
+        assert!(processor.privacy_reason.is_none());
+        let lines: Vec<String> = receiver.try_iter().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("event=word_discard ")
+                    && line.contains("reason=configuration chars=3")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_worker_takes_a_privacy_refresh_and_lets_the_next_one_be_queued() {
+        let (state, receiver) = test_gate_state(4);
+        let foreground = test_foreground();
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.foreground_override = Some(foreground);
+        processor.process_override = Some((Some(EDITOR.to_owned()), Some(0x2000)));
+        processor.current_integrity_level = Some(0x2000);
+        let asked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&asked);
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-refresh", move || {
+                move |_: (ForegroundContext, u64, u64)| {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                    None
+                }
+            })
+            .unwrap(),
+        );
+        assert!(state.enqueue(RawInputEvent::PrivacyRefresh(foreground)));
+        assert!(state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
+        processor.process(receiver.try_recv().unwrap());
+        assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+        assert!(processor.privacy_reason.is_none());
+        // The next refresh is queued again, and while a gate holds keys it asks nothing.
+        assert!(state.enqueue(RawInputEvent::PrivacyRefresh(foreground)));
+        state.metrics.active_gate_token.store(9, Ordering::Release);
+        processor.process(receiver.try_recv().expect("queued again"));
+        assert!(!state.metrics.privacy_refresh_queued.load(Ordering::Acquire));
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// The kinds of the refresh events waiting in `receiver`.
+    fn queued_refreshes(receiver: &Receiver<QueuedInputEvent>) -> Vec<&'static str> {
+        receiver
+            .try_iter()
+            .map(|queued| match queued.event {
+                RawInputEvent::ProfileRefresh => "profiles",
+                RawInputEvent::PrivacyRefresh(_) => "privacy",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_timer_tick_refreshes_the_keyboard_profiles_also_over_the_shell() {
+        let (mut state, receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        let now = Instant::now();
+        // The shell gets no field check, but its keyboard profiles age like any other.
+        queue_periodic_refreshes(&mut state, foreground, true, now);
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+        state
+            .metrics
+            .profile_refresh_queued
+            .store(false, Ordering::Release);
+        queue_periodic_refreshes(&mut state, foreground, false, now);
+        assert_eq!(queued_refreshes(&receiver), ["profiles", "privacy"]);
+        // The field check keeps its own interval; the profiles come with every tick.
+        state
+            .metrics
+            .profile_refresh_queued
+            .store(false, Ordering::Release);
+        state
+            .metrics
+            .privacy_refresh_queued
+            .store(false, Ordering::Release);
+        queue_periodic_refreshes(&mut state, foreground, false, now);
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+    }
+
+    #[test]
+    fn a_missing_tray_icon_spends_no_update_budget() {
+        let now = Instant::now();
+        let mut throttle = TrayThrottle::new();
+        // Before the icon exists (or while it cannot be added) nothing is shown...
+        assert!(!tray_update_allowed(false, false, &mut throttle, now));
+        // ...and the icon added a moment later shows the status at once.
+        assert!(tray_update_allowed(true, false, &mut throttle, now));
+        // The budget holds for an icon that exists: two updates per second.
+        assert!(!tray_update_allowed(true, false, &mut throttle, now));
+        assert!(tray_update_allowed(
+            true,
+            false,
+            &mut throttle,
+            now + TrayThrottle::MIN_INTERVAL
+        ));
+        // A gate holding keys refuses it without spending the budget, as before.
+        let later = now + TrayThrottle::MIN_INTERVAL * 2;
+        assert!(!tray_update_allowed(true, true, &mut throttle, later));
+        assert!(tray_update_allowed(true, false, &mut throttle, later));
+    }
+
+    #[test]
+    fn a_tray_offer_chosen_twice_is_saved_once() {
+        let now = Instant::now();
+        let word = |word: &str| {
+            VolatileLexiconCandidate::new(
+                LexiconOfferTarget::UserDictionary,
+                Language::English,
+                word.to_owned(),
+                now,
+            )
+        };
+        let mut saves = LexiconSaves::new();
+        assert!(saves.begin(&word("teh")));
+        // Chosen again while the first save waits for the disk: no second writer.
+        assert!(!saves.begin(&word("teh")));
+        assert!(saves.begin(&word("adn")));
+        saves.end(&word("teh"));
+        assert!(saves.begin(&word("teh")));
+    }
+
+    #[test]
+    fn a_word_save_finished_during_shutdown_starts_nothing() {
+        // Its report reloads the configuration on a thread of its own.
+        assert!(ignored_while_shutting_down(LEXICON_SAVED_MESSAGE));
+        assert!(ignored_while_shutting_down(WM_COMMAND));
+        assert!(!ignored_while_shutting_down(WM_TIMER));
+    }
+
+    #[test]
+    fn the_keyboard_profiles_are_refreshed_under_an_open_tray_menu() {
+        let (mut state, receiver) = test_gate_state(8);
+        assert!(!queue_refreshes_under_menu(&mut state));
+        assert!(queued_refreshes(&receiver).is_empty());
+        state.menu_open = true;
+        assert!(queue_refreshes_under_menu(&mut state));
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+    }
+
+    #[test]
+    fn a_profile_refresh_waits_once_in_the_queue_and_a_full_queue_only_drops_it() {
+        let (state, receiver) = test_gate_state(1);
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        assert_eq!(queued_refreshes(&receiver), ["profiles"]);
+        // Still marked as queued until the worker takes it: the next tick sends nothing.
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        assert!(receiver.try_recv().is_err());
+        state
+            .metrics
+            .profile_refresh_queued
+            .store(false, Ordering::Release);
+        assert!(state.enqueue(RawInputEvent::Mouse));
+        let epoch = state.metrics.input_epoch.load(Ordering::Acquire);
+        assert!(!state.enqueue(RawInputEvent::ProfileRefresh));
+        assert_eq!(state.metrics.input_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(state.metrics.dropped_events.load(Ordering::Acquire), 0);
+        assert!(!state.metrics.profile_refresh_queued.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_profile_refresh_polls_the_keyboard_profiles_unless_a_gate_holds_keys() {
+        let (state, receiver) = test_gate_state(4);
+        let mut processor = InputProcessor::new(Arc::clone(&state.metrics), 0);
+        processor.profile_override = None;
+        let asked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&asked);
+        let snapshot = test_profiles();
+        processor.input_profiles = KeyboardProfileCache::with_resolver(
+            BoundedProbe::spawn("test-profiles", move || {
+                move |()| {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                    Ok(snapshot.clone())
+                }
+            })
+            .unwrap(),
+        );
+        state.metrics.active_gate_token.store(9, Ordering::Release);
+        assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+        processor.process(receiver.try_recv().unwrap());
+        assert!(!state.metrics.profile_refresh_queued.load(Ordering::Acquire));
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(asked.load(Ordering::Acquire), 0, "a gate holds keys");
+        state.metrics.active_gate_token.store(0, Ordering::Release);
+        // The provider answers a request on a later refresh.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while processor.input_profiles.generation() == 0 && Instant::now() < deadline {
+            assert!(state.enqueue(RawInputEvent::ProfileRefresh));
+            processor.process(receiver.try_recv().unwrap());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(processor.input_profiles.generation(), 1);
+        assert!(asked.load(Ordering::Acquire) >= 1);
+        assert_eq!(processor.resolved_profiles(), Some(&test_profiles()));
+    }
+
+    #[test]
+    fn a_word_remembered_before_the_profiles_aged_out_is_not_stale_when_they_come_back() {
+        // Before this, an open tray menu stopped the refreshes: after six seconds the snapshot
+        // aged out, the same bindings came back in a new generation and the word remembered when
+        // the tray was clicked was dropped as stale.
+        use autokeyboardlayot::profile_resolver::{PROFILE_MAX_AGE, ProfileResolutionError};
+        let mut processor = processor_at_the_test_target();
+        processor.profile_override = None;
+        let answering = Arc::new(AtomicBool::new(true));
+        let provider = Arc::clone(&answering);
+        processor.input_profiles = KeyboardProfileCache::with_resolver(
+            BoundedProbe::spawn("test-profiles", move || {
+                move |()| {
+                    if provider.load(Ordering::Acquire) {
+                        Ok(test_profiles())
+                    } else {
+                        Err(ProfileResolutionError::Unavailable)
+                    }
+                }
+            })
+            .unwrap(),
+        );
+        let refresh_until = |processor: &mut InputProcessor, available: bool| {
+            let deadline = Instant::now() + PROFILE_MAX_AGE + Duration::from_secs(5);
+            while processor.resolved_profiles().is_some() != available {
+                assert!(Instant::now() < deadline, "available={available}");
+                processor.refresh_input_profiles();
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        refresh_until(&mut processor, true);
+        let generation = processor.input_profiles.generation();
+        let target = recent_ok_foreground();
+        processor.last_boundary = Some(LastBoundary {
+            replay_keys: vec![
+                ReplayKey {
+                    scan_code: 0x23,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                };
+                5
+            ],
+            delimiter: Some(' '),
+            foreground: target,
+            epoch: 0,
+            profile_generation: generation,
+        });
+        processor.remember_word(target, None, Instant::now());
+        processor.last_boundary = None;
+        // No refresh succeeds for longer than the snapshot lives, then the same bindings return.
+        answering.store(false, Ordering::Release);
+        refresh_until(&mut processor, false);
+        answering.store(true, Ordering::Release);
+        refresh_until(&mut processor, true);
+        assert_eq!(processor.input_profiles.generation(), generation);
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        assert!(
+            processor
+                .restore_remembered_word(target, Instant::now())
+                .is_some(),
+            "the remembered word is stale"
+        );
+        assert!(processor.last_boundary.is_some());
+    }
+
+    #[test]
+    fn a_pause_press_over_a_word_never_writes_the_word() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.settings.pause_break_undo = true;
+        type_letters(&mut processor, "secret");
+        let pause = RawKeyEvent {
+            hotkey_trigger: true,
+            ..test_raw_key(WM_KEYDOWN, VK_PAUSE, 5, 0)
+        };
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(5, Ordering::Release);
+        processor.last_foreground = Some(foreground_identity_key(pause.foreground));
+        processor.last_layout = Some(pause.foreground.layout);
+        processor.last_process_id = Some(pause.foreground.process_id);
+        processor.process_key(pause);
+        let records: Vec<String> = receiver.try_iter().collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.starts_with("event=hotkey ")),
+            "{records:?}"
+        );
+        assert_no_record_contains(&records, &["secret"]);
+    }
+
+    #[test]
+    fn the_barrier_report_never_carries_the_text_it_compared() {
+        let report = classify_text_barrier(
+            "привет\u{a0}",
+            "привет ",
+            TextBarrierStage::TextCompared,
+            -7,
+        );
+        let line = format_text_barrier_report(report);
+        assert!(line.contains("nbsp_equiv=true"), "{line}");
+        assert_no_record_contains(&[line], &["привет"]);
+    }
+
+    /// A scripted text field. The caret is at the end of `text`, and `selected` characters
+    /// before it are selected (shared, so a test can look after the field was moved).
+    struct FakeField {
+        text: Vec<char>,
+        selected: std::rc::Rc<Cell<usize>>,
+        selection_fails: bool,
+        not_one_range: bool,
+        range_unreadable: bool,
+        clone_fails: bool,
+        move_short: bool,
+        text_fails: bool,
+        /// Select() reports failure; with `select_applies` the field selects all the same.
+        select_fails: bool,
+        select_applies: bool,
+        /// The field selects one character less than asked.
+        select_short: bool,
+        /// From the first Select() on, the selection cannot be read.
+        unreadable_after_select: bool,
+        /// Moving a range's start onto its end fails.
+        collapse_fails: bool,
+        /// Selecting an empty range is accepted but changes nothing.
+        ignores_collapse: bool,
+        /// Select() is accepted, but the field never shows the selection.
+        never_shows: bool,
+        selected_once: Cell<bool>,
+    }
+
+    struct FakeRange {
+        start: Cell<usize>,
+        end: usize,
+    }
+
+    fn fake_field(text: &str) -> FakeField {
+        FakeField {
+            text: text.chars().collect(),
+            selected: std::rc::Rc::new(Cell::new(0)),
+            selection_fails: false,
+            not_one_range: false,
+            range_unreadable: false,
+            clone_fails: false,
+            move_short: false,
+            text_fails: false,
+            select_fails: false,
+            select_applies: false,
+            select_short: false,
+            unreadable_after_select: false,
+            collapse_fails: false,
+            ignores_collapse: false,
+            never_shows: false,
+            selected_once: Cell::new(false),
+        }
+    }
+
+    impl TextField for FakeField {
+        type Range = FakeRange;
+
+        fn selection(&self) -> SelectionRead<FakeRange> {
+            if self.selection_fails || (self.unreadable_after_select && self.selected_once.get()) {
+                return SelectionRead::Unreadable;
+            }
+            if self.not_one_range {
+                return SelectionRead::NotOneRange;
+            }
+            if self.range_unreadable {
+                return SelectionRead::RangeUnreadable;
+            }
+            let end = self.text.len();
+            SelectionRead::One(FakeRange {
+                start: Cell::new(end - self.selected.get()),
+                end,
+            })
+        }
+
+        fn is_empty(&self, range: &FakeRange) -> Option<bool> {
+            Some(range.start.get() == range.end)
+        }
+
+        fn clone_range(&self, range: &FakeRange) -> Option<FakeRange> {
+            (!self.clone_fails).then(|| FakeRange {
+                start: Cell::new(range.start.get()),
+                end: range.end,
+            })
+        }
+
+        fn move_start(&self, range: &FakeRange, units: i32) -> Option<i32> {
+            let old = i32::try_from(range.start.get()).unwrap();
+            let new = (old + units).max(0);
+            range.start.set(usize::try_from(new).unwrap());
+            Some(if self.move_short {
+                units + 1
+            } else {
+                new - old
+            })
+        }
+
+        fn text(&self, range: &FakeRange) -> Option<String> {
+            (!self.text_fails).then(|| self.text[range.start.get()..range.end].iter().collect())
+        }
+
+        fn select(&self, range: &FakeRange) -> bool {
+            if self.ignores_collapse && range.start.get() == range.end {
+                return true;
+            }
+            self.selected_once.set(true);
+            if self.never_shows {
+                return true;
+            }
+            if !self.select_fails || self.select_applies {
+                let length = range.end - range.start.get();
+                let short = usize::from(self.select_short && length > 0);
+                self.selected.set(length - short);
+            }
+            !self.select_fails
+        }
+
+        fn collapse_to_end(&self, range: &FakeRange) -> bool {
+            if self.collapse_fails {
+                return false;
+            }
+            range.start.set(range.end);
+            true
+        }
+    }
+
+    /// One selection attempt for "ghbdtn " on `field`; returns it, its report and how many
+    /// characters stay selected.
+    fn select_in(field: FakeField, earlier: bool) -> (SelectionAttempt, TextBarrierReport, usize) {
+        let expected = "ghbdtn ";
+        let selected = std::rc::Rc::clone(&field.selected);
+        let report = Cell::new(TextBarrierReport {
+            expected_chars: expected.chars().count(),
+            ..TextBarrierReport::default()
+        });
+        let attempt = select_preceding_text_in(
+            expected,
+            Duration::from_millis(20),
+            earlier,
+            &report,
+            || Ok(field),
+        );
+        (attempt, report.get(), selected.get())
+    }
+
+    #[test]
+    fn pause_selects_a_field_that_did_not_show_it_again_only_with_time_for_it() {
+        // The field never shows one selection; with a gate holding a second attempt's time the
+        // word is selected twice, without it once.
+        for (left_ms, attempts) in [(None, 2), (Some(900), 1)] {
+            let budget = PasteBudget {
+                deadline: left_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            };
+            let report = Cell::new(TextBarrierReport::default());
+            let (status, cleanup) = select_preceding_text_retrying(
+                "ghbdtn ",
+                PastePatience::Manual,
+                budget,
+                &report,
+                || {
+                    Ok(FakeField {
+                        never_shows: true,
+                        ..fake_field("hello ghbdtn ")
+                    })
+                },
+            );
+            assert_eq!(status, TextBarrierStatus::Mismatch, "{left_ms:?}");
+            assert_eq!(cleanup, Some(SelectionCleanup::Collapsed), "{left_ms:?}");
+            assert_eq!(report.get().attempts, attempts, "{left_ms:?}");
+        }
+    }
+
+    #[test]
+    fn a_selection_the_field_confirms_is_kept() {
+        let (attempt, report, selected) = select_in(fake_field("hello ghbdtn "), false);
+        assert_eq!(attempt.status, TextBarrierStatus::Match);
+        assert_eq!(attempt.confirmation, Some(SelectionConfirmation::Confirmed));
+        assert_eq!(attempt.cleanup, None);
+        assert_eq!(report.cleanup, None);
+        assert_eq!(selected, 7);
+    }
+
+    #[test]
+    fn a_select_call_that_fails_is_still_collapsed_and_read_back() {
+        // The field applied the selection although the call reported failure.
+        let (attempt, report, selected) = select_in(
+            FakeField {
+                select_fails: true,
+                select_applies: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.status, TextBarrierStatus::Mismatch);
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(report.stage, TextBarrierStage::SelectCall);
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(selected, 0);
+        // When it cannot be collapsed, the selection is reported left.
+        let (attempt, report, selected) = select_in(
+            FakeField {
+                select_fails: true,
+                select_applies: true,
+                collapse_fails: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(selected, 7);
+    }
+
+    #[test]
+    fn a_selection_that_cannot_be_read_back_or_collapsed_is_reported_left() {
+        // A busy field: the selection is made, then nothing can be read any more.
+        let (attempt, report, _) = select_in(
+            FakeField {
+                unreadable_after_select: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(
+            attempt.confirmation,
+            Some(SelectionConfirmation::Unreadable)
+        );
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(report.stage, TextBarrierStage::SelectionConfirm);
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Unverified));
+        // The field shows other text and refuses to collapse it.
+        let (attempt, _, selected) = select_in(
+            FakeField {
+                select_short: true,
+                collapse_fails: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.confirmation, Some(SelectionConfirmation::OtherText));
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Unverified));
+        assert_eq!(selected, 6);
+        // The same field, collapsing: the selection is gone and that is confirmed.
+        let (attempt, report, selected) = select_in(
+            FakeField {
+                select_short: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            false,
+        );
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn a_late_selection_found_by_a_second_attempt_is_collapsed_and_a_users_is_not() {
+        let late = || {
+            let field = fake_field("hello ghbdtn ");
+            field.selected.set(7);
+            field
+        };
+        let (attempt, report, selected) = select_in(late(), true);
+        assert_eq!(attempt.status, TextBarrierStatus::Mismatch);
+        assert_eq!(report.stage, TextBarrierStage::CaretNotEmpty);
+        assert_eq!(attempt.cleanup, Some(SelectionCleanup::Collapsed));
+        assert_eq!(selected, 0);
+        let (attempt, _, selected) = select_in(late(), false);
+        assert_eq!(attempt.cleanup, None);
+        assert_eq!(
+            selected, 7,
+            "the first attempt leaves a selection it finds alone"
+        );
+    }
+
+    /// A barrier answer that names itself through the report's character count.
+    fn marked_barrier_answer(mark: usize) -> (TextBarrierStatus, TextBarrierReport) {
+        (
+            TextBarrierStatus::Match,
+            TextBarrierReport {
+                stage: TextBarrierStage::TextCompared,
+                expected_chars: mark,
+                ..TextBarrierReport::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_barrier_read_that_never_returns_holds_the_worker_only_until_its_deadline() {
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawned);
+        let (hanging, hung) = std::sync::mpsc::channel::<()>();
+        // The first provider hangs in its first read for good, once it has said so; the ones
+        // after it answer.
+        let mut probe: BarrierProbe = BoundedProbe::spawn_resilient(
+            "barrier-hang-test",
+            move || {
+                let hangs = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                let hanging = hanging.clone();
+                move |_: BarrierRead| {
+                    if hangs {
+                        let _ = hanging.send(());
+                        loop {
+                            thread::park();
+                        }
+                    }
+                    marked_barrier_answer(41)
+                }
+            },
+            Duration::from_millis(300),
+            1,
+        )
+        .expect("barrier provider");
+        let read = |text: &str| BarrierRead {
+            process_id: 7,
+            text: text.to_owned(),
+            check: 1,
+        };
+        let age = Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        // A read whose deadline has come does not wait at all, whatever the provider does.
+        let started = Instant::now();
+        let (status, report) = barrier_answer(&mut probe, read("ghbdtn "), started, age);
+        assert_eq!(status, TextBarrierStatus::Unavailable);
+        assert_eq!(report.stage, TextBarrierStage::Provider);
+        assert_eq!(report.expected_chars, 7);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        // The provider has taken that read and hangs in it. The next read waits in the queue no
+        // longer than its own deadline.
+        hung.recv_timeout(Duration::from_secs(10))
+            .expect("the provider took the read");
+        let next = Instant::now();
+        let (status, _) = barrier_answer(
+            &mut probe,
+            read("vbh "),
+            next + Duration::from_millis(50),
+            age,
+        );
+        assert_eq!(status, TextBarrierStatus::Unavailable);
+        assert!(
+            next.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            next.elapsed()
+        );
+        // With the queue full, a read is refused at once, however long it may wait.
+        let refused = Instant::now();
+        let (status, report) = barrier_answer(
+            &mut probe,
+            read("lf "),
+            refused + Duration::from_secs(30),
+            age,
+        );
+        assert_eq!(
+            (status, report.stage),
+            (TextBarrierStatus::Unavailable, TextBarrierStage::Provider)
+        );
+        assert!(
+            refused.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            refused.elapsed()
+        );
+        // Stuck past its time, the provider is replaced and a fresh one answers.
+        thread::sleep(Duration::from_millis(350));
+        let (status, report) = barrier_answer(
+            &mut probe,
+            read("lf "),
+            Instant::now() + Duration::from_secs(5),
+            age,
+        );
+        assert_eq!(
+            (status, report.expected_chars),
+            (TextBarrierStatus::Match, 41)
+        );
+        assert_eq!(probe.respawn_count(), 1);
+        assert_eq!(spawned.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_late_answer_to_an_earlier_barrier_check_never_answers_the_next_one() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new(metrics, 0);
+        let (release, released) = sync_channel::<()>(1);
+        // The first read sees the field before the edit, and finishes only once released.
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-late-test", move || {
+                let mut reads = 0;
+                move |_: BarrierRead| {
+                    reads += 1;
+                    if reads == 1 {
+                        let _ = released.recv();
+                        (TextBarrierStatus::Mismatch, TextBarrierReport::default())
+                    } else {
+                        marked_barrier_answer(41)
+                    }
+                }
+            })
+            .expect("barrier provider"),
+        );
+        let first =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_millis(30));
+        assert_eq!(first, TextBarrierStatus::Unavailable);
+        // Its answer arrives just after that check ended.
+        release.send(()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        // The next check of the same word reads the field again.
+        let next =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        assert_eq!(next, TextBarrierStatus::Match);
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().expected_chars,
+            41
+        );
+    }
+
+    #[test]
+    fn a_commit_read_behind_one_under_way_counts_past_the_age_of_a_poll_answer() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new(metrics, 0);
+        let (release, released) = sync_channel::<()>(1);
+        // The field is busy with the paste: the first read answers only once released; the
+        // provider answers the next one at once, with the replacement.
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-commit-late-test", move || {
+                move |read: BarrierRead| {
+                    if read.check == 1 {
+                        let _ = released.recv();
+                    }
+                    marked_barrier_answer(41)
+                }
+            })
+            .expect("barrier provider"),
+        );
+        assert_eq!(
+            processor.commit_read(7, "привет", Instant::now() + Duration::from_millis(30)),
+            (TextBarrierStatus::Unavailable, false)
+        );
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(220));
+            release.send(()).unwrap();
+        });
+        // The next read waits behind it and is answered 250 ms after it was asked: past the age
+        // of a poll's answer, and still counted.
+        let started = Instant::now();
+        assert_eq!(
+            processor.commit_read(7, "привет", Instant::now() + Duration::from_secs(2)),
+            (TextBarrierStatus::Match, true)
+        );
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().expected_chars,
+            41
+        );
+        assert!(
+            started.elapsed() > Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS)
+                && started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn the_text_barrier_asks_its_provider_and_keeps_its_report() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let processor = InputProcessor::new(metrics, 0);
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-answer-test", || {
+                |read: BarrierRead| marked_barrier_answer(read.text.chars().count() + 100)
+            })
+            .expect("barrier provider"),
+        );
+        let status =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        assert_eq!(status, TextBarrierStatus::Match);
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().expected_chars,
+            107
+        );
+        // Without a provider the barrier is unavailable, never a match.
+        *processor.barrier_probe.borrow_mut() = None;
+        let status =
+            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        assert_eq!(status, TextBarrierStatus::Unavailable);
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().stage,
+            TextBarrierStage::Provider
+        );
+    }
+
+    #[test]
+    fn a_collapse_the_field_ignores_gives_up_within_its_budget() {
+        // The collapse call fails, or it is accepted and the selection stays: read back, it is
+        // never shown gone.
+        for field in [
+            FakeField {
+                collapse_fails: true,
+                ..fake_field("hello ghbdtn ")
+            },
+            FakeField {
+                ignores_collapse: true,
+                ..fake_field("hello ghbdtn ")
+            },
+        ] {
+            field.selected.set(7);
+            let started = Instant::now();
+            assert_eq!(collapse_selection(&field), SelectionCleanup::Unverified);
+            assert!(started.elapsed() < Duration::from_millis(SELECTION_COLLAPSE_BUDGET_MS + 100));
+            assert_eq!(field.selected.get(), 7);
+            field.selected.set(0);
+            assert_eq!(collapse_selection(&field), SelectionCleanup::Collapsed);
+        }
+    }
+
+    #[test]
+    fn every_early_exit_of_the_barrier_names_its_own_stage() {
+        type Break = fn(&mut FakeField);
+        let cases: [(Break, TextBarrierStage, TextBarrierStatus); 8] = [
+            (
+                |field| field.selection_fails = true,
+                TextBarrierStage::Selection,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.not_one_range = true,
+                TextBarrierStage::SelectionRanges,
+                TextBarrierStatus::Mismatch,
+            ),
+            (
+                |field| field.range_unreadable = true,
+                TextBarrierStage::Caret,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.selected.set(2),
+                TextBarrierStage::CaretNotEmpty,
+                TextBarrierStatus::Mismatch,
+            ),
+            (
+                |field| field.clone_fails = true,
+                TextBarrierStage::RangeClone,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.move_short = true,
+                TextBarrierStage::RangeMove,
+                TextBarrierStatus::Mismatch,
+            ),
+            (
+                |field| field.text_fails = true,
+                TextBarrierStage::TextRead,
+                TextBarrierStatus::Unavailable,
+            ),
+            (
+                |field| field.text = "hello world ".chars().collect(),
+                TextBarrierStage::TextCompared,
+                TextBarrierStatus::Mismatch,
+            ),
+        ];
+        let mut stages = vec![TextBarrierStage::TextLength, TextBarrierStage::SelectCall];
+        for (break_field, stage, status) in cases {
+            let mut field = fake_field("hello ghbdtn ");
+            break_field(&mut field);
+            let report = Cell::new(TextBarrierReport::default());
+            let result = read_preceding_text(&field, 7, "ghbdtn ", &report);
+            assert_eq!(result.err(), Some(status), "{stage:?}");
+            assert_eq!(report.get().stage, stage);
+            stages.push(stage);
+        }
+        // A text the barrier does not check stops before the field is even looked for.
+        for text in [String::new(), "x".repeat(129)] {
+            let report = Cell::new(TextBarrierReport::default());
+            let attempt = select_preceding_text_in(
+                &text,
+                Duration::from_millis(1),
+                false,
+                &report,
+                || -> core::result::Result<FakeField, TextBarrierStatus> { panic!("resolved") },
+            );
+            assert_eq!(attempt.status, TextBarrierStatus::Unavailable);
+            assert_eq!(report.get().stage, TextBarrierStage::TextLength);
+        }
+        let count = stages.len();
+        stages.sort_by_key(|stage| format!("{stage:?}"));
+        stages.dedup();
+        assert_eq!(
+            stages.len(),
+            count,
+            "every early exit has a stage of its own"
+        );
+    }
+
+    #[test]
+    fn a_collapse_adds_its_result_to_the_report_without_overwriting_the_step() {
+        let guard = PrivacyGuard {
+            automation: None,
+            privacy_cache: None,
+            com_initialized: false,
+            last_barrier_report: Cell::new(TextBarrierReport {
+                stage: TextBarrierStage::TextCompared,
+                expected_chars: 7,
+                ..TextBarrierReport::default()
+            }),
+        };
+        // Without UI Automation the field cannot even be found: the collapse is unverified.
+        assert_eq!(
+            guard.collapse_selection_to_end(3),
+            SelectionCleanup::Unverified
+        );
+        let report = guard.last_barrier_report();
+        assert_eq!(report.stage, TextBarrierStage::TextCompared);
+        assert_eq!(report.resolver_reason, EditableResolverReason::None);
+        assert_eq!(report.cleanup, Some(SelectionCleanup::Unverified));
+        assert!(format_text_barrier_report(report).ends_with(",cleanup=Some(Unverified)"));
+    }
+
+    #[test]
+    fn a_paste_that_may_leave_the_word_selected_keeps_the_held_keys_for_recovery() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 42, PasteRoute::Backend)
+                .is_none()
+        );
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        assert_eq!(
+            metrics.last_failure_reason.load(Ordering::Acquire),
+            ConversionFailureReason::SelectionLeft as u8
+        );
+        assert_eq!(
+            conversion_failure_label(ConversionFailureReason::SelectionLeft as u8),
+            "selection-left"
+        );
+        processor.end_conversion_gate(42);
+        assert_eq!(processor.last_gate_retention_token, 42);
+        assert_eq!(processor.last_gate_release_token, 42);
+        // The next conversion's gate is released as usual.
+        processor.end_conversion_gate(43);
+        assert_eq!(processor.last_gate_release_token, 43);
+        assert_eq!(processor.last_gate_retention_token, 42);
+        // An undo whose paste may leave the word selected keeps its held keys as well.
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 44, PasteRoute::Backend)
+                .is_none()
+        );
+        processor.execute_undo(44);
+        assert_eq!(processor.last_gate_retention_token, 44);
+    }
+
+    #[test]
+    fn a_retention_request_posts_a_fail_open_that_names_the_left_selection() {
+        let module = unsafe { GetModuleHandleW(None) }.unwrap();
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("AutoKeyboardLayot gate retention test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(module.into()),
+                None,
+            )
+        }
+        .unwrap();
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), window.0 as usize);
+        processor.request_gate_retention(77);
+        let mut message = MSG::default();
+        let taken = unsafe {
+            PeekMessageW(
+                &mut message,
+                Some(window),
+                GATE_FAIL_OPEN_MESSAGE,
+                GATE_FAIL_OPEN_MESSAGE,
+                PM_REMOVE,
+            )
+            .as_bool()
+        };
+        unsafe { DestroyWindow(window) }.unwrap();
+        assert!(taken);
+        assert_eq!(message.wParam.0, 77);
+        assert_eq!(
+            fail_open_cause(message.lParam.0),
+            GateFailureCause::SelectionLeft
+        );
+        assert_eq!(fail_open_cause(0), GateFailureCause::WorkerAck);
+    }
+
+    #[test]
+    fn a_fail_open_for_a_left_selection_retains_the_keys_without_replaying_them() {
+        let (mut state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        state.correction_gate.activate(10);
+        state
+            .correction_gate
+            .held
+            .push(test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0));
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        fail_open_correction_gate(10, GateFailureCause::SelectionLeft);
+        let state = take_app_state().unwrap();
+        assert!(!state.correction_gate.active);
+        assert!(state.pending_held_replay.is_empty());
+        let retained = metrics.retained_input.lock().unwrap().clone();
+        let retained = retained.expect("the held key is retained");
+        assert_eq!(retained.events.len(), 1);
+        assert!(!retained.auto_recover);
+        assert!(!receiver.try_iter().any(|queued| matches!(
+            queued.event,
+            RawInputEvent::RecoverInput {
+                explicit: false,
+                ..
+            }
+        )));
+    }
+
+    fn stalled_record(retained_at: Instant) -> RetainedInput {
+        RetainedInput {
+            token: 10,
+            foreground: test_foreground(),
+            events: vec![test_raw_key(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0, 0)],
+            delivery_uncertain: false,
+            expires_at: retained_at + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
+            recovering: false,
+            retained_at,
+            auto_recover: true,
+            input_mark: 0,
+        }
+    }
+
+    #[test]
+    fn held_keys_come_back_from_the_ui_thread_only_past_a_stalled_worker() {
+        let foreground = test_foreground();
+        let now = Instant::now();
+        let record = stalled_record(now);
+        let unavailable = Some(PrivacyBlockReason::InspectionUnavailable);
+        let ready = HandBackFacts {
+            now: now + Duration::from_millis(STALLED_WORKER_HAND_BACK_MS),
+            worker_stalled: true,
+            typed_input: 0,
+            selection_left_token: 0,
+            modifiers_released: true,
+            current: Some(foreground),
+            privacy: None,
+        };
+        assert!(stalled_worker_may_hand_back(&record, ready));
+        assert!(stalled_worker_may_hand_back(
+            &record,
+            HandBackFacts {
+                privacy: unavailable,
+                ..ready
+            }
+        ));
+        // Each condition alone keeps the keys back.
+        for (case, facts) in [
+            (
+                "too early",
+                HandBackFacts {
+                    now: ready.now - Duration::from_millis(1),
+                    ..ready
+                },
+            ),
+            (
+                "worker not stalled",
+                HandBackFacts {
+                    worker_stalled: false,
+                    ..ready
+                },
+            ),
+            (
+                "typed or clicked since",
+                HandBackFacts {
+                    typed_input: 1,
+                    ..ready
+                },
+            ),
+            (
+                "modifier held",
+                HandBackFacts {
+                    modifiers_released: false,
+                    ..ready
+                },
+            ),
+            (
+                "its paste may have left the word selected",
+                HandBackFacts {
+                    selection_left_token: record.token,
+                    ..ready
+                },
+            ),
+            (
+                "another control",
+                HandBackFacts {
+                    current: Some(ForegroundContext {
+                        focus: 9,
+                        ..foreground
+                    }),
+                    ..ready
+                },
+            ),
+            (
+                "no foreground",
+                HandBackFacts {
+                    current: None,
+                    ..ready
+                },
+            ),
+        ] {
+            assert!(!stalled_worker_may_hand_back(&record, facts), "{case}");
+        }
+        for blocked in [
+            PrivacyBlockReason::PasswordField,
+            PrivacyBlockReason::ExcludedProcess,
+            PrivacyBlockReason::ElevatedProcess,
+        ] {
+            let facts = HandBackFacts {
+                privacy: Some(blocked),
+                ..ready
+            };
+            assert!(!stalled_worker_may_hand_back(&record, facts), "{blocked:?}");
+            assert_eq!(
+                privacy_reason_from_code(privacy_reason_code(Some(blocked))),
+                Some(blocked)
+            );
+        }
+        for changed in [
+            RetainedInput {
+                auto_recover: false,
+                ..record.clone()
+            },
+            RetainedInput {
+                recovering: true,
+                ..record.clone()
+            },
+            RetainedInput {
+                delivery_uncertain: true,
+                ..record.clone()
+            },
+        ] {
+            assert!(!stalled_worker_may_hand_back(&changed, ready));
+        }
+        assert_eq!(privacy_reason_from_code(PRIVACY_ALLOWED), None);
+        assert_eq!(privacy_reason_from_code(PRIVACY_UNAVAILABLE), unavailable);
+    }
+
+    /// The scan code and whether it is a key-up, of every keyboard input.
+    fn scan_edges(inputs: &[INPUT]) -> Vec<(u16, bool)> {
+        inputs
+            .iter()
+            .map(|input| {
+                let key = unsafe { input.Anonymous.ki };
+                (key.wScan, key.dwFlags.contains(KEYEVENTF_KEYUP))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_keys_the_ui_thread_returns_leave_no_key_down() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let edge = |message, key, scan_code| RawKeyEvent {
+            scan_code,
+            ..test_raw_key(message, key, 0, 0)
+        };
+        // Shift is still down when the gate breaks; its physical key-up passes through later.
+        state.pending_held_replay.extend([
+            edge(WM_KEYDOWN, VK_LSHIFT, 0x2a),
+            edge(WM_KEYDOWN, VIRTUAL_KEY(0x47), 0x22),
+            edge(WM_KEYUP, VIRTUAL_KEY(0x47), 0x22),
+        ]);
+        state
+            .pending_key_releases
+            .push(edge(WM_KEYUP, VK_LCONTROL, 0x1d));
+        let held = take_held_keys_return(&mut state).unwrap();
+        assert_eq!(
+            scan_edges(&held.inputs),
+            [
+                (0x2a, false),
+                (0x22, false),
+                (0x22, true),
+                (0x1d, true),
+                (0x2a, true)
+            ]
+        );
+        assert_eq!(held.handed_back, None);
+        assert!(state.pending_held_replay.is_empty());
+        assert!(state.pending_key_releases.is_empty());
+        assert!(take_held_keys_return(&mut state).is_none());
+    }
+
+    #[test]
+    fn keys_handed_back_past_a_stalled_worker_disarm_recovery_and_report_to_it() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(retained_at));
+        metrics.worker_busy.store(true, Ordering::Release);
+        metrics.recovery_armed.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let mut state = take_app_state().unwrap();
+        assert!(metrics.retained_input.lock().unwrap().is_none());
+        // Pause no longer has anything to recover.
+        assert!(!metrics.recovery_armed.load(Ordering::Acquire));
+        let held = take_held_keys_return(&mut state).unwrap();
+        assert_eq!(held.handed_back, Some(10));
+        assert_eq!(held.inputs.len(), 2, "the held G is released as well");
+        finish_held_keys_return(&state, &held, 1);
+        let reports: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|queued| match queued.event {
+                RawInputEvent::RetainedInputHandedBack {
+                    token,
+                    submitted,
+                    requested,
+                } => Some((token, submitted, requested)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports, [(10, 1, 2)]);
+        // Keys a broken gate returns by itself are no recovery: nothing to report.
+        state
+            .pending_key_releases
+            .push(test_raw_key(WM_KEYUP, VK_LSHIFT, 0, 0));
+        let held = take_held_keys_return(&mut state).unwrap();
+        finish_held_keys_return(&state, &held, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_worker_finishes_the_recovery_of_keys_the_ui_thread_handed_back() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let pause = || {
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.safety_paused.store(true, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(ConversionFailureReason::GateDrain as u8, Ordering::Release);
+        };
+        let handed_back = |processor: &mut InputProcessor, submitted| {
+            let queued_epoch = metrics.input_epoch.load(Ordering::Acquire);
+            // The gate abort and the stale recovery the worker found nothing for moved it on.
+            metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+            processor.process_event(QueuedInputEvent {
+                epoch: queued_epoch,
+                captured_at: Instant::now(),
+                event: RawInputEvent::RetainedInputHandedBack {
+                    token: 10,
+                    submitted,
+                    requested: 2,
+                },
+                configuration: None,
+            });
+        };
+        // Only some of the keys went out: the session is unknown, the pause stays.
+        pause();
+        handed_back(&mut processor, 1);
+        assert!(processor.session.is_suppressed());
+        assert!(processor.recovered_mid_word);
+        assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+        // All of them: policy D1 resumes automatic conversion.
+        processor.session.clear();
+        handed_back(&mut processor, 2);
+        assert!(processor.session.is_suppressed());
+        assert!(metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(!metrics.safety_paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_timer_hands_back_keys_a_stalled_worker_holds_but_not_from_inside_an_edit() {
+        let (state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(retained_at));
+        metrics.worker_busy.store(true, Ordering::Release);
+        metrics.edit_in_flight.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        // Inside an edit the field may show the word selected: the keys stay retained.
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        assert!(metrics.retained_input.lock().unwrap().is_some());
+        metrics.edit_in_flight.store(false, Ordering::Release);
+        // A click since the keys were retained: they would land after it.
+        APP_STATE.with(|slot| {
+            let mut borrowed = slot.borrow_mut();
+            observe_mouse_button(borrowed.as_mut().unwrap(), false);
+        });
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        assert!(metrics.retained_input.lock().unwrap().is_some());
+        APP_STATE.with(|slot| {
+            let mut borrowed = slot.borrow_mut();
+            borrowed.as_mut().unwrap().typed_input = 0;
+        });
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let state = take_app_state().unwrap();
+        assert!(metrics.retained_input.lock().unwrap().is_none());
+        assert_eq!(state.pending_held_replay.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn an_unconfirmed_paste_gives_the_real_clipboard_back_only_after_its_target_read_it() {
+        let _com = PrivacyGuard::new();
+        let source = clipboard_test_window(w!("AutoKeyboardLayot deferred source"));
+        put_test_clipboard_text(source, "akl-user-clipboard");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot deferred probe"));
+        let own_process = unsafe { GetCurrentProcessId() };
+        let wait_for = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while test_clipboard_unicode(window).as_deref() != Some(expected)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            test_clipboard_unicode(window)
+        };
+
+        // This process is the paste's target: reading the replacement is the late paste, and
+        // the user's clipboard comes back right after it.
+        let brokers = ClipboardBrokers::default();
+        let mut transaction = ProtectedClipboard::begin(
+            "akl-deferred-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            own_process,
+        )
+        .expect("protected clipboard transaction");
+        transaction.mark_submitted();
+        transaction.defer();
+        drop(transaction);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-deferred-probe")
+        );
+        assert_eq!(
+            wait_for("akl-user-clipboard").as_deref(),
+            Some("akl-user-clipboard")
+        );
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+
+        // Another process is the target: this one reading the replacement proves nothing, and
+        // the replacement stays once the wait is over.
+        let mut transaction = ProtectedClipboard::begin_with(
+            "akl-deferred-probe",
+            Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS),
+            &brokers,
+            (4, Duration::from_millis(300)),
+            SystemClipboard::new,
+            Box::new(system_clipboard_state),
+        )
+        .expect("protected clipboard transaction");
+        transaction.mark_submitted();
+        transaction.defer();
+        drop(transaction);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-deferred-probe")
+        );
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Unread]);
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-deferred-probe")
+        );
+        unsafe {
+            DestroyWindow(window).expect("destroy probe window");
+        }
+    }
+
+    /// A scripted clipboard for the broker: its text, sequence and owner, and the failures and
+    /// delays to inject.
+    #[derive(Default)]
+    struct FakeClipboardState {
+        text: String,
+        sequence: u32,
+        owner: usize,
+        empties: u32,
+        restores: u32,
+        snapshot_delay: Duration,
+        restore_delay: Duration,
+        /// Another program puts this on the clipboard while the copy is taken.
+        writer_during_snapshot: Option<String>,
+        open_fails: bool,
+        /// How many of the next openings fail (another program holds the clipboard open).
+        open_failures: u32,
+        /// The copy fails this many more times.
+        snapshot_failures: u32,
+        /// The process holding the clipboard open.
+        holder: u32,
+        install_fails_after_empty: bool,
+        restore_fails: bool,
+        /// Processes that read the replacement (0: without a window), and when.
+        readers: Vec<(u32, Instant)>,
+    }
+
+    const FAKE_BROKER_OWNER: usize = 7;
+    const FAKE_TARGET: u32 = 1234;
+
+    struct FakeClipboard(Arc<Mutex<FakeClipboardState>>);
+
+    impl ClipboardSystem for FakeClipboard {
+        type Snapshot = String;
+
+        fn sequence(&self) -> u32 {
+            self.0.lock().unwrap().sequence
+        }
+
+        fn owner(&self) -> usize {
+            FAKE_BROKER_OWNER
+        }
+
+        fn owned(&self) -> bool {
+            self.0.lock().unwrap().owner == FAKE_BROKER_OWNER
+        }
+
+        fn snapshot(&mut self) -> Option<String> {
+            let delay = self.0.lock().unwrap().snapshot_delay;
+            thread::sleep(delay);
+            let mut state = self.0.lock().unwrap();
+            if state.snapshot_failures > 0 {
+                state.snapshot_failures -= 1;
+                return None;
+            }
+            let copy = state.text.clone();
+            if let Some(newer) = state.writer_during_snapshot.take() {
+                state.text = newer;
+                state.sequence += 1;
+                state.owner = 99;
+            }
+            Some(copy)
+        }
+
+        fn install(&mut self, text: &str, expected: u32, cancelled: &AtomicBool) -> InstallOutcome {
+            let mut state = self.0.lock().unwrap();
+            if state.open_fails || state.open_failures > 0 {
+                state.open_failures = state.open_failures.saturating_sub(1);
+                return InstallOutcome::Untouched(BrokerFailure::Open);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return InstallOutcome::Untouched(BrokerFailure::Cancelled);
+            }
+            if state.sequence != expected {
+                return InstallOutcome::Untouched(BrokerFailure::Changed);
+            }
+            state.empties += 1;
+            state.text.clear();
+            state.owner = FAKE_BROKER_OWNER;
+            state.sequence += 1;
+            if state.install_fails_after_empty {
+                return InstallOutcome::Emptied {
+                    sequence: state.sequence,
+                };
+            }
+            state.text = text.to_owned();
+            state.sequence += 1;
+            InstallOutcome::Installed {
+                sequence: state.sequence,
+            }
+        }
+
+        fn restore(&mut self, expected: Option<u32>, snapshot: &mut String) -> bool {
+            let delay = self.0.lock().unwrap().restore_delay;
+            thread::sleep(delay);
+            let mut state = self.0.lock().unwrap();
+            if state.restore_fails
+                || expected.is_some_and(|sequence| {
+                    state.sequence != sequence || state.owner != FAKE_BROKER_OWNER
+                })
+            {
+                return false;
+            }
+            state.restores += 1;
+            state.text = snapshot.clone();
+            state.sequence += 1;
+            true
+        }
+
+        fn wait(
+            &mut self,
+            commands: Option<&Receiver<ClipboardBrokerCommand>>,
+            timeout: Option<Duration>,
+        ) -> BrokerWait {
+            match (commands, timeout) {
+                (Some(commands), Some(timeout)) => match commands.recv_timeout(timeout) {
+                    Ok(command) => BrokerWait::Command(command),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => BrokerWait::Timeout,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        BrokerWait::Disconnected
+                    }
+                },
+                (Some(commands), None) => commands
+                    .recv()
+                    .map_or(BrokerWait::Disconnected, BrokerWait::Command),
+                (None, timeout) => {
+                    thread::sleep(timeout.unwrap_or(Duration::from_millis(10)));
+                    BrokerWait::Timeout
+                }
+            }
+        }
+
+        fn read_by(&self, process: u32, submitted_at: Instant) -> bool {
+            replacement_read_by(&self.0.lock().unwrap().readers, process, submitted_at)
+        }
+
+        fn holder(&self) -> u32 {
+            self.0.lock().unwrap().holder
+        }
+    }
+
+    fn fake_clipboard(text: &str) -> Arc<Mutex<FakeClipboardState>> {
+        Arc::new(Mutex::new(FakeClipboardState {
+            text: text.to_owned(),
+            sequence: 1,
+            owner: 99,
+            ..FakeClipboardState::default()
+        }))
+    }
+
+    /// Begins a protected clipboard on `state` for a paste to `FAKE_TARGET` that, unconfirmed,
+    /// waits `deferred_wait` for its target; the worker's checks read the same state.
+    fn begin_fake_with<'a>(
+        state: &Arc<Mutex<FakeClipboardState>>,
+        brokers: &'a ClipboardBrokers,
+        install_timeout: Duration,
+        deferred_wait: Duration,
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+        begin_fake_for(
+            state,
+            brokers,
+            "привет",
+            install_timeout,
+            (FAKE_TARGET, deferred_wait),
+        )
+    }
+
+    /// Begins a protected clipboard on `state` that puts `text` there for a paste to `target.0`
+    /// which, unconfirmed, waits `target.1` for it; the worker's checks read the same state.
+    fn begin_fake_for<'a>(
+        state: &Arc<Mutex<FakeClipboardState>>,
+        brokers: &'a ClipboardBrokers,
+        text: &str,
+        install_timeout: Duration,
+        target: (u32, Duration),
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+        let broker_state = Arc::clone(state);
+        let probe_state = Arc::clone(state);
+        ProtectedClipboard::begin_with(
+            text,
+            install_timeout,
+            brokers,
+            target,
+            move || Some(FakeClipboard(broker_state)),
+            Box::new(move || {
+                let state = probe_state.lock().unwrap();
+                (state.sequence, state.owner)
+            }),
+        )
+    }
+
+    fn begin_fake<'a>(
+        state: &Arc<Mutex<FakeClipboardState>>,
+        brokers: &'a ClipboardBrokers,
+        install_timeout: Duration,
+    ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+        begin_fake_with(state, brokers, install_timeout, Duration::from_secs(2))
+    }
+
+    /// Waits until every broker the worker stopped waiting for is over; says how they ended.
+    fn reap_all(brokers: &ClipboardBrokers) -> Vec<BrokerEnd> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while brokers.busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        brokers.reap()
+    }
+
+    #[test]
+    fn a_confirmed_paste_puts_the_users_clipboard_back() {
+        let state = fake_clipboard("user text");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        assert!(clipboard.is_current());
+        assert_eq!(state.lock().unwrap().text, "привет");
+        clipboard.mark_submitted();
+        assert!(clipboard.restore());
+        drop(clipboard);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert_eq!(state.lock().unwrap().restores, 1);
+        assert!(brokers.reap().is_empty(), "the broker was waited for");
+    }
+
+    #[test]
+    fn a_paste_sent_and_not_confirmed_gives_the_clipboard_back_only_after_its_target_read_it() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        clipboard.defer();
+        drop(clipboard);
+        // Another program reading it proves nothing: the replacement stays for the late paste.
+        state.lock().unwrap().readers.push((99, Instant::now()));
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert!(brokers.busy());
+        // The target reads it. That may be its clipboard listener, with the queued Ctrl+V right
+        // after: the replacement stays a moment longer.
+        state
+            .lock()
+            .unwrap()
+            .readers
+            .push((FAKE_TARGET, Instant::now()));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert!(brokers.busy());
+        // Then the password comes back.
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_restore_that_finds_the_replacement_replaced_ends_its_broker_at_once() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.text = "theirs".to_owned();
+            state.sequence += 1;
+            state.owner = 99;
+        }
+        assert!(!clipboard.restore());
+        // The broker is over before the next paste could start, and theirs stays.
+        assert_eq!(clipboard.shared.end(), BrokerEnd::Kept);
+        drop(clipboard);
+        assert!(brokers.reap().is_empty());
+        assert_eq!(state.lock().unwrap().text, "theirs");
+        assert_eq!(state.lock().unwrap().restores, 0);
+    }
+
+    #[test]
+    fn a_broker_window_going_away_renders_the_replacement_past_a_busy_clipboard() {
+        // Another program holds the clipboard at the first attempt.
+        let mut asked = 0;
+        let mut rendered = false;
+        assert!(render_before_destroy(
+            |retries| {
+                asked = retries;
+                (retries > 1).then_some(())
+            },
+            || true,
+            || rendered = true,
+        ));
+        assert!(rendered);
+        assert_eq!(asked, CLIPBOARD_OPEN_RETRIES);
+        // The clipboard is not the window's any more: nothing is rendered.
+        let mut rendered = false;
+        assert!(!render_before_destroy(
+            |_| Some(()),
+            || false,
+            || rendered = true
+        ));
+        assert!(!rendered);
+    }
+
+    #[test]
+    fn a_restore_that_cannot_open_the_clipboard_keeps_the_replacement_renderable() {
+        let mut forgotten = false;
+        assert!(!restore_holding_clipboard(
+            || None::<()>,
+            || forgotten = true,
+            |_| true
+        ));
+        assert!(
+            !forgotten,
+            "the window still renders it before it goes away"
+        );
+        let mut forgotten = false;
+        assert!(restore_holding_clipboard(
+            || Some(()),
+            || forgotten = true,
+            |_| true
+        ));
+        assert!(forgotten);
+    }
+
+    #[test]
+    fn a_reader_without_a_window_after_the_ctrl_v_counts_as_the_pastes_target() {
+        let submitted = Instant::now();
+        let before = submitted - Duration::from_millis(1);
+        let after = submitted + Duration::from_millis(1);
+        // .NET, consoles and many toolkits open the clipboard without a window.
+        assert!(replacement_read_by(&[(0, after)], FAKE_TARGET, submitted));
+        // Before the Ctrl+V it cannot be the paste (a clipboard helper, say).
+        assert!(!replacement_read_by(&[(0, before)], FAKE_TARGET, submitted));
+        // Another program with a window proves nothing; the target itself does.
+        assert!(!replacement_read_by(&[(99, after)], FAKE_TARGET, submitted));
+        assert!(replacement_read_by(
+            &[(99, after), (FAKE_TARGET, before)],
+            FAKE_TARGET,
+            submitted
+        ));
+    }
+
+    #[test]
+    fn a_deferred_paste_read_without_a_window_gives_the_clipboard_back() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        // The field reads through OpenClipboard(NULL) while the worker still waits to see the
+        // replacement, and shows it too late for that wait.
+        thread::sleep(Duration::from_millis(5));
+        state.lock().unwrap().readers.push((0, Instant::now()));
+        thread::sleep(Duration::from_millis(5));
+        clipboard.defer();
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_replacement_read_only_before_its_ctrl_v_ends_unread_and_stays() {
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake_with(
+            &state,
+            &brokers,
+            Duration::from_secs(2),
+            Duration::from_millis(150),
+        )
+        .unwrap();
+        state.lock().unwrap().readers.push((0, Instant::now()));
+        thread::sleep(Duration::from_millis(5));
+        clipboard.mark_submitted();
+        clipboard.defer();
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Unread]);
+        assert_eq!(state.lock().unwrap().text, "привет");
+    }
+
+    #[test]
+    fn a_render_request_without_a_window_holding_the_clipboard_is_noted() {
+        BROKER_RENDER.with(|render| {
+            *render.borrow_mut() = Some(BrokerRender {
+                text: "привет".to_owned(),
+                readers: Vec::new(),
+            });
+        });
+        // Nobody here holds the clipboard open, and without opening it the text is not placed.
+        render_replacement(true);
+        let readers = BROKER_RENDER.with(|render| render.borrow_mut().take().map(|r| r.readers));
+        assert_eq!(readers.map(|readers| readers.len()), Some(1));
+    }
+
+    #[test]
+    fn a_replacement_its_target_never_read_stays_on_the_clipboard() {
+        // Dropped after the Ctrl+V (an early return), the transaction defers all the same.
+        let state = fake_clipboard("password");
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard = begin_fake_with(
+            &state,
+            &brokers,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        clipboard.mark_submitted();
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Unread]);
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert_eq!(state.lock().unwrap().restores, 0);
+        // Another program that replaced the replacement keeps its content.
+        let state = fake_clipboard("password");
+        let mut clipboard = begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        clipboard.defer();
+        drop(clipboard);
+        {
+            let mut state = state.lock().unwrap();
+            state.text = "theirs".to_owned();
+            state.sequence += 1;
+            state.owner = 99;
+        }
+        assert_eq!(reap_all(&brokers), [BrokerEnd::NotRestored]);
+        assert_eq!(state.lock().unwrap().text, "theirs");
+        // Before the Ctrl+V, dropping it puts the user's clipboard back at once.
+        let state = fake_clipboard("user text");
+        drop(begin_fake(&state, &brokers, Duration::from_secs(2)).unwrap());
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert!(brokers.reap().is_empty());
+    }
+
+    #[test]
+    fn the_users_clipboard_comes_back_only_after_the_field_showed_the_paste() {
+        assert_eq!(
+            clipboard_after_paste(ReplayAttempt::Applied),
+            ClipboardAfterPaste::Restore
+        );
+        for unconfirmed in [
+            ReplayAttempt::Cancelled,
+            ReplayAttempt::Failed,
+            ReplayAttempt::LayoutSwitchFailed,
+        ] {
+            assert_eq!(
+                clipboard_after_paste(unconfirmed),
+                ClipboardAfterPaste::Defer,
+                "{unconfirmed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clipboard_changed_while_it_is_copied_is_left_alone() {
+        let state = fake_clipboard("old");
+        state.lock().unwrap().writer_during_snapshot = Some("newer".to_owned());
+        let brokers = ClipboardBrokers::default();
+        // Not tried again: the copy would be of what the other program put there, which it may
+        // replace again.
+        assert!(matches!(
+            begin_fake(&state, &brokers, Duration::from_secs(2)),
+            Err(ClipboardBeginFailure::NotInstalled(Some(BrokerRefusal {
+                reason: BrokerFailure::Changed,
+                attempts: 1,
+                ..
+            })))
+        ));
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        let state = state.lock().unwrap();
+        assert_eq!(state.text, "newer");
+        assert_eq!(state.empties, 0);
+        assert_eq!(state.restores, 0);
+    }
+
+    #[test]
+    fn a_clipboard_another_program_holds_open_for_a_moment_is_tried_again() {
+        // Clipboard listeners open the clipboard for a moment after every change: the copy and
+        // the installation are tried again.
+        let brokers = ClipboardBrokers::default();
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().open_failures = CLIPBOARD_INSTALL_ATTEMPTS - 1;
+        let mut transaction =
+            begin_fake(&state, &brokers, Duration::from_secs(2)).expect("installed at the last");
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert!(transaction.restore());
+        drop(transaction);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        // A copy that failed for a moment is taken again too.
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().snapshot_failures = 1;
+        let mut transaction =
+            begin_fake(&state, &brokers, Duration::from_secs(2)).expect("installed again");
+        assert!(transaction.restore());
+        drop(transaction);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        // Held open for good: the broker gives up after its attempts and says who held it.
+        let state = fake_clipboard("user text");
+        {
+            let mut state = state.lock().unwrap();
+            state.open_fails = true;
+            state.holder = 4321;
+        }
+        assert_eq!(
+            begin_fake(&state, &brokers, Duration::from_secs(2)).err(),
+            Some(ClipboardBeginFailure::NotInstalled(Some(BrokerRefusal {
+                reason: BrokerFailure::Open,
+                attempts: CLIPBOARD_INSTALL_ATTEMPTS,
+                holder: 4321,
+            })))
+        );
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        assert_eq!(state.lock().unwrap().empties, 0);
+        assert_eq!(state.lock().unwrap().text, "user text");
+    }
+
+    #[test]
+    fn a_restore_waits_only_as_long_as_it_is_given_and_then_finishes_on_its_own() {
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().restore_delay = Duration::from_millis(400);
+        let brokers = ClipboardBrokers::default();
+        let mut clipboard =
+            begin_fake(&state, &brokers, Duration::from_secs(2)).expect("installed");
+        let started = Instant::now();
+        assert!(!clipboard.restore_waiting(Duration::from_millis(20)));
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(clipboard.restore_pending());
+        drop(clipboard);
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "user text");
+    }
+
+    #[test]
+    fn a_failed_installation_is_logged_with_its_reason_and_the_program_holding_the_clipboard() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(metrics, 0);
+        let refusal = |holder| {
+            ClipboardBeginFailure::NotInstalled(Some(BrokerRefusal {
+                reason: BrokerFailure::Open,
+                attempts: 3,
+                holder,
+            }))
+        };
+        processor.process_override = Some((Some(r"C:\Tools\ClipTool.exe".to_owned()), None));
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(4321)),
+            "NotInstalled reason=Open attempts=3 holder=ClipTool.exe"
+        );
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(0)),
+            "NotInstalled reason=Open attempts=3 holder=none"
+        );
+        // An excluded program, a password manager for one, is never named.
+        processor.process_override = Some((Some(r"C:\Tools\KeePass\KeePass.exe".to_owned()), None));
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(4321)),
+            "NotInstalled reason=Open attempts=3 holder=excluded"
+        );
+        processor.process_override = Some((None, None));
+        assert_eq!(
+            processor.clipboard_failure_text(refusal(4321)),
+            "NotInstalled reason=Open attempts=3 holder=unavailable"
+        );
+        assert_eq!(
+            processor.clipboard_failure_text(ClipboardBeginFailure::NotInstalled(None)),
+            "NotInstalled reason=timeout"
+        );
+        assert_eq!(
+            processor.clipboard_failure_text(ClipboardBeginFailure::Busy),
+            "Busy"
+        );
+    }
+
+    #[test]
+    fn a_failed_installation_is_undone_only_when_it_emptied_the_clipboard() {
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().install_fails_after_empty = true;
+        let brokers = ClipboardBrokers::default();
+        assert!(begin_fake(&state, &brokers, Duration::from_secs(2)).is_err());
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Restored]);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert_eq!(state.lock().unwrap().restores, 1);
+        // A clipboard that could not even be opened was never changed: nothing is put back.
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().open_fails = true;
+        assert!(begin_fake(&state, &brokers, Duration::from_secs(2)).is_err());
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        assert_eq!(state.lock().unwrap().empties, 0);
+        assert_eq!(state.lock().unwrap().restores, 0);
+    }
+
+    #[test]
+    fn a_broker_the_worker_stopped_waiting_for_never_installs_and_holds_back_the_next_paste() {
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().snapshot_delay = Duration::from_millis(300);
+        let brokers = ClipboardBrokers::default();
+        assert!(matches!(
+            begin_fake(&state, &brokers, Duration::from_millis(20)),
+            Err(ClipboardBeginFailure::NotInstalled(None))
+        ));
+        // One broker at a time: the next paste does not start while that one still runs.
+        let other = fake_clipboard("other");
+        assert!(matches!(
+            begin_fake(&other, &brokers, Duration::from_secs(2)),
+            Err(ClipboardBeginFailure::Busy)
+        ));
+        assert_eq!(reap_all(&brokers), [BrokerEnd::Untouched]);
+        assert_eq!(state.lock().unwrap().text, "user text");
+        assert_eq!(state.lock().unwrap().empties, 0);
+        assert!(begin_fake(&other, &brokers, Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn a_restore_the_worker_stopped_waiting_for_is_logged_when_it_ends() {
+        let (processor, receiver) = processor_with_diagnostics();
+        let state = fake_clipboard("user text");
+        state.lock().unwrap().restore_delay =
+            Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS + 200);
+        let mut clipboard =
+            begin_fake(&state, &processor.clipboard_brokers, Duration::from_secs(2)).unwrap();
+        clipboard.mark_submitted();
+        assert!(!clipboard.restore(), "not waited for");
+        drop(clipboard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while processor.clipboard_brokers.busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        processor.log_finished_clipboard_brokers();
+        let lines: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.contains("phase=broker_end"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("result=Restored"), "{lines:?}");
+        assert_eq!(state.lock().unwrap().text, "user text");
+    }
+
+    #[test]
+    fn a_restored_item_gets_the_opt_outs_it_lacked_and_keeps_its_own() {
+        let opt_outs = [101, 102, 103];
+        assert_eq!(missing_opt_out_formats(&[13, 1], opt_outs), [101, 102, 103]);
+        assert_eq!(missing_opt_out_formats(&[13, 102], opt_outs), [101, 103]);
+        assert!(missing_opt_out_formats(&[101, 102, 103, 13], opt_outs).is_empty());
+    }
+
+    #[test]
+    fn a_paste_fits_its_waits_into_the_time_the_gate_has_left() {
+        let now = Instant::now();
+        let at = |ms: u64| PasteBudget {
+            deadline: Some(now + Duration::from_millis(ms)),
+        };
+        assert_eq!(PASTE_AFTER_SUBMIT_MS, 750);
+        // Without a gate nothing is cut short.
+        let unbounded = PasteBudget { deadline: None };
+        assert!(unbounded.allows_selection(now, PastePatience::Manual));
+        assert_eq!(
+            unbounded.install_timeout(now, PastePatience::Manual),
+            Some(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
+        );
+        assert!(unbounded.allows_submit(now));
+        // A gate armed a settle ago: an automatic paste keeps its installation limit, Pause gets
+        // what is left after everything that follows the Ctrl+V.
+        let fresh = at(CORRECTION_GATE_MAX_HOLD_MS - NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        assert!(fresh.allows_selection(now, PastePatience::Automatic));
+        assert!(fresh.allows_selection(now, PastePatience::Manual));
+        assert_eq!(
+            fresh.install_timeout(now, PastePatience::Automatic),
+            Some(Duration::from_millis(
+                CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS
+            ))
+        );
+        assert_eq!(
+            fresh.install_timeout(now, PastePatience::Manual),
+            Some(Duration::from_millis(1_050 - PASTE_AFTER_SUBMIT_MS))
+        );
+        // The selection starts only with its confirmation, the least installation and
+        // everything after the Ctrl+V in hand.
+        let automatic =
+            UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+        assert!(at(automatic).allows_selection(now, PastePatience::Automatic));
+        assert!(!at(automatic - 1).allows_selection(now, PastePatience::Automatic));
+        // Pause starts as soon as one attempt fits; a second one has to fit again (see
+        // a_pause_selects_again_only_while_another_attempt_fits).
+        let manual =
+            UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+        assert!(at(manual).allows_selection(now, PastePatience::Manual));
+        assert!(!at(manual - 1).allows_selection(now, PastePatience::Manual));
+        // Less than the least installation is no installation.
+        let least = PASTE_AFTER_SUBMIT_MS + PASTE_MIN_INSTALL_MS;
+        assert_eq!(
+            at(least).install_timeout(now, PastePatience::Automatic),
+            Some(Duration::from_millis(PASTE_MIN_INSTALL_MS))
+        );
+        assert_eq!(
+            at(least - 1).install_timeout(now, PastePatience::Automatic),
+            None
+        );
+        // The Ctrl+V needs everything after it in hand.
+        assert!(at(PASTE_AFTER_SUBMIT_MS).allows_submit(now));
+        assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
+    }
+
+    #[test]
+    fn a_late_commit_answer_is_waited_for_only_within_what_the_gate_has_left() {
+        let now = Instant::now();
+        let poll_end = now + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        let late = poll_end + Duration::from_millis(PASTE_COMMIT_LATE_ANSWER_MS);
+        // The steps after the commit at the least: the layout switch, the second commit's least
+        // check and the margin; the restore and the rest of the second check take what is left.
+        let after = Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS);
+        assert_eq!(PASTE_AFTER_LATE_COMMIT_MS, 400);
+        assert_eq!(PASTE_AFTER_COMMIT_MS, 600);
+        // Without a gate, or with time to spare, the whole late wait.
+        assert_eq!(
+            PasteBudget { deadline: None }.commit_late_until(poll_end, after),
+            late
+        );
+        let spare = PasteBudget {
+            deadline: Some(late + after + Duration::from_millis(1)),
+        };
+        assert_eq!(spare.commit_late_until(poll_end, after), late);
+        // Otherwise it ends where the steps after the commit need the rest.
+        let deadline = now + Duration::from_millis(800);
+        let tight = PasteBudget {
+            deadline: Some(deadline),
+        };
+        assert_eq!(tight.commit_late_until(poll_end, after), deadline - after);
+        // With nothing to spare it is over before it began.
+        let none = PasteBudget {
+            deadline: Some(poll_end + after - Duration::from_millis(50)),
+        };
+        assert!(none.commit_late_until(poll_end, after) < poll_end);
+    }
+
+    #[test]
+    fn a_step_of_a_paste_waits_only_for_what_the_steps_after_it_leave() {
+        let now = Instant::now();
+        let limit = Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS);
+        let after = Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS);
+        let at = |ms: u64| PasteBudget {
+            deadline: Some(now + Duration::from_millis(ms)),
+        };
+        assert_eq!(
+            PasteBudget { deadline: None }.wait_within(now, limit, after),
+            limit
+        );
+        assert_eq!(
+            at(PASTE_AFTER_LATE_COMMIT_MS + CLIPBOARD_RESTORE_WAIT_MS + 1)
+                .wait_within(now, limit, after),
+            limit
+        );
+        assert_eq!(
+            at(PASTE_AFTER_LATE_COMMIT_MS + 30).wait_within(now, limit, after),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            at(PASTE_AFTER_LATE_COMMIT_MS - 10).wait_within(now, limit, after),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_paste_commit_check_goes_on_while_the_field_is_too_busy_to_answer() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(30);
+        let late_until = started + Duration::from_millis(400);
+        // The field does not answer before the poll ends; once it is free it first answers
+        // without the replacement (it handles the queued read before the paste), then with it.
+        let reads = Cell::new(0);
+        let busy_then_pasted = |until: Instant| {
+            reads.set(reads.get() + 1);
+            match reads.get() {
+                1 => {
+                    thread::sleep(until.saturating_duration_since(Instant::now()));
+                    (TextBarrierStatus::Unavailable, false)
+                }
+                2 => (TextBarrierStatus::Mismatch, true),
+                _ => (TextBarrierStatus::Match, true),
+            }
+        };
+        assert_eq!(
+            poll_text_commit(deadline, late_until, || None, busy_then_pasted),
+            ReplayAttempt::Applied
+        );
+        assert_eq!(reads.get(), 3);
+        assert!(started.elapsed() < Duration::from_millis(400));
+        // A field that answers without the replacement is not waited for past the poll.
+        let started = Instant::now();
+        assert_eq!(
+            poll_text_commit(
+                started + Duration::from_millis(30),
+                started + Duration::from_secs(5),
+                || None,
+                |_| (TextBarrierStatus::Mismatch, true)
+            ),
+            ReplayAttempt::Failed
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // Busy, it is waited for until the late limit, and no longer.
+        let started = Instant::now();
+        let late_until = started + Duration::from_millis(200);
+        assert_eq!(
+            poll_text_commit(
+                started + Duration::from_millis(30),
+                late_until,
+                || None,
+                |until: Instant| {
+                    thread::sleep(until.saturating_duration_since(Instant::now()));
+                    (TextBarrierStatus::Unavailable, false)
+                }
+            ),
+            ReplayAttempt::Failed
+        );
+        assert!(Instant::now() >= late_until);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // The user acts while the field is busy: the check stops.
+        let reads = Cell::new(0);
+        let started = Instant::now();
+        assert_eq!(
+            poll_text_commit(
+                started + Duration::from_millis(30),
+                started + Duration::from_secs(5),
+                || (reads.get() >= 2).then_some(ReplayAttempt::Cancelled),
+                |until: Instant| {
+                    reads.set(reads.get() + 1);
+                    thread::sleep(
+                        until
+                            .min(Instant::now() + Duration::from_millis(40))
+                            .saturating_duration_since(Instant::now()),
+                    );
+                    (TextBarrierStatus::Unavailable, false)
+                }
+            ),
+            ReplayAttempt::Cancelled
+        );
+        // Stopped at once, the field is not read.
+        let reads = Cell::new(0);
+        assert_eq!(
+            poll_text_commit(
+                Instant::now() + Duration::from_millis(30),
+                Instant::now() + Duration::from_secs(5),
+                || Some(ReplayAttempt::Failed),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    (TextBarrierStatus::Match, true)
+                }
+            ),
+            ReplayAttempt::Failed
+        );
+        assert_eq!(reads.get(), 0);
+    }
+
+    /// What the gate of `accepting_gate_window` has left when the worker prepares a handoff.
+    const ACCEPTING_GATE_REMAINING_MS: u64 = 1_080;
+
+    /// A gate window that arms a gate, prepares a handoff (its gate has
+    /// `ACCEPTING_GATE_REMAINING_MS` left) and accepts a drain whenever asked.
+    unsafe extern "system" fn accepting_gate_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            GATE_HANDOFF_BUDGET_MESSAGE => LRESULT(ACCEPTING_GATE_REMAINING_MS as isize),
+            GATE_ARM_MESSAGE | GATE_DRAIN_ACK_MESSAGE => LRESULT(1),
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    /// A window of the calling thread that accepts every gate request, so that it answers the
+    /// worker's messages within the call. It goes with the thread.
+    fn accepting_gate_window() -> HWND {
+        let module = unsafe { GetModuleHandleW(None).expect("module") };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(accepting_gate_procedure),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: w!("AutoKeyboardLayotAcceptingGateTest"),
+            ..Default::default()
+        };
+        // A second registration fails harmlessly: the class is the same.
+        unsafe { RegisterClassW(&class) };
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("AutoKeyboardLayotAcceptingGateTest"),
+                w!("AutoKeyboardLayot gate test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+            .expect("gate window")
+        }
+    }
+
+    #[test]
+    fn a_gate_the_worker_arms_or_hands_over_gives_the_edit_the_time_the_gate_has() {
+        let window = accepting_gate_window();
+        let mut processor = InputProcessor::new(Arc::new(ObserverMetrics::default()), 0);
+        processor.gate_window = window.0 as usize;
+        let lets_go_after = |before: Instant, ms: u64, processor: &InputProcessor| {
+            let hold = Duration::from_millis(ms);
+            processor.edit_deadline.get().is_some_and(|deadline| {
+                deadline >= before + hold && deadline <= Instant::now() + hold
+            })
+        };
+
+        // Armed by the worker (a Pause conversion, a word whose keys it waited for): the keys go
+        // after the gate's longest hold.
+        let before = Instant::now();
+        assert!(processor.arm_correction_gate(9));
+        assert!(lets_go_after(
+            before,
+            CORRECTION_GATE_MAX_HOLD_MS,
+            &processor
+        ));
+
+        // Handed over to the next word: the edit has what the gate has left, not only what the
+        // word's route needs (1 ms of scheduling more would otherwise cancel a chained paste).
+        let detection = Detection {
+            source_language: Language::English,
+            target_language: Language::Russian,
+            original: "z".into(),
+            replacement: "я".into(),
+            source_score: 0.0,
+            target_score: 1.0,
+        };
+        let transaction = ConversionTransaction::without_delimiter(&detection).unwrap();
+        let replay_steps = transaction.forward.erase_characters + 1;
+        for (backend, required_ms) in [
+            (TextEditBackend::ProtectedPaste, paste_gate_budget_ms(false)),
+            (TextEditBackend::CapabilityProbe, paste_gate_budget_ms(true)),
+            (
+                TextEditBackend::PhysicalReplay,
+                conversion_gate_budget_ms(replay_steps, false, false).unwrap(),
+            ),
+        ] {
+            processor.edit_deadline.set(None);
+            processor.text_edit_backend = backend;
+            // Automatic conversion is off: the conversion stops right after the handoff.
+            processor.pending_conversion = Some(PendingConversion {
+                transaction: transaction.clone(),
+                foreground: test_foreground(),
+                source_layout: test_foreground().layout,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 7,
+                replay_keys: Vec::new(),
+                forced: false,
+                cycle_order: Vec::new(),
+            });
+            processor.deferred_drained_conversion = Some(DeferredDrainedConversion {
+                gate_token: 6,
+                boundary_sequence: 7,
+            });
+            let before = Instant::now();
+            processor.process_gate_drain_ready(6, 0, true);
+            assert!(required_ms < ACCEPTING_GATE_REMAINING_MS, "{backend:?}");
+            assert!(
+                lets_go_after(before, ACCEPTING_GATE_REMAINING_MS, &processor),
+                "{backend:?}"
+            );
+            if backend != TextEditBackend::PhysicalReplay {
+                // A settle step that took 151 ms leaves the selection its time.
+                let budget = PasteBudget {
+                    deadline: processor.edit_deadline.get(),
+                };
+                assert!(
+                    budget.allows_selection(
+                        before + Duration::from_millis(151),
+                        PastePatience::Automatic
+                    ),
+                    "{backend:?}"
+                );
+            }
+        }
+        // The release the conversion posted is not handled here.
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, Some(window), 0, 0, PM_REMOVE) }.as_bool() {}
+        unsafe {
+            DestroyWindow(window).expect("destroy gate window");
+        }
+    }
+
+    /// A configuration folder holding the default document.
+    fn configuration_folder() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("config.ini"),
+            ConfigurationDocument::default().to_text().unwrap(),
+        )
+        .unwrap();
+        directory
+    }
+
+    fn dictionary_offer(word: &str) -> VolatileLexiconCandidate {
+        VolatileLexiconCandidate::new(
+            LexiconOfferTarget::UserDictionary,
+            Language::English,
+            word.to_owned(),
+            Instant::now(),
+        )
+    }
+
+    fn saved_document(directory: &Path) -> ConfigurationDocument {
+        autokeyboardlayot::configuration::load_configuration_directory(directory).unwrap()
+    }
+
+    #[test]
+    fn a_draft_older_than_the_configuration_is_refused_and_a_current_one_is_saved() {
+        let folder = configuration_folder();
+        let base = ConfigurationDocument::default();
+        let mut first = base.clone();
+        first.user_dictionary.push("en-US: firefox".to_owned());
+        save_configuration_if_unchanged(folder.path(), &first, &base).unwrap();
+        let mut stale = base.clone();
+        stale.process_exclusions.push("private.exe".to_owned());
+        assert_eq!(
+            save_configuration_if_unchanged(folder.path(), &stale, &base)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let saved = saved_document(folder.path());
+        assert_eq!(saved.user_dictionary, ["en-US: firefox"]);
+        assert!(saved.process_exclusions.is_empty());
+    }
+
+    #[test]
+    fn a_tray_offer_moves_its_word_out_of_the_other_list() {
+        let exclusion_offer = |word: &str| VolatileLexiconCandidate {
+            target: LexiconOfferTarget::WordExclusions,
+            ..dictionary_offer(word)
+        };
+        for (offer, dictionary, exclusions) in [
+            (dictionary_offer("firefox"), true, false),
+            (exclusion_offer("firefox"), false, true),
+        ] {
+            let folder = configuration_folder();
+            let mut document = saved_document(folder.path());
+            // The word is in the list the offer does not add to.
+            if dictionary {
+                document.word_exclusions.push("en-US: firefox".to_owned());
+            } else {
+                document.user_dictionary.push("en-US: Firefox".to_owned());
+            }
+            write_configuration_document(folder.path(), &document).unwrap();
+            persist_lexicon_candidate(folder.path(), &offer).unwrap();
+            let saved = saved_document(folder.path());
+            let entry = "en-US: firefox".to_owned();
+            assert_eq!(saved.user_dictionary.contains(&entry), dictionary);
+            assert_eq!(saved.word_exclusions.contains(&entry), exclusions);
+        }
+    }
+
+    #[test]
+    fn writers_saving_at_the_same_time_each_keep_their_entry() {
+        let folder = configuration_folder();
+        let words = ["alpha", "beta", "gamma", "delta"];
+        let start = Arc::new(std::sync::Barrier::new(words.len()));
+        let writers: Vec<_> = words
+            .into_iter()
+            .map(|word| {
+                let directory = folder.path().to_owned();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    loop {
+                        match persist_lexicon_candidate(&directory, &dictionary_offer(word)) {
+                            // Another writer holds the lock: a user would try again.
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            outcome => break outcome,
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let saved = saved_document(folder.path()).user_dictionary;
+        for word in words {
+            assert!(
+                saved.contains(&format!("en-US: {word}")),
+                "{word}: {saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tray_word_is_saved_off_the_calling_thread_while_another_writer_holds_the_lock() {
+        let folder = configuration_folder();
+        let held = ConfigurationWriteGuard::acquire().unwrap();
+        let (sender, outcome) = sync_channel(1);
+        let started = Instant::now();
+        save_lexicon_candidate_in_background(
+            folder.path().to_owned(),
+            dictionary_offer("firefox"),
+            move |candidate, result| {
+                let _ = sender.send((candidate.word, result));
+            },
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the caller waited for the lock"
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert!(outcome.try_recv().is_err(), "saved past the held lock");
+        drop(held);
+        let (word, result) = outcome.recv_timeout(Duration::from_secs(5)).unwrap();
+        result.unwrap();
+        assert_eq!(word, "firefox");
+        assert_eq!(
+            saved_document(folder.path()).user_dictionary,
+            ["en-US: firefox"]
+        );
+    }
+
+    #[test]
+    fn a_configuration_load_that_panics_fails_that_read_and_the_loader_keeps_serving() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&loads);
+        let mut loader = RuntimeConfigurationLoader::spawn_with(move || {
+            assert!(
+                counter.fetch_add(1, Ordering::AcqRel) > 0,
+                "a row the parser did not expect"
+            );
+            Ok(RuntimeConfiguration::default())
+        })
+        .unwrap();
+        let answer = |loader: &mut RuntimeConfigurationLoader| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = loader.poll() {
+                    return result;
+                }
+                assert!(Instant::now() < deadline, "the loader did not answer");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(loader.request());
+        assert_eq!(
+            answer(&mut loader).unwrap_err().to_string(),
+            "configuration_loader_panicked"
+        );
+        assert!(loader.request());
+        assert!(answer(&mut loader).is_ok());
+        assert_eq!(loads.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn an_armed_space_gives_its_conversion_the_deadline_of_its_gate() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        let queued = armed_space(&metrics, 7, 0);
+        let captured_at = queued.captured_at;
+        processor.process(queued);
+        assert_eq!(
+            processor.edit_deadline.get(),
+            Some(captured_at + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS))
+        );
+        // An event that armed no gate carries no deadline.
+        metrics.active_gate_token.store(0, Ordering::Release);
+        processor.process(QueuedInputEvent {
+            epoch: metrics.input_epoch.load(Ordering::Acquire),
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(test_raw_key(WM_KEYUP, VK_SPACE, 8, 0)),
+            configuration: None,
+        });
+        assert_eq!(processor.edit_deadline.get(), None);
+    }
+
+    #[test]
+    fn nothing_typed_is_no_failure_and_each_failure_after_the_paste_names_its_reason() {
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.auto_enabled.store(true, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        for (attempt, status) in [
+            (TextEditAttempt::Unsupported, BACKEND_SELECTION_UNSUPPORTED),
+            (TextEditAttempt::Cancelled, BACKEND_SELECTION_MISMATCH),
+        ] {
+            for route in [PasteRoute::Backend, PasteRoute::CapabilityProbe] {
+                metrics
+                    .backend_status
+                    .store(BACKEND_CAPABILITY_PROBE, Ordering::Release);
+                assert!(
+                    processor
+                        .apply_paste_attempt_result(attempt, 5, route)
+                        .is_none()
+                );
+                assert!(
+                    metrics.auto_enabled.load(Ordering::Acquire),
+                    "{attempt:?} {route:?}"
+                );
+                let expected = if route == PasteRoute::CapabilityProbe {
+                    status
+                } else {
+                    BACKEND_CAPABILITY_PROBE
+                };
+                assert_eq!(metrics.backend_status.load(Ordering::Acquire), expected);
+            }
+        }
+        assert_eq!(
+            processor.apply_paste_attempt_result(
+                TextEditAttempt::Applied,
+                6,
+                PasteRoute::CapabilityProbe
+            ),
+            Some(EditStrategy::ProtectedPaste)
+        );
+        assert_eq!(
+            metrics.backend_status.load(Ordering::Acquire),
+            BACKEND_PROTECTED_PASTE
+        );
+        for reason in [
+            ConversionFailureReason::TextCommit,
+            ConversionFailureReason::LayoutSwitch,
+            ConversionFailureReason::ClipboardEdit,
+        ] {
+            metrics.auto_enabled.store(true, Ordering::Release);
+            assert!(
+                processor
+                    .apply_paste_attempt_result(
+                        TextEditAttempt::Failed(reason),
+                        7,
+                        PasteRoute::Backend
+                    )
+                    .is_none()
+            );
+            assert!(!metrics.auto_enabled.load(Ordering::Acquire));
+            assert_eq!(
+                metrics.last_failure_reason.load(Ordering::Acquire),
+                reason as u8
+            );
+        }
+        assert_eq!(
+            conversion_failure_label(ConversionFailureReason::LayoutSwitch as u8),
+            "layout-switch"
+        );
+    }
+
+    #[test]
+    fn a_replay_that_lost_its_guard_after_sending_is_logged_as_applied_uncertain() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        type_letters(&mut processor, "hel");
+        assert!(!processor.finish_replay_commit(ReplayAttempt::Cancelled, 9, 0x0419, "conversion"));
+        assert_eq!(processor.session.buffered_character_count(), 0);
+        assert_eq!(
+            processor.layout_switch_in_flight.map(|(layout, _)| layout),
+            Some(0x0419)
+        );
+        // Every key was sent: this is no failed edit.
+        assert!(processor.metrics.auto_enabled.load(Ordering::Acquire));
+        assert!(!processor.finish_replay_commit(ReplayAttempt::Cancelled, 10, 0x0409, "undo"));
+        let lines: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.contains("result=applied-uncertain"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("event=conversion ") && lines[0].contains("sequence=9"));
+        assert!(lines[1].starts_with("event=undo ") && lines[1].contains("sequence=10"));
+        assert!(processor.finish_replay_commit(ReplayAttempt::Applied, 11, 0x0409, "conversion"));
+        assert!(!processor.finish_replay_commit(ReplayAttempt::Failed, 12, 0x0409, "conversion"));
+        assert_eq!(
+            processor
+                .metrics
+                .last_failure_reason
+                .load(Ordering::Acquire),
+            ConversionFailureReason::ReplayCommit as u8
+        );
+    }
+
+    #[test]
+    fn a_paste_abandoned_after_the_user_acted_leaves_the_selection_alone() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        let foreground = test_foreground();
+        processor.privacy_guard = PrivacyGuard {
+            automation: None,
+            privacy_cache: None,
+            com_initialized: false,
+            last_barrier_report: Cell::new(TextBarrierReport::default()),
+        };
+        // The input is still the edit's: the selection is collapsed (here it cannot be shown
+        // gone, without UI Automation).
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(5, Ordering::Release);
+        assert_eq!(
+            processor.abandon_selection(foreground, 5, TextEditAttempt::Cancelled),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(
+            processor.privacy_guard.last_barrier_report().cleanup,
+            Some(SelectionCleanup::Unverified)
+        );
+        // The user typed or clicked since: what is selected may be theirs and is not touched.
+        processor
+            .privacy_guard
+            .last_barrier_report
+            .set(TextBarrierReport::default());
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(6, Ordering::Release);
+        assert_eq!(
+            processor.abandon_selection(foreground, 5, TextEditAttempt::Cancelled),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(processor.privacy_guard.last_barrier_report().cleanup, None);
+        let cleanups: Vec<String> = receiver
+            .try_iter()
+            .filter(|record| record.contains("phase=cleanup"))
+            .collect();
+        assert_eq!(cleanups.len(), 2, "{cleanups:?}");
+        assert!(cleanups[0].contains("result=Unverified"), "{cleanups:?}");
+        assert!(cleanups[1].contains("result=skipped"), "{cleanups:?}");
+    }
+
+    #[test]
+    fn keys_whose_paste_may_have_left_the_word_selected_come_back_only_when_asked() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        *processor.metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            token: 42,
+            ..stalled_record(Instant::now())
+        });
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        assert!(
+            processor
+                .apply_paste_attempt_result(TextEditAttempt::SelectionLeft, 42, PasteRoute::Backend)
+                .is_none()
+        );
+        assert_eq!(
+            processor
+                .metrics
+                .selection_left_token
+                .load(Ordering::Acquire),
+            42
+        );
+        processor.recover_retained_input(50, false);
+        assert!(processor.metrics.retained_input.lock().unwrap().is_some());
+        assert!(
+            receiver
+                .try_iter()
+                .any(|record| record.contains("result=retained reason=selection-left"))
+        );
+    }
+
+    const PASTE_SEQUENCE: u64 = 5;
+
+    /// What the outside steps of a scripted paste saw: each step in order (`submit:N` for a
+    /// SendInput call of N keys), the installation's time limit, and the clipboard's text when
+    /// the Ctrl+V went out.
+    #[derive(Default)]
+    struct PasteSteps {
+        steps: Vec<String>,
+        install_timeout: Option<Duration>,
+        clipboard_at_submit: Option<String>,
+    }
+
+    /// The clipboard of a scripted paste: a scripted one whose unconfirmed paste waits the given
+    /// time for its target, or the real one (test VM only).
+    enum PasteClipboard {
+        Fake(Arc<Mutex<FakeClipboardState>>, Duration),
+        System,
+    }
+
+    /// Something that happens right after a step of a scripted paste: the user clicks, the step
+    /// takes long, another program writes the clipboard, the field reads it.
+    type PasteEvent = Box<dyn FnOnce() + Send>;
+
+    /// The outside steps of a protected paste as a test scripts them: the selection's finding,
+    /// the clipboard, how many keys of a chord SendInput takes (all of them when `None`), the
+    /// field's answers to the commit waits (shown once they run out), the layout switch and the
+    /// collapse.
+    struct ScriptedPaste {
+        steps: Arc<Mutex<PasteSteps>>,
+        settled: TextBarrierStatus,
+        selection: (TextBarrierStatus, Option<SelectionCleanup>),
+        clipboard: PasteClipboard,
+        taken: Option<usize>,
+        commits: VecDeque<ReplayAttempt>,
+        layout: ReplayAttempt,
+        collapse: SelectionCleanup,
+        events: Vec<(&'static str, PasteEvent)>,
+    }
+
+    impl ScriptedPaste {
+        /// A paste that goes through: the word is selected and the field shows each change.
+        fn new(clipboard: PasteClipboard) -> (Self, Arc<Mutex<PasteSteps>>) {
+            let steps = Arc::new(Mutex::new(PasteSteps::default()));
+            let script = Self {
+                steps: Arc::clone(&steps),
+                settled: TextBarrierStatus::Match,
+                selection: (TextBarrierStatus::Match, None),
+                clipboard,
+                taken: None,
+                commits: VecDeque::new(),
+                layout: ReplayAttempt::Applied,
+                collapse: SelectionCleanup::Collapsed,
+                events: Vec::new(),
+            };
+            (script, steps)
+        }
+
+        fn after(mut self, step: &'static str, event: impl FnOnce() + Send + 'static) -> Self {
+            self.events.push((step, Box::new(event)));
+            self
+        }
+
+        /// Notes `step` and lets what follows it happen.
+        fn step(&mut self, step: &str) {
+            self.steps.lock().unwrap().steps.push(step.to_owned());
+            while let Some(index) = self.events.iter().position(|(name, _)| *name == step) {
+                let (_, event) = self.events.remove(index);
+                event();
+            }
+        }
+    }
+
+    impl PasteSeam for ScriptedPaste {
+        fn settle(&mut self) -> TextBarrierStatus {
+            self.step("settle");
+            self.settled
+        }
+
+        fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>) {
+            self.step("select");
+            self.selection
+        }
+
+        fn begin<'a>(
+            &mut self,
+            text: &str,
+            install_timeout: Duration,
+            brokers: &'a ClipboardBrokers,
+            target_process: u32,
+        ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure> {
+            self.steps.lock().unwrap().install_timeout = Some(install_timeout);
+            let clipboard = match &self.clipboard {
+                PasteClipboard::Fake(state, deferred_wait) => begin_fake_for(
+                    state,
+                    brokers,
+                    text,
+                    install_timeout,
+                    (target_process, *deferred_wait),
+                ),
+                PasteClipboard::System => {
+                    ProtectedClipboard::begin(text, install_timeout, brokers, target_process)
+                }
+            };
+            self.step("begin");
+            clipboard
+        }
+
+        fn submit(&mut self, requested: usize) -> usize {
+            // Reading the real clipboard here would count as the field's paste.
+            if let PasteClipboard::Fake(state, _) = &self.clipboard {
+                let text = state.lock().unwrap().text.clone();
+                self.steps
+                    .lock()
+                    .unwrap()
+                    .clipboard_at_submit
+                    .get_or_insert(text);
+            }
+            self.step(&format!("submit:{requested}"));
+            self.taken.take().unwrap_or(requested)
+        }
+
+        fn commit(&mut self) -> ReplayAttempt {
+            self.step("commit");
+            self.commits.pop_front().unwrap_or(ReplayAttempt::Applied)
+        }
+
+        fn switch_layout(&mut self) -> ReplayAttempt {
+            self.step("layout");
+            self.layout
+        }
+
+        fn collapse(&mut self) -> SelectionCleanup {
+            self.step("collapse");
+            self.collapse
+        }
+    }
+
+    /// A scripted paste on a scripted clipboard holding `password`; unconfirmed, it waits two
+    /// seconds for its target.
+    fn scripted_paste() -> (
+        ScriptedPaste,
+        Arc<Mutex<PasteSteps>>,
+        Arc<Mutex<FakeClipboardState>>,
+    ) {
+        let state = fake_clipboard("password");
+        let (script, steps) = ScriptedPaste::new(PasteClipboard::Fake(
+            Arc::clone(&state),
+            Duration::from_secs(2),
+        ));
+        (script, steps, state)
+    }
+
+    /// A processor whose edit of input `PASTE_SEQUENCE` still holds its gate in the field of
+    /// `foreground`, with the outside steps of its protected paste scripted by `script`.
+    fn paste_processor(
+        foreground: ForegroundContext,
+        script: impl FnOnce(&Arc<ObserverMetrics>) -> ScriptedPaste,
+    ) -> InputProcessor {
+        let (mut processor, _receiver) = processor_in_field(EDITOR, None);
+        processor.foreground_override = Some(foreground);
+        let metrics = &processor.metrics;
+        metrics
+            .active_gate_token
+            .store(PASTE_SEQUENCE, Ordering::Release);
+        metrics
+            .forwarded_input_sequence
+            .store(PASTE_SEQUENCE, Ordering::Release);
+        let script = script(metrics);
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor
+    }
+
+    /// A click: the edit's input is no longer current.
+    fn user_clicks(metrics: &Arc<ObserverMetrics>) -> impl FnOnce() + Send + 'static {
+        let metrics = Arc::clone(metrics);
+        move || {
+            metrics.input_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Converts `ghbdtn` to `привет` by a protected paste in the processor's field.
+    fn run_paste(processor: &InputProcessor, patience: PastePatience) -> TextEditAttempt {
+        processor.perform_protected_paste(
+            processor.foreground_override.unwrap(),
+            PASTE_SEQUENCE,
+            0x0409,
+            HKL(0x0419 as *mut c_void),
+            "ghbdtn",
+            "привет",
+            patience,
+        )
+    }
+
+    #[test]
+    fn every_paste_that_could_not_give_the_clipboard_back_is_counted_once() {
+        let failures = |processor: &InputProcessor| {
+            processor
+                .metrics
+                .clipboard_restore_failures
+                .load(Ordering::Acquire)
+        };
+        let reap = |processor: &InputProcessor| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while processor.clipboard_brokers.busy() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            processor.log_finished_clipboard_brokers();
+        };
+        // Before its Ctrl+V: the user clicked (what is selected is left to them), and the
+        // clipboard did not come back.
+        let (script, _steps, state) = scripted_paste();
+        state.lock().unwrap().restore_fails = true;
+        let processor = paste_processor(test_foreground(), |metrics| {
+            script.after("begin", user_clicks(metrics))
+        });
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(state.lock().unwrap().text, "привет");
+        assert_eq!(failures(&processor), 1);
+        // After a paste whose layout switch failed.
+        let (mut script, _steps, state) = scripted_paste();
+        state.lock().unwrap().restore_fails = true;
+        script.layout = ReplayAttempt::Failed;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch)
+        );
+        assert_eq!(failures(&processor), 1);
+        // An unconfirmed paste whose target never read the replacement, once its broker is over.
+        let state = fake_clipboard("password");
+        let (mut script, _steps) = ScriptedPaste::new(PasteClipboard::Fake(
+            Arc::clone(&state),
+            Duration::from_millis(100),
+        ));
+        script.commits = vec![ReplayAttempt::Failed].into();
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+        assert_eq!(failures(&processor), 0, "not over yet");
+        reap(&processor);
+        assert_eq!(failures(&processor), 1);
+        // A restore that outlasts its wait: counted once its broker is over, and only if it
+        // failed.
+        for (fails, counted) in [(true, 1), (false, 0)] {
+            let (script, _steps, state) = scripted_paste();
+            {
+                let mut state = state.lock().unwrap();
+                state.restore_fails = fails;
+                state.restore_delay = Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS * 3);
+            }
+            let mut processor = paste_processor(test_foreground(), |_| script);
+            let outcome = run_paste(&processor, PastePatience::Automatic);
+            assert_eq!(outcome, TextEditAttempt::AppliedClipboardNotRestored);
+            processor.apply_paste_attempt_result(outcome, PASTE_SEQUENCE, PasteRoute::Backend);
+            assert_eq!(failures(&processor), 0, "fails={fails}: not known yet");
+            reap(&processor);
+            assert_eq!(failures(&processor), counted, "fails={fails}");
+            // Each end counts once.
+            processor.log_finished_clipboard_brokers();
+            assert_eq!(failures(&processor), counted, "fails={fails}");
+        }
+    }
+
+    #[test]
+    fn a_clipboard_that_did_not_come_back_is_announced_once_per_new_failure() {
+        let mut announced = 0;
+        assert!(!clipboard_failures_to_announce(&mut announced, 0));
+        assert!(clipboard_failures_to_announce(&mut announced, 1));
+        assert!(!clipboard_failures_to_announce(&mut announced, 1));
+        assert!(clipboard_failures_to_announce(&mut announced, 3));
+        assert_eq!(announced, 3);
+    }
+
+    #[test]
+    fn a_paste_gives_the_users_clipboard_back_only_once_the_field_showed_the_replacement() {
+        let target = test_foreground().process_id;
+        // Shown in the field: the user's clipboard comes back before the paste ends.
+        let (script, steps, state) = scripted_paste();
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout", "commit"]
+        );
+        assert_eq!(
+            steps.lock().unwrap().clipboard_at_submit.as_deref(),
+            Some("привет")
+        );
+        assert_eq!(state.lock().unwrap().text, "password");
+        assert!(processor.clipboard_brokers.reap().is_empty());
+
+        // A busy field that showed nothing in time, and a chord sent only in part (Ctrl is let go):
+        // either may still paste, so the replacement stays until the field reads it.
+        for (taken, commits, reason, expected) in [
+            (
+                None,
+                vec![ReplayAttempt::Failed],
+                ConversionFailureReason::TextCommit,
+                &["select", "begin", "submit:4", "commit", "collapse"][..],
+            ),
+            (
+                Some(2),
+                Vec::new(),
+                ConversionFailureReason::ClipboardEdit,
+                &["select", "begin", "submit:4", "submit:1", "collapse"][..],
+            ),
+        ] {
+            let (mut script, steps, state) = scripted_paste();
+            script.taken = taken;
+            script.commits = commits.into();
+            let processor = paste_processor(test_foreground(), |_| script);
+            assert_eq!(
+                run_paste(&processor, PastePatience::Automatic),
+                TextEditAttempt::Failed(reason)
+            );
+            assert_eq!(steps.lock().unwrap().steps, expected, "{reason:?}");
+            // Another program reading it proves nothing.
+            state.lock().unwrap().readers.push((99, Instant::now()));
+            thread::sleep(Duration::from_millis(30));
+            assert_eq!(state.lock().unwrap().text, "привет", "{reason:?}");
+            assert!(processor.clipboard_brokers.busy(), "{reason:?}");
+            // The field handles its Ctrl+V late and gets the replacement; then the password is
+            // back.
+            state.lock().unwrap().readers.push((target, Instant::now()));
+            assert_eq!(
+                reap_all(&processor.clipboard_brokers),
+                [BrokerEnd::Restored]
+            );
+            assert_eq!(state.lock().unwrap().text, "password");
+        }
+    }
+
+    /// A processor in an editor's field on the protected-paste backend whose keyboard, settle
+    /// step and paste are scripted, so that Pause runs its whole pipeline in a test: the field
+    /// shows `layout`, and automatic conversion is off.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn pause_processor(
+        layout: usize,
+    ) -> (
+        InputProcessor,
+        Receiver<String>,
+        ForegroundContext,
+        Arc<Mutex<PasteSteps>>,
+    ) {
+        let (mut processor, diagnostics) = processor_in_field(EDITOR, None);
+        let foreground = ForegroundContext {
+            layout,
+            ..test_foreground()
+        };
+        processor.gate_window = accepting_gate_window().0 as usize;
+        processor.foreground_override = Some(foreground);
+        processor.last_foreground = Some(foreground_identity_key(foreground));
+        processor.last_layout = Some(layout);
+        processor.test_keyboard = Some(test_keyboard);
+        processor.backend_rules =
+            BackendRules::from_lines(["editor.exe = protected-paste"]).unwrap();
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        let (script, steps, _clipboard) = scripted_paste();
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        (processor, diagnostics, foreground, steps)
+    }
+
+    /// Types the keys with these scan codes and a Space in the processor's field.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn type_word_and_space(processor: &mut InputProcessor, scan_codes: &[u32]) {
+        let foreground = processor.foreground_override.expect("the field");
+        type_keys(processor, foreground, scan_codes);
+        processor.process_key(space_key(foreground, scan_codes.len() as u64 + 1, 0));
+    }
+
+    /// Presses Pause in the processor's field, through `process_key` as the worker takes it, and
+    /// returns the diagnostics written meanwhile. A press that converts leaves the field in the
+    /// target layout, as Windows would.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn press_pause(
+        processor: &mut InputProcessor,
+        diagnostics: &Receiver<String>,
+        sequence: u64,
+    ) -> Vec<String> {
+        diagnostics.try_iter().for_each(drop);
+        let foreground = processor.foreground_override.expect("the field");
+        processor
+            .metrics
+            .active_gate_token
+            .store(sequence, Ordering::Release);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(sequence, Ordering::Release);
+        processor.settings.pause_break_undo = true;
+        processor.process_key(RawKeyEvent {
+            foreground,
+            hotkey_trigger: true,
+            ..test_raw_key(WM_KEYDOWN, VK_PAUSE, sequence, 0)
+        });
+        if let Some(cycle) = &processor.transpose_cycle {
+            let layout = processor
+                .find_layout(cycle.language)
+                .expect("the target layout")
+                .0 as usize;
+            processor.foreground_override = Some(ForegroundContext {
+                layout,
+                ..foreground
+            });
+            processor.last_layout = Some(layout);
+        }
+        diagnostics.try_iter().collect()
+    }
+
+    /// The language and text of the word after each of three Pause presses.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn three_pause_presses(
+        processor: &mut InputProcessor,
+        diagnostics: &Receiver<String>,
+    ) -> Vec<(Language, String)> {
+        (0..3)
+            .map(|press| {
+                press_pause(processor, diagnostics, 41 + press);
+                let cycle = processor
+                    .transpose_cycle
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("press {} converts", press + 1));
+                (cycle.language, cycle.text.clone())
+            })
+            .collect()
+    }
+
+    const GHBDTN: [u32; 6] = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_the_last_word_after_a_manual_layout_switch() {
+        let (mut processor, diagnostics, foreground, steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GHBDTN);
+        // Alt+Shift: the field now shows the Russian layout; the word was typed in English.
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0419,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("event=source_settle") && line.contains("result=Applied")),
+            "{lines:?}"
+        );
+        let cycle = processor.transpose_cycle.as_ref().expect("converted");
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "привет");
+        assert_eq!(steps.lock().unwrap().steps[0], "settle");
+        // A manual switch between two presses: the next press starts from the layout the field
+        // shows (Estonian), not from the one the last press left.
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0425,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 42);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("event=source_settle") && line.contains("result=Applied")),
+            "{lines:?}"
+        );
+        let cycle = processor.transpose_cycle.as_ref().expect("converted again");
+        assert_ne!(cycle.language, Language::Russian, "{lines:?}");
+        assert_eq!(cycle.text, "ghbdtn");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_manual_layout_switch_between_two_pause_presses_keeps_the_cycle() {
+        // "ghbdtn" without a Space: the first press converts the keys before the caret; then
+        // Alt+Shift shows the Estonian layout, and the second press walks the cycle on.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor.transpose_cycle.as_ref().expect("converted");
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "привет");
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0425,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 42);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("the cycle was lost: {lines:?}"));
+        assert_ne!(cycle.language, Language::Russian, "{lines:?}");
+        assert_eq!(cycle.text, "ghbdtn");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_token_that_starts_with_a_digit_after_a_manual_switch_is_kept_for_pause() {
+        // Alt+Shift from Russian to English, then "6ghbdtn": the digit first, typed right after
+        // the switch, starts the token Pause converts.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0419);
+        let english = ForegroundContext {
+            layout: 0x0409,
+            ..foreground
+        };
+        processor.foreground_override = Some(english);
+        switch_layout_by_hand(&mut processor, 0x0409);
+        type_keys(
+            &mut processor,
+            english,
+            &[0x07, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31],
+        );
+        assert_eq!(processor.replay_keys.len(), 7);
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("not converted: {lines:?}"));
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "6привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_after_a_manual_switch_to_a_layout_of_no_enabled_language() {
+        // English and Russian enabled; Alt+Shift shows the Estonian layout, loaded in Windows but
+        // not enabled here. The word typed in English is still converted to Russian.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        processor
+            .settings
+            .set_pack_enabled(autokeyboardlayot::PackId::parse("et-EE").unwrap(), false);
+        type_word_and_space(&mut processor, &GHBDTN);
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0425,
+            ..foreground
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("not converted: {lines:?}"));
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_presses_pass_through_the_original_layout() {
+        // English, Russian and Estonian: Estonian reads Latin letters as English does, so the
+        // presses go back to English rather than to a lookalike layout.
+        let (mut processor, diagnostics, _, _) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GHBDTN);
+        assert_eq!(
+            three_pause_presses(&mut processor, &diagnostics),
+            [
+                (Language::Russian, "привет".to_owned()),
+                (Language::English, "ghbdtn".to_owned()),
+                (Language::Russian, "привет".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_presses_follow_the_stored_order_through_every_enabled_layout() {
+        // "k[simus" reads differently in all three layouts; the first press orders them by how
+        // plausible each reading is (the Estonian "küsimus" is a dictionary word), and the next
+        // presses keep that order.
+        let (mut processor, diagnostics, _, _) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &[0x25, 0x1a, 0x1f, 0x17, 0x32, 0x16, 0x1f]);
+        let mut orders = Vec::new();
+        let mut words = Vec::new();
+        for press in 0..3 {
+            let lines = press_pause(&mut processor, &diagnostics, 41 + press);
+            orders.extend(lines.iter().filter_map(|line| {
+                line.split(' ')
+                    .find_map(|field| field.strip_prefix("cycle="))
+                    .map(str::to_owned)
+            }));
+            let cycle = processor.transpose_cycle.as_ref().expect("converted");
+            words.push((cycle.language, cycle.text.clone()));
+        }
+        assert_eq!(
+            words,
+            [
+                (Language::Estonian, "küsimus".to_owned()),
+                (Language::Russian, "лхышьгы".to_owned()),
+                (Language::English, "k[simus".to_owned()),
+            ]
+        );
+        assert_eq!(orders, ["en-US,et-EE,ru-RU"; 3]);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_remembered_word_outlives_a_new_input_epoch_but_not_new_keyboard_profiles() {
+        for profiles_changed in [false, true] {
+            let (mut processor, diagnostics, field, _) = pause_processor(0x0409);
+            type_word_and_space(&mut processor, &GHBDTN);
+            // Another window gets the keys; the field's last word is remembered.
+            let elsewhere = ForegroundContext {
+                hwnd: 8,
+                focus: 8,
+                ..field
+            };
+            processor.foreground_override = Some(elsewhere);
+            type_keys(&mut processor, elsewhere, &[0x1e]);
+            assert_eq!(processor.remembered_words.len(), 1);
+            if profiles_changed && let Some(word) = processor.remembered_words[0].word.as_mut() {
+                word.profile_generation += 1;
+            }
+            // A settings Apply starts a new input epoch.
+            let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            processor.process(QueuedInputEvent {
+                epoch,
+                captured_at: Instant::now(),
+                event: RawInputEvent::Mouse,
+                configuration: None,
+            });
+            processor.foreground_override = Some(field);
+            let lines = press_pause(&mut processor, &diagnostics, 41);
+            assert!(!processor.session.is_suppressed(), "{lines:?}");
+            if profiles_changed {
+                assert!(processor.transpose_cycle.is_none(), "{lines:?}");
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("source=remembered result=stale")),
+                    "{lines:?}"
+                );
+            } else {
+                let cycle = processor.transpose_cycle.as_ref().expect("converted");
+                assert_eq!(cycle.text, "привет", "{lines:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_candidate_that_is_not_converted_says_why() {
+        // (automatic conversion on, the key that ends "ghbdtn", the reason logged)
+        let space = |sequence| (VK_SPACE, 0x39, 0, false, sequence);
+        for (automatic, (key, scan_code, held, caps_lock, sequence), reason) in [
+            (false, space(7), Some("automatic-off")),
+            (
+                true,
+                (VK_SPACE, 0x39, held_keys(&[VK_LSHIFT]), false, 8),
+                Some("shift"),
+            ),
+            (true, (VK_SPACE, 0x39, 0, true, 7), Some("caps-lock")),
+            (true, (VK_RETURN, 0x1c, 0, false, 7), Some("boundary")),
+            (true, space(7), None),
+        ] {
+            let (mut processor, diagnostics, foreground, _) = pause_processor(0x0409);
+            processor
+                .metrics
+                .auto_enabled
+                .store(automatic, Ordering::Release);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            if held != 0 {
+                processor.process_key(RawKeyEvent {
+                    scan_code: 0x2a,
+                    held_modifiers: held,
+                    foreground,
+                    ..test_raw_key(WM_KEYDOWN, VK_LSHIFT, 7, 0)
+                });
+            }
+            diagnostics.try_iter().for_each(drop);
+            processor.process_key(RawKeyEvent {
+                scan_code,
+                held_modifiers: held,
+                caps_lock,
+                foreground,
+                ..test_raw_key(WM_KEYDOWN, key, sequence, 0)
+            });
+            let words: Vec<String> = diagnostics
+                .try_iter()
+                .filter(|line| line.starts_with("event=word "))
+                .collect();
+            match reason {
+                Some(reason) => {
+                    assert_eq!(words.len(), 1, "{words:?}");
+                    assert!(
+                        words[0].ends_with(&format!("result=not-attempted reason={reason}")),
+                        "{words:?}"
+                    );
+                }
+                None => assert!(words.is_empty(), "{words:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_conversion_planned_for_another_space_is_rejected_although_every_later_guard_passes() {
+        // (sequence the edit runs for, converts): the Space down or the key after it qualifies.
+        for (boundary, converts) in [(41, true), (42, true), (99, false)] {
+            let (mut processor, _diagnostics, foreground, steps) = pause_processor(0x0409);
+            processor.refresh_process_policy(foreground.process_id);
+            let detection = Detection {
+                source_language: Language::English,
+                target_language: Language::Russian,
+                original: "ghbdtn".into(),
+                replacement: "привет".into(),
+                source_score: 0.0,
+                target_score: 1.0,
+            };
+            let replay_keys = GHBDTN
+                .map(|scan_code| ReplayKey {
+                    scan_code: scan_code as u16,
+                    shift: false,
+                    caps_lock: false,
+                    extended: false,
+                })
+                .to_vec();
+            processor.pending_conversion = Some(PendingConversion {
+                transaction: ConversionTransaction::new(&detection, ' ').unwrap(),
+                foreground,
+                source_layout: foreground.layout,
+                profile_generation: processor.input_profiles.generation(),
+                space_down_sequence: 41,
+                replay_keys,
+                forced: true,
+                cycle_order: vec![Language::English, Language::Russian, Language::Estonian],
+            });
+            processor
+                .metrics
+                .active_gate_token
+                .store(boundary, Ordering::Release);
+            processor
+                .metrics
+                .forwarded_input_sequence
+                .store(boundary, Ordering::Release);
+            processor.execute_pending_conversion_inner(boundary);
+            assert!(processor.pending_conversion.is_none(), "{boundary}");
+            assert_eq!(processor.transpose_cycle.is_some(), converts, "{boundary}");
+            assert_eq!(
+                steps.lock().unwrap().steps.is_empty(),
+                !converts,
+                "{boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_paste_that_panics_after_the_ctrl_v_leaves_the_replacement_for_its_field() {
+        let (script, _steps, state) = scripted_paste();
+        let script = script.after("submit:4", || panic!("the worker fails after the chord"));
+        let processor = paste_processor(test_foreground(), |_| script);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_paste(&processor, PastePatience::Automatic)
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(state.lock().unwrap().text, "привет");
+        state
+            .lock()
+            .unwrap()
+            .readers
+            .push((test_foreground().process_id, Instant::now()));
+        assert_eq!(
+            reap_all(&processor.clipboard_brokers),
+            [BrokerEnd::Restored]
+        );
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_confirmed_paste_whose_clipboard_another_program_took_meanwhile_says_so() {
+        let (script, _steps, state) = scripted_paste();
+        let writer = Arc::clone(&state);
+        let script = script.after("commit", move || {
+            let mut state = writer.lock().unwrap();
+            state.text = "theirs".to_owned();
+            state.sequence += 1;
+            state.owner = 99;
+        });
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::AppliedClipboardNotRestored
+        );
+        assert_eq!(state.lock().unwrap().text, "theirs");
+        assert_eq!(state.lock().unwrap().restores, 0);
+    }
+
+    #[test]
+    fn a_layout_that_does_not_switch_after_the_paste_fails_with_its_own_reason() {
+        let (mut script, steps, state) = scripted_paste();
+        script.layout = ReplayAttempt::LayoutSwitchFailed;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::LayoutSwitch)
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout"]
+        );
+        // The replacement was shown, so the user's clipboard was already back.
+        assert_eq!(state.lock().unwrap().text, "password");
+    }
+
+    #[test]
+    fn a_paste_that_types_nothing_ends_by_what_it_found() {
+        use SelectionCleanup::{Collapsed, Unverified};
+        for (selection, open_fails, outcome, expected) in [
+            (
+                (TextBarrierStatus::Unavailable, None),
+                false,
+                TextEditAttempt::Unsupported,
+                &["select"][..],
+            ),
+            (
+                (TextBarrierStatus::Mismatch, Some(Collapsed)),
+                false,
+                TextEditAttempt::Cancelled,
+                &["select"][..],
+            ),
+            (
+                (TextBarrierStatus::Mismatch, Some(Unverified)),
+                false,
+                TextEditAttempt::SelectionLeft,
+                &["select"][..],
+            ),
+            // The clipboard did not take the replacement: a busy clipboard is a word left alone.
+            (
+                (TextBarrierStatus::Match, None),
+                true,
+                TextEditAttempt::Cancelled,
+                &["select", "begin", "collapse"][..],
+            ),
+        ] {
+            let (mut script, steps, state) = scripted_paste();
+            script.selection = selection;
+            state.lock().unwrap().open_fails = open_fails;
+            let processor = paste_processor(test_foreground(), |_| script);
+            assert_eq!(
+                run_paste(&processor, PastePatience::Automatic),
+                outcome,
+                "{selection:?}"
+            );
+            assert_eq!(steps.lock().unwrap().steps, expected, "{selection:?}");
+            assert_eq!(state.lock().unwrap().text, "password");
+            assert_eq!(state.lock().unwrap().empties, 0);
+        }
+    }
+
+    #[test]
+    fn a_paste_stops_before_each_step_the_gate_has_no_time_left_for() {
+        let paste = |budget_ms: u64, slow_step: Option<&'static str>| {
+            let (mut script, steps, state) = scripted_paste();
+            if let Some(step) = slow_step {
+                script = script.after(step, || thread::sleep(Duration::from_millis(300)));
+            }
+            let processor = paste_processor(test_foreground(), |_| script);
+            processor
+                .edit_deadline
+                .set(Some(Instant::now() + Duration::from_millis(budget_ms)));
+            let attempt = run_paste(&processor, PastePatience::Automatic);
+            let steps = std::mem::take(&mut *steps.lock().unwrap());
+            (attempt, steps, state)
+        };
+        // No time left: not even the selection starts.
+        let (attempt, steps, _) = paste(0, None);
+        assert_eq!(attempt, TextEditAttempt::Cancelled);
+        assert!(steps.steps.is_empty(), "{:?}", steps.steps);
+        // Time for the selection and a shortened installation (the gate's 900 ms less everything
+        // after the Ctrl+V leave 150 ms of the usual 200).
+        let (attempt, steps, _) = paste(900, None);
+        assert_eq!(attempt, TextEditAttempt::Applied);
+        let install = steps.install_timeout.unwrap();
+        assert!(
+            install >= Duration::from_millis(PASTE_MIN_INSTALL_MS)
+                && install < Duration::from_millis(CLIPBOARD_AUTOMATIC_INSTALL_TIMEOUT_MS),
+            "{install:?}"
+        );
+        // A slow selection leaves no time for the installation: the clipboard is not touched.
+        let (attempt, steps, state) = paste(1_000, Some("select"));
+        assert_eq!(attempt, TextEditAttempt::Cancelled);
+        assert_eq!(steps.steps, ["select", "collapse"]);
+        assert_eq!(state.lock().unwrap().empties, 0);
+        // A slow installation leaves no time for what follows the Ctrl+V: it is not sent, and the
+        // user's clipboard comes back at once.
+        let (attempt, steps, state) = paste(1_000, Some("begin"));
+        assert_eq!(attempt, TextEditAttempt::Cancelled);
+        assert_eq!(steps.steps, ["select", "begin", "collapse"]);
+        assert_eq!(state.lock().unwrap().text, "password");
+        assert_eq!(state.lock().unwrap().restores, 1);
+    }
+
+    #[test]
+    fn a_paste_the_user_interrupted_leaves_the_selection_alone() {
+        // A click before the Ctrl+V: nothing was sent, so the user's clipboard comes back at once;
+        // what is selected may be the user's by now and is not touched.
+        let (script, steps, state) = scripted_paste();
+        let processor = paste_processor(test_foreground(), |metrics| {
+            script.after("begin", user_clicks(metrics))
+        });
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(steps.lock().unwrap().steps, ["select", "begin"]);
+        assert_eq!(state.lock().unwrap().text, "password");
+        assert_eq!(state.lock().unwrap().restores, 1);
+
+        // A click while the field had not shown the paste: the replacement waits for the field,
+        // and the selection is left alone as well.
+        let (mut script, steps, state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Cancelled]);
+        let processor = paste_processor(test_foreground(), |metrics| {
+            script.after("commit", user_clicks(metrics))
+        });
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit"]
+        );
+        assert_eq!(state.lock().unwrap().text, "привет");
+
+        // Without a click, a collapse the field does not show ends the same way.
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Failed]);
+        script.collapse = SelectionCleanup::Unverified;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::SelectionLeft
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "collapse"]
+        );
+    }
+
+    #[test]
+    #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
+    fn a_paste_on_the_real_clipboard_gives_a_late_field_the_replacement_and_the_user_their_clipboard()
+     {
+        let _com = PrivacyGuard::new();
+        let source = clipboard_test_window(w!("AutoKeyboardLayot paste source"));
+        put_test_clipboard_text(source, "akl-user-clipboard");
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+        let window = clipboard_test_window(w!("AutoKeyboardLayot paste probe"));
+        // This process plays the field the paste goes to.
+        let foreground = ForegroundContext {
+            process_id: unsafe { GetCurrentProcessId() },
+            ..test_foreground()
+        };
+
+        // A field that pastes at once and shows it: the user's clipboard is back when the paste
+        // ends.
+        let pasted = Arc::new(Mutex::new(None));
+        let field = Arc::clone(&pasted);
+        let reader = window.0 as usize;
+        let (script, steps) = ScriptedPaste::new(PasteClipboard::System);
+        let script = script.after("commit", move || {
+            *field.lock().unwrap() = test_clipboard_unicode(HWND(reader as *mut c_void));
+        });
+        let processor = paste_processor(foreground, |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Manual),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout", "commit"]
+        );
+        assert_eq!(pasted.lock().unwrap().as_deref(), Some("привет"));
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-user-clipboard")
+        );
+        assert!(processor.clipboard_brokers.reap().is_empty());
+
+        // A busy field that handles its Ctrl+V only after the paste stopped waiting: it gets the
+        // replacement, never the user's clipboard, which comes back right after.
+        let (mut script, steps) = ScriptedPaste::new(PasteClipboard::System);
+        script.commits = VecDeque::from([ReplayAttempt::Failed]);
+        let processor = paste_processor(foreground, |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Manual),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "collapse"]
+        );
+        assert!(processor.clipboard_brokers.busy());
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
+        // That read may be the field's own look at the clipboard: a paste right after it still
+        // gets the replacement.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while test_clipboard_unicode(window).as_deref() != Some("akl-user-clipboard")
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            test_clipboard_unicode(window).as_deref(),
+            Some("akl-user-clipboard")
+        );
+        assert_eq!(
+            reap_all(&processor.clipboard_brokers),
+            [BrokerEnd::Restored]
+        );
+        unsafe {
+            DestroyWindow(window).expect("destroy probe window");
+        }
+    }
+
+    /// The field of the desktop paste acceptance: a WinForms rich edit in a process of its own,
+    /// which Windows PowerShell compiles on the spot. It listens to the clipboard; the first time
+    /// the agent's broker puts something there, it stays busy for a while, as a program that
+    /// handles its paste late does. `WM_APP + 0x40` sets for the next paste how long it is busy
+    /// (wparam, in milliseconds) and, when lparam is not zero, that it then reads the new
+    /// clipboard itself (a clipboard listener) and is busy lparam milliseconds more.
+    const DESKTOP_FIELD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+public class AklBusyField : Form {
+    [DllImport("user32.dll")] static extern bool AddClipboardFormatListener(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr window, StringBuilder name, int size);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr process);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    readonly RichTextBox box = new RichTextBox();
+    int busyMs;
+    int readThenBusyMs;
+    public AklBusyField() {
+        Text = "AutoKeyboardLayot busy field";
+        StartPosition = FormStartPosition.Manual;
+        SetBounds(80, 80, 640, 140);
+        box.Multiline = false;
+        box.Dock = DockStyle.Fill;
+        box.Font = new System.Drawing.Font("Segoe UI", 16f);
+        Controls.Add(box);
+        Shown += delegate { TakeForeground(); };
+    }
+    void TakeForeground() {
+        uint other = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint own = GetCurrentThreadId();
+        bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+        SetForegroundWindow(Handle);
+        Activate();
+        box.Focus();
+        if (attached) { AttachThreadInput(own, other, false); }
+    }
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        AddClipboardFormatListener(Handle);
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x8040) {
+            busyMs = m.WParam.ToInt32();
+            readThenBusyMs = m.LParam.ToInt32();
+            m.Result = new IntPtr(1);
+            return;
+        }
+        if (m.Msg == 0x031D) {
+            StringBuilder owner = new StringBuilder(128);
+            GetClassName(GetClipboardOwner(), owner, owner.Capacity);
+            if (owner.ToString() == "AutoKeyboardLayotClipboardBroker") {
+                int busy = busyMs;
+                int after = readThenBusyMs;
+                busyMs = 0;
+                readThenBusyMs = 0;
+                if (busy > 0) { Thread.Sleep(busy); }
+                if (after > 0) {
+                    try { Clipboard.GetText(); } catch (Exception) { }
+                    Thread.Sleep(after);
+                }
+            }
+        }
+        base.WndProc(ref m);
+    }
+}
+'@
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::Run((New-Object AklBusyField))
+"#;
+
+    /// A field that reads a paste the way .NET programs, consoles and many toolkits do: on Ctrl+V
+    /// it opens the clipboard without a window (`OpenClipboard(NULL)`), reads the text at once,
+    /// then stays busy for 400 ms before it shows it, too late for the paste's confirmation.
+    const WINDOWLESS_READER_FIELD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class AklWindowlessReader : Form {
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint format);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr process);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    readonly RichTextBox box = new RichTextBox();
+    public AklWindowlessReader() {
+        Text = "AutoKeyboardLayot windowless reader field";
+        StartPosition = FormStartPosition.Manual;
+        SetBounds(80, 80, 640, 140);
+        box.Multiline = false;
+        box.Dock = DockStyle.Fill;
+        box.Font = new System.Drawing.Font("Segoe UI", 16f);
+        Controls.Add(box);
+        Shown += delegate { TakeForeground(); };
+    }
+    void TakeForeground() {
+        uint other = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint own = GetCurrentThreadId();
+        bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+        SetForegroundWindow(Handle);
+        Activate();
+        box.Focus();
+        if (attached) { AttachThreadInput(own, other, false); }
+    }
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData) {
+        if (keyData == (Keys.Control | Keys.V)) {
+            string text = ReadWithoutWindow();
+            System.Threading.Thread.Sleep(400);
+            if (text != null) { box.SelectedText = text; }
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+    static string ReadWithoutWindow() {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            if (OpenClipboard(IntPtr.Zero)) {
+                try {
+                    IntPtr data = GetClipboardData(13);
+                    if (data == IntPtr.Zero) { return null; }
+                    IntPtr text = GlobalLock(data);
+                    try { return Marshal.PtrToStringUni(text); } finally { GlobalUnlock(data); }
+                } finally { CloseClipboard(); }
+            }
+            System.Threading.Thread.Sleep(2);
+        }
+        return null;
+    }
+}
+'@
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::Run((New-Object AklWindowlessReader))
+"#;
+
+    /// The busy field of the desktop acceptance, in front on the interactive session's desktop.
+    /// It is ended however the test ends.
+    struct DesktopField {
+        child: std::process::Child,
+        script: PathBuf,
+        context: ForegroundContext,
+    }
+
+    impl DesktopField {
+        const CONFIGURE: u32 = 0x8040;
+
+        /// Starts the field and brings it to the front. Started by this process it may not take
+        /// the foreground by itself, and Start's search window can keep it after a first sign-in:
+        /// the search is dismissed and the field is clicked, as the user would.
+        fn start() -> Self {
+            Self::start_script(DESKTOP_FIELD_SCRIPT, w!("AutoKeyboardLayot busy field"))
+        }
+
+        /// Starts the field of `source`, whose window has the title `title`.
+        fn start_script(source: &str, title: PCWSTR) -> Self {
+            use windows::Win32::Foundation::RECT;
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                MOUSEEVENTF_MOVE, MOUSEINPUT,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                AllowSetForegroundWindow, FindWindowW, GetSystemMetrics, GetWindowRect,
+                SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow,
+            };
+            let escape = [
+                keyboard_input(VK_ESCAPE, 0, Default::default()),
+                keyboard_input(VK_ESCAPE, 0, KEYEVENTF_KEYUP),
+            ];
+            assert!(send_input_batch(&escape));
+            thread::sleep(Duration::from_millis(500));
+            let script =
+                std::env::temp_dir().join(format!("akl-busy-field-{}.ps1", std::process::id()));
+            fs::write(&script, source).expect("field script");
+            let child = {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(&script)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn()
+                    .expect("start the field")
+            };
+            let mut field = Self {
+                child,
+                script,
+                context: test_foreground(),
+            };
+            unsafe {
+                let _ = AllowSetForegroundWindow(field.child.id());
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(context) = current_foreground_context()
+                    && context.process_id == field.child.id()
+                    && context.focus != 0
+                {
+                    field.context = context;
+                    return field;
+                }
+                if let Ok(window) = unsafe { FindWindowW(None, title) } {
+                    unsafe {
+                        let _ = SetForegroundWindow(window);
+                    }
+                    let mut rect = RECT::default();
+                    if unsafe { GetWindowRect(window, &mut rect) }.is_ok() {
+                        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(2);
+                        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(2);
+                        let mouse = |flags| INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dx: (rect.left + rect.right) / 2 * 65_535 / (width - 1),
+                                    dy: (rect.top + rect.bottom) / 2 * 65_535 / (height - 1),
+                                    dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let click = [
+                            mouse(MOUSEEVENTF_MOVE),
+                            mouse(MOUSEEVENTF_LEFTDOWN),
+                            mouse(MOUSEEVENTF_LEFTUP),
+                        ];
+                        assert!(send_input_batch(&click));
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the field did not take the foreground: {:?}",
+                    current_foreground_context()
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn send(window: usize, message: u32, wparam: usize, lparam: isize) -> usize {
+            let mut result = 0usize;
+            unsafe {
+                let _ = SendMessageTimeoutW(
+                    HWND(window as *mut c_void),
+                    message,
+                    WPARAM(wparam),
+                    LPARAM(lparam),
+                    SMTO_BLOCK,
+                    5_000,
+                    Some(&mut result),
+                );
+            }
+            result
+        }
+
+        fn text(&self) -> String {
+            use windows::Win32::UI::WindowsAndMessaging::WM_GETTEXT;
+            let mut buffer = [0u16; 256];
+            let copied = Self::send(
+                self.context.focus,
+                WM_GETTEXT,
+                buffer.len(),
+                buffer.as_mut_ptr() as isize,
+            );
+            String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
+        }
+
+        /// Puts `text` in the field with the caret at its end.
+        fn set_text(&self, text: &str) {
+            use windows::Win32::UI::WindowsAndMessaging::WM_SETTEXT;
+            const EM_SETSEL: u32 = 0x00B1;
+            let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+            Self::send(self.context.focus, WM_SETTEXT, 0, wide.as_ptr() as isize);
+            let end = wide.len() - 1;
+            Self::send(self.context.focus, EM_SETSEL, end, end as isize);
+        }
+
+        /// How the field behaves when the next paste's replacement arrives (`DESKTOP_FIELD_SCRIPT`).
+        fn configure(&self, busy_ms: usize, read_then_busy_ms: isize) {
+            Self::send(
+                self.context.hwnd,
+                Self::CONFIGURE,
+                busy_ms,
+                read_then_busy_ms,
+            );
+        }
+
+        /// The field's text once it changed from `before` and stopped changing (a busy field
+        /// pastes late), or after five seconds.
+        fn settled_text(&self, before: &str) -> String {
+            let mut text = self.text();
+            let mut changed_at = Instant::now();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline
+                && (text == before || changed_at.elapsed() < Duration::from_millis(700))
+            {
+                thread::sleep(Duration::from_millis(50));
+                let now = self.text();
+                if now != text {
+                    text = now;
+                    changed_at = Instant::now();
+                }
+            }
+            text
+        }
+    }
+
+    impl Drop for DesktopField {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.context.hwnd as *mut c_void)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_file(&self.script);
+        }
+    }
+
+    /// Puts `text` on the clipboard as the user's, from a window that is gone right after.
+    fn put_user_clipboard(text: &str) {
+        let source = clipboard_test_window(w!("AutoKeyboardLayot desktop clipboard source"));
+        put_test_clipboard_text(source, text);
+        unsafe {
+            DestroyWindow(source).expect("destroy source window");
+        }
+    }
+
+    /// The clipboard's text once it is `expected`, or after `timeout`.
+    fn clipboard_once(probe: HWND, expected: &str, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while test_clipboard_unicode(probe).as_deref() != Some(expected)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        test_clipboard_unicode(probe)
+    }
+
+    #[test]
+    #[ignore = "drives a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn a_protected_paste_on_the_desktop_gives_a_busy_field_the_replacement_and_never_the_clipboard()
+    {
+        let field = DesktopField::start();
+        let probe = clipboard_test_window(w!("AutoKeyboardLayot desktop paste probe"));
+        let mut outcomes = Vec::new();
+        // A field that is not busy, one busy for a while or long after the clipboard changed, and
+        // one that is busy until the paste stopped waiting, then reads the new clipboard itself
+        // and handles the paste a moment later (less than the grace after a target's read).
+        for (busy_ms, read_then_busy_ms) in [(0, 0), (300, 0), (1_000, 0), (300, 300)] {
+            put_user_clipboard("akl-password");
+            field.set_text("ghbdtn");
+            field.configure(busy_ms, read_then_busy_ms);
+            let foreground = current_foreground_context().expect("foreground");
+            assert!(
+                same_input_target(foreground, field.context),
+                "the field lost the foreground"
+            );
+            let (mut processor, receiver) = processor_with_diagnostics();
+            processor.foreground_override = Some(foreground);
+            processor
+                .metrics
+                .observed_input_sequence
+                .store(5, Ordering::Release);
+            let attempt = processor.perform_protected_paste(
+                foreground,
+                5,
+                foreground.layout,
+                HKL(foreground.layout as *mut c_void),
+                "ghbdtn",
+                "привет",
+                PastePatience::Manual,
+            );
+            // The clipboard is read only once the field settled: earlier it would be a read of the
+            // replacement by another process than the paste's target.
+            let text = field.settled_text("ghbdtn");
+            let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(4));
+            let brokers = reap_all(&processor.clipboard_brokers);
+            eprintln!(
+                "busy_ms={busy_ms} read_then_busy_ms={read_then_busy_ms} attempt={attempt:?} \
+                 replaced={} clipboard_back={} brokers={brokers:?}",
+                text == "привет",
+                clipboard.as_deref() == Some("akl-password")
+            );
+            for line in receiver
+                .try_iter()
+                .filter(|line| line.starts_with("event=paste"))
+            {
+                eprintln!("  {line}");
+            }
+            outcomes.push((busy_ms, read_then_busy_ms, attempt, text, clipboard));
+        }
+        unsafe {
+            DestroyWindow(probe).expect("destroy probe window");
+        }
+        drop(field);
+        for (busy_ms, read_then_busy_ms, attempt, text, clipboard) in outcomes {
+            let case = format!(
+                "busy_ms={busy_ms} read_then_busy_ms={read_then_busy_ms} attempt={attempt:?}"
+            );
+            assert_eq!(text, "привет", "{case}");
+            assert_eq!(clipboard.as_deref(), Some("akl-password"), "{case}");
+            // A field busy for less than the late wait answers in time: the paste is confirmed,
+            // not counted as failed (which would turn automatic conversion off).
+            if read_then_busy_ms == 0 && busy_ms <= 300 {
+                assert_eq!(attempt, TextEditAttempt::Applied, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "drives a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn a_late_paste_read_without_a_window_on_the_desktop_gives_the_clipboard_back() {
+        let field = DesktopField::start_script(
+            WINDOWLESS_READER_FIELD_SCRIPT,
+            w!("AutoKeyboardLayot windowless reader field"),
+        );
+        let probe = clipboard_test_window(w!("AutoKeyboardLayot windowless reader probe"));
+        put_user_clipboard("akl-password");
+        field.set_text("ghbdtn");
+        // A window that just came up may not show UI Automation its focus yet.
+        thread::sleep(Duration::from_millis(500));
+        let foreground = current_foreground_context().expect("foreground");
+        assert!(
+            same_input_target(foreground, field.context),
+            "the field lost the foreground"
+        );
+        let (mut processor, receiver) = processor_with_diagnostics();
+        processor.foreground_override = Some(foreground);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(5, Ordering::Release);
+        let attempt = processor.perform_protected_paste(
+            foreground,
+            5,
+            foreground.layout,
+            HKL(foreground.layout as *mut c_void),
+            "ghbdtn",
+            "привет",
+            PastePatience::Manual,
+        );
+        // The clipboard is read only once the field settled: the field's own read comes first.
+        let text = field.settled_text("ghbdtn");
+        let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(8));
+        let brokers = reap_all(&processor.clipboard_brokers);
+        eprintln!(
+            "attempt={attempt:?} replaced={} clipboard_back={} brokers={brokers:?}",
+            text == "привет",
+            clipboard.as_deref() == Some("akl-password")
+        );
+        for line in receiver
+            .try_iter()
+            .filter(|line| line.starts_with("event=paste"))
+        {
+            eprintln!("  {line}");
+        }
+        unsafe {
+            DestroyWindow(probe).expect("destroy probe window");
+        }
+        drop(field);
+        assert_eq!(text, "привет");
+        assert_eq!(clipboard.as_deref(), Some("akl-password"));
+        // Busy while it pastes, the field answers once it has: the paste is confirmed.
+        assert_eq!(attempt, TextEditAttempt::Applied);
+    }
+
+    #[test]
+    #[ignore = "runs the agent on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_a_word_in_a_busy_field_and_never_pastes_the_clipboard() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardLayoutList, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, WM_CLOSE, WM_INPUTLANGCHANGEREQUEST,
+        };
+        // The word is typed in English and converted to Russian: the account needs both layouts.
+        let mut layouts = [HKL::default(); 16];
+        let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) }.max(0) as usize;
+        let languages: Vec<usize> = layouts[..count.min(layouts.len())]
+            .iter()
+            .map(|layout| layout.0 as usize & 0xffff)
+            .collect();
+        assert!(
+            languages.contains(&0x0409) && languages.contains(&0x0419),
+            "the account needs the English and Russian layouts: {languages:x?}"
+        );
+        // A profile of its own: diagnostics on, and a word typed after the test switches the
+        // layout back to English still converted.
+        let profile =
+            std::env::temp_dir().join(format!("akl-agent-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        document.settings.suppress_after_manual_layout_change = false;
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let field = DesktopField::start();
+        let probe = clipboard_test_window(w!("AutoKeyboardLayot agent acceptance probe"));
+        let agent = thread::spawn(run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let agent_window = loop {
+            if let Ok(window) = unsafe { FindWindowW(WINDOW_CLASS, None) } {
+                break window;
+            }
+            assert!(Instant::now() < deadline, "the agent did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        // The agent sends panics to its crash log; the test wants them on screen.
+        drop(std::panic::take_hook());
+        // The worker reads the configuration and the layouts.
+        thread::sleep(Duration::from_secs(2));
+        let type_keys = |keys: &[VIRTUAL_KEY]| {
+            for key in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                for flags in [Default::default(), KEYEVENTF_KEYUP] {
+                    let input =
+                        keyboard_input_with_marker(*key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                    assert!(send_input_batch(&[input]));
+                    thread::sleep(Duration::from_millis(40));
+                }
+            }
+        };
+        let english = 0x0409_0409usize;
+        let mut outcomes = Vec::new();
+        // A field that pastes at once, one busy when the replacement arrives (it answers UI
+        // Automation only once it has handled the paste), and one that pastes at once again: the
+        // busy one turned nothing off.
+        for busy_ms in [0usize, 300, 0] {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(field.context.hwnd as *mut c_void)),
+                    WM_INPUTLANGCHANGEREQUEST,
+                    WPARAM(0),
+                    LPARAM(english as isize),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while current_foreground_context().is_none_or(|context| context.layout != english)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            field.set_text("");
+            put_user_clipboard("akl-password");
+            field.configure(busy_ms, 0);
+            thread::sleep(Duration::from_millis(500));
+            // g h b d t n, Space: "привет" typed in the English layout.
+            type_keys(&[
+                VIRTUAL_KEY(0x47),
+                VIRTUAL_KEY(0x48),
+                VIRTUAL_KEY(0x42),
+                VIRTUAL_KEY(0x44),
+                VIRTUAL_KEY(0x54),
+                VIRTUAL_KEY(0x4E),
+                VK_SPACE,
+            ]);
+            let text = field.settled_text("ghbdtn ");
+            let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(4));
+            eprintln!(
+                "busy_ms={busy_ms} converted={} clipboard_back={} text_chars={}",
+                text == "привет ",
+                clipboard.as_deref() == Some("akl-password"),
+                text.chars().count()
+            );
+            outcomes.push((busy_ms, text, clipboard));
+        }
+        // The agent's own record: the gates it armed, the conversions and the pastes.
+        let record = |filter: &dyn Fn(&str) -> bool| {
+            let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+            for line in log.lines().filter(|line| filter(line)) {
+                eprintln!("  {line}");
+            }
+        };
+        record(&|line| {
+            line.contains("event=paste")
+                || line.contains("event=conversion")
+                || line.contains("event=word")
+                || line.contains("event=privacy_probe")
+                || line.contains("event=context")
+                || line.contains("phase=armed")
+                || line.contains("event=gate_ack")
+        });
+        // A graceful close is declined while the agent holds keys back for recovery, which expire
+        // after RETAINED_INPUT_LIFETIME_MS: it is asked again until it accepts.
+        let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
+        while !agent.is_finished() && Instant::now() < deadline {
+            unsafe {
+                let _ = PostMessageW(Some(agent_window), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+        record(&|line| line.contains("phase=shutdown"));
+        assert!(agent.is_finished(), "the agent declined to stop");
+        let stopped = agent.join();
+        unsafe {
+            DestroyWindow(probe).expect("destroy probe window");
+        }
+        drop(field);
+        let _ = fs::remove_dir_all(&profile);
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the agent did not stop cleanly"
+        );
+        for (busy_ms, text, clipboard) in outcomes {
+            assert_eq!(text, "привет ", "busy_ms={busy_ms}");
+            assert_eq!(
+                clipboard.as_deref(),
+                Some("akl-password"),
+                "busy_ms={busy_ms}"
+            );
+        }
+    }
+
+    // Tray acceptance on the desktop of the test VM: the real notification area and Explorer.
+
+    /// The rectangle of `window`'s tray icon on the screen, while the shell shows it.
+    fn tray_icon_rect(window: HWND) -> Option<windows::Win32::Foundation::RECT> {
+        use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
+        let identifier = NOTIFYICONIDENTIFIER {
+            cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: window,
+            uID: TRAY_ID,
+            ..Default::default()
+        };
+        unsafe { Shell_NotifyIconGetRect(&identifier) }.ok()
+    }
+
+    /// Every visible top-level window: its handle, class name and text.
+    fn visible_windows() -> Vec<(usize, String, String)> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetClassNameW, GetWindowTextW, IsWindowVisible,
+        };
+        unsafe extern "system" fn collect(window: HWND, list: LPARAM) -> windows::core::BOOL {
+            let list = unsafe { &mut *(list.0 as *mut Vec<(usize, String, String)>) };
+            if unsafe { IsWindowVisible(window) }.as_bool() {
+                let mut class = [0u16; 128];
+                let mut text = [0u16; 512];
+                let class_length = unsafe { GetClassNameW(window, &mut class) }.max(0) as usize;
+                let text_length = unsafe { GetWindowTextW(window, &mut text) }.max(0) as usize;
+                list.push((
+                    window.0 as usize,
+                    String::from_utf16_lossy(&class[..class_length]),
+                    String::from_utf16_lossy(&text[..text_length]),
+                ));
+            }
+            true.into()
+        }
+        let mut list: Vec<(usize, String, String)> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(Some(collect), LPARAM(&mut list as *mut _ as isize));
+        }
+        list
+    }
+
+    /// The names that UI Automation shows under `window`, down to eight levels, as
+    /// "control type: name".
+    fn automation_texts(window: usize) -> Vec<String> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let Ok(automation) =
+                CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+            else {
+                return Vec::new();
+            };
+            let (Ok(walker), Ok(top)) = (
+                automation.RawViewWalker(),
+                automation.ElementFromHandle(HWND(window as *mut c_void)),
+            ) else {
+                return Vec::new();
+            };
+            let mut texts = Vec::new();
+            let mut stack = vec![(top, 0)];
+            while let Some((element, depth)) = stack.pop() {
+                if texts.len() > 500 {
+                    break;
+                }
+                let kind = element.CurrentControlType().map_or(0, |kind| kind.0);
+                let name = element
+                    .CurrentName()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    texts.push(format!("{kind}: {name}"));
+                }
+                if depth < 8 {
+                    let mut child = walker.GetFirstChildElement(&element).ok();
+                    while let Some(current) = child {
+                        child = walker.GetNextSiblingElement(&current).ok();
+                        stack.push((current, depth + 1));
+                    }
+                }
+            }
+            texts
+        }
+    }
+
+    /// Saves the whole screen as a 32-bit bitmap file.
+    fn save_screenshot(path: &Path) {
+        use windows::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPFILEHEADER, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+            CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, GetDC, GetDIBits, ReleaseDC, SRCCOPY,
+            SelectObject,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+        unsafe {
+            let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let screen = GetDC(None);
+            let memory = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            let previous = SelectObject(memory, HGDIOBJ(bitmap.0));
+            let _ = BitBlt(memory, 0, 0, width, height, Some(screen), 0, 0, SRCCOPY);
+            SelectObject(memory, previous);
+            let mut header = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            GetDIBits(
+                memory,
+                bitmap,
+                0,
+                height as u32,
+                Some(pixels.as_mut_ptr().cast()),
+                &mut header,
+                DIB_RGB_COLORS,
+            );
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(memory);
+            ReleaseDC(None, screen);
+            let offset = (size_of::<BITMAPFILEHEADER>() + size_of::<BITMAPINFOHEADER>()) as u32;
+            let file = BITMAPFILEHEADER {
+                bfType: 0x4D42,
+                bfSize: offset + pixels.len() as u32,
+                bfOffBits: offset,
+                ..Default::default()
+            };
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const file).cast::<u8>(),
+                size_of::<BITMAPFILEHEADER>(),
+            ));
+            bytes.extend_from_slice(core::slice::from_raw_parts(
+                (&raw const header.bmiHeader).cast::<u8>(),
+                size_of::<BITMAPINFOHEADER>(),
+            ));
+            bytes.extend_from_slice(&pixels);
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    /// The names of the tooltips that UI Automation finds among the desktop's windows, their
+    /// children and grandchildren.
+    fn automation_tooltips() -> Vec<String> {
+        use windows::Win32::UI::Accessibility::UIA_ToolTipControlTypeId;
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let Ok(automation) =
+                CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+            else {
+                return Vec::new();
+            };
+            let (Ok(walker), Ok(root)) = (automation.RawViewWalker(), automation.GetRootElement())
+            else {
+                return Vec::new();
+            };
+            let mut names = Vec::new();
+            let mut stack = vec![(root, 0)];
+            let mut visited = 0;
+            while let Some((element, depth)) = stack.pop() {
+                visited += 1;
+                if visited > 3_000 {
+                    break;
+                }
+                if element
+                    .CurrentControlType()
+                    .is_ok_and(|kind| kind == UIA_ToolTipControlTypeId)
+                    && let Ok(name) = element.CurrentName()
+                {
+                    names.push(name.to_string());
+                }
+                if depth < 3 {
+                    let mut child = walker.GetFirstChildElement(&element).ok();
+                    while let Some(current) = child {
+                        child = walker.GetNextSiblingElement(&current).ok();
+                        stack.push((current, depth + 1));
+                    }
+                }
+            }
+            names
+        }
+    }
+
+    /// Moves the pointer to `point` with real input, so that the window under it sees the move.
+    fn move_pointer(point: POINT) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+            MOUSEINPUT,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        let (left, top, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        let scale =
+            |value: i32, origin: i32, size: i32| (value - origin) * 65_535 / (size - 1).max(1);
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: scale(point.x, left, width),
+                    dy: scale(point.y, top, height),
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(send_input_batch(&[input]), "move the pointer");
+    }
+
+    /// The first value `probe` gives within `timeout`, asked every 100 ms.
+    fn within<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = probe() {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Lets the calling thread's windows handle what is queued for them.
+    fn pump_messages() {
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    /// Moves this executable's tray icon out of the overflow area, as the taskbar settings do.
+    /// Windows 11 keeps a new icon there, and an icon there cannot be hovered over.
+    fn promote_this_executables_tray_icon() -> bool {
+        let executable = std::env::current_exe().expect("executable");
+        let name = executable
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_lowercase();
+        let key = within(Duration::from_secs(10), || {
+            let output = std::process::Command::new("reg")
+                .args(["query", r"HKCU\Control Panel\NotifyIconSettings", "/s"])
+                .output()
+                .ok()?;
+            let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+            let mut current = None;
+            for line in listing.lines() {
+                if line.starts_with("HKEY_CURRENT_USER") {
+                    current = Some(line.trim().to_owned());
+                } else if line.contains("ExecutablePath") && line.to_lowercase().ends_with(&name) {
+                    return current.clone();
+                }
+            }
+            None
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        std::process::Command::new("reg")
+            .args([
+                "add",
+                &key,
+                "/v",
+                "IsPromoted",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Whether Explorer's taskbar exists.
+    fn taskbar_exists() -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+        unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.is_ok()
+    }
+
+    /// The agent's state on this thread, owning a window with the agent's procedure, so that the
+    /// tray code runs as in the agent. Explorer's TaskbarCreated reaches that window.
+    fn desktop_tray_state() -> (HWND, Receiver<QueuedInputEvent>) {
+        TASKBAR_CREATED.store(
+            unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            Ordering::Release,
+        );
+        let window = agent_procedure_window();
+        let (mut state, receiver) = test_gate_state(4);
+        state.window = window;
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        (window, receiver)
+    }
+
+    thread_local! {
+        /// The notifications that the icon of `notification_window` received (lParam's low word).
+        static ICON_NOTIFICATIONS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn notification_procedure(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == TRAY_CALLBACK_MESSAGE {
+            ICON_NOTIFICATIONS.with(|list| list.borrow_mut().push((lparam.0 as u32) & 0xffff));
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    /// A top-level window of the calling thread that records its icon's notifications.
+    fn notification_window() -> HWND {
+        let module = unsafe { GetModuleHandleW(None).expect("module") };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(notification_procedure),
+            hInstance: HINSTANCE(module.0),
+            lpszClassName: w!("AutoKeyboardLayotNotificationTest"),
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&class) };
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("AutoKeyboardLayotNotificationTest"),
+                w!("AutoKeyboardLayot notification test"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(HINSTANCE(module.0)),
+                None,
+            )
+            .expect("window")
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the notification area: run it alone in an interactive session on the test VM"]
+    fn the_tray_icon_on_the_desktop_shows_its_status_in_a_tooltip() {
+        let (_agent_window, _receiver) = desktop_tray_state();
+        // The icon belongs to a window that records what the shell tells it.
+        let window = notification_window();
+        let status = TrayStatus {
+            auto_enabled: true,
+            ..TrayStatus::initial(LayoutIndicator::English)
+        };
+        assert!(add_tray(window, status), "the icon was not added");
+        let expected = tray_tooltip(status);
+        let mode = expected.split(';').next().expect("mode").to_owned();
+        eprintln!("rect before promotion: {:?}", tray_icon_rect(window));
+        let promoted = promote_this_executables_tray_icon();
+        let rect = within(Duration::from_secs(10), || tray_icon_rect(window));
+        eprintln!("promoted={promoted} rect={rect:?} expected={mode:?}");
+        let mut shown = None;
+        if let Some(rect) = rect {
+            let center = POINT {
+                x: (rect.left + rect.right) / 2,
+                y: (rect.top + rect.bottom) / 2,
+            };
+            // Hover: from above the icon onto it, a little more after a moment.
+            move_pointer(POINT {
+                x: center.x,
+                y: center.y - 80,
+            });
+            thread::sleep(Duration::from_millis(300));
+            move_pointer(center);
+            thread::sleep(Duration::from_millis(100));
+            move_pointer(POINT {
+                x: center.x + 1,
+                y: center.y,
+            });
+            let mut captured = false;
+            let hovered = Instant::now();
+            shown = within(Duration::from_secs(6), || {
+                pump_messages();
+                if !captured && hovered.elapsed() > Duration::from_millis(2_500) {
+                    captured = true;
+                    save_screenshot(Path::new("tray-tooltip.bmp"));
+                }
+                // A classic tooltip carries its text; one of the XAML taskbar's popups shows it
+                // to UI Automation.
+                visible_windows()
+                    .into_iter()
+                    .flat_map(|(window, class, text)| {
+                        let mut seen = vec![format!("window {class}: {text}")];
+                        if class.contains("Popup") || class.to_lowercase().contains("tooltip") {
+                            seen.extend(
+                                automation_texts(window)
+                                    .into_iter()
+                                    .map(|text| format!("{class} automation {text}")),
+                            );
+                        }
+                        seen
+                    })
+                    .chain(
+                        automation_tooltips()
+                            .into_iter()
+                            .map(|name| format!("automation tooltip: {name}")),
+                    )
+                    .find(|seen| seen.contains(&mode))
+            });
+            if !captured {
+                save_screenshot(Path::new("tray-tooltip.bmp"));
+            }
+        }
+        pump_messages();
+        let notifications = ICON_NOTIFICATIONS.with(|list| list.borrow().clone());
+        eprintln!("notifications: {notifications:x?}");
+        eprintln!("tooltip: {shown:?}");
+        for (window, class, text) in visible_windows() {
+            eprintln!("  visible {window:#x} {class}: {text}");
+            if class.contains("Popup") || class.to_lowercase().contains("tooltip") {
+                for text in automation_texts(window) {
+                    eprintln!("    {text}");
+                }
+            }
+        }
+        for name in automation_tooltips() {
+            eprintln!("  automation tooltip: {name}");
+        }
+        drop(take_app_state());
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+        assert!(rect.is_some(), "the shell does not show the icon");
+        assert!(shown.is_some(), "no tooltip with the status appeared");
+        // Without NIF_SHOWTIP the shell leaves the hover to the program (NIN_POPUPOPEN), and a
+        // shell that honours that shows no tooltip at all.
+        assert!(
+            !notifications.contains(&windows::Win32::UI::Shell::NIN_POPUPOPEN),
+            "the shell asked for a popup of the program's own instead of showing the tooltip"
+        );
+    }
+
+    #[test]
+    #[ignore = "restarts Explorer: run it alone in an interactive session on the test VM"]
+    fn the_tray_icon_on_the_desktop_returns_after_explorer_restarts_without_a_false_pause_notice() {
+        let (window, _receiver) = desktop_tray_state();
+        // A conversion failed and paused automatic conversion, and the tray announced it.
+        APP_STATE.with(|slot| {
+            let borrowed = slot.borrow();
+            let metrics = &borrowed.as_ref().expect("state").metrics;
+            metrics.auto_enabled.store(false, Ordering::Release);
+            metrics.conversion_failures.store(1, Ordering::Release);
+            metrics
+                .last_failure_reason
+                .store(ConversionFailureReason::TextCommit as u8, Ordering::Release);
+        });
+        let indicator = LayoutIndicator::English;
+        assert!(add_tray(window, TrayStatus::initial(indicator)));
+        update_tray(indicator, Instant::now());
+        // From here on the calls to the notification area are recorded on their way to it.
+        SCRIPTED_SHELL.with(|slot| {
+            *slot.borrow_mut() = Some(ScriptedShell {
+                real: true,
+                ..ScriptedShell::default()
+            });
+        });
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "explorer.exe"])
+            .output();
+        let gone = within(Duration::from_secs(10), || {
+            (!taskbar_exists()).then_some(())
+        });
+        // Windows starts the shell again by itself; this does it when it does not.
+        thread::sleep(Duration::from_secs(3));
+        let restarted_by_windows = taskbar_exists();
+        if !restarted_by_windows {
+            let _ = std::process::Command::new("explorer.exe").spawn();
+        }
+        // The agent's timer ticks: TaskbarCreated reaches the window between them.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut back_since = None;
+        while Instant::now() < deadline {
+            pump_messages();
+            retry_tray(window);
+            update_tray(indicator, Instant::now());
+            let added = scripted_shell(|shell| {
+                shell
+                    .calls
+                    .iter()
+                    .any(|call| call.message == NIM_ADD && call.answer)
+            });
+            if added && back_since.is_none() {
+                back_since = Some(Instant::now());
+            }
+            if back_since.is_some_and(|since| since.elapsed() > Duration::from_secs(5)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let rect = tray_icon_rect(window);
+        let shell = SCRIPTED_SHELL
+            .with(|slot| slot.borrow_mut().take())
+            .expect("recording shell");
+        for call in &shell.calls {
+            eprintln!(
+                "  {:?} flags={:?} answer={} tip={:?}",
+                call.message, call.flags, call.answer, call.tip
+            );
+        }
+        let balloons = shell
+            .calls
+            .iter()
+            .filter(|call| call.flags.contains(NIF_INFO))
+            .count();
+        eprintln!(
+            "gone={:?} restarted_by_windows={restarted_by_windows} back={:?} rect={rect:?} \
+             balloons={balloons}",
+            gone.is_some(),
+            back_since.is_some()
+        );
+        drop(take_app_state());
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+        assert!(gone.is_some(), "Explorer did not stop");
+        assert!(back_since.is_some(), "the icon did not come back");
+        assert_eq!(balloons, 0, "an old failure was announced again");
+    }
+
+    #[test]
+    #[ignore = "runs the agent without Explorer: run it alone in an interactive session on the test VM \
+                with AutoRestartShell off"]
+    fn the_agent_on_the_desktop_starts_without_a_taskbar_and_adds_its_icon_once_there_is_one() {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_CLOSE};
+        let profile =
+            std::env::temp_dir().join(format!("akl-tray-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "explorer.exe"])
+            .output();
+        let gone = within(Duration::from_secs(10), || {
+            (!taskbar_exists()).then_some(())
+        });
+        // With AutoRestartShell off nothing brings the taskbar back on its own.
+        thread::sleep(Duration::from_secs(3));
+        let still_gone = !taskbar_exists();
+        let agent = thread::spawn(run);
+        let agent_window = within(Duration::from_secs(10), || {
+            unsafe { FindWindowW(WINDOW_CLASS, None) }.ok()
+        });
+        // The agent sends panics to its crash log; the test wants them on screen.
+        drop(std::panic::take_hook());
+        thread::sleep(Duration::from_secs(5));
+        let running_without_taskbar = !agent.is_finished();
+        let _ = std::process::Command::new("explorer.exe").spawn();
+        let taskbar = within(Duration::from_secs(60), || taskbar_exists().then_some(()));
+        let log = || fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+        let added = within(Duration::from_secs(60), || {
+            log()
+                .lines()
+                .any(|line| line.contains("event=tray") && line.contains("result=added"))
+                .then_some(())
+        });
+        let rect = agent_window.and_then(tray_icon_rect);
+        for line in log().lines().filter(|line| line.contains("event=tray")) {
+            eprintln!("  {line}");
+        }
+        eprintln!(
+            "gone={} still_gone={still_gone} window={} running={running_without_taskbar} \
+             taskbar={} added={} rect={rect:?}",
+            gone.is_some(),
+            agent_window.is_some(),
+            taskbar.is_some(),
+            added.is_some()
+        );
+        // A graceful close is declined while keys are retained; none are here, but ask again.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !agent.is_finished() && Instant::now() < deadline {
+            if let Some(window) = agent_window {
+                unsafe {
+                    let _ = PostMessageW(Some(window), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+        let stopped = agent.is_finished().then(|| agent.join());
+        let _ = fs::remove_dir_all(&profile);
+        assert!(gone.is_some() && still_gone, "Explorer was not stopped");
+        assert!(agent_window.is_some(), "the agent created no window");
+        assert!(
+            running_without_taskbar,
+            "the agent stopped without a taskbar"
+        );
+        assert!(taskbar.is_some(), "Explorer did not start again");
+        assert!(added.is_some(), "the agent did not add its icon");
+        assert!(
+            matches!(stopped, Some(Ok(Ok(())))),
+            "the agent did not stop cleanly"
+        );
+    }
+
+    // Privacy acceptance on the desktop of the test VM: nothing about typing in a blocked field.
+
+    /// A form with a user name box above a password box; its title is the first argument and its
+    /// top edge the second. The message 0x8041 brings it to the front with the user name box
+    /// focused, as a window switch would, without any input the agent could take for injected.
+    const PRIVACY_FORM_SCRIPT: &str = r#"param([string]$Title, [int]$Top)
+$ErrorActionPreference = 'Stop'
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class AklPrivacyForm : Form {
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr process);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint to, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    readonly TextBox user = new TextBox();
+    readonly TextBox password = new TextBox();
+    public AklPrivacyForm(string title, int top) {
+        Text = title;
+        StartPosition = FormStartPosition.Manual;
+        SetBounds(80, top, 640, 200);
+        System.Drawing.Font font = new System.Drawing.Font("Segoe UI", 16f);
+        password.UseSystemPasswordChar = true;
+        password.Dock = DockStyle.Bottom;
+        password.Font = font;
+        user.Dock = DockStyle.Top;
+        user.Font = font;
+        Controls.Add(password);
+        Controls.Add(user);
+    }
+    void TakeForeground() {
+        uint other = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint own = GetCurrentThreadId();
+        bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+        SetForegroundWindow(Handle);
+        Activate();
+        user.Focus();
+        if (attached) { AttachThreadInput(own, other, false); }
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x8041) {
+            TakeForeground();
+            m.Result = new IntPtr(1);
+            return;
+        }
+        base.WndProc(ref m);
+    }
+}
+'@
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::Run((New-Object AklPrivacyForm($Title, $Top)))
+"#;
+
+    /// A privacy form of `PRIVACY_FORM_SCRIPT` run by `host`; ended however the test ends.
+    struct PrivacyForm {
+        child: std::process::Child,
+        title: Vec<u16>,
+    }
+
+    impl PrivacyForm {
+        const ACTIVATE: u32 = 0x8041;
+
+        fn start(host: &Path, script: &Path, title: &str, top: i32) -> Self {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let child = std::process::Command::new(host)
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(script)
+                .arg(title)
+                .arg(top.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("start the form");
+            unsafe {
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(child.id());
+            }
+            Self {
+                child,
+                title: title.encode_utf16().chain([0]).collect(),
+            }
+        }
+
+        /// Asks the form to come to the front with its user name box focused, and waits until it
+        /// is there.
+        fn activate(&self) -> ForegroundContext {
+            use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Ok(window) = unsafe { FindWindowW(None, PCWSTR(self.title.as_ptr())) } {
+                    DesktopField::send(window.0 as usize, Self::ACTIVATE, 0, 0);
+                    let settled = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < settled {
+                        if let Some(context) = current_foreground_context()
+                            && context.process_id == self.child.id()
+                            && context.focus != 0
+                            && context.focus != context.hwnd
+                        {
+                            return context;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the form did not take the foreground: {:?}",
+                    current_foreground_context()
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+
+    impl Drop for PrivacyForm {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The `captured_ms` of a diagnostics record.
+    fn captured_ms(line: &str) -> Option<u128> {
+        line.split(' ')
+            .find_map(|field| field.strip_prefix("captured_ms="))
+            .and_then(|value| value.parse().ok())
+    }
+
+    fn now_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    #[test]
+    #[ignore = "runs the agent on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_writes_nothing_about_typing_in_an_excluded_program_or_a_password_field()
+     {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_CLOSE};
+        let profile =
+            std::env::temp_dir().join(format!("akl-privacy-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        // The excluded program is a copy of PowerShell under a name of its own.
+        let excluded_host = profile.join("akl-excluded-field.exe");
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let powershell =
+            PathBuf::from(system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        fs::copy(&powershell, &excluded_host).expect("copy PowerShell");
+        let script = profile.join("akl-privacy-form.ps1");
+        fs::write(&script, PRIVACY_FORM_SCRIPT).expect("form script");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        document.process_exclusions = vec!["akl-excluded-field.exe".to_owned()];
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let escape = [
+            keyboard_input(VK_ESCAPE, 0, Default::default()),
+            keyboard_input(VK_ESCAPE, 0, KEYEVENTF_KEYUP),
+        ];
+        assert!(send_input_batch(&escape));
+        let allowed =
+            PrivacyForm::start(&powershell, &script, "AutoKeyboardLayot allowed form", 60);
+        let excluded = PrivacyForm::start(
+            &excluded_host,
+            &script,
+            "AutoKeyboardLayot excluded form",
+            320,
+        );
+        put_user_clipboard("akl-password");
+        allowed.activate();
+        let agent = thread::spawn(run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let agent_window = loop {
+            if let Ok(window) = unsafe { FindWindowW(WINDOW_CLASS, None) } {
+                break window;
+            }
+            assert!(Instant::now() < deadline, "the agent did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        drop(std::panic::take_hook());
+        thread::sleep(Duration::from_secs(2));
+        let press = |keys: &[(VIRTUAL_KEY, bool)]| {
+            for &(key, up) in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                let flags = if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                };
+                let input = keyboard_input_with_marker(key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                assert!(send_input_batch(&[input]));
+                thread::sleep(Duration::from_millis(40));
+            }
+        };
+        let tap = |keys: &[VIRTUAL_KEY]| {
+            for &key in keys {
+                press(&[(key, false), (key, true)]);
+            }
+        };
+        let paste = || {
+            press(&[
+                (VK_LCONTROL, false),
+                (VIRTUAL_KEY(0x56), false),
+                (VIRTUAL_KEY(0x56), true),
+                (VK_LCONTROL, true),
+            ]);
+        };
+        // The keys of a blocked phase follow its focus change at once, as a user's would: given
+        // time, the periodic field check would find the field blocked before them.
+        // A word begun in the allowed form.
+        allowed.activate();
+        tap(&[VIRTUAL_KEY(0x47), VIRTUAL_KEY(0x48), VIRTUAL_KEY(0x42)]);
+        thread::sleep(Duration::from_millis(300));
+        // The excluded program: a paste, keys that type nothing, then letters.
+        let excluded_from = now_ms();
+        excluded.activate();
+        paste();
+        tap(&[
+            VK_SPACE,
+            VK_BACK,
+            VIRTUAL_KEY(0x41),
+            VIRTUAL_KEY(0x42),
+            VK_SPACE,
+        ]);
+        thread::sleep(Duration::from_millis(300));
+        let excluded_until = now_ms();
+        // Back in the allowed form: a user name, then Tab to its password box and a paste there.
+        allowed.activate();
+        tap(&[
+            VIRTUAL_KEY(0x55),
+            VIRTUAL_KEY(0x53),
+            VIRTUAL_KEY(0x45),
+            VIRTUAL_KEY(0x52),
+        ]);
+        press(&[(VK_TAB, false), (VK_TAB, true)]);
+        thread::sleep(Duration::from_millis(150));
+        let password_from = now_ms();
+        paste();
+        tap(&[VK_SPACE, VIRTUAL_KEY(0x41), VIRTUAL_KEY(0x42), VK_SPACE]);
+        thread::sleep(Duration::from_millis(1_500));
+        let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
+        while !agent.is_finished() && Instant::now() < deadline {
+            unsafe {
+                let _ = PostMessageW(Some(agent_window), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+        let stopped = agent.join();
+        let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+        drop(allowed);
+        drop(excluded);
+        let _ = fs::remove_dir_all(&profile);
+        // Lines about typing: keys, words, the field check, shortcuts, the gate, slow callbacks.
+        // The queue waits of the timer's own refreshes are not about keys.
+        let about_typing = |line: &str| {
+            let queued_typing = line.contains("event=input_queue ")
+                && ["kind=key ", "kind=gate_ack ", "kind=recovery"]
+                    .iter()
+                    .any(|kind| line.contains(kind));
+            queued_typing
+                || [
+                    "event=input ",
+                    "event=word ",
+                    "event=word_discard ",
+                    "event=candidate ",
+                    "event=hotkey ",
+                    "event=privacy_probe ",
+                    "event=gate ",
+                    "event=hook_slow hook=keyboard",
+                    "event=conversion ",
+                    "event=paste",
+                ]
+                .iter()
+                .any(|event| line.contains(event))
+        };
+        let mut leaks = Vec::new();
+        for line in log.lines() {
+            let at = captured_ms(line).unwrap_or(0);
+            let phase = if (excluded_from..excluded_until).contains(&at) {
+                "excluded"
+            } else if at >= password_from && !line.contains("phase=shutdown") {
+                "password"
+            } else {
+                "allowed"
+            };
+            eprintln!("{phase:>8} {line}");
+            if phase != "allowed" && about_typing(line) {
+                leaks.push(format!("{phase}: {line}"));
+            }
+        }
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the agent did not stop cleanly"
+        );
+        assert!(
+            leaks.is_empty(),
+            "lines about typing in a blocked field: {leaks:#?}"
+        );
     }
 }

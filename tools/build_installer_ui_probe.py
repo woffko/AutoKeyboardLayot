@@ -1,4 +1,8 @@
-"""Build an installation-disabled UI probe, never launch or publish it."""
+"""Build an installation-disabled UI probe, never launch or publish it.
+
+Usage: build_installer_ui_probe.py --output target/NEW_DIRECTORY --iscc PATH_TO_ISCC --notices NOTICES_FILE
+The notices file may be an incomplete one: the probe installs nothing.
+"""
 import argparse
 import hashlib
 import json
@@ -8,8 +12,15 @@ import tomllib
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--output', default='target/installer-ui-probe-20260912-01')
+parser.add_argument('--output', required=True, help='A new child directory of target/')
+parser.add_argument('--iscc', required=True, help='Path to the reviewed Inno Setup compiler')
+parser.add_argument('--notices', required=True, help='Third-party notices file to bundle')
 args = parser.parse_args()
+compiler = Path(args.iscc)
+notices = (root / args.notices).resolve()
+for path, what in ((compiler, 'Inno Setup compiler'), (notices, 'notices file')):
+    if not path.is_file():
+        raise SystemExit(f'The {what} {path} does not exist.')
 output = (root / args.output).resolve()
 if output == root / 'target' or not output.is_relative_to(root / 'target'):
     raise SystemExit('Output must be a fresh child of this project target directory.')
@@ -29,10 +40,8 @@ def windows(path):
 release = root / "target/xwin-hotkeys/x86_64-pc-windows-msvc/release"
 app = release / "AutoKeyboardLayot.exe"
 helper = release / "installer-package-helper.exe"
-notices = root / "target/base-notices-actual-build-20260909/THIRD-PARTY-NOTICES.incomplete.txt"
 version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
-compiler = "/mnt/c/Users/w0w/AppData/Local/Programs/Inno Setup 6/ISCC.exe"
-command = [compiler, "/DInstallerUiProbe", "/DAppVersion=" + version,
+command = [str(compiler), "/DInstallerUiProbe", "/DAppVersion=" + version,
            "/DAppExecutable=" + windows(app), "/DPackageHelper=" + windows(helper),
            "/DBundleNotices=" + windows(notices), "/O" + windows(output),
            windows(root / "installer/AutoKeyboardLayot.iss")]
