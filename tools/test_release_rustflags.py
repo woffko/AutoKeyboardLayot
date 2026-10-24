@@ -19,11 +19,13 @@ class ReleaseRustflagsTests(unittest.TestCase):
             (root / '.cargo/config.toml').write_text(
                 '[target.x86_64-pc-windows-msvc]\nrustflags = ["-C", "target-feature=+crt-static"]\n',
                 encoding='utf-8')
-            flags = release_rustflags(root, Path('/srv/builder/.cargo'), Path('/opt/toolchain'))
+            cargo_home, sysroot = Path('/srv/builder/.cargo'), Path('/opt/toolchain')
+            flags = release_rustflags(root, cargo_home, sysroot)
+        # The paths as this platform writes them (backslashes on Windows).
         self.assertEqual(flags, [
             '-C', 'target-feature=+crt-static',
-            '--remap-path-prefix=/srv/builder/.cargo=/cargo',
-            '--remap-path-prefix=/opt/toolchain=/rust',
+            f'--remap-path-prefix={cargo_home}=/cargo',
+            f'--remap-path-prefix={sysroot}=/rust',
             f'--remap-path-prefix={root}=.',
         ])
         self.assertEqual(encoded(flags).split('\x1f'), flags)
@@ -40,11 +42,13 @@ class ReleaseRustflagsTests(unittest.TestCase):
         paths = [Path('/srv/builder/.cargo'), Path('/srv/builder/checkout')]
         clean = b'\x00/cargo/registry/src/fst-0.4.7/src/raw.rs\x00./src/main.rs\x00'
         self.assertEqual(leaked_paths(clean, paths), [])
-        self.assertEqual(leaked_paths(clean + b'/srv/builder/checkout/src/lib.rs', paths), [paths[1]])
+        leaked = f'{paths[1]}/src/lib.rs'.encode('utf-8')
+        self.assertEqual(leaked_paths(clean + leaked, paths), [paths[1]])
         # Windows resources and wide strings hold text as UTF-16LE.
-        wide = '/srv/builder/.cargo/registry'.encode('utf-16le')
+        wide = f'{paths[0]}/registry'.encode('utf-16le')
         self.assertEqual(leaked_paths(clean + wide, paths), [paths[0]])
 
+    @unittest.skipIf(os.name == 'nt', 'a shell stub for rustc and symbolic links; release builds run from WSL')
     def test_the_machine_paths_are_the_resolved_ones_the_compiler_sees(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()
