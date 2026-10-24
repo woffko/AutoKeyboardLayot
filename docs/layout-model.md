@@ -311,7 +311,8 @@ takes about a minute on a GPU and longer on a CPU).
    differ from each other). The shipped `en-ru-et.aklm` was trained before
    seeding, so it can be retrained to the same quality but not rebuilt byte
    for byte. `tools/test_layout_model_training.py` checks the seeding with
-   the environment of step 3.
+   the environment of step 3; `tools/verify-wsl.sh` runs it with that
+   environment, on the CPU only, whenever `target/layout-model/.venv` exists.
 
 6. **Build it in.** Copy `target/layout-model/model.aklm` over
    `data/layout-model/en-ru-et.aklm` and `target/layout-model/fixture.json`

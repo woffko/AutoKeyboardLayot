@@ -28,7 +28,9 @@ Runs the complete local verification gate from WSL, one logged step at a time:
   05 test-default      cargo test --locked --all-targets
   06 test-no-default   cargo test --locked --no-default-features
   07 validate-locales  cargo run --locked --example validate_locales -- data/package-locales --require-complete
-  08 python-tests      python3 -m unittest discover -s tools -p "test_*.py"
+  08 python-tests      python3 -m unittest discover -s tools -p "test_*.py", then the torch tests (layout model
+                       training) with target/layout-model/.venv when it exists, on the CPU only
+                       (CUDA_VISIBLE_DEVICES empty); a skip there fails the step (tools/python_test_step.py)
   09 windows-tests     cross-build the Windows unit tests with cargo-xwin and run them on the
                        Windows host with LOCALAPPDATA pointing at a temporary directory
   10 clippy-signing    cargo clippy --locked --features signing-tools --all-targets -- -D warnings
@@ -55,9 +57,9 @@ Logs and summary.txt are written to target/verify/<UTC timestamp>/. The exit sta
 every selected step passed.
 
 Test-count floors: AKL_MIN_LINUX_LIB_TESTS (default 377) applies to the library tests of step 05,
-AKL_MIN_WINDOWS_TESTS (default 370) to step 09 and AKL_MIN_WINDOWS_ALL_TESTS (default 1523, both
-configurations together) to step 15. Raise them when tests are added; never lower them to hide a
-deleted test.
+AKL_MIN_PYTHON_TESTS (default 125) to the Python unit tests of step 08, AKL_MIN_WINDOWS_TESTS
+(default 370) to step 09 and AKL_MIN_WINDOWS_ALL_TESTS (default 1523, both configurations together)
+to step 15. Raise them when tests are added; never lower them to hide a deleted test.
 EOF
 }
 
@@ -102,6 +104,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 2
 cd "$repo_root" || exit 2
 
 min_linux_lib=${AKL_MIN_LINUX_LIB_TESTS:-377}
+min_python=${AKL_MIN_PYTHON_TESTS:-125}
 min_windows=${AKL_MIN_WINDOWS_TESTS:-370}
 min_windows_all=${AKL_MIN_WINDOWS_ALL_TESTS:-1523}
 
@@ -210,7 +213,10 @@ step_clippy_windows() { run_logged cargo clippy --locked --target x86_64-pc-wind
 step_test_default() { run_logged cargo test --locked --all-targets; }
 step_test_no_default() { run_logged cargo test --locked --no-default-features; }
 step_validate_locales() { run_logged cargo run --locked --example validate_locales -- data/package-locales --require-complete; }
-step_python_tests() { run_logged env PYTHONUTF8=1 python3 -m unittest discover -s tools -p 'test_*.py'; }
+step_python_tests() {
+    run_logged env PYTHONUTF8=1 python3 -m unittest discover -s tools -p 'test_*.py' &&
+        run_logged python3 tools/python_test_step.py torch
+}
 step_clippy_signing() { run_logged cargo clippy --locked --features signing-tools --all-targets -- -D warnings; }
 step_test_signing() { run_logged cargo test --locked --features signing-tools --all-targets; }
 step_clippy_windows_installer() { run_logged cargo clippy --locked --target x86_64-pc-windows-msvc --no-default-features --features installer-tools --all-targets -- -D warnings; }
@@ -428,6 +434,9 @@ run_one() {
     case "$name" in
         test-default | test-no-default | test-signing | windows-tests | windows-signing-tests | windows-all-tests)
             evaluate_counts "$name" "$log" || status=1
+            ;;
+        python-tests)
+            step_detail=$(python3 tools/python_test_step.py detail "$log" "$min_python") || status=1
             ;;
     esac
     elapsed=$((SECONDS - begin))
