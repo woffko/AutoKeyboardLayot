@@ -70,11 +70,14 @@ ACCEPTED_ADVISORIES = {
     'RUSTSEC-2024-0436',  # paste, build-time proc macro of the Slint compiler
     'RUSTSEC-2026-0206',  # rustybuzz, Slint SVG text shaping
     'RUSTSEC-2026-0192',  # ttf-parser, Slint SVG font parsing
+    'RUSTSEC-2026-0370',  # zvariant, Linux accessibility bridge of Slint (AT-SPI)
+    'RUSTSEC-2026-0371',  # zbus_names, same path
+    'RUSTSEC-2026-0372',  # zvariant_derive, same path
 }
 
 
 class AuditPolicy(unittest.TestCase):
-    def test_exactly_the_four_reviewed_notices_are_ignored(self):
+    def test_exactly_the_reviewed_notices_are_ignored(self):
         policy = tomllib.loads((ROOT / '.cargo/audit.toml').read_text(encoding='utf-8'))
         self.assertEqual(set(policy['advisories']['ignore']), ACCEPTED_ADVISORIES)
         self.assertEqual(len(policy['advisories']['ignore']), len(ACCEPTED_ADVISORIES))
