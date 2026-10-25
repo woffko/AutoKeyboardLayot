@@ -26774,6 +26774,196 @@ public class AklWindowlessReader : Form {
         }
     }
 
+    /// Desktop acceptance of trailing marks, the Pause token and conversion before Enter on the
+    /// test VM, with the busy field turned multiline and routed by `route`: "gjnjv/" and a Space,
+    /// "gjnjv/ghbdtn" and Pause, and twenty times "ghbdtn" and an Enter that must arrive once.
+    fn desktop_marks_tokens_and_enter(route: &str) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardLayoutList, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, WM_CLOSE, WM_INPUTLANGCHANGEREQUEST,
+        };
+        let mut layouts = [HKL::default(); 16];
+        let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) }.max(0) as usize;
+        let languages: Vec<usize> = layouts[..count.min(layouts.len())]
+            .iter()
+            .map(|layout| layout.0 as usize & 0xffff)
+            .collect();
+        assert!(
+            languages.contains(&0x0409) && languages.contains(&0x0419),
+            "the account needs the English and Russian layouts: {languages:x?}"
+        );
+        let profile =
+            std::env::temp_dir().join(format!("akl-agent-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        document.settings.suppress_after_manual_layout_change = false;
+        document.settings.convert_on_enter = true;
+        let rule = format!("powershell.exe = {route}");
+        document.backend_rules =
+            BackendRules::from_lines([rule.as_str(), "* = capability-probe"]).expect("rules");
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        let script =
+            DESKTOP_FIELD_SCRIPT.replace("box.Multiline = false;", "box.Multiline = true;");
+        let field = DesktopField::start_script(&script, w!("AutoKeyboardLayot busy field"));
+        let agent = thread::spawn(run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let agent_window = loop {
+            if let Ok(window) = unsafe { FindWindowW(WINDOW_CLASS, None) } {
+                break window;
+            }
+            assert!(Instant::now() < deadline, "the agent did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        drop(std::panic::take_hook());
+        thread::sleep(Duration::from_secs(2));
+        let type_keys = |keys: &[VIRTUAL_KEY]| {
+            for key in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                for flags in [Default::default(), KEYEVENTF_KEYUP] {
+                    let input =
+                        keyboard_input_with_marker(*key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                    assert!(send_input_batch(&[input]));
+                    thread::sleep(Duration::from_millis(40));
+                }
+            }
+        };
+        let english = 0x0409_0409usize;
+        let to_english = || {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(field.context.hwnd as *mut c_void)),
+                    WM_INPUTLANGCHANGEREQUEST,
+                    WPARAM(0),
+                    LPARAM(english as isize),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while current_foreground_context().is_none_or(|context| context.layout != english)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            thread::sleep(Duration::from_millis(300));
+        };
+        // A RichEdit control ends its lines with "\r" or "\r\n".
+        let text = |before: &str| {
+            field
+                .settled_text(before)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+        };
+        let (g, j, n, v, h, b, d, t) = (
+            VIRTUAL_KEY(0x47),
+            VIRTUAL_KEY(0x4A),
+            VIRTUAL_KEY(0x4E),
+            VIRTUAL_KEY(0x56),
+            VIRTUAL_KEY(0x48),
+            VIRTUAL_KEY(0x42),
+            VIRTUAL_KEY(0x44),
+            VIRTUAL_KEY(0x54),
+        );
+        let slash = VIRTUAL_KEY(0xBF);
+        let mut outcomes: Vec<(String, String, String)> = Vec::new();
+        // A trailing mark: "потом." typed in the English layout.
+        field.set_text("");
+        to_english();
+        type_keys(&[g, j, n, j, v, slash, VK_SPACE]);
+        let marked = text("gjnjv/ ");
+        eprintln!("mark: converted={}", marked == "потом. ");
+        outcomes.push(("mark".to_owned(), marked, "потом. ".to_owned()));
+        // The whole token since the last Space, converted by Pause.
+        field.set_text("");
+        to_english();
+        type_keys(&[g, j, n, j, v, slash, g, h, b, d, t, n]);
+        let typed = text("");
+        type_keys(&[VK_PAUSE]);
+        let token = text(&typed);
+        eprintln!("token: converted={}", token == "потом.привет");
+        outcomes.push(("token".to_owned(), token, "потом.привет".to_owned()));
+        // Twenty words before an Enter: each converted, each Enter delivered once.
+        field.set_text("");
+        let mut expected = String::new();
+        for round in 0..20 {
+            to_english();
+            let before = text("");
+            type_keys(&[g, h, b, d, t, n, VK_RETURN]);
+            expected.push_str("привет\n");
+            let after = text(&before);
+            if after != expected {
+                eprintln!(
+                    "enter: round {round} differs, {} chars",
+                    after.chars().count()
+                );
+            }
+        }
+        let lines = text("");
+        eprintln!(
+            "enter: converted_lines={} newlines={} of 20",
+            lines.matches("привет\n").count(),
+            lines.matches('\n').count()
+        );
+        outcomes.push(("enter".to_owned(), lines, expected));
+        let record = |filter: &dyn Fn(&str) -> bool| {
+            let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+            for line in log.lines().filter(|line| filter(line)) {
+                eprintln!("  {line}");
+            }
+        };
+        record(&|line| {
+            line.contains("event=paste")
+                || line.contains("event=conversion")
+                || line.contains("event=word")
+                || line.contains("event=hotkey")
+                || line.contains("event=context")
+                || line.contains("phase=armed")
+                || line.contains("phase=release_forced")
+                || line.contains("phase=abort")
+        });
+        let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
+        while !agent.is_finished() && Instant::now() < deadline {
+            unsafe {
+                let _ = PostMessageW(Some(agent_window), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+        assert!(agent.is_finished(), "the agent declined to stop");
+        let stopped = agent.join();
+        drop(field);
+        let _ = fs::remove_dir_all(&profile);
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the agent did not stop cleanly"
+        );
+        for (case, text, expected) in outcomes {
+            assert_eq!(text, expected, "{route} {case}");
+        }
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_marks_tokens_and_words_before_enter_by_paste() {
+        desktop_marks_tokens_and_enter("protected-paste");
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_marks_tokens_and_words_before_enter_by_replay() {
+        desktop_marks_tokens_and_enter("physical-replay");
+    }
+
     // Tray acceptance on the desktop of the test VM: the real notification area and Explorer.
 
     /// The rectangle of `window`'s tray icon on the screen, while the shell shows it.
