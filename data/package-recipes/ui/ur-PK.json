@@ -1,6 +1,6 @@
 {
   "package_id": "ur-PK",
-  "revision": 1,
+  "revision": 2,
   "ui_locale": "ur",
   "components": {
     "ui": "../../package-locales/ur.json",
