@@ -97,9 +97,9 @@ use windows::{
                 GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
                 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
                 MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_APPS,
-                VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-                VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
-                VK_MENU, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
+                VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+                VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
+                VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
                 VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
                 VK_UP,
             },
@@ -9032,9 +9032,12 @@ impl InputProcessor {
                 // Punctuation right after a word stays with it until the Space ("gjnjv/" is
                 // "потом."): the target layouts read the key as no letter either, or it would
                 // continue the word as one.
+                // A keypad key is no mark: the keypad's "." prints "," in Russian, which is not
+                // what a full stop typed there meant.
                 if let Some(character) = printable
                     && input_event == InputEvent::Boundary
                     && !character.is_whitespace()
+                    && !is_keypad_key(event.virtual_key)
                     && self.session.buffered_character_count() != 0
                     && !self.session.is_suppressed()
                 {
@@ -12478,6 +12481,11 @@ fn build_balanced_replay_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
 }
 
 /// Whether a virtual key is a keypad digit or the keypad decimal key.
+/// A key of the numeric keypad: a digit, its decimal key or an operator.
+fn is_keypad_key(virtual_key: u32) -> bool {
+    (u32::from(VK_NUMPAD0.0)..=u32::from(VK_DIVIDE.0)).contains(&virtual_key)
+}
+
 fn is_keypad_digit_key(virtual_key: u32) -> bool {
     u16::try_from(virtual_key)
         .is_ok_and(|key| (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&key) || key == VK_DECIMAL.0)
