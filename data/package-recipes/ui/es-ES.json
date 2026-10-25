@@ -1,6 +1,6 @@
 {
   "package_id": "es-ES",
-  "revision": 1,
+  "revision": 2,
   "ui_locale": "es",
   "components": {
     "ui": "../../package-locales/es.json",
