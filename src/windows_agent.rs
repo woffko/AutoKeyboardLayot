@@ -24910,6 +24910,166 @@ mod tests {
         assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
     }
 
+    /// A key that is no letter of the test keyboard in any layout ends nothing: `g`.
+    const G: u32 = 0x22;
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_token_ends_at_more_keys_than_it_may_hold() {
+        let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &[G; MANUAL_TOKEN_MAX_KEYS]);
+        assert_eq!(processor.pause_keys.len(), MANUAL_TOKEN_MAX_KEYS);
+        type_keys(&mut processor, foreground, &[G]);
+        assert!(processor.pause_keys.is_empty());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn erasing_the_space_after_a_token_returns_to_it_for_pause() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GJNJV_MARK_GHBDTN);
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 14, 0)
+        });
+        assert_eq!(processor.pause_keys.len(), 12);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_shortcut_enter_a_click_and_a_new_input_epoch_end_the_token() {
+        // Each of them may change the text before the caret or move the caret.
+        let typed = || {
+            let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            assert_eq!(processor.pause_keys.len(), 6);
+            (processor, foreground)
+        };
+        // Ctrl+V.
+        let (mut processor, foreground) = typed();
+        processor.process_key(RawKeyEvent {
+            foreground,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..test_raw_key(WM_KEYDOWN, VK_LCONTROL, 7, 0)
+        });
+        processor.process_key(RawKeyEvent {
+            foreground,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..letter(0x56, 8)
+        });
+        assert!(processor.pause_keys.is_empty(), "shortcut");
+        // Enter.
+        let (mut processor, foreground) = typed();
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_RETURN, 7, 0)
+        });
+        assert!(processor.pause_keys.is_empty(), "enter");
+        // A click.
+        let (mut processor, _foreground) = typed();
+        let epoch = processor.metrics.input_epoch.load(Ordering::Acquire);
+        processor.process(QueuedInputEvent {
+            configuration: None,
+            captured_at: Instant::now(),
+            epoch,
+            event: RawInputEvent::Mouse,
+        });
+        assert!(processor.pause_keys.is_empty(), "click");
+        // A new input epoch (a queue overflow, a settings Apply).
+        let (mut processor, _foreground) = typed();
+        let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.reset_for_epoch(epoch);
+        assert!(processor.pause_keys.is_empty(), "epoch");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_forced_conversion_starts_a_new_token() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
+        assert!(processor.pause_keys.is_empty());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_key_typed_where_the_field_turned_into_a_password_field_ends_the_token() {
+        let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        // The first check passes, the second finds a password field.
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-password-later", move || {
+                move |_| {
+                    (counted.fetch_add(1, Ordering::SeqCst) == 1)
+                        .then_some(PrivacyBlockReason::PasswordField)
+                }
+            })
+            .unwrap(),
+        );
+        processor.privacy_needs_check = true;
+        type_keys(&mut processor, foreground, &GHBDTN);
+        assert_eq!(processor.pause_keys.len(), 6);
+        processor.privacy_needs_check = true;
+        type_keys(&mut processor, foreground, &[G]);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(processor.pause_keys.is_empty());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn leaving_a_field_remembers_its_whole_token() {
+        let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GJNJV_MARK_GHBDTN);
+        let other = ForegroundContext {
+            hwnd: foreground.hwnd + 1,
+            ..foreground
+        };
+        processor.process_key(RawKeyEvent {
+            scan_code: G,
+            foreground: other,
+            ..letter(0x41, 13)
+        });
+        let remembered = processor
+            .remembered_words
+            .iter()
+            .find(|entry| same_input_target(entry.target, foreground))
+            .expect("the field is remembered");
+        assert_eq!(
+            remembered.word.as_ref().map(|word| word.replay_keys.len()),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn a_token_being_typed_wins_over_a_remembered_word() {
+        let target = recent_ok_foreground();
+        let now = Instant::now();
+        let mut processor = processor_at_the_test_target();
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        processor.last_boundary = Some(test_last_boundary(&processor, 6));
+        processor.remember_word(target, Some(target.layout), now);
+        processor.last_boundary = None;
+        // A punctuation key: a token, though no word of the automatic conversion.
+        processor.pause_keys = test_last_boundary(&processor, 1).replay_keys;
+        assert!(processor.replay_keys.is_empty());
+        assert_eq!(processor.restore_remembered_word(target, now), None);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_manual_layout_switch_keeps_the_whole_token_for_pause() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GJNJV_MARK_GHBDTN);
+        // Alt+Shift: the field shows the Russian layout; the token was typed in English.
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0419,
+            ..foreground
+        });
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
     fn pause_converts_nothing_typed_in_a_password_field() {
