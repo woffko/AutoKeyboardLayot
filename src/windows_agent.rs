@@ -7560,6 +7560,10 @@ struct InputProcessor {
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
+    /// Every key typed since the last Space, Tab or Enter in this field, whatever it printed
+    /// (letters, digits, punctuation): what Pause converts. A key that may move the caret or
+    /// change other text, a click and a field change end it; Backspace erases its last key.
+    pause_keys: Vec<ReplayKey>,
     // Field-inspection fallback authorizes manual input only, until a check of the
     // same field passes before the word ends (`manual_only_inspection`); the
     // recent-good rule's softened failure is no such check.
@@ -7752,6 +7756,7 @@ impl InputProcessor {
             last_process_id: None,
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
+            pause_keys: Vec::new(),
             manual_only_word: false,
             manual_only_inspection: false,
             manual_token_start_known: false,
@@ -8298,6 +8303,7 @@ impl InputProcessor {
             self.invalidate_conversion_state();
             self.session.clear();
             self.replay_keys.clear();
+            self.pause_keys.clear();
             return;
         }
 
@@ -8311,6 +8317,7 @@ impl InputProcessor {
                 self.recovered_mid_word = false;
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
+                self.pause_keys.clear();
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.session.handle(InputEvent::Mouse, None, &self.detector);
@@ -8318,6 +8325,7 @@ impl InputProcessor {
             }
             RawInputEvent::ExternalInjection => {
                 self.last_word_reset = "external-input";
+                self.pause_keys.clear();
                 self.invalidate_conversion_state();
                 self.suppress_session();
                 self.mark_privacy_dirty(true);
@@ -8522,6 +8530,7 @@ impl InputProcessor {
             self.session.clear();
         }
         self.replay_keys.clear();
+        self.pause_keys.clear();
         self.modifiers = Modifiers::default();
         self.resync_modifiers = true;
         self.metrics
@@ -8677,6 +8686,7 @@ impl InputProcessor {
             if let Some(previous) = self.last_key_foreground {
                 self.remember_word(previous, self.last_layout, Instant::now());
             }
+            self.pause_keys.clear();
             // A new window may belong to a new process that reuses the previous one's ID: its
             // image, integrity and exclusion are read again instead of taken from the cache. A
             // blocked program is blocked before anything about this key is written.
@@ -8727,7 +8737,13 @@ impl InputProcessor {
                 // A manual switch ends automatic conversion of this word, not Pause: the word
                 // typed so far, or else the last completed word, stays available to the hotkey
                 // and is read in the layout it was typed in. Any other key drops it as usual.
+                let pause_keys = core::mem::take(&mut self.pause_keys);
                 let typed = core::mem::take(&mut self.replay_keys);
+                let typed = if pause_keys.is_empty() {
+                    typed
+                } else {
+                    pause_keys
+                };
                 let kept = match self.last_layout {
                     Some(typed_layout) if !typed.is_empty() => Some(LastBoundary {
                         replay_keys: typed,
@@ -8845,6 +8861,7 @@ impl InputProcessor {
         if self.modifiers.has_shortcut_modifier() {
             self.last_word_reset = "shortcut";
             self.replay_keys.clear();
+            self.pause_keys.clear();
             self.last_boundary = None;
             self.transpose_cycle = None;
             if event.virtual_key as u16 == VK_BACK.0
@@ -8872,6 +8889,7 @@ impl InputProcessor {
 
         match event.virtual_key as u16 {
             key if key == VK_BACK.0 => {
+                self.erase_pause_key(previous_boundary.as_ref(), event);
                 if self.settings.suppress_after_backspace
                     || !self.erase_or_resume_word(previous_boundary, event, language)
                 {
@@ -8909,7 +8927,13 @@ impl InputProcessor {
                 self.navigate(language, self.settings.suppress_after_home_end);
             }
             key if key == VK_SPACE.0 => {
-                let last_keys = self.replay_keys.clone();
+                // Pause converts the whole token, the automatic conversion only its last word.
+                let pause_keys = core::mem::take(&mut self.pause_keys);
+                let last_keys = if pause_keys.is_empty() {
+                    self.replay_keys.clone()
+                } else {
+                    pause_keys
+                };
                 self.transpose_cycle = None;
                 // A second space invalidates adjacency too. Record the source
                 // before attempting an edit so a partial failure cannot restore
@@ -8970,6 +8994,7 @@ impl InputProcessor {
                 }
             }
             key if key == VK_TAB.0 => {
+                self.pause_keys.clear();
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
@@ -8982,6 +9007,7 @@ impl InputProcessor {
                 self.navigate(language, true);
             }
             key if key == VK_RETURN.0 => {
+                self.pause_keys.clear();
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
@@ -8994,6 +9020,7 @@ impl InputProcessor {
                 {
                     // Nothing is logged here: one line per key would give a secret's length.
                     self.last_word_reset = "privacy";
+                    self.pause_keys.clear();
                     self.suppress_session();
                     return;
                 }
@@ -9001,6 +9028,7 @@ impl InputProcessor {
                     self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
                 let printable = self.printable_character(event);
+                self.extend_pause_keys(printable, event);
                 // A letter the offline tables place needs no readings. Any other key is judged by
                 // what it prints in the target layouts, such as the Estonian "ü" typed as "[" in
                 // the English layout, or the keypad's "." that prints "," in Russian where the
@@ -9130,6 +9158,36 @@ impl InputProcessor {
                     self.privacy_needs_check = true;
                 }
             }
+        }
+    }
+
+    /// Adds a key that typed `printable` to the token Pause converts. A key that types nothing
+    /// or whitespace ends the token, and so does one more key than a token may hold.
+    fn extend_pause_keys(&mut self, printable: Option<char>, event: RawKeyEvent) {
+        match (
+            printable.filter(|character| !character.is_whitespace()),
+            replay_key_from_event(event, self.modifiers),
+        ) {
+            (Some(_), Some(key)) if self.pause_keys.len() < MANUAL_TOKEN_MAX_KEYS => {
+                self.pause_keys.push(key);
+            }
+            _ => self.pause_keys.clear(),
+        }
+    }
+
+    /// Backspace erases the last key of the token Pause converts; right after the Space that
+    /// ended a token in this field, erasing the Space returns to that token.
+    fn erase_pause_key(&mut self, previous_boundary: Option<&LastBoundary>, event: RawKeyEvent) {
+        if self.pause_keys.pop().is_some() {
+            return;
+        }
+        if let Some(last) = previous_boundary.filter(|last| {
+            last.delimiter.is_some()
+                && same_input_target(last.foreground, event.foreground)
+                && last.foreground.layout == event.foreground.layout
+                && last.epoch == self.metrics.input_epoch.load(Ordering::Acquire)
+        }) {
+            self.pause_keys = last.replay_keys.clone();
         }
     }
 
@@ -9480,6 +9538,7 @@ impl InputProcessor {
     fn navigate(&mut self, language: Option<Language>, suppress_until_boundary: bool) {
         self.last_word_reset = "navigation";
         self.replay_keys.clear();
+        self.pause_keys.clear();
         self.handle_switching_rule(InputEvent::Navigation, language, suppress_until_boundary);
         self.mark_privacy_dirty(false);
     }
@@ -9525,11 +9584,16 @@ impl InputProcessor {
         typed_layout: Option<usize>,
         now: Instant,
     ) {
-        let word = if self.replay_keys.is_empty() {
+        let keys = if self.pause_keys.is_empty() {
+            &self.replay_keys
+        } else {
+            &self.pause_keys
+        };
+        let word = if keys.is_empty() {
             self.last_boundary.clone()
         } else {
             typed_layout.map(|layout| LastBoundary {
-                replay_keys: self.replay_keys.clone(),
+                replay_keys: keys.clone(),
                 delimiter: None,
                 foreground: ForegroundContext { layout, ..target },
                 epoch: self.last_input_epoch,
@@ -9572,6 +9636,7 @@ impl InputProcessor {
             || self.transpose_cycle.is_some()
             || self.last_boundary.is_some()
             || !self.replay_keys.is_empty()
+            || !self.pause_keys.is_empty()
         {
             return None;
         }
@@ -9611,6 +9676,11 @@ impl InputProcessor {
         &self,
         event: RawKeyEvent,
     ) -> Option<(Vec<ReplayKey>, Option<char>, usize)> {
+        // A manual layout switch moves the token to `last_boundary`, so these keys were typed in
+        // the layout the field has now.
+        if !self.pause_keys.is_empty() {
+            return Some((self.pause_keys.clone(), None, event.foreground.layout));
+        }
         if !self.replay_keys.is_empty() {
             return Some((self.replay_keys.clone(), None, event.foreground.layout));
         }
@@ -9917,27 +9987,11 @@ impl InputProcessor {
         reason: Option<PrivacyBlockReason>,
         foreground: ForegroundContext,
     ) -> bool {
-        let terminal = self.process_reason.is_none()
-            && self.last_process_id == Some(foreground.process_id)
-            && self.text_edit_backend == TextEditBackend::PhysicalReplay
-            && self
-                .process_facts(foreground.process_id)
-                .0
-                .is_some_and(|path| {
-                    matches!(
-                        path.rsplit(['/', '\\'])
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_lowercase()
-                            .as_str(),
-                        "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
-                    )
-                });
-        autokeyboardlayot::privacy::manual_conversion_allowed(
-            reason,
-            self.settings.manual_terminal_uia_fallback,
-            terminal,
-        )
+        // The owner's decision (2026-10-25): a field that cannot be inspected allows Pause in any
+        // program whose process passed its own checks, not only in terminals.
+        let verified_process =
+            self.process_reason.is_none() && self.last_process_id == Some(foreground.process_id);
+        autokeyboardlayot::privacy::manual_conversion_allowed(reason, verified_process)
     }
 
     /// Records each replacement of a stuck privacy provider once.
@@ -10470,6 +10524,9 @@ impl InputProcessor {
             });
         }
         if pending.forced {
+            // The field shows the converted token now; the cycle goes on from its own keys, and
+            // keys typed next start a new token.
+            self.pause_keys.clear();
             self.transpose_cycle = Some(TransposeCycle {
                 replay_keys: pending.replay_keys.clone(),
                 delimiter: pending.transaction.delimiter,
@@ -21070,7 +21127,6 @@ mod tests {
             Some(r"C:\Program Files\WindowsApps\Terminal\WindowsTerminal.exe".to_owned()),
             Some(0x2000),
         ));
-        processor.settings.manual_terminal_uia_fallback = true;
         let checks = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&checks);
         // The field does not answer the first check, and passes the next one.
@@ -21258,31 +21314,41 @@ mod tests {
 
     #[test]
     fn the_privacy_check_of_a_key_tells_an_allowed_field_from_a_blocked_one() {
-        for (image, integrity, answer, blocked) in [
-            (EDITOR, Some(0x2000), None, false),
+        // (image, integrity, answer, blocked, manual_only): a field that cannot be inspected
+        // blocks automatic conversion but keeps the word for Pause in any program (the owner's
+        // decision, 2026-10-25).
+        for (image, integrity, answer, blocked, manual_only) in [
+            (EDITOR, Some(0x2000), None, false, false),
             (
                 EDITOR,
                 Some(0x2000),
                 Some(PrivacyBlockReason::PasswordField),
                 true,
+                false,
             ),
             (
                 EDITOR,
                 Some(0x2000),
                 Some(PrivacyBlockReason::FieldInspectionUnavailable),
                 true,
+                true,
             ),
-            (KEEPASS, Some(0x2000), None, true),
+            (KEEPASS, Some(0x2000), None, true, false),
             // An elevated program, and one whose integrity cannot be read.
-            (EDITOR, Some(0x3000), None, true),
-            (EDITOR, None, None, true),
+            (EDITOR, Some(0x3000), None, true, false),
+            (EDITOR, None, None, true, false),
         ] {
             let (mut processor, _receiver) = processor_in_field(image, answer);
             processor.process_override = Some((Some(image.to_owned()), integrity));
             processor.process_key(letter(0x41, 1));
             let case = format!("{image} {integrity:?} {answer:?}");
             assert_eq!(processor.privacy_reason.is_some(), blocked, "{case}");
-            assert_eq!(processor.last_word_reset == "privacy", blocked, "{case}");
+            assert_eq!(
+                processor.last_word_reset == "privacy",
+                blocked && !manual_only,
+                "{case}"
+            );
+            assert_eq!(processor.manual_only_word, manual_only, "{case}");
             // An allowed key goes on to the word (here a key the test layout cannot type).
             assert!(!blocked || processor.session.is_suppressed(), "{case}");
         }
@@ -24716,6 +24782,148 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains("gjnjv")),
             "{lines:?}"
+        );
+    }
+
+    /// The keys of "gjnjv/ghbdtn", "потом.привет" typed in the English layout.
+    const GJNJV_MARK_GHBDTN: [u32; 12] = [
+        0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31,
+    ];
+
+    /// Presses Pause and returns the text the cycle left, or the diagnostics when it left none.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn pause_text(processor: &mut InputProcessor, diagnostics: &Receiver<String>) -> String {
+        let lines = press_pause(processor, diagnostics, 41);
+        processor
+            .transpose_cycle
+            .as_ref()
+            .map(|cycle| cycle.text.clone())
+            .unwrap_or_else(|| panic!("not converted: {lines:?}"))
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_everything_typed_since_the_last_space() {
+        // The mark between the words ends the automatic word, not what Pause converts.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GJNJV_MARK_GHBDTN);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_a_token_with_digits_and_punctuation() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x23, 0x30, 0x20, 0x14, 0x31, 0x02, 0x35],
+        );
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет1.");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_the_whole_last_token_after_its_space() {
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GJNJV_MARK_GHBDTN);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_keeps_the_token_after_delete() {
+        // Delete removes text after the caret; what was typed before it is still there.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_DELETE, 7, 0)
+        });
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn backspace_corrects_the_token_pause_converts() {
+        // "ghbdtnn", Backspace, "/": the token is "ghbdtn/" whether Backspace ends the automatic
+        // word (the default) or not.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        assert!(processor.settings.suppress_after_backspace);
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x23, 0x30, 0x20, 0x14, 0x31, 0x31],
+        );
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 8, 0)
+        });
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x35,
+            foreground,
+            ..letter(0x41, 9)
+        });
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет.");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn moving_the_caret_ends_the_token() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LEFT, 7, 0)
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        assert!(processor.transpose_cycle.is_none(), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("reason=no-word-before-caret")),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_a_word_in_a_field_that_cannot_be_inspected_in_any_program() {
+        // The owner's decision (2026-10-25): where the field cannot be inspected, which is no
+        // password field, Pause works in every program, not only in terminals. The word is not
+        // converted automatically there.
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(
+            PrivacyBlockReason::FieldInspectionUnavailable,
+        )));
+        processor.privacy_needs_check = true;
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        type_word_and_space(&mut processor, &GHBDTN);
+        assert!(processor.pending_conversion.is_none());
+        processor
+            .metrics
+            .auto_enabled
+            .store(false, Ordering::Release);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_nothing_typed_in_a_password_field() {
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(PrivacyBlockReason::PasswordField)));
+        processor.privacy_needs_check = true;
+        type_word_and_space(&mut processor, &GHBDTN);
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        assert!(processor.transpose_cycle.is_none(), "{lines:?}");
+        assert!(
+            processor
+                .last_boundary
+                .as_ref()
+                .is_none_or(|last| last.replay_keys.is_empty())
         );
     }
 

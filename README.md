@@ -219,7 +219,15 @@ also re-arm the first word when its setting is enabled. An additional Backspace
 on an already empty line still invalidates the context because it joins the
 line with preceding text. Pause/Break is reserved when its setting is enabled:
 it triggers undo when available, otherwise it forces the current buffered word
-through the same replacement pipeline even when automatic mode is off. Repeated
+through the same replacement pipeline even when automatic mode is off. What it
+converts is everything typed since the last Space, Tab or Enter in the field,
+whatever it is: letters, digits, punctuation between or after words
+(`gjnjv/ghbdtn` → `потом.привет`), a word that automatic conversion skipped for
+any reason. Delete keeps it (it removes text after the caret) and Backspace
+erases its last key; a key that moves the caret, a click, a shortcut and a field
+change end it, because the text before the caret is then unknown. Readings are
+ranked by their runs of letters, so punctuation inside the token does not decide
+the first layout. Repeated
 presses walk the word through every enabled layout: the first goes to the
 language in which the word reads best (a dictionary word first), the next ones to
 the remaining languages, and the last one back to the original; without a clear
@@ -439,12 +447,15 @@ one-character words, but only against the pack's short-word tier or the user
 dictionary; it is off by default and every other single-letter word stays
 opt-in through the user dictionary.
 
-`manual_terminal_uia_fallback` is a separate, default-off permission for manual
-conversion in Windows Terminal, OpenConsole and Conhost when only the focused
-field's UIA inspection is unavailable. The process and integrity checks, current
-input epoch and target identity still have to succeed. A transport timeout,
-changed target, unreadable process or confirmed password field does not qualify.
-Routing an application to `physical-replay` alone never grants this permission.
+Manual conversion (Pause/Break) works in every program when only the focused
+field's UIA inspection is unavailable; such a word is never converted
+automatically, and its keys are kept in memory for Pause only, never written to
+the log. Until 2026-10-25 this was the default-off `manual_terminal_uia_fallback`
+permission for Windows Terminal, OpenConsole and Conhost; the setting is gone (an
+older configuration file still loads, and the key is not written again). The
+process and integrity checks, current input epoch and target identity still have
+to succeed. A transport timeout, changed target, unreadable process or confirmed
+password field does not qualify.
 
 The field check asks the focused field's program once, for its process and its
 password property together, and waits for it up to 250 ms (other UI Automation
@@ -465,7 +476,7 @@ before 2026-10-24). A password field,
 an excluded or unreadable process, a changed context and every transport failure
 stand as before, and recovery of held keys and manual conversion always take a
 failure at face value. A word that met a standing failure of the field check in
-a terminal (kept for Pause by `manual_terminal_uia_fallback`) becomes automatic
+a field (kept for Pause) becomes automatic
 again when a check of the same field passes before the word ends; a softened
 failure is no such check. A word resumed by erasing its delimiter stays
 manual-only whatever the checks say.

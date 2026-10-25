@@ -33,7 +33,6 @@ pub struct Settings {
     pub layout_model: bool,
     /// Explicitly permit manual conversion in verified terminals when only the
     /// focused field's UIA inspection is unavailable.
-    pub manual_terminal_uia_fallback: bool,
     /// A short, quiet sound after each conversion and a lower one after an undo.
     pub conversion_sound: bool,
     pub diagnostics_enabled: bool,
@@ -86,7 +85,6 @@ impl Default for Settings {
             physical_fallback_for_unsupported_apps: true,
             single_letter_words: false,
             layout_model: false,
-            manual_terminal_uia_fallback: false,
             conversion_sound: false,
             diagnostics_enabled: false,
             suppress_after_backspace: true,
@@ -218,7 +216,6 @@ impl Settings {
                 }
                 "single_letter_words" => &mut settings.single_letter_words,
                 "layout_model" => &mut settings.layout_model,
-                "manual_terminal_uia_fallback" => &mut settings.manual_terminal_uia_fallback,
                 "conversion_sound" => &mut settings.conversion_sound,
                 "diagnostics_enabled" => &mut settings.diagnostics_enabled,
                 "suppress_after_backspace" => &mut settings.suppress_after_backspace,
@@ -277,7 +274,6 @@ impl Settings {
              physical_fallback_for_unsupported_apps={}\n\
              single_letter_words={}\n\
              layout_model={}\n\
-             manual_terminal_uia_fallback={}\n\
              conversion_sound={}\n\
              diagnostics_enabled={}\n\
              suppress_after_backspace={}\n\
@@ -299,7 +295,6 @@ impl Settings {
             self.physical_fallback_for_unsupported_apps,
             self.single_letter_words,
             self.layout_model,
-            self.manual_terminal_uia_fallback,
             self.conversion_sound,
             self.diagnostics_enabled,
             self.suppress_after_backspace,
@@ -354,7 +349,6 @@ fn is_known_key(key: &str) -> bool {
             | "physical_fallback_for_unsupported_apps"
             | "single_letter_words"
             | "layout_model"
-            | "manual_terminal_uia_fallback"
             | "conversion_sound"
             | "diagnostics_enabled"
             | "suppress_after_backspace"
@@ -650,7 +644,10 @@ mod tests {
         assert!(!parsed.recheck_first_word_after_erasing);
         assert!(parsed.physical_fallback_for_unsupported_apps);
         assert!(parsed.single_letter_words);
-        assert!(parsed.manual_terminal_uia_fallback);
+        // No longer a setting (Pause works where a field cannot be inspected in every program,
+        // the owner's decision of 2026-10-25): an older file still loads, and the key is not
+        // written again.
+        assert!(!parsed.to_text().contains("manual_terminal_uia_fallback"));
         assert!(parsed.diagnostics_enabled);
         assert!(!parsed.suppress_after_backspace);
         assert!(!parsed.suppress_after_delete);

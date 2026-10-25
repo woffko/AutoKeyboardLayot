@@ -734,22 +734,28 @@ impl Detector {
         chosen
     }
 
-    /// The languages of `readings` (one word read in several layouts) from the most to the least
-    /// plausible reading. The word score of the reading's letters decides (punctuation at its
-    /// edges, such as the full stop of "потом.", is not scored), which includes the dictionary
-    /// bonus; equal scores keep the given order. The hotkey sends a word to the first of them.
+    /// The languages of `readings` (one word or token read in several layouts) from the most to
+    /// the least plausible reading. The word scores of the reading's runs of letters decide,
+    /// summed (punctuation between or around them, such as in "потом.привет", is not scored),
+    /// which includes the dictionary bonus; equal scores keep the given order. The hotkey sends a
+    /// word to the first of them.
     pub fn rank_candidates(&self, readings: &[(Language, String)]) -> Vec<Language> {
         let mut scored: Vec<(Language, f32)> = readings
             .iter()
             .map(|(language, reading)| {
-                let core = self.letter_core(*language, reading);
-                let score = score_word(
-                    if core.is_empty() { reading } else { core },
-                    *language,
-                    &self.user_dictionary,
-                    &self.dictionaries,
-                );
-                (*language, score)
+                let score = |text: &str| {
+                    score_word(text, *language, &self.user_dictionary, &self.dictionaries)
+                };
+                let runs: Vec<&str> = reading
+                    .split(|character| !self.accepts_character(*language, character))
+                    .filter(|run| !run.is_empty())
+                    .collect();
+                let total = if runs.is_empty() {
+                    score(reading)
+                } else {
+                    runs.into_iter().map(score).sum()
+                };
+                (*language, total)
             })
             .collect();
         scored.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -981,6 +987,14 @@ mod tests {
             detector.rank_candidates(&mapped(&[
                 (Language::Estonian, "gjnjv-"),
                 (Language::Russian, "потом."),
+            ])),
+            [Language::Russian, Language::Estonian]
+        );
+        // Pause converts a whole token: `gjnjv/ghbdtn` reads "потом.привет", two Russian words.
+        assert_eq!(
+            detector.rank_candidates(&mapped(&[
+                (Language::Estonian, "gjnjv-ghbdtn"),
+                (Language::Russian, "потом.привет"),
             ])),
             [Language::Russian, Language::Estonian]
         );
