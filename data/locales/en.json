@@ -3,6 +3,7 @@
   "locale": "en",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "Allow manual conversion in terminals when field inspection is unavailable",
     "rollback.choose": "Review previous version…",
     "rollback.confirm": "Confirm rollback",
     "rollback.preview": "Roll back revision {from} to {to}? This may restore older defects. The highest-seen version remains recorded: other intermediate older versions stay blocked. Preferences and user data are kept. The previous package and its license are shown below.",

@@ -3,6 +3,7 @@
   "locale": "es",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "Permitir la conversión manual en terminales cuando no se pueda inspeccionar el campo",
     "rollback.choose": "Revisar la versión anterior…",
     "rollback.confirm": "Confirmar reversión",
     "rollback.preview": "¿Volver de la revisión {from} a {to}? Pueden reaparecer errores antiguos. La versión más alta conocida seguirá registrada: las demás versiones intermedias anteriores seguirán bloqueadas. Se conservarán las preferencias y los datos del usuario. A continuación se muestran el paquete anterior y su licencia.",

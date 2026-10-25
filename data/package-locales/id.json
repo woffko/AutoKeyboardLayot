@@ -3,6 +3,7 @@
   "locale": "id",
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "Izinkan konversi manual di terminal ketika pemeriksaan kolom tidak tersedia",
     "rollback.choose": "Tinjau versi sebelumnya…",
     "rollback.confirm": "Konfirmasi pengembalian versi",
     "rollback.preview": "Kembalikan revisi {from} ke {to}? Masalah lama mungkin muncul kembali. Versi tertinggi yang diketahui tetap tercatat: versi lama lain di antaranya tetap diblokir. Preferensi dan data pengguna dipertahankan. Paket sebelumnya dan lisensinya ditampilkan di bawah.",

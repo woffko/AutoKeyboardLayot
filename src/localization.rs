@@ -601,6 +601,20 @@ mod tests {
     }
 
     #[test]
+    fn every_message_a_published_package_may_carry_stays_in_the_english_catalog() {
+        // An installed package with a message the English catalog no longer has is refused
+        // (UnknownMessage), and the agent's whole profile with it: a message is never removed
+        // from the English catalog, only no longer shown.
+        let english = english_catalog();
+        for key in include_str!("../tests/fixtures/published-ui-message-keys.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            assert!(english.messages.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
     fn english_is_complete_without_any_external_directory() {
         let registry = CatalogRegistry::default();
         assert!(registry.english.messages.len() >= 125);

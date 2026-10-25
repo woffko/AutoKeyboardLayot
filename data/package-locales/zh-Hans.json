@@ -7,6 +7,7 @@
   ],
   "direction": "ltr",
   "messages": {
+    "general.manual_terminal_uia_fallback": "无法检查输入字段时允许在终端中手动转换",
     "rollback.choose": "查看上一版本…",
     "rollback.confirm": "确认回退",
     "rollback.preview": "将修订版 {from} 回退到 {to}？旧问题可能再次出现。已知的最高版本仍会保留在记录中，其他较旧的中间版本仍将被禁止安装。偏好设置和用户数据将保留。下方显示上一版本的软件包及其许可证。",
