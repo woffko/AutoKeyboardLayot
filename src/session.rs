@@ -541,6 +541,40 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_drops_the_trailing_marks() {
+        // A shortcut after "gjnjv/" suppresses the next word; stale marks would end that
+        // suppression at its first letter.
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(&mut session, "gjnjv", "/", &detector);
+        session.handle(InputEvent::Shortcut, Some(Language::English), &detector);
+        assert!(!session.ends_with_marks());
+        assert!(session.is_suppressed());
+    }
+
+    #[test]
+    fn trailing_marks_count_toward_the_word_length_limit() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(
+            &mut session,
+            &"g".repeat(DEFAULT_MAX_WORD_CHARACTERS - 1),
+            "/",
+            &detector,
+        );
+        assert_eq!(
+            session.handle(
+                InputEvent::TrailingMark('/'),
+                Some(Language::English),
+                &detector
+            ),
+            SessionAction::Reset(ResetReason::UnsupportedInput)
+        );
+        assert_eq!(session.buffered_character_count(), 0);
+        assert!(session.is_suppressed());
+    }
+
+    #[test]
     fn a_word_ends_with_marks_until_all_of_them_are_erased() {
         let detector = crate::test_support::detector();
         let mut session = InputSession::default();

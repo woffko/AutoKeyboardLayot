@@ -1064,6 +1064,31 @@ mod tests {
     }
 
     #[test]
+    fn a_word_with_trailing_marks_reaches_the_layout_model_with_a_context() {
+        let detector = model_detector();
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду!"),
+            (Language::Estonian, "küsimusele!"),
+        ]);
+        assert!(
+            detector
+                .detect_with_trailing_marks("k[simusele!", 1, Language::English, &candidates, None)
+                .is_none(),
+            "the dictionaries alone do not convert it"
+        );
+        let detection = detector
+            .detect_with_trailing_marks(
+                "k[simusele!",
+                1,
+                Language::English,
+                &candidates,
+                Some(&[Language::English]),
+            )
+            .expect("the model converts it");
+        assert_eq!(detection.replacement, "küsimusele!");
+    }
+
+    #[test]
     fn layout_model_corrects_estonian_words_the_dictionary_misses() {
         let detector = model_detector();
         for (word, typed, candidates, previous, expected) in [
