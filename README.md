@@ -192,6 +192,19 @@ letters alike (Latin Estonian) is not used, as it would change only the marks.
 No English word of the token corpora followed by such a mark is converted
 (`tests/dev_tokens.rs`).
 
+`convert_on_enter` (off by default, "Also convert the word before Enter" in the
+settings) converts the word before a plain Enter as before a Space. The Enter
+arms the decision gate and the gate holds the Enter itself: the word is replaced
+with no delimiter after it, and only then does the Enter reach the program, so a
+messenger sends and a terminal runs the converted text. The Enter waits for the
+conversion (usually 100–300 ms, at most the gate's 1.2 s deadline); without a
+word to convert it goes on at once. A gate that breaks hands the Enter back like
+any held key (automatically after a deadline, a full gate, a worker queue or a
+hook reinstall; after a focus change it is kept for recovery with Pause and never
+typed into the other window). Shift+Enter and Ctrl+Enter are left alone: Shift,
+held by the gate, would turn the edit's letters into capitals and its paste into
+Ctrl+Shift+V.
+
 After a successful Pause/Break undo, the original source-layout word may be
 held in memory for at most two minutes. A passive tray notification enables an
 explicit "Do not correct the last undone word" action. The word is not

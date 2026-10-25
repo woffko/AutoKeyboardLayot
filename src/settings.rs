@@ -36,6 +36,8 @@ pub struct Settings {
     /// A short, quiet sound after each conversion and a lower one after an undo.
     pub conversion_sound: bool,
     pub diagnostics_enabled: bool,
+    /// The word before an Enter is converted too, the Enter held until it is (off by default).
+    pub convert_on_enter: bool,
     pub suppress_after_backspace: bool,
     pub suppress_after_delete: bool,
     pub suppress_after_left: bool,
@@ -87,6 +89,7 @@ impl Default for Settings {
             layout_model: false,
             conversion_sound: false,
             diagnostics_enabled: false,
+            convert_on_enter: false,
             suppress_after_backspace: true,
             suppress_after_delete: true,
             suppress_after_left: true,
@@ -218,6 +221,7 @@ impl Settings {
                 "layout_model" => &mut settings.layout_model,
                 "conversion_sound" => &mut settings.conversion_sound,
                 "diagnostics_enabled" => &mut settings.diagnostics_enabled,
+                "convert_on_enter" => &mut settings.convert_on_enter,
                 "suppress_after_backspace" => &mut settings.suppress_after_backspace,
                 "suppress_after_delete" => &mut settings.suppress_after_delete,
                 "suppress_after_left" => &mut settings.suppress_after_left,
@@ -276,6 +280,7 @@ impl Settings {
              layout_model={}\n\
              conversion_sound={}\n\
              diagnostics_enabled={}\n\
+             convert_on_enter={}\n\
              suppress_after_backspace={}\n\
              suppress_after_delete={}\n\
              suppress_after_left={}\n\
@@ -297,6 +302,7 @@ impl Settings {
             self.layout_model,
             self.conversion_sound,
             self.diagnostics_enabled,
+            self.convert_on_enter,
             self.suppress_after_backspace,
             self.suppress_after_delete,
             self.suppress_after_left,
@@ -351,6 +357,7 @@ fn is_known_key(key: &str) -> bool {
             | "layout_model"
             | "conversion_sound"
             | "diagnostics_enabled"
+            | "convert_on_enter"
             | "suppress_after_backspace"
             | "suppress_after_delete"
             | "suppress_after_left"
@@ -574,6 +581,15 @@ mod tests {
         }
         let error = Settings::try_from_text("# comment\n\npause_break_undo=bad").unwrap_err();
         assert_eq!(error.line, 3);
+    }
+
+    #[test]
+    fn conversion_on_enter_is_off_by_default_and_round_trips() {
+        assert!(!Settings::default().convert_on_enter);
+        let parsed = Settings::try_from_text("convert_on_enter=yes").unwrap();
+        assert!(parsed.convert_on_enter);
+        assert!(parsed.to_text().contains("convert_on_enter=true\n"));
+        assert_eq!(Settings::from_text(&parsed.to_text()), parsed);
     }
 
     #[test]

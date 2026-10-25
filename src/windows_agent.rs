@@ -435,6 +435,8 @@ struct ObserverMetrics {
     // another process meets a verdict that is not its own.
     privacy_process_id: AtomicU32,
     auto_enabled: AtomicBool,
+    /// The `convert_on_enter` setting, for the hook.
+    convert_on_enter: AtomicBool,
     safety_paused: AtomicBool,
     pause_break_undo: AtomicBool,
     force_hotkey_virtual_key: AtomicU32,
@@ -492,6 +494,7 @@ impl Default for ObserverMetrics {
             privacy_reason: AtomicU8::new(PRIVACY_UNAVAILABLE),
             privacy_process_id: AtomicU32::new(0),
             auto_enabled: AtomicBool::new(false),
+            convert_on_enter: AtomicBool::new(false),
             safety_paused: AtomicBool::new(false),
             pause_break_undo: AtomicBool::new(true),
             force_hotkey_virtual_key: AtomicU32::new(u32::from(Hotkey::default().virtual_key)),
@@ -790,6 +793,9 @@ impl CorrectionGate {
 #[derive(Debug, Clone, Copy)]
 enum RawInputEvent {
     Key(RawKeyEvent),
+    /// The Enter that ends a word with `convert_on_enter` on: the gate it armed holds it, and the
+    /// worker converts the word before it and then lets it go (`convert_before_held_enter`).
+    EnterDecision(RawKeyEvent),
     Mouse,
     ExternalInjection,
     PrivacyRefresh(ForegroundContext),
@@ -2935,6 +2941,28 @@ impl AppState {
         self.post_held_keys_return();
     }
 
+    /// Arms the decision gate with `token`, the Space or Enter that ends a word in `foreground`.
+    fn arm_decision_gate(&mut self, token: u64, foreground: ForegroundContext) {
+        self.correction_gate.activate(token);
+        self.gate_diagnostic("armed", format!("token={token}"));
+        self.correction_gate.origin = Some(foreground);
+        self.metrics
+            .active_gate_token
+            .store(token, Ordering::Release);
+        self.metrics
+            .cancelled_gate_token
+            .store(0, Ordering::Release);
+    }
+
+    /// Arms the gate on an Enter (`convert_on_enter`) and holds the Enter itself: it reaches the
+    /// program when the gate lets its keys go, after the word before it is converted. A gate that
+    /// breaks hands it back like any held key.
+    fn hold_enter_for_decision(&mut self, enter: RawKeyEvent, foreground: ForegroundContext) {
+        self.arm_decision_gate(enter.sequence, foreground);
+        let held = self.correction_gate.hold(enter);
+        debug_assert!(held, "a gate just armed holds its first key");
+    }
+
     /// Holds an edge that arrived while the gate is active. A gate that is full or past its
     /// deadline breaks, and the edge joins the retained input as well: forwarding it now would
     /// overtake every edge held before it. False when no gate is active, so the edge passes.
@@ -3994,6 +4022,9 @@ fn toggle_auto_enabled() {
 }
 
 fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: &Settings) {
+    metrics
+        .convert_on_enter
+        .store(settings.convert_on_enter, Ordering::Release);
     let hotkey = settings.force_hotkey();
     metrics
         .force_hotkey_virtual_key
@@ -5407,30 +5438,40 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             .explicit_hotkey_sequence
                             .store(sequence, Ordering::Release);
                     }
+                    let may_arm = !has_retained_input(&state.metrics)
+                        && !state.metrics.configuration_pending.load(Ordering::Acquire);
+                    let privacy = hook_privacy_reason(&state.metrics, foreground.process_id);
+                    let mut held_enter = false;
                     if should_arm_space_decision_gate(
                         drained,
                         key_down,
                         event.vkCode as u16,
                         state.metrics.auto_enabled.load(Ordering::Acquire),
-                        hook_privacy_reason(&state.metrics, foreground.process_id),
+                        privacy,
                         state.correction_gate.active,
                         shortcut_modifiers_released(),
-                    ) && !has_retained_input(&state.metrics)
-                        && !state.metrics.configuration_pending.load(Ordering::Acquire)
+                    ) && may_arm
                     {
-                        state.correction_gate.activate(sequence);
-                        state.gate_diagnostic("armed", format!("token={sequence}"));
-                        state.correction_gate.origin = Some(foreground);
-                        state
-                            .metrics
-                            .active_gate_token
-                            .store(sequence, Ordering::Release);
-                        state
-                            .metrics
-                            .cancelled_gate_token
-                            .store(0, Ordering::Release);
+                        state.arm_decision_gate(sequence, foreground);
+                    } else if should_arm_enter_decision_gate(
+                        drained,
+                        key_down,
+                        event.vkCode as u16,
+                        state.metrics.convert_on_enter.load(Ordering::Acquire),
+                        state.metrics.auto_enabled.load(Ordering::Acquire),
+                        privacy,
+                        state.correction_gate.active,
+                        shortcut_modifiers_released(),
+                        shift_released(),
+                    ) && may_arm
+                    {
+                        state.hold_enter_for_decision(raw, foreground);
+                        held_enter = true;
+                        swallow = true;
                     }
-                    let queued = if claimed_hotkey && has_retained_input(&state.metrics) {
+                    let queued = if held_enter {
+                        state.enqueue(RawInputEvent::EnterDecision(raw))
+                    } else if claimed_hotkey && has_retained_input(&state.metrics) {
                         let armed = state.metrics.recovery_armed.swap(false, Ordering::AcqRel);
                         if !armed {
                             state.gate_diagnostic(
@@ -8149,12 +8190,16 @@ impl InputProcessor {
 
     /// The gate token when this event is the Space key-down that armed the decision gate, else 0.
     fn armed_gate_token(&self, queued: &QueuedInputEvent) -> u64 {
-        let RawInputEvent::Key(key) = &queued.event else {
-            return 0;
+        let (key, armed_by) = match &queued.event {
+            RawInputEvent::Key(key) => (
+                key,
+                matches!(key.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+                    && key.virtual_key == u32::from(VK_SPACE.0),
+            ),
+            RawInputEvent::EnterDecision(key) => (key, true),
+            _ => return 0,
         };
-        let is_space_down = matches!(key.message, WM_KEYDOWN | WM_SYSKEYDOWN)
-            && key.virtual_key == u32::from(VK_SPACE.0);
-        if is_space_down
+        if armed_by
             && key.drain_token == 0
             && key.sequence != 0
             && self.metrics.active_gate_token.load(Ordering::Acquire) == key.sequence
@@ -8189,6 +8234,7 @@ impl InputProcessor {
         {
             let kind = match queued.event {
                 RawInputEvent::Key(_) => "key",
+                RawInputEvent::EnterDecision(_) => "enter",
                 RawInputEvent::GateDrainReady { .. } => "gate_ack",
                 RawInputEvent::PrivacyRefresh(_) => "privacy",
                 RawInputEvent::ProfileRefresh => "profiles",
@@ -8331,6 +8377,7 @@ impl InputProcessor {
                 self.mark_privacy_dirty(true);
             }
             RawInputEvent::Key(event) => self.process_key(event),
+            RawInputEvent::EnterDecision(event) => self.convert_before_held_enter(event),
             RawInputEvent::ProfileRefresh => {
                 // Like the privacy refresh, never in the way of a fence acknowledgement.
                 if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
@@ -9269,6 +9316,18 @@ impl InputProcessor {
         delimiter: Option<char>,
         may_change_focus: bool,
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
+        self.handle_boundary_with(language, delimiter, may_change_focus, false)
+    }
+
+    /// As `handle_boundary`; `without_delimiter` converts the word with no delimiter after it,
+    /// for an Enter the gate holds (`convert_before_held_enter`).
+    fn handle_boundary_with(
+        &mut self,
+        language: Option<Language>,
+        delimiter: Option<char>,
+        may_change_focus: bool,
+        without_delimiter: bool,
+    ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
         let manual_only = core::mem::take(&mut self.manual_only_word);
         // A boundary ends the unknown word a recovery may have left.
@@ -9327,9 +9386,13 @@ impl InputProcessor {
                         self.text_edit_backend,
                     ),
                 );
-                let transaction = delimiter
-                    .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter));
-                if transaction.is_none() {
+                let transaction = if without_delimiter {
+                    ConversionTransaction::without_delimiter(&detection)
+                } else {
+                    delimiter
+                        .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter))
+                };
+                if transaction.is_none() && !without_delimiter {
                     // Tab or Enter: the edit could not put the word back before them.
                     self.diagnostic("word", "result=not-attempted reason=boundary".to_owned());
                 }
@@ -9382,6 +9445,48 @@ impl InputProcessor {
             self.mark_privacy_dirty(false);
         }
         transaction.map(|transaction| (transaction, replay_keys))
+    }
+
+    /// The Enter that armed the gate is held (`convert_on_enter`): the word before it is
+    /// converted as at a Space, but without a delimiter, and the gate then lets the Enter go.
+    /// Nothing else about Enter happens here: the held Enter comes back through the hook as a
+    /// drained key and ends the word as usual.
+    fn convert_before_held_enter(&mut self, event: RawKeyEvent) {
+        let language = self.language_for_layout(event.foreground.layout);
+        let applies = self.settings.convert_on_enter
+            && self.last_foreground == Some(foreground_identity_key(event.foreground))
+            && !self.modifiers.has_shortcut_modifier()
+            && !self.modifiers.shift();
+        if applies
+            && let Some((transaction, replay_keys)) =
+                self.handle_boundary_with(language, None, false, true)
+        {
+            if replay_keys.len() != transaction.original.chars().count() {
+                self.diagnostic("word", "result=not-attempted reason=keys".to_owned());
+            } else if replay_keys
+                .iter()
+                .any(|key| key.caps_lock != event.caps_lock)
+            {
+                self.diagnostic("word", "result=not-attempted reason=caps-lock".to_owned());
+            } else {
+                // The keys before the Enter reached the program; the Enter itself is held, as a
+                // Pause press is swallowed.
+                self.metrics
+                    .forwarded_input_sequence
+                    .fetch_max(event.sequence, Ordering::AcqRel);
+                self.pending_conversion = Some(PendingConversion {
+                    transaction,
+                    foreground: event.foreground,
+                    source_layout: event.foreground.layout,
+                    profile_generation: self.input_profiles.generation(),
+                    space_down_sequence: event.sequence,
+                    replay_keys,
+                    forced: false,
+                    cycle_order: Vec::new(),
+                });
+            }
+        }
+        self.execute_pending_conversion(event.sequence);
     }
 
     fn remember_word_language(&mut self, language: Language) {
@@ -12031,6 +12136,37 @@ const fn should_arm_space_decision_gate(
         && privacy_reason == PRIVACY_ALLOWED
         && !gate_active
         && shortcut_modifiers_released
+}
+
+/// With `convert_on_enter`, a plain Enter (no Ctrl, Alt, Windows key or Shift) arms the gate as
+/// the Space does, and the gate holds the Enter itself, so the word before it can be converted
+/// before the Enter reaches the program. Shift+Enter is left alone: Shift, held by the gate,
+/// would turn the edit's letters into capitals and its paste into Ctrl+Shift+V.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+const fn should_arm_enter_decision_gate(
+    drained: bool,
+    key_down: bool,
+    virtual_key: u16,
+    convert_on_enter: bool,
+    auto_enabled: bool,
+    privacy_reason: u8,
+    gate_active: bool,
+    shortcut_modifiers_released: bool,
+    shift_released: bool,
+) -> bool {
+    !drained
+        && key_down
+        && virtual_key == VK_RETURN.0
+        && convert_on_enter
+        && auto_enabled
+        && privacy_reason == PRIVACY_ALLOWED
+        && !gate_active
+        && shortcut_modifiers_released
+        && shift_released
+}
+
+fn shift_released() -> bool {
+    unsafe { GetAsyncKeyState(i32::from(VK_SHIFT.0)) as u16 & 0x8000 == 0 }
 }
 
 /// The deadline of a gate handed over to a conversion: `answer` is what the gate had left when
@@ -17917,6 +18053,187 @@ mod tests {
             assert_eq!(gate_request_enabled(&metrics, 0), enabled);
         }
         drop(take_app_state());
+    }
+
+    #[test]
+    fn a_plain_enter_arms_the_decision_gate_only_with_conversion_on_enter() {
+        // (drained, key down, key, conversion on Enter, automatic, privacy, gate active,
+        // modifiers released, Shift released)
+        let arms = |drained, down, key, on_enter, automatic, privacy, active, released, shift| {
+            should_arm_enter_decision_gate(
+                drained, down, key, on_enter, automatic, privacy, active, released, shift,
+            )
+        };
+        assert!(arms(
+            false,
+            true,
+            VK_RETURN.0,
+            true,
+            true,
+            PRIVACY_ALLOWED,
+            false,
+            true,
+            true
+        ));
+        for (case, armed) in [
+            (
+                "drained",
+                arms(
+                    true,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "key up",
+                arms(
+                    false,
+                    false,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "space",
+                arms(
+                    false,
+                    true,
+                    VK_SPACE.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "setting off",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    false,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "automatic off",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    false,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "privacy",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_UNAVAILABLE,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "gate active",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    true,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "Ctrl+Enter",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    false,
+                    true,
+                ),
+            ),
+            (
+                "Shift+Enter",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    false,
+                ),
+            ),
+        ] {
+            assert!(!armed, "{case}");
+        }
+    }
+
+    #[test]
+    fn an_enter_held_for_a_decision_arms_the_gate_with_the_enter_held() {
+        let (mut state, _receiver) = test_gate_state(4);
+        let enter = RawKeyEvent {
+            sequence: 5,
+            ..test_raw_key(WM_KEYDOWN, VK_RETURN, 5, 0)
+        };
+        state.hold_enter_for_decision(enter, enter.foreground);
+        assert!(state.correction_gate.active);
+        assert_eq!(state.correction_gate.token, 5);
+        assert_eq!(state.correction_gate.held.len(), 1);
+        assert_eq!(state.correction_gate.held[0].sequence, 5);
+        assert_eq!(
+            state.correction_gate.held[0].virtual_key,
+            u32::from(VK_RETURN.0)
+        );
+        assert!(
+            state
+                .correction_gate
+                .origin
+                .is_some_and(|origin| same_input_target(origin, enter.foreground))
+        );
+        assert_eq!(state.metrics.active_gate_token.load(Ordering::Acquire), 5);
+        assert_eq!(
+            state.metrics.cancelled_gate_token.load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -25068,6 +25385,94 @@ mod tests {
             ..foreground
         });
         assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    /// A processor in an editor with automatic conversion and conversion on Enter on, where
+    /// `scan_codes` were typed and an Enter (sequence after them) armed the gate and is held.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn processor_with_a_held_enter(
+        convert_on_enter: bool,
+        scan_codes: &[u32],
+    ) -> (
+        InputProcessor,
+        Receiver<String>,
+        u64,
+        Arc<Mutex<PasteSteps>>,
+    ) {
+        let (mut processor, diagnostics, foreground, steps) = pause_processor(0x0409);
+        processor.settings.convert_on_enter = convert_on_enter;
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        type_keys(&mut processor, foreground, scan_codes);
+        let enter = scan_codes.len() as u64 + 1;
+        // The hook armed the gate on the Enter and holds it: the keys before it went on.
+        processor
+            .metrics
+            .active_gate_token
+            .store(enter, Ordering::Release);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(enter, Ordering::Release);
+        processor
+            .metrics
+            .forwarded_input_sequence
+            .store(enter - 1, Ordering::Release);
+        diagnostics.try_iter().for_each(drop);
+        let epoch = processor.metrics.input_epoch.load(Ordering::Acquire);
+        processor.process(QueuedInputEvent {
+            configuration: None,
+            captured_at: Instant::now(),
+            epoch,
+            event: RawInputEvent::EnterDecision(RawKeyEvent {
+                foreground,
+                ..test_raw_key(WM_KEYDOWN, VK_RETURN, enter, 0)
+            }),
+        });
+        (processor, diagnostics, enter, steps)
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_word_before_a_held_enter_is_converted_without_a_delimiter() {
+        let (processor, diagnostics, enter, steps) = processor_with_a_held_enter(true, &GHBDTN);
+        let lines: Vec<String> = diagnostics.try_iter().collect();
+        // The Enter is not in the field yet: the word is replaced with no delimiter after it.
+        assert_eq!(
+            steps.lock().unwrap().clipboard_at_submit.as_deref(),
+            Some("привет")
+        );
+        assert!(
+            lines.iter().any(
+                |line| line.starts_with("event=conversion ") && line.contains("result=applied")
+            ),
+            "{lines:?}"
+        );
+        // The gate lets the Enter go after the edit.
+        assert_eq!(processor.last_gate_release_token, enter);
+        assert!(processor.metrics.undo_available.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_held_enter_without_a_word_to_convert_is_let_go_at_once() {
+        for (convert_on_enter, keys) in [(true, &[][..]), (false, &GHBDTN[..])] {
+            let (processor, diagnostics, enter, _steps) =
+                processor_with_a_held_enter(convert_on_enter, keys);
+            let lines: Vec<String> = diagnostics.try_iter().collect();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.starts_with("event=conversion ")),
+                "{convert_on_enter}: {lines:?}"
+            );
+            assert_eq!(
+                processor.last_gate_release_token, enter,
+                "{convert_on_enter}"
+            );
+        }
     }
 
     #[cfg(feature = "legacy-bundled-input")]
