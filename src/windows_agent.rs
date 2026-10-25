@@ -26856,7 +26856,10 @@ public class AklWindowlessReader : Form {
             {
                 thread::sleep(Duration::from_millis(50));
             }
-            thread::sleep(Duration::from_millis(300));
+            // A loaded VM shows the switch to this process before the field's keys carry it:
+            // keys typed in between look like a manual switch to the agent, which starts a new
+            // token at the first key in the new layout.
+            thread::sleep(Duration::from_millis(1500));
         };
         // A RichEdit control ends its lines with "\r" or "\r\n".
         let text = |before: &str| {
