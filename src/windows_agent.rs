@@ -25131,6 +25131,7 @@ mod tests {
     }
 
     /// The keys of "gjnjv/ghbdtn", "потом.привет" typed in the English layout.
+    #[cfg(feature = "legacy-bundled-input")]
     const GJNJV_MARK_GHBDTN: [u32; 12] = [
         0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31,
     ];
@@ -25255,7 +25256,8 @@ mod tests {
         assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
     }
 
-    /// A key that is no letter of the test keyboard in any layout ends nothing: `g`.
+    /// The key of `g`.
+    #[cfg(feature = "legacy-bundled-input")]
     const G: u32 = 0x22;
 
     #[cfg(feature = "legacy-bundled-input")]
