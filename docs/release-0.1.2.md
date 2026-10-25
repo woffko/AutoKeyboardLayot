@@ -1,8 +1,9 @@
 # AutoKeyboardLayot 0.1.2: release notes
 
-**Status: in preparation.** The installer, the language packages and catalog revision 8 are built
-from this commit; signing with the release key and publication need the owner's approval at the
-moment they are done. The source commit and the checksums are filled in below once they exist.
+**Status: published** on 2026-10-25 as the release
+[`v0.1.2`](https://github.com/woffko/AutoKeyboardLayot/releases/tag/v0.1.2) (Latest), built from
+`59b425725ba7d30a1154e9e647d585dfe386be33`. The packages and the catalog were signed with the
+release key, and the release published, at the owner's approval at the moment of each step.
 
 0.1.2 is the first published build since 0.1.0 (release `lang-r5-20260919`). 0.1.1 was built for
 acceptance on 2026-10-11 and never published; everything in its draft notes
@@ -109,6 +110,43 @@ same BSL-1.0 text, and the "Bundled layout model" section names wordfreq 3.1.1 a
 SUBTLEX authors, as wordfreq's distribution of SUBTLEX requires. The 17 upstream license texts
 were fetched again at the revisions Cargo records; 16 are byte for byte the cached ones.
 
+## Acceptance
+
+- `tools/verify-wsl.sh` on the source commit: 15 of 15 PASS.
+- Installer on the test VM (`tools/run_vm_installer_ui.py`): `retry`, `uninstall-confirmation`,
+  `startup-removal`, `settings-open`, `helper-failure`, `no-store`, `missing-exe`, `fence-invalid`
+  and `timer-exception` pass. `download-failure`, `cancel-restarts-agent` and `late-exception`
+  need test builds of the package helper whose downloads or catalog replies fail; they passed
+  with those in goal R7, and neither the setup scripts nor the helper changed since. After the
+  publication, `retry` passed again against the published catalog revision 8 (13 rows; a
+  language downloaded and installed).
+- Every package verified offline (`verify_language_package`: `RELEASE_SIGNATURE_VERIFIED`), and
+  the catalog with all 13 packages (`verify_release_catalog`); 502 hours of validity.
+- After the publication, downloaded without credentials: `releases/latest/download/catalog.aklc`,
+  the installer from the same path, and all 13 package URLs the catalog names; every file
+  matched the local one byte for byte.
+
 ## Checksums
 
-Filled in once the release exists.
+| File | Bytes | SHA-256 |
+|---|---|---|
+| `AutoKeyboardLayot-0.1.2-setup-experimental.exe` | 11208740 | `91d9ddfd6920499e8bd78167883e24090fbc50833e0d48a94df05cc29d16c613` |
+| `AutoKeyboardLayot.exe` (inside) | 22827520 | `c36b09080659c7a19b93129f21b7a5747ca27e85762abd16284c3059a6e4110d` |
+| `installer-package-helper.exe` (inside) | 1773056 | `779f0706695f01882ee9741db421f058e8c32c96d0f7cab2aa229d2bd761f57a` |
+| `catalog.aklc` (revision 8, valid 2026-10-25 03:58:38 to 2026-11-15 03:58:38 UTC) | 3462 | `733f6a4c93bf69bceeb4c90f994e14093db15508b3fd9cab67a1e976e17e3815` |
+| `ru-RU-r5.aklp` | 34486974 | `ad619a22c783ae83d2593ee86446e05b5ecd1fb91d0a29d904b64fbfb4482743` |
+| `et-EE-r3.aklp` | 3539659 | `72d3a3fd20eff661fd2b4b613aeccf45aafea810164f64963d5d943abcd43361` |
+| `ar-SA-r2.aklp` | 34056 | `4b0f07647b127be4559d6c025cfda962dfcc769363ac738389aeea7f958ee0f2` |
+| `bn-BD-r2.aklp` | 49590 | `f86b26df4214f80d612cad2fe410183cf93fc06c26fa4817aee313b03bf78ec3` |
+| `de-DE-r2.aklp` | 29528 | `1f6bc23f2ea41dc2924f36df1bca4382d5a1f26572c96dad27b4dba746553b8c` |
+| `es-ES-r2.aklp` | 28698 | `11b9075625fc76ea81ff09546cf6312d856b1f1a012212ada69455d236f64e1e` |
+| `fr-FR-r2.aklp` | 29880 | `2e53e6c19bdf64fe006605e1ae05f311534b864183e078912edb9e932a71d1d2` |
+| `hi-IN-r2.aklp` | 48498 | `680c1e92c17905b30a783ce7b049d95e50e0f602135267e2add83ae74c2f2223` |
+| `id-ID-r2.aklp` | 26911 | `1c4b9a21d1e2db41e6825071496b4b29be54146483391e3aa82c100c21255991` |
+| `ja-JP-r2.aklp` | 33092 | `8cbc2fb66c6a18fa53aa7251d31cac415c8feabfeca3e360c193cec1c8c81f2b` |
+| `pt-BR-r2.aklp` | 28467 | `b3c351b0775a682f6c4722ab98da94cc07fd2d2246433d1f29fe70f9d90e951e` |
+| `ur-PK-r2.aklp` | 36632 | `3b7350e333bdc6a402cc4f48c8ebc0eeafea9d30394f6b5c0a900e9d46109785` |
+| `zh-CN-r2.aklp` | 25141 | `5031a04ea7abd2af4aea30e9a178f5035f5eb5cc86a3d8c16fa6128b23d120a1` |
+
+Signer: `sign-language-package.exe` built from the source commit, SHA-256
+`93ccbcbeef5dd69eb686e9380e7775ce167cb3acbdc96902d2ca68ce6ad6f4ca`; key `pkg-20260912-01`.
