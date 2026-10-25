@@ -181,6 +181,17 @@ layouts: the keypad's `.` prints `,` in Russian, so it ends the word. A valid wo
 the current layout is a hard veto; automatic correction does not override it
 even when another pack also contains a plausible word.
 
+Punctuation right after a word that the other layouts read as punctuation too
+stays with the word until the Space, and the word is converted with it:
+`gjnjv/` → `потом.` and `gjnjv?` → `потом,` (the `/` key prints a full stop in
+Russian). Earlier such a key ended the word, which was then neither converted
+nor available to Pause/Break. The word is judged without its marks, and a
+known word before them still vetoes the conversion; a letter or digit after the
+marks starts a new word as before (`src/main.rs`), and a target that reads the
+letters alike (Latin Estonian) is not used, as it would change only the marks.
+No English word of the token corpora followed by such a mark is converted
+(`tests/dev_tokens.rs`).
+
 After a successful Pause/Break undo, the original source-layout word may be
 held in memory for at most two minutes. A passive tray notification enables an
 explicit "Do not correct the last undone word" action. The word is not

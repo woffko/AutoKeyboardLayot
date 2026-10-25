@@ -252,6 +252,69 @@ impl Detector {
             .or_else(|| self.detect_with_layout_model(word, current_language, candidates, previous))
     }
 
+    /// As `detect_mapped_candidates_in_context` (`detect_mapped_candidates` without `previous`)
+    /// for a word whose last `marks` characters are trailing marks (`InputEvent::TrailingMark`):
+    /// the word and its candidates are judged without the marks, and the replacement gets them
+    /// as the target layout reads the same keys, which must not be letters there ("gjnjv/" is
+    /// "потом.").
+    pub fn detect_with_trailing_marks(
+        &self,
+        word: &str,
+        marks: usize,
+        current_language: Language,
+        candidates: &[(Language, String)],
+        previous: Option<&[Language]>,
+    ) -> Option<Detection> {
+        let detect = |word: &str, candidates: &[(Language, String)]| match previous {
+            Some(previous) => self.detect_mapped_candidates_in_context(
+                word,
+                current_language,
+                candidates,
+                previous,
+            ),
+            None => self.detect_mapped_candidates(word, current_language, candidates),
+        };
+        if marks == 0 {
+            return detect(word, candidates);
+        }
+        let length = word.chars().count();
+        let core_length = length.checked_sub(marks).filter(|&core| core > 0)?;
+        let split = |text: &str| {
+            (text.chars().count() == length).then(|| {
+                (
+                    text.chars().take(core_length).collect::<String>(),
+                    text.chars().skip(core_length).collect::<String>(),
+                )
+            })
+        };
+        let (core, _) = split(word)?;
+        let mut cores = Vec::new();
+        let mut tails = Vec::new();
+        for (language, text) in self.resolve_candidates(word, current_language, candidates) {
+            if let Some((candidate_core, tail)) = split(&text) {
+                cores.push((language, candidate_core));
+                tails.push((language, tail));
+            }
+        }
+        let mut detection = detect(&core, &cores)?;
+        // A target that reads the letters alike ("endi" in Estonian) would change only the marks.
+        if detection.replacement == core {
+            return None;
+        }
+        let (_, tail) = tails
+            .into_iter()
+            .find(|(language, _)| *language == detection.target_language)?;
+        if tail
+            .chars()
+            .any(|character| self.accepts_character(detection.target_language, character))
+        {
+            return None;
+        }
+        detection.original = word.to_owned();
+        detection.replacement.push_str(&tail);
+        Some(detection)
+    }
+
     /// Second stage. It keeps every hard rule of the dictionary detector: the
     /// word must be long enough, not excluded and not a known word in the typed
     /// layout, and the target must use the target language's alphabet. The
@@ -672,14 +735,16 @@ impl Detector {
     }
 
     /// The languages of `readings` (one word read in several layouts) from the most to the least
-    /// plausible reading. The word score decides, which includes the dictionary bonus; equal
-    /// scores keep the given order. The hotkey sends a word to the first of them.
+    /// plausible reading. The word score of the reading's letters decides (punctuation at its
+    /// edges, such as the full stop of "потом.", is not scored), which includes the dictionary
+    /// bonus; equal scores keep the given order. The hotkey sends a word to the first of them.
     pub fn rank_candidates(&self, readings: &[(Language, String)]) -> Vec<Language> {
         let mut scored: Vec<(Language, f32)> = readings
             .iter()
             .map(|(language, reading)| {
+                let core = self.letter_core(*language, reading);
                 let score = score_word(
-                    reading,
+                    if core.is_empty() { reading } else { core },
                     *language,
                     &self.user_dictionary,
                     &self.dictionaries,
@@ -905,6 +970,97 @@ mod tests {
             [Language::Estonian, Language::Russian]
         );
         assert!(detector.rank_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_hotkey_ranks_a_reading_by_its_letters_without_edge_punctuation() {
+        let detector = crate::test_support::detector();
+        // `gjnjv/` typed in the English layout: Russian reads "потом." (a word and a full stop),
+        // Estonian "gjnjv-".
+        assert_eq!(
+            detector.rank_candidates(&mapped(&[
+                (Language::Estonian, "gjnjv-"),
+                (Language::Russian, "потом."),
+            ])),
+            [Language::Russian, Language::Estonian]
+        );
+    }
+
+    #[test]
+    fn a_word_with_trailing_marks_is_judged_by_its_letters() {
+        let detector = crate::test_support::detector();
+        let candidates = mapped(&[
+            (Language::Russian, "потом."),
+            (Language::Estonian, "gjnjv-"),
+        ]);
+        let detection = detector
+            .detect_with_trailing_marks("gjnjv/", 1, Language::English, &candidates, None)
+            .expect("converted");
+        assert_eq!(detection.original, "gjnjv/");
+        assert_eq!(detection.replacement, "потом.");
+        // Without its mark the word is judged as before.
+        assert_eq!(
+            detector.detect_with_trailing_marks("gjnjv/", 0, Language::English, &candidates, None),
+            detector.detect_mapped_candidates("gjnjv/", Language::English, &candidates)
+        );
+        // A known word before the mark stays ("key." is no "луню").
+        assert!(
+            detector
+                .detect_with_trailing_marks(
+                    "key/",
+                    1,
+                    Language::English,
+                    &mapped(&[(Language::Russian, "лун.")]),
+                    None
+                )
+                .is_none()
+        );
+        // A mark the target reads as a letter is no trailing mark.
+        assert!(
+            detector
+                .detect_with_trailing_marks(
+                    "gjnjv/",
+                    1,
+                    Language::English,
+                    &mapped(&[(Language::Russian, "потомж")]),
+                    None
+                )
+                .is_none()
+        );
+        // The Estonian layout reads "endi" as the same letters: converting it would only turn the
+        // question mark into "_".
+        assert!(
+            detector
+                .detect_mapped_candidates(
+                    "endi",
+                    Language::English,
+                    &mapped(&[(Language::Estonian, "endi")])
+                )
+                .is_some(),
+            "the premise: the word alone is converted to Estonian"
+        );
+        assert!(
+            detector
+                .detect_with_trailing_marks(
+                    "endi?",
+                    1,
+                    Language::English,
+                    &mapped(&[(Language::Estonian, "endi_")]),
+                    None
+                )
+                .is_none()
+        );
+        // Only marks, or more marks than characters, are nothing to convert.
+        assert!(
+            detector
+                .detect_with_trailing_marks("//", 2, Language::English, &[], None)
+                .is_none()
+        );
+        assert!(
+            detector
+                .detect_with_trailing_marks("gj", 3, Language::English, &[], None)
+                .is_none()
+        );
     }
 
     #[test]

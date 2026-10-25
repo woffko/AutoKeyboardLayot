@@ -9017,7 +9017,7 @@ impl InputProcessor {
                     }
                     _ => Vec::new(),
                 };
-                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
+                let mut input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
                     if language.is_some_and(|language| {
                         self.detector
                             .can_extend_word_with_readings(character, language, &readings)
@@ -9029,6 +9029,34 @@ impl InputProcessor {
                         InputEvent::UnsupportedInput
                     }
                 });
+                // Punctuation right after a word stays with it until the Space ("gjnjv/" is
+                // "потом."): the target layouts read the key as no letter either, or it would
+                // continue the word as one.
+                if let Some(character) = printable
+                    && input_event == InputEvent::Boundary
+                    && !character.is_whitespace()
+                    && self.session.buffered_character_count() != 0
+                    && !self.session.is_suppressed()
+                {
+                    input_event = InputEvent::TrailingMark(character);
+                }
+                if self.session.ends_with_marks()
+                    && !matches!(input_event, InputEvent::TrailingMark(_))
+                {
+                    // Anything else after the marks ends the word unconverted, as the boundary
+                    // at its first mark did before.
+                    self.log_word_discard("punctuation", WordDiscardDetail::None);
+                    if let SessionAction::Candidate(_) =
+                        self.session
+                            .handle(InputEvent::Boundary, language, &self.detector)
+                    {
+                        self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.replay_keys.clear();
+                    self.last_word_reset = "boundary";
+                    self.recovered_mid_word = false;
+                    self.privacy_needs_check = true;
+                }
                 // Before the reset below is overwritten: a token may start with a digit right
                 // after a shortcut or a manual layout switch.
                 let buffered_before = self.session.buffered_character_count();
@@ -9044,7 +9072,10 @@ impl InputProcessor {
                         ),
                     );
                 }
-                if matches!(input_event, InputEvent::Printable(_)) {
+                if matches!(
+                    input_event,
+                    InputEvent::Printable(_) | InputEvent::TrailingMark(_)
+                ) {
                     // A new word has started; the previous word is no longer the
                     // one adjacent to the caret.
                     self.last_boundary = None;
@@ -9077,8 +9108,10 @@ impl InputProcessor {
                     SessionAction::Reset(_) => self.replay_keys.clear(),
                     SessionAction::None => {}
                 }
-                if matches!(input_event, InputEvent::Printable(_))
-                    && self.session.buffered_character_count() == buffered_before + 1
+                if matches!(
+                    input_event,
+                    InputEvent::Printable(_) | InputEvent::TrailingMark(_)
+                ) && self.session.buffered_character_count() == buffered_before + 1
                 {
                     if let Some(key) = replay_key_from_event(event, self.modifiers) {
                         self.replay_keys.push(key);
@@ -17429,6 +17462,74 @@ mod tests {
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
+    fn a_word_with_a_trailing_punctuation_key_is_converted_with_it() {
+        // "gjnjv/" is "потом." typed with the English layout: the "/" key prints a full stop in
+        // Russian, so the mark stays with the word and both are converted at the Space.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(
+            &mut processor,
+            foreground,
+            &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35],
+        );
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "gjnjv/");
+        assert_eq!(pending.transaction.replacement, "потом.");
+        assert_eq!(pending.transaction.target_language, Language::Russian);
+        assert_eq!(pending.replay_keys.len(), 6);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_letter_after_a_trailing_punctuation_key_starts_a_new_word() {
+        // "gjnjv/ghbdtn": the letter after the mark ends "gjnjv/" unconverted, as before, and
+        // only "ghbdtn" ("привет") is converted at the Space.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(
+            &mut processor,
+            foreground,
+            &[
+                0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31,
+            ],
+        );
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "ghbdtn");
+        assert_eq!(pending.transaction.replacement, "привет");
+        assert_eq!(pending.replay_keys.len(), 6);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn erasing_a_trailing_punctuation_key_keeps_the_word() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        // As on the owner's computer: Backspace corrects the word instead of ending it.
+        processor.settings.suppress_after_backspace = false;
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35],
+        );
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 7, 0)
+        });
+        processor.process_key(space_key(foreground, 8, 9));
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "gjnjv");
+        assert_eq!(pending.transaction.replacement, "потом");
+        assert_eq!(pending.replay_keys.len(), 5);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
     fn a_keypad_period_ends_the_word_where_the_target_layouts_print_a_comma() {
         // The offline table reads "." as the Russian "ю", the key of the main row. The keypad's
         // "." prints "," in the Russian and Estonian layouts: after "ghbdtn" it ends the word
@@ -24586,6 +24687,44 @@ mod tests {
     }
 
     const GHBDTN: [u32; 6] = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_ended_by_a_letter_after_its_trailing_mark_is_logged_without_text() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22],
+        );
+        let lines: Vec<String> = diagnostics.try_iter().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("event=word_discard ")
+                    && line.contains(" reason=punctuation chars=6")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("gjnjv")),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_a_word_with_a_trailing_punctuation_key() {
+        // "gjnjv/" is "потом." typed with the English layout.
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35]);
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("converted: {lines:?}"));
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "потом.");
+    }
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]

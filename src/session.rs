@@ -21,6 +21,10 @@ pub enum ResetReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
     Printable(char),
+    /// A punctuation mark typed right after a word, which the target layouts read as punctuation
+    /// too (the "/" key prints a full stop in Russian). It stays with the word until the
+    /// boundary, so the word is converted with it; a letter after it starts a new word.
+    TrailingMark(char),
     Boundary,
     Backspace,
     Delete,
@@ -40,6 +44,7 @@ impl InputEvent {
     pub const fn category(self) -> &'static str {
         match self {
             Self::Printable(_) => "Printable",
+            Self::TrailingMark(_) => "TrailingMark",
             Self::Boundary => "Boundary",
             Self::Backspace => "Backspace",
             Self::Delete => "Delete",
@@ -71,6 +76,8 @@ type MappedContext<'a> = (&'a [(Language, String)], &'a [Language]);
 #[derive(Debug, Clone)]
 pub struct InputSession {
     current_word: String,
+    /// How many characters at the end of `current_word` are trailing marks.
+    trailing_marks: usize,
     suppressed_until_boundary: bool,
     backspace_remaining: Option<usize>,
     max_word_characters: usize,
@@ -83,6 +90,7 @@ impl Default for InputSession {
     fn default() -> Self {
         Self {
             current_word: String::new(),
+            trailing_marks: 0,
             suppressed_until_boundary: false,
             backspace_remaining: None,
             max_word_characters: DEFAULT_MAX_WORD_CHARACTERS,
@@ -119,6 +127,10 @@ impl InputSession {
                     self.backspace_remaining = None;
                     return SessionAction::None;
                 }
+                if self.trailing_marks > 0 {
+                    // The mark ends the word once a letter follows, as a boundary did.
+                    let _ = self.finish_boundary(current_language, detector, None);
+                }
                 let Some(language) = current_language else {
                     return self.reset(ResetReason::UnsupportedInput, true);
                 };
@@ -133,6 +145,21 @@ impl InputSession {
                 }
                 self.at_line_start = false;
                 self.current_word.push(character);
+                SessionAction::None
+            }
+            InputEvent::TrailingMark(character) => {
+                if self.suppressed_until_boundary {
+                    self.backspace_remaining = None;
+                    return SessionAction::None;
+                }
+                if self.current_word.is_empty() {
+                    return self.finish_boundary(current_language, detector, None);
+                }
+                if self.current_word.chars().count() >= self.max_word_characters {
+                    return self.reset(ResetReason::UnsupportedInput, true);
+                }
+                self.current_word.push(character);
+                self.trailing_marks += 1;
                 SessionAction::None
             }
             InputEvent::Boundary => self.finish_boundary(current_language, detector, None),
@@ -150,6 +177,7 @@ impl InputSession {
 
     pub fn clear(&mut self) {
         self.current_word.clear();
+        self.trailing_marks = 0;
         self.suppressed_until_boundary = false;
         self.backspace_remaining = None;
         self.at_line_start = false;
@@ -175,6 +203,11 @@ impl InputSession {
 
     pub const fn is_suppressed(&self) -> bool {
         self.suppressed_until_boundary
+    }
+
+    /// Whether the word typed so far ends with trailing marks.
+    pub const fn ends_with_marks(&self) -> bool {
+        self.trailing_marks > 0
     }
 
     /// Apply an observed composition state from the platform adapter.
@@ -207,6 +240,7 @@ impl InputSession {
         if self.suppressed_until_boundary || self.current_word.pop().is_none() {
             return false;
         }
+        self.trailing_marks = self.trailing_marks.saturating_sub(1);
         self.backspace_remaining = None;
         if self.current_word.is_empty() {
             self.at_line_start = self.current_word_started_at_line_start;
@@ -257,23 +291,29 @@ impl InputSession {
         }
 
         self.backspace_remaining = None;
+        let marks = core::mem::take(&mut self.trailing_marks);
         let word = core::mem::take(&mut self.current_word);
         self.at_line_start = false;
         self.current_word_started_at_line_start = false;
         let Some(language) = current_language else {
             return SessionAction::None;
         };
-        let detection = candidates.map_or_else(
-            || detector.detect(&word, language),
-            |(candidates, previous)| {
-                detector.detect_mapped_candidates_in_context(&word, language, candidates, previous)
-            },
-        );
+        let detection = match candidates {
+            None => detector.detect_with_trailing_marks(&word, marks, language, &[], None),
+            Some((candidates, previous)) => detector.detect_with_trailing_marks(
+                &word,
+                marks,
+                language,
+                candidates,
+                Some(previous),
+            ),
+        };
         detection.map_or(SessionAction::None, SessionAction::Candidate)
     }
 
     fn reset(&mut self, reason: ResetReason, suppress_until_boundary: bool) -> SessionAction {
         self.current_word.clear();
+        self.trailing_marks = 0;
         self.suppressed_until_boundary = suppress_until_boundary;
         self.backspace_remaining = None;
         self.at_line_start = false;
@@ -363,6 +403,152 @@ mod tests {
             assert_eq!(category, "Printable");
             assert!(!category.contains(character));
         }
+        for character in ['/', '?', '!'] {
+            let category = InputEvent::TrailingMark(character).category();
+            assert_eq!(category, "TrailingMark");
+            assert!(!category.contains(character));
+        }
+    }
+
+    /// Types `word` and then each of `marks` as a trailing mark.
+    fn type_word_and_marks(
+        session: &mut InputSession,
+        word: &str,
+        marks: &str,
+        detector: &Detector,
+    ) {
+        for character in word.chars() {
+            session.handle(
+                InputEvent::Printable(character),
+                Some(Language::English),
+                detector,
+            );
+        }
+        for mark in marks.chars() {
+            assert_eq!(
+                session.handle(
+                    InputEvent::TrailingMark(mark),
+                    Some(Language::English),
+                    detector
+                ),
+                SessionAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_mark_stays_with_the_word_until_the_boundary() {
+        // "gjnjv/" is "потом." typed with the English layout: the "/" key prints a full stop in
+        // Russian, so the word is converted with it.
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(&mut session, "gjnjv", "/", &detector);
+        assert_eq!(session.buffered_character_count(), 6);
+        assert!(session.ends_with_marks());
+        let action = session.finish_boundary_in_context(
+            Some(Language::English),
+            &detector,
+            &[
+                (Language::Russian, "потом.".to_owned()),
+                (Language::Estonian, "gjnjv-".to_owned()),
+            ],
+            &[],
+        );
+        let SessionAction::Candidate(detection) = action else {
+            panic!("not converted: {action:?}");
+        };
+        assert_eq!(detection.original, "gjnjv/");
+        assert_eq!(detection.replacement, "потом.");
+        assert_eq!(detection.target_language, Language::Russian);
+        assert!(!session.ends_with_marks());
+        assert_eq!(session.buffered_character_count(), 0);
+    }
+
+    #[test]
+    fn several_trailing_marks_stay_with_the_word() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(&mut session, "gjnjv", "//", &detector);
+        assert_eq!(session.buffered_character_count(), 7);
+        assert!(session.ends_with_marks());
+    }
+
+    #[test]
+    fn a_letter_after_a_trailing_mark_starts_a_new_word() {
+        // "src/main": once a letter follows, the mark ends "src" as a boundary did.
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(&mut session, "src", "/", &detector);
+        session.handle(
+            InputEvent::Printable('m'),
+            Some(Language::English),
+            &detector,
+        );
+        assert_eq!(session.buffered_character_count(), 1);
+        assert!(!session.ends_with_marks());
+        assert!(!session.is_suppressed());
+    }
+
+    #[test]
+    fn a_trailing_mark_without_a_word_is_a_boundary() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        assert_eq!(
+            session.handle(
+                InputEvent::TrailingMark('/'),
+                Some(Language::English),
+                &detector
+            ),
+            SessionAction::None
+        );
+        assert_eq!(session.buffered_character_count(), 0);
+        assert!(!session.ends_with_marks());
+    }
+
+    #[test]
+    fn a_suppressed_word_takes_no_trailing_mark() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        session.handle(
+            InputEvent::UnsupportedInput,
+            Some(Language::English),
+            &detector,
+        );
+        session.handle(
+            InputEvent::TrailingMark('/'),
+            Some(Language::English),
+            &detector,
+        );
+        assert_eq!(session.buffered_character_count(), 0);
+        assert!(!session.ends_with_marks());
+        assert!(session.is_suppressed());
+    }
+
+    #[test]
+    fn erasing_a_trailing_mark_returns_to_the_word() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(&mut session, "gjnjv", "/", &detector);
+        assert!(session.erase_last_character());
+        assert_eq!(session.buffered_character_count(), 5);
+        assert!(!session.ends_with_marks());
+        session.handle(
+            InputEvent::Printable('f'),
+            Some(Language::English),
+            &detector,
+        );
+        assert_eq!(session.buffered_character_count(), 6);
+    }
+
+    #[test]
+    fn a_word_ends_with_marks_until_all_of_them_are_erased() {
+        let detector = crate::test_support::detector();
+        let mut session = InputSession::default();
+        type_word_and_marks(&mut session, "gjnjv", "//", &detector);
+        assert!(session.erase_last_character());
+        assert!(session.ends_with_marks());
+        assert!(session.erase_last_character());
+        assert!(!session.ends_with_marks());
     }
 
     #[test]
