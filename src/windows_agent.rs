@@ -18208,6 +18208,34 @@ mod tests {
     }
 
     #[test]
+    fn the_hook_learns_the_conversion_on_enter_setting() {
+        let metrics = ObserverMetrics::default();
+        let mut settings = Settings::default();
+        store_hotkey_configuration(&metrics, &settings);
+        assert!(!metrics.convert_on_enter.load(Ordering::Acquire));
+        settings.convert_on_enter = true;
+        store_hotkey_configuration(&metrics, &settings);
+        assert!(metrics.convert_on_enter.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_stale_enter_decision_still_lets_its_enter_go() {
+        // An Enter decision queued before a new input epoch is not processed, but the gate it
+        // armed must still let the held Enter go.
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.input_epoch.store(2, Ordering::Release);
+        metrics.active_gate_token.store(9, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.process(QueuedInputEvent {
+            configuration: None,
+            captured_at: Instant::now(),
+            epoch: 1,
+            event: RawInputEvent::EnterDecision(test_raw_key(WM_KEYDOWN, VK_RETURN, 9, 0)),
+        });
+        assert_eq!(processor.last_gate_release_token, 9);
+    }
+
+    #[test]
     fn an_enter_held_for_a_decision_arms_the_gate_with_the_enter_held() {
         let (mut state, _receiver) = test_gate_state(4);
         let enter = RawKeyEvent {
@@ -25450,6 +25478,12 @@ mod tests {
             ),
             "{lines:?}"
         );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("result=not-attempted")),
+            "{lines:?}"
+        );
         // The gate lets the Enter go after the edit.
         assert_eq!(processor.last_gate_release_token, enter);
         assert!(processor.metrics.undo_available.load(Ordering::Acquire));
@@ -25466,6 +25500,13 @@ mod tests {
                 !lines
                     .iter()
                     .any(|line| line.starts_with("event=conversion ")),
+                "{convert_on_enter}: {lines:?}"
+            );
+            // Let go by the worker itself, not by the safety net of a forced release.
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("phase=release_forced")),
                 "{convert_on_enter}: {lines:?}"
             );
             assert_eq!(
