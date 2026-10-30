@@ -253,6 +253,10 @@ const LAYOUT_SWITCH_TIMEOUT_MS: u64 = 250;
 const LAYOUT_STABLE_MS: u64 = 50;
 const REPLAY_COMMIT_MS: u64 = 50;
 const CORRECTION_GATE_MAX_HOLD_MS: u64 = 1_200;
+/// The desktop acceptance ends a gate early on the UI thread, while the worker still counts on all
+/// of it: what a worker that overruns the deadline looks like.
+#[cfg(test)]
+static TEST_GATE_HOLD_MS: AtomicU64 = AtomicU64::new(CORRECTION_GATE_MAX_HOLD_MS);
 const CORRECTION_GATE_CAPACITY: usize = 256;
 /// Held keys that could not be handed back wait this long in memory for an explicit recovery and
 /// are then deleted, so that they cannot keep automatic conversion paused and Exit declined for
@@ -736,7 +740,7 @@ impl CorrectionGate {
         self.held.clear();
         self.origin = None;
         self.pending_hotkey = None;
-        self.deadline = Instant::now() + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS);
+        self.deadline = Instant::now() + Duration::from_millis(correction_gate_hold_ms());
     }
 
     fn hold(&mut self, event: RawKeyEvent) -> bool {
@@ -6150,6 +6154,17 @@ fn retained_input_awaits_the_user(metrics: &ObserverMetrics) -> bool {
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
         .is_some_and(|input| !input.enter_comes_back())
+}
+
+/// How long a gate holds its keys on the UI thread.
+#[cfg(not(test))]
+const fn correction_gate_hold_ms() -> u64 {
+    CORRECTION_GATE_MAX_HOLD_MS
+}
+
+#[cfg(test)]
+fn correction_gate_hold_ms() -> u64 {
+    TEST_GATE_HOLD_MS.load(Ordering::Acquire)
 }
 
 /// The cause a worker's fail-open request names in its LPARAM: a selection the edit may have
@@ -28331,6 +28346,46 @@ public class AklWindowlessReader : Form {
                 format!("busy_ms={busy_ms}"),
                 text,
                 format!("привет\n{}", "kl".repeat(12)),
+            )]
+        });
+    }
+
+    /// Desktop acceptance of an Enter whose gate runs out before the edit has ended, with typing
+    /// going on after it: the gate breaks on its deadline while the field still keeps the worker
+    /// waiting, and the letters typed then wait behind the Enter.
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_when_its_gate_runs_out() {
+        TEST_GATE_HOLD_MS.store(50, Ordering::Release);
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            typing.field.set_text("");
+            typing.to_english();
+            typing.field.configure(1_000, 0);
+            thread::sleep(Duration::from_millis(500));
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            let (k, l) = (VIRTUAL_KEY(0x4B), VIRTUAL_KEY(0x4C));
+            typing.type_keys(&[VK_RETURN]);
+            for _ in 0..12 {
+                typing.type_keys(&[k, l]);
+            }
+            let text = typing.text("ghbdtn");
+            eprintln!(
+                "newlines={} after_enter={:?} word_kept={}",
+                text.matches('\n').count(),
+                text.split_once('\n').map(|(_, after)| after),
+                text.starts_with("привет") || text.starts_with("ghbdtn")
+            );
+            // The edit gave up with the gate, so the word may be either: that it is still there,
+            // once, is the point.
+            let word = if text.starts_with("привет") {
+                "привет"
+            } else {
+                "ghbdtn"
+            };
+            vec![(
+                "deadline".to_owned(),
+                text,
+                format!("{word}\n{}", "kl".repeat(12)),
             )]
         });
     }
