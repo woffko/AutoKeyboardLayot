@@ -17663,6 +17663,21 @@ mod tests {
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
+    fn a_word_two_layouts_read_alike_is_converted() {
+        // "just" typed in the Russian layout: English and Estonian read the same known letters.
+        let (mut processor, foreground) = processor_typing_in(0x0419);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x24, 0x16, 0x1f, 0x14]);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "огые");
+        assert_eq!(pending.transaction.replacement, "just");
+        assert_eq!(pending.transaction.target_language, Language::English);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
     fn a_word_with_a_trailing_punctuation_key_is_converted_with_it() {
         // "gjnjv/" is "потом." typed with the English layout: the "/" key prints a full stop in
         // Russian, so the mark stays with the word and both are converted at the Space.

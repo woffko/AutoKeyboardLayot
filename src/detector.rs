@@ -601,7 +601,7 @@ impl Detector {
             // A general-list abbreviation is not as strong as a common word.
             source_score -= DICTIONARY_SCORE_BONUS;
         }
-        let mut dictionary_candidate = None;
+        let mut dictionary_candidate: Option<Detection> = None;
         let mut statistical_candidate = None;
 
         let resolved_candidates = self.resolve_candidates(word, current_language, candidates);
@@ -657,10 +657,17 @@ impl Detector {
             }
 
             if target_in_dictionary {
-                if dictionary_candidate.is_some() {
-                    return None;
+                match &mut dictionary_candidate {
+                    // Two targets that give the same text (Latin letters that read alike in
+                    // English and Estonian) are no ambiguity: the one that reads best stays.
+                    Some(kept) if kept.replacement == detection.replacement => {
+                        if detection.target_score > kept.target_score {
+                            *kept = detection;
+                        }
+                    }
+                    Some(_) => return None,
+                    None => dictionary_candidate = Some(detection),
                 }
-                dictionary_candidate = Some(detection);
             } else {
                 if statistical_candidate.is_some() {
                     return None;
@@ -1100,6 +1107,37 @@ mod tests {
             )
             .expect("the model converts it");
         assert_eq!(detection.replacement, "küsimusele!");
+    }
+
+    #[test]
+    fn two_dictionary_targets_with_the_same_text_are_no_ambiguity() {
+        // "just" typed in the Russian layout reads the same letters in English and in Estonian, and
+        // both dictionaries know them: the text is the same whichever target is taken.
+        let detector = crate::test_support::detector();
+        let same = mapped(&[(Language::English, "just"), (Language::Estonian, "just")]);
+        let detection = detector
+            .detect_mapped_candidates("огые", Language::Russian, &same)
+            .expect("converted");
+        assert_eq!(detection.original, "огые");
+        assert_eq!(detection.replacement, "just");
+        assert_eq!(detection.target_language, Language::English);
+        // The target whose word scores best stays, in either order.
+        let reversed = mapped(&[(Language::Estonian, "just"), (Language::English, "just")]);
+        assert_eq!(
+            detector.detect_mapped_candidates("огые", Language::Russian, &reversed),
+            Some(detection)
+        );
+    }
+
+    #[test]
+    fn two_dictionary_targets_with_different_texts_stay_ambiguous() {
+        let detector = crate::test_support::detector();
+        let different = mapped(&[(Language::English, "just"), (Language::Estonian, "maja")]);
+        assert!(
+            detector
+                .detect_mapped_candidates("огые", Language::Russian, &different)
+                .is_none()
+        );
     }
 
     #[test]
