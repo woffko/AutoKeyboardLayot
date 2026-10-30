@@ -6033,7 +6033,7 @@ const fn hands_held_keys_back_automatically(cause: GateFailureCause) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct HandBackFacts {
     now: Instant,
-    /// The worker is busy, and not inside an edit that may have selected or typed text.
+    /// The worker is gone, or busy and not inside an edit that may have selected or typed text.
     worker_stalled: bool,
     /// `AppState::typed_input` now.
     typed_input: u64,
@@ -6059,8 +6059,9 @@ fn hand_back_stalled_retained_input(
         };
         let facts = HandBackFacts {
             now,
-            worker_stalled: state.metrics.worker_busy.load(Ordering::Acquire)
-                && !state.metrics.edit_in_flight.load(Ordering::Acquire),
+            worker_stalled: state.metrics.worker_dead.load(Ordering::Acquire)
+                || (state.metrics.worker_busy.load(Ordering::Acquire)
+                    && !state.metrics.edit_in_flight.load(Ordering::Acquire)),
             typed_input: state.typed_input,
             selection_left_token: state.metrics.selection_left_token.load(Ordering::Acquire),
             modifiers_released,
@@ -25083,6 +25084,18 @@ mod tests {
     }
 
     #[test]
+    fn only_the_press_of_an_enter_counts_as_an_enter() {
+        assert!(holds_enter(&[enter_edge(WM_KEYDOWN)]));
+        assert!(holds_enter(&[RawKeyEvent {
+            message: WM_SYSKEYDOWN,
+            ..enter_edge(WM_KEYDOWN)
+        }]));
+        assert!(!holds_enter(&[enter_edge(WM_KEYUP)]));
+        assert!(!holds_enter(&[letter_edge(WM_KEYDOWN)]));
+        assert!(!holds_enter(&[]));
+    }
+
+    #[test]
     fn a_held_enter_comes_back_by_itself_after_every_cause_but_a_focus_change() {
         for (cause, comes_back) in [
             (GateFailureCause::Deadline, true),
@@ -25177,6 +25190,92 @@ mod tests {
             ]
         );
         assert_eq!(state.typed_input, typed, "the program has not seen them");
+    }
+
+    /// The hook's verdict on a key edge for the window in front, in a state with a retained Enter
+    /// there: the record and what the worker was told afterwards. The edge is no real input: a
+    /// verdict to pass it reaches nothing.
+    fn hook_verdict_behind_a_retained_enter(
+        event: KBDLLHOOKSTRUCT,
+        prepare: impl FnOnce(&ObserverMetrics),
+    ) -> Option<(LRESULT, RetainedInput, Vec<QueuedInputEvent>)> {
+        let foreground = current_foreground_context()?;
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            foreground,
+            ..retained_enter(Instant::now())
+        });
+        prepare(&metrics);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        let verdict = unsafe {
+            keyboard_hook_body(
+                0,
+                WPARAM(WM_KEYDOWN as usize),
+                LPARAM(core::ptr::from_ref(&event) as isize),
+            )
+        };
+        drop(take_app_state());
+        let record = metrics.retained_input.lock().unwrap().clone()?;
+        Some((verdict, record, receiver.try_iter().collect()))
+    }
+
+    #[test]
+    fn the_hook_keeps_a_new_key_from_overtaking_a_retained_enter() {
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: 0x47,
+            scanCode: u32::from(LETTER_SCAN),
+            ..Default::default()
+        };
+        // Without a window in front (a service session) there is no input target to wait for.
+        let Some((verdict, record, told)) = hook_verdict_behind_a_retained_enter(event, |_| {})
+        else {
+            return;
+        };
+        assert_eq!(verdict, LRESULT(1), "swallowed");
+        assert_eq!(record.events.len(), 2);
+        assert!(told.is_empty(), "the worker sees it when it goes out");
+    }
+
+    #[test]
+    fn the_hook_leaves_a_drained_key_alone_behind_a_retained_enter() {
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: 0x47,
+            scanCode: u32::from(LETTER_SCAN),
+            dwExtraInfo: DRAINED_EVENT_MARKER,
+            flags: LLKHF_INJECTED,
+            ..Default::default()
+        };
+        let Some((verdict, record, told)) = hook_verdict_behind_a_retained_enter(event, |_| {})
+        else {
+            return;
+        };
+        assert_ne!(verdict, LRESULT(1), "passed");
+        assert_eq!(record.events.len(), 1);
+        assert!(
+            told.iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::Key(_)))
+        );
+    }
+
+    #[test]
+    fn the_hook_leaves_the_hotkey_alone_behind_a_retained_enter() {
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_PAUSE.0),
+            scanCode: 0x45,
+            ..Default::default()
+        };
+        let verdict = hook_verdict_behind_a_retained_enter(event, |metrics| {
+            metrics.pause_break_undo.store(true, Ordering::Release);
+            metrics
+                .force_hotkey_virtual_key
+                .store(u32::from(VK_PAUSE.0), Ordering::Release);
+            metrics.force_hotkey_modifiers.store(0, Ordering::Release);
+        });
+        let Some((_, record, _)) = verdict else {
+            return;
+        };
+        assert_eq!(record.events.len(), 1, "Pause is no text behind the Enter");
     }
 
     #[test]
@@ -25305,6 +25404,60 @@ mod tests {
         assert!(
             steps.lock().unwrap().steps.is_empty(),
             "a busy field would apply a selection set through UI Automation among its queued keys"
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_right_arrow_nothing_took_is_pressed_with_the_next_attempt() {
+        let (mut processor, _steps) = enter_recovered_through_a_selection();
+        processor.recovery_input_limit = 0;
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            processor
+                .metrics
+                .selection_left_token
+                .load(Ordering::Acquire),
+            10
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_some());
+        processor.recovery_input_limit = usize::MAX;
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_right_arrow_goes_once_before_keys_that_came_while_the_enter_went_out() {
+        let (mut processor, _steps) = enter_recovered_through_a_selection();
+        let metrics = Arc::clone(&processor.metrics);
+        let arrived = AtomicBool::new(false);
+        processor.during_recovery_send = Some(Box::new(move || {
+            if !arrived.swap(true, Ordering::AcqRel) {
+                let mut retained = metrics.retained_input.lock().unwrap();
+                let record = retained.as_mut().unwrap();
+                record.events.push(letter_edge(WM_KEYDOWN));
+                record.events.push(letter_edge(WM_KEYUP));
+            }
+        }));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true),
+                (LETTER_SCAN, false),
+                (LETTER_SCAN, true)
+            ]
         );
     }
 
@@ -25468,6 +25621,11 @@ mod tests {
             delivery_uncertain: true,
             ..retained_enter(Instant::now())
         });
+        // Nothing else stands in its way: no new input since the request.
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
         processor.recover_retained_input(50, false);
         assert!(recovered_edges(&processor).is_empty());
         assert!(processor.metrics.retained_input.lock().unwrap().is_some());
@@ -25653,6 +25811,21 @@ mod tests {
             ]
         );
         assert_eq!(held.handed_back, Some(10));
+    }
+
+    #[test]
+    fn a_worker_that_is_gone_counts_as_stalled_for_held_keys() {
+        let (state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(retained_at));
+        metrics.worker_dead.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let mut state = take_app_state().unwrap();
+        assert!(!has_retained_input(&metrics));
+        assert!(take_held_keys_return(&mut state).is_some());
     }
 
     #[test]
