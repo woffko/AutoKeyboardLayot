@@ -238,9 +238,10 @@ impl Detector {
         self.layout_model.is_some()
     }
 
-    /// Dictionary detection first; when it leaves the word unchanged, the
-    /// optional layout model may still pick another layout. `previous` holds
-    /// the languages of recent words, never their text.
+    /// Dictionary detection first; when it leaves the word unchanged, or two targets with the same
+    /// text leave the layout open, the optional layout model may still pick the layout: it knows
+    /// the words before this one. `previous` holds the languages of recent words, never their
+    /// text.
     pub fn detect_mapped_candidates_in_context(
         &self,
         word: &str,
@@ -248,8 +249,12 @@ impl Detector {
         candidates: &[(Language, String)],
         previous: &[Language],
     ) -> Option<Detection> {
-        self.detect_mapped_candidates(word, current_language, candidates)
-            .or_else(|| self.detect_with_layout_model(word, current_language, candidates, previous))
+        match self.dictionary_stage(word, current_language, candidates) {
+            Some((detection, false)) => Some(detection),
+            found => self
+                .detect_with_layout_model(word, current_language, candidates, previous)
+                .or(found.map(|(detection, _)| detection)),
+        }
     }
 
     /// As `detect_mapped_candidates_in_context` (`detect_mapped_candidates` without `previous`)
@@ -558,13 +563,27 @@ impl Detector {
         current_language: Language,
         candidates: &[(Language, String)],
     ) -> Option<Detection> {
+        self.dictionary_stage(word, current_language, candidates)
+            .map(|(detection, _)| detection)
+    }
+
+    /// `detect_mapped_candidates`, and whether two dictionary targets gave the text of the
+    /// detection, so that its target is only the one that reads best.
+    fn dictionary_stage(
+        &self,
+        word: &str,
+        current_language: Language,
+        candidates: &[(Language, String)],
+    ) -> Option<(Detection, bool)> {
         self.dictionaries.active_language(current_language)?;
         let character_count = word.chars().count();
         if character_count == 1 {
             if !self.config.single_letter_words {
                 return None;
             }
-            return self.detect_single_letter(word, current_language, candidates);
+            return self
+                .detect_single_letter(word, current_language, candidates)
+                .map(|detection| (detection, false));
         }
         if character_count < self.config.minimum_word_characters {
             return None;
@@ -602,6 +621,7 @@ impl Detector {
             source_score -= DICTIONARY_SCORE_BONUS;
         }
         let mut dictionary_candidate: Option<Detection> = None;
+        let mut same_text_targets = false;
         let mut statistical_candidate = None;
 
         let resolved_candidates = self.resolve_candidates(word, current_language, candidates);
@@ -661,6 +681,7 @@ impl Detector {
                     // Two targets that give the same text (Latin letters that read alike in
                     // English and Estonian) are no ambiguity: the one that reads best stays.
                     Some(kept) if kept.replacement == detection.replacement => {
+                        same_text_targets = true;
                         if detection.target_score > kept.target_score {
                             *kept = detection;
                         }
@@ -676,7 +697,9 @@ impl Detector {
             }
         }
 
-        dictionary_candidate.or(statistical_candidate)
+        dictionary_candidate
+            .map(|detection| (detection, same_text_targets))
+            .or(statistical_candidate.map(|detection| (detection, false)))
     }
 
     /// List-only policy for one-character words. A single letter has no
@@ -1126,6 +1149,66 @@ mod tests {
         assert_eq!(
             detector.detect_mapped_candidates("огые", Language::Russian, &reversed),
             Some(detection)
+        );
+    }
+
+    #[test]
+    fn the_layout_model_chooses_between_two_targets_with_the_same_text() {
+        // "selle" typed in the Russian layout after Estonian words: the text is the same in
+        // English and Estonian, and the layout to switch to is the one the words before say.
+        let detector = model_detector();
+        let same = mapped(&[(Language::English, "selle"), (Language::Estonian, "selle")]);
+        let previous = [Language::Estonian; 3];
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context("ыудду", Language::Russian, &same, &previous)
+                .map(|detection| detection.target_language),
+            Some(Language::Estonian)
+        );
+        // Without the model the target that reads best stays, and where the model has no opinion
+        // (a word too short for it) as well.
+        assert_eq!(
+            crate::test_support::detector()
+                .detect_mapped_candidates_in_context("ыудду", Language::Russian, &same, &previous)
+                .map(|detection| detection.target_language),
+            Some(Language::English)
+        );
+        let short = mapped(&[(Language::English, "on"), (Language::Estonian, "on")]);
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context("щт", Language::Russian, &short, &previous)
+                .map(|detection| detection.replacement),
+            Some("on".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_layout_model_is_asked_only_about_two_dictionary_targets() {
+        // One dictionary target: only the English dictionary knows "and", though the Estonian
+        // layout reads the same letters. It stays what the dictionary stage found, as before.
+        let detector = model_detector();
+        let one = mapped(&[(Language::English, "and"), (Language::Estonian, "and")]);
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context("фтв", Language::Russian, &one, &[])
+                .map(|detection| detection.target_language),
+            Some(Language::English)
+        );
+        // A statistical target: neither dictionary knows the word.
+        let statistical = mapped(&[
+            (Language::English, "sellest"),
+            (Language::Estonian, "sellest"),
+        ]);
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "ыуддуые",
+                    Language::Russian,
+                    &statistical,
+                    &[Language::Russian]
+                )
+                .map(|detection| detection.target_language),
+            Some(Language::English)
         );
     }
 

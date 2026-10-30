@@ -184,10 +184,12 @@ even when another pack also contains a plausible word.
 Two dictionary targets that differ in text are ambiguous and the word stays as
 typed. Two that give the same text are not: a word typed in the Russian layout
 that reads the same Latin letters in English and Estonian (`огые` is `just`,
-`зщду` is `pole`) is converted, and the target whose word scores best supplies
-the layout to switch to. On the layout model's 200 000 evaluation cases this
-converts 278 more words with the layout model and single-letter words on (651
-with the dictionaries alone), makes no case worse and adds no false conversion.
+`зщду` is `pole`) is converted. The layout to switch to comes from the layout
+model when it is on and sure, as it knows the words before this one, and otherwise
+from the target whose word scores best. On the layout model's 200 000 evaluation
+cases this converts 278 more words with the layout model and single-letter words
+on (651 with the dictionaries alone), makes no case worse, adds no false
+conversion and leaves every target the layout model chose before unchanged.
 
 Punctuation right after a word that the other layouts read as punctuation too
 stays with the word until the Space, and the word is converted with it:
