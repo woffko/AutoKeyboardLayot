@@ -208,12 +208,17 @@ arms the decision gate and the gate holds the Enter itself: the word is replaced
 with no delimiter after it, and only then does the Enter reach the program, so a
 messenger sends and a terminal runs the converted text. The Enter waits for the
 conversion (usually 100–300 ms, at most the gate's 1.2 s deadline); without a
-word to convert it goes on at once. A gate that breaks hands the Enter back like
-any held key (automatically after a deadline, a full gate, a worker queue or a
-hook reinstall; after a focus change it is kept for recovery with Pause and never
-typed into the other window). Shift+Enter and Ctrl+Enter are left alone: Shift,
-held by the gate, would turn the edit's letters into capitals and its paste into
-Ctrl+Shift+V.
+word to convert it goes on at once. A failed conversion or a gate that breaks,
+for any reason, does not keep the Enter: it reaches the program as soon as the
+edit has ended, and keys typed meanwhile wait behind it, in their order. A word
+the edit may have left selected is unselected first with a Right arrow, which
+deletes nothing, so the Enter cannot replace it. The one exception is
+a change of window or field: the Enter is never typed there, nor after coming
+back; it waits for recovery with Pause and is deleted after a minute. An Enter
+that may already have reached the program is not sent again without being asked.
+The same goes for an Enter held behind a Space; other held keys keep the rules
+below. Shift+Enter and Ctrl+Enter are left alone: Shift, held by the gate, would
+turn the edit's letters into capitals and its paste into Ctrl+Shift+V.
 
 After a successful Pause/Break undo, the original source-layout word may be
 held in memory for at most two minutes. A passive tray notification enables an
@@ -341,7 +346,9 @@ Held keys that are not handed back (the gate ended at a click, physical or injec
 by another program, a focus change, injected input, a failed submission or an
 internal fault after the field changed, or the hand-back was refused) wait in memory
 for an explicit recovery from the tray menu for at most one minute, or one
-minute from preparing that recovery, and are then deleted. None of this is
+minute from preparing that recovery, and are then deleted. Held keys with an Enter
+among them come back on all of these paths except a change of window or field, as
+described for `convert_on_enter`. None of this is
 written to logs, configuration, diagnostics, or network services. Unsupported
 input, editing, navigation, focus changes, layout changes, and queue overflow
 clear or suppress the current context.
@@ -616,6 +623,10 @@ recovery instead of being replayed over the word, automatic conversion pauses
 input, a click, another field) leaves what is selected alone, as it may be the
 user's own selection now, and keeps the held keys the same way. Keys kept like
 this never come back automatically; only an explicit recovery brings them back.
+Only keys with an Enter among them go on, after a Right arrow that takes the
+selection away and deletes nothing. It is a key in the input stream, not a
+selection set through UI Automation: a busy field would apply that later, among
+the keys it has queued, and they would land elsewhere.
 When the text edit is
 confirmed but the previous clipboard contents cannot be put back (restoring
 waits up to 60 ms for the clipboard), the conversion still counts as done:
@@ -668,7 +679,11 @@ password field or excluded or elevated program was found, and the worker is not
 inside an edit that may have selected or typed text (`phase=recovery_handed_back`).
 The worker then finishes that recovery as if it had sent the keys itself: the word at the
 caret is not converted until the next boundary, a prepared recovery is cancelled, and
-automatic conversion resumes when every key went out (policy above).
+automatic conversion resumes when every key went out (policy above). Keys with an
+Enter among them need only the same input target, a released modifier and a worker
+outside an edit: what was typed since waits behind them, a left selection gets a
+Right arrow first, and at the end of their minute they are handed back the same way
+instead of being deleted.
 
 The tray icon's tooltip shows the mode (or the safety pause and its reason), the
 layout code and the counters. The icon uses version 4 of the notification-area protocol,

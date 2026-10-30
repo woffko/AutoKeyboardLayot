@@ -637,6 +637,9 @@ struct RetainedInput {
     expires_at: Instant,
     /// The worker is sending these keys right now; the lifetime timer leaves the record alone.
     recovering: bool,
+    /// How many of `events`, from the first, that sending covers: keys that wait behind an Enter
+    /// join the record meanwhile.
+    sending: usize,
     /// When the keys were retained.
     retained_at: Instant,
     /// The gate broke for a cause that hands its keys back without being asked (see
@@ -644,6 +647,24 @@ struct RetainedInput {
     auto_recover: bool,
     /// `AppState::typed_input` when the keys were retained.
     input_mark: u64,
+}
+
+impl RetainedInput {
+    /// An Enter is among the keys and must reach its program: nothing the user does in that
+    /// program keeps it back, what they type waits behind it, and a word the edit may have left
+    /// selected is unselected first. Only a change of the input target stops it, and an Enter
+    /// that may have gone out already is not sent again unasked.
+    fn enter_comes_back(&self) -> bool {
+        self.auto_recover && !self.delivery_uncertain && holds_enter(&self.events)
+    }
+}
+
+/// Whether `events` press an Enter.
+fn holds_enter(events: &[RawKeyEvent]) -> bool {
+    events.iter().any(|event| {
+        event.virtual_key == u32::from(VK_RETURN.0)
+            && matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+    })
 }
 
 struct CorrectionGate {
@@ -2497,6 +2518,8 @@ struct AppState {
     /// The token of the retained record the UI thread handed back past a stalled worker: once its
     /// keys were sent, the worker finishes the recovery.
     pending_hand_back: Option<u64>,
+    /// A Right arrow goes before the keys handed back: their word may still be selected.
+    pending_selection_release: bool,
     /// `ObserverMetrics::clipboard_restore_failures` as last announced to the user.
     announced_clipboard_failures: u64,
     /// Physical key-downs that reached the application, clicks and input injected by other
@@ -2833,6 +2856,8 @@ impl AppState {
         };
         let returned = releases.len();
         self.pending_key_releases.extend(releases);
+        let enter_comes_back = holds_enter(&held) && cause != GateFailureCause::FocusChanged;
+        let auto_recover = enter_comes_back || hands_held_keys_back_automatically(cause);
         let mut retained = false;
         if !held.is_empty() {
             // There cannot be a second gate while recovery is outstanding.
@@ -2855,11 +2880,15 @@ impl AppState {
                         })
                         .unwrap_or(fallback),
                     events: held,
-                    delivery_uncertain: cause == GateFailureCause::DownstreamHook,
+                    // The edge a downstream hook consumed was not one of these keys. Only an
+                    // Enter goes on regardless: it is what the user is waiting for.
+                    delivery_uncertain: cause == GateFailureCause::DownstreamHook
+                        && !enter_comes_back,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                     recovering: false,
+                    sending: 0,
                     retained_at: Instant::now(),
-                    auto_recover: hands_held_keys_back_automatically(cause),
+                    auto_recover,
                     input_mark: self.typed_input,
                 });
                 retained = true;
@@ -2893,7 +2922,7 @@ impl AppState {
             drained_count: 0,
             replay_succeeded: false,
         });
-        if retained && hands_held_keys_back_automatically(cause) {
+        if retained && auto_recover {
             let _ = self.enqueue(RawInputEvent::RecoverInput {
                 sequence,
                 explicit: false,
@@ -2931,6 +2960,21 @@ impl AppState {
         }
     }
 
+    /// Queues the keys of `record` for the window procedure, which reports them to the worker. A
+    /// word the edit of an Enter's gate may have left selected is unselected first.
+    fn hand_back_retained_input(&mut self, record: RetainedInput) {
+        self.metrics.recovery_armed.store(false, Ordering::Release);
+        self.gate_diagnostic(
+            "recovery_handed_back",
+            format!("token={} held={}", record.token, record.events.len()),
+        );
+        self.pending_selection_release =
+            self.metrics.selection_left_token.load(Ordering::Acquire) == record.token;
+        self.pending_held_replay.extend(record.events);
+        self.pending_hand_back = Some(record.token);
+        self.post_held_keys_return();
+    }
+
     /// Queues the key-ups that leave with a record of retained input (see
     /// split_delivered_key_releases).
     fn queue_delivered_key_releases(&mut self, releases: Vec<RawKeyEvent>) {
@@ -2956,11 +3000,51 @@ impl AppState {
 
     /// Arms the gate on an Enter (`convert_on_enter`) and holds the Enter itself: it reaches the
     /// program when the gate lets its keys go, after the word before it is converted. A gate that
-    /// breaks hands it back like any held key.
+    /// breaks hands it back (`RetainedInput::enter_comes_back`).
     fn hold_enter_for_decision(&mut self, enter: RawKeyEvent, foreground: ForegroundContext) {
         self.arm_decision_gate(enter.sequence, foreground);
         let held = self.correction_gate.hold(enter);
         debug_assert!(held, "a gate just armed holds its first key");
+    }
+
+    /// Holds an edge for `foreground` behind a retained Enter on its way back to that input
+    /// target, so that new typing cannot overtake the Enter. Not an edge for another target, nor
+    /// a key-up of a key pressed before the record: it types nothing, and withholding it would
+    /// leave the key pressed. False when the edge passes.
+    fn hold_behind_retained_enter(
+        &mut self,
+        mut raw: RawKeyEvent,
+        foreground: ForegroundContext,
+    ) -> bool {
+        let mut retained = self
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(input) = retained.as_mut() else {
+            return false;
+        };
+        let key = (raw.virtual_key, raw.scan_code, raw.extended);
+        let key_up = matches!(raw.message, WM_KEYUP | WM_SYSKEYUP);
+        if !input.enter_comes_back()
+            || input.events.len() > CORRECTION_GATE_CAPACITY * 2
+            || !same_input_target(input.foreground, foreground)
+            || (key_up
+                && !input
+                    .events
+                    .iter()
+                    .any(|event| (event.virtual_key, event.scan_code, event.extended) == key))
+        {
+            return false;
+        }
+        if !key_up {
+            raw.repeat = gated_key_down_repeats(&input.events, &raw, || {
+                let key_state = unsafe { GetAsyncKeyState(raw.virtual_key as i32) };
+                key_state as u16 & 0x8000 != 0
+            });
+        }
+        input.events.push(raw);
+        true
     }
 
     /// Holds an edge that arrived while the gate is active. A gate that is full or past its
@@ -3023,6 +3107,23 @@ impl AppState {
             "submit_failed",
             format!("token={token} submitted={sent} raw_edges={}", prefix.len()),
         );
+        // The edges SendInput took are in the program. An Enter after them was not typed: it
+        // still comes back, and only the edges before it may not go twice.
+        let enter_unsent = prefix.get(sent..).is_some_and(holds_enter)
+            || holds_enter(&self.correction_gate.held)
+            || self
+                .metrics
+                .retained_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|input| holds_enter(&input.events));
+        let sent = if enter_unsent {
+            prefix.drain(..sent.min(prefix.len()));
+            0
+        } else {
+            sent
+        };
         if self.correction_gate.active {
             prefix.append(&mut self.correction_gate.held);
             self.correction_gate.held = prefix;
@@ -3051,6 +3152,7 @@ impl AppState {
                     delivery_uncertain: sent != 0,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                     recovering: false,
+                    sending: 0,
                     retained_at: Instant::now(),
                     auto_recover: false,
                     input_mark: self.typed_input,
@@ -3063,6 +3165,7 @@ impl AppState {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(retained) = retained.as_mut() {
+            retained.auto_recover |= enter_unsent;
             retained.delivery_uncertain |= sent != 0;
         }
         self.record_gate_failure_without_worker();
@@ -3911,9 +4014,9 @@ fn prepare_retained_recovery(metrics: &ObserverMetrics, token: u64, now: Instant
 /// in the middle must not keep the keys, the pause and the declined Exit forever.
 const RETAINED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 
-/// Marks the retained record `token` as being sent by the worker. False when it is gone (expired,
-/// discarded or replaced) or another recovery is already sending it.
-fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> bool {
+/// Marks the retained record `token` as being sent by the worker and returns its keys. None when
+/// it is gone (expired, discarded or replaced) or another recovery is already sending it.
+fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> Option<Vec<RawKeyEvent>> {
     let mut retained = metrics
         .retained_input
         .lock()
@@ -3921,15 +4024,23 @@ fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> bool {
     match retained.as_mut() {
         Some(input) if input.token == token && !input.recovering => {
             input.recovering = true;
-            true
+            input.sending = input.events.len();
+            Some(input.events.clone())
         }
-        _ => false,
+        _ => None,
     }
 }
 
-/// Ends a recovery that sent `sent` of `requested` inputs: a complete one removes the record, an
-/// incomplete one keeps it for another attempt, marked uncertain when part of it went out.
-fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, requested: usize) {
+/// Ends a recovery that sent `sent` of `requested` inputs: a complete one removes the keys it sent
+/// and the record with them, an incomplete one keeps it for another attempt, marked uncertain when
+/// part of it went out. An Enter that did not go out stays certain: the edges SendInput took are
+/// removed instead. True when keys that came meanwhile wait to be sent now.
+fn finish_retained_recovery(
+    metrics: &ObserverMetrics,
+    token: u64,
+    sent: usize,
+    requested: usize,
+) -> bool {
     let mut retained = metrics
         .retained_input
         .lock()
@@ -3937,13 +4048,20 @@ fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, 
     if let Some(input) = retained.as_mut()
         && input.token == token
     {
+        input.recovering = false;
         if sent == requested {
+            input.events.drain(..input.sending);
+            if !input.events.is_empty() {
+                return true;
+            }
             *retained = None;
+        } else if input.events.get(sent..).is_some_and(holds_enter) {
+            input.events.drain(..sent);
         } else {
-            input.recovering = false;
             input.delivery_uncertain |= sent != 0;
         }
     }
+    false
 }
 
 /// Deletes the held keys the user confirmed deleting. True when they were deleted: their lifetime
@@ -4840,6 +4958,7 @@ pub fn run() -> Result<()> {
                 pending_key_releases: Vec::new(),
                 pending_held_replay: Vec::new(),
                 pending_hand_back: None,
+                pending_selection_release: false,
                 announced_clipboard_failures: 0,
                 typed_input: 0,
             });
@@ -4980,13 +5099,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             finish_configuration_load(hwnd);
             finish_lexicon_saves(hwnd);
             expire_correction_gate();
-            expire_retained_input(hwnd, Instant::now());
+            expire_retained_input(
+                hwnd,
+                Instant::now(),
+                current_foreground_context(),
+                physical_modifiers_released(),
+            );
             announce_clipboard_failures(hwnd);
             hand_back_stalled_retained_input(
                 current_foreground_context(),
                 physical_modifiers_released(),
                 Instant::now(),
             );
+            retry_retained_enter();
             // In case the message that normally sends them could not be posted.
             send_pending_held_keys();
             expire_lexicon_candidate();
@@ -5088,7 +5213,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // A stopped worker gets its own notice; recovery would be an empty promise.
             if APP_STATE.with(|slot| {
                 slot.borrow().as_ref().is_some_and(|state| {
-                    has_retained_input(&state.metrics)
+                    retained_input_awaits_the_user(&state.metrics)
                         && !state.metrics.worker_dead.load(Ordering::Acquire)
                 })
             }) {
@@ -5421,6 +5546,13 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             return;
                         }
                     }
+                    if !drained
+                        && !claimed_hotkey
+                        && state.hold_behind_retained_enter(raw, foreground)
+                    {
+                        swallow = true;
+                        return;
+                    }
 
                     if key_down && !drained {
                         state.typed_input = state.typed_input.wrapping_add(1);
@@ -5566,7 +5698,7 @@ unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT 
 }
 
 /// A mouse button went down. A click, physical or injected by another program, may move the caret,
-/// so held keys must not be replayed after it: the gate breaks either way.
+/// so held keys other than an Enter must not be replayed after it: the gate breaks either way.
 fn observe_mouse_button(state: &mut AppState, injected: bool) {
     state.typed_input = state.typed_input.wrapping_add(1);
     state
@@ -5734,8 +5866,13 @@ fn take_held_keys_return(state: &mut AppState) -> Option<HeldKeysReturn> {
     }
     let mut events = core::mem::take(&mut state.pending_held_replay);
     events.append(&mut state.pending_key_releases);
+    let mut inputs = Vec::new();
+    if core::mem::take(&mut state.pending_selection_release) {
+        inputs.extend(selection_release_inputs());
+    }
+    inputs.extend(build_balanced_replay_inputs(&events).unwrap_or_default());
     Some(HeldKeysReturn {
-        inputs: build_balanced_replay_inputs(&events).unwrap_or_default(),
+        inputs,
         handed_back: state.pending_hand_back.take(),
     })
 }
@@ -5948,37 +6085,70 @@ fn hand_back_stalled_retained_input(
         let Some(record) = record else {
             return;
         };
-        state.metrics.recovery_armed.store(false, Ordering::Release);
-        state.gate_diagnostic(
-            "recovery_handed_back",
-            format!("token={} held={}", record.token, record.events.len()),
-        );
-        state.pending_held_replay.extend(record.events);
-        state.pending_hand_back = Some(record.token);
-        state.post_held_keys_return();
+        state.hand_back_retained_input(record);
     });
 }
 
 /// Whether the UI thread hands a retained record back itself: the record is one that comes back
 /// automatically, is not being sent and was certainly never typed; the worker has been busy for
 /// `STALLED_WORKER_HAND_BACK_MS` since the keys were retained, but not inside an edit that may
-/// have selected or typed text; nothing was typed or clicked since, and no modifier is held; no
-/// paste of its gate may have left the word selected; the input target is still the record's;
-/// and no positive privacy finding keeps the keys back.
+/// have selected or typed text; no modifier is held; the input target is still the record's. Keys
+/// other than an Enter also need that nothing was typed or clicked since, that no paste of their
+/// gate may have left the word selected, and that no positive privacy finding keeps them back
+/// (see `RetainedInput::enter_comes_back`).
 fn stalled_worker_may_hand_back(input: &RetainedInput, facts: HandBackFacts) -> bool {
     input.auto_recover
         && !input.recovering
         && !input.delivery_uncertain
         && facts.worker_stalled
-        && facts.typed_input == input.input_mark
-        && facts.selection_left_token != input.token
+        && (input.enter_comes_back()
+            || (facts.typed_input == input.input_mark
+                && facts.selection_left_token != input.token
+                && recovery_privacy_allows(facts.privacy)))
         && facts.modifiers_released
         && facts.now.saturating_duration_since(input.retained_at)
             >= Duration::from_millis(STALLED_WORKER_HAND_BACK_MS)
         && facts
             .current
             .is_some_and(|current| same_input_target(input.foreground, current))
-        && recovery_privacy_allows(facts.privacy)
+}
+
+/// Asks the idle worker again for a retained Enter it could not send yet: a modifier was held, its
+/// queue was full, or SendInput refused the keys.
+fn retry_retained_enter() {
+    APP_STATE.with(|slot| {
+        let borrowed = slot.borrow();
+        let Some(state) = borrowed.as_ref() else {
+            return;
+        };
+        let waiting = state
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|input| input.enter_comes_back() && !input.recovering);
+        if waiting && !state.metrics.worker_busy.load(Ordering::Acquire) {
+            let sequence = state
+                .metrics
+                .observed_input_sequence
+                .load(Ordering::Acquire);
+            let _ = state.enqueue(RawInputEvent::RecoverInput {
+                sequence,
+                explicit: false,
+            });
+        }
+    });
+}
+
+/// Whether held keys wait for the user to bring them back; those of an Enter come back alone.
+fn retained_input_awaits_the_user(metrics: &ObserverMetrics) -> bool {
+    metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|input| !input.enter_comes_back())
 }
 
 /// The cause a worker's fail-open request names in its LPARAM: a selection the edit may have
@@ -5994,8 +6164,14 @@ const fn fail_open_cause(code: isize) -> GateFailureCause {
 /// Deletes held keys that were neither handed back nor recovered within their lifetime. They were
 /// never typed, and keeping them would keep automatic conversion paused, the gate disarmed and
 /// Exit declined until someone acted on the tray notice. The worker then decides whether
-/// automatic conversion resumes, under the budget of a recovered gate abort (policy D1).
-fn expire_retained_input(hwnd: HWND, now: Instant) {
+/// automatic conversion resumes, under the budget of a recovered gate abort (policy D1). An Enter
+/// still in its input target `current` is handed back instead, once no modifier is held.
+fn expire_retained_input(
+    hwnd: HWND,
+    now: Instant,
+    current: Option<ForegroundContext>,
+    modifiers_released: bool,
+) {
     let expired = APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         let state = state.as_mut()?;
@@ -6012,15 +6188,29 @@ fn expire_retained_input(hwnd: HWND, now: Instant) {
                     input.expires_at
                 }
             };
-            if retained
-                .as_ref()
-                .is_some_and(|input| now >= deadline(input))
-            {
-                retained.take()
-            } else {
-                None
+            let goes_back = |input: &RetainedInput| {
+                input.enter_comes_back()
+                    && !input.recovering
+                    && current.is_some_and(|target| same_input_target(input.foreground, target))
+            };
+            match retained.as_ref() {
+                Some(input) if now >= deadline(input) => {
+                    if !goes_back(input) {
+                        retained.take().map(|record| (record, false))
+                    } else if modifiers_released {
+                        retained.take().map(|record| (record, true))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }
-        }?;
+        };
+        let (expired, goes_back) = expired?;
+        if goes_back {
+            state.hand_back_retained_input(expired);
+            return None;
+        }
         state.metrics.recovery_armed.store(false, Ordering::Release);
         state.gate_diagnostic(
             "recovery_discarded",
@@ -7568,6 +7758,15 @@ struct InputProcessor {
     // SendInput and the keyboard layout.
     #[cfg(test)]
     paste_seam: Option<RefCell<Box<dyn PasteSeam + Send>>>,
+    // Tests collect what a recovery sends, instead of typing it into the window in front.
+    #[cfg(test)]
+    recovery_inputs: Option<RefCell<Vec<INPUT>>>,
+    // Tests make SendInput take only this many keys of a recovery.
+    #[cfg(test)]
+    recovery_input_limit: usize,
+    // Tests let keys arrive while a recovery is being sent.
+    #[cfg(test)]
+    during_recovery_send: Option<Box<dyn Fn() + Send>>,
     // Tests give what each key prints in each layout (by handle), instead of the layouts Windows
     // has loaded.
     #[cfg(test)]
@@ -7738,6 +7937,12 @@ impl InputProcessor {
             process_override: None,
             #[cfg(test)]
             paste_seam: None,
+            #[cfg(test)]
+            recovery_inputs: None,
+            #[cfg(test)]
+            recovery_input_limit: usize::MAX,
+            #[cfg(test)]
+            during_recovery_send: None,
             #[cfg(test)]
             test_keyboard: None,
             session,
@@ -8601,12 +8806,15 @@ impl InputProcessor {
         let Some(record) = record else {
             return;
         };
-        if record.delivery_uncertain && !explicit {
+        if !explicit && (record.delivery_uncertain || !record.auto_recover) {
             return;
         }
+        let enter = record.enter_comes_back();
+        let selection_left =
+            self.metrics.selection_left_token.load(Ordering::Acquire) == record.token;
         // The paste of this gate may have left the word selected: replaying the keys would type
-        // over it, so only the user brings them back.
-        if !explicit && self.metrics.selection_left_token.load(Ordering::Acquire) == record.token {
+        // over it, so only the user brings them back. An Enter unselects the word instead.
+        if selection_left && !explicit && !enter {
             self.diagnostic(
                 "recovery",
                 format!(
@@ -8616,7 +8824,9 @@ impl InputProcessor {
             );
             return;
         }
-        if !self.input_sequence_is_current(sequence) || !self.foreground_matches(record.foreground)
+        if !enter
+            && (!self.input_sequence_is_current(sequence)
+                || !self.foreground_matches(record.foreground))
         {
             self.diagnostic(
                 "recovery",
@@ -8634,37 +8844,118 @@ impl InputProcessor {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        self.privacy_needs_check = true;
-        self.ensure_privacy(record.foreground, ProbeTrigger::Recovery);
-        if !recovery_privacy_allows(self.privacy_reason) {
-            self.diagnostic(
-                "recovery",
-                format!("token={} result=retained reason=privacy", record.token),
-            );
-            return;
+        if enter {
+            if !self.foreground_matches(record.foreground) {
+                self.keep_enter_for_the_user(record.token);
+                return;
+            }
+        } else {
+            self.privacy_needs_check = true;
+            self.ensure_privacy(record.foreground, ProbeTrigger::Recovery);
+            if !recovery_privacy_allows(self.privacy_reason) {
+                self.diagnostic(
+                    "recovery",
+                    format!("token={} result=retained reason=privacy", record.token),
+                );
+                return;
+            }
+            if !self.input_sequence_is_current(sequence)
+                || self.metrics.input_epoch.load(Ordering::Acquire) != self.last_input_epoch
+                || self
+                    .current_foreground()
+                    .is_none_or(|current| current != record.foreground)
+                || !physical_modifiers_released()
+            {
+                return;
+            }
         }
-        let Some(inputs) = build_recovery_inputs(&record.events) else {
-            return;
+        // A key in the input stream, not a selection set through UI Automation: a busy field
+        // would apply that later, among the keys it has queued, and they would land elsewhere.
+        let mut selection_keys = if selection_left && holds_enter(&record.events) {
+            selection_release_inputs().to_vec()
+        } else {
+            Vec::new()
         };
-        if !self.input_sequence_is_current(sequence)
-            || self.metrics.input_epoch.load(Ordering::Acquire) != self.last_input_epoch
-            || current_foreground_context().is_none_or(|current| current != record.foreground)
-            || !physical_modifiers_released()
-        {
-            return;
-        }
+        let (mut sent, mut requested) = (0, 0);
         // Marked under the lock before sending, so that the lifetime timer cannot report keys as
-        // deleted while they are being typed.
-        if !begin_retained_recovery(&self.metrics, record.token) {
+        // deleted while they are being typed. Keys that come behind an Enter meanwhile go next.
+        while let Some(events) = begin_retained_recovery(&self.metrics, record.token) {
+            let Some(replay) = build_recovery_inputs(&events) else {
+                finish_retained_recovery(&self.metrics, record.token, 0, 1);
+                return;
+            };
+            let unsent_keys = core::mem::take(&mut selection_keys);
+            let lead = unsent_keys.len();
+            let inputs = [unsent_keys, replay].concat();
+            let accepted = self.send_recovery_inputs(&inputs);
+            sent += accepted;
+            requested += inputs.len();
+            if accepted != 0 {
+                self.metrics
+                    .selection_left_token
+                    .store(0, Ordering::Release);
+            }
+            if !finish_retained_recovery(
+                &self.metrics,
+                record.token,
+                accepted.saturating_sub(lead),
+                inputs.len() - lead,
+            ) {
+                break;
+            }
+        }
+        if requested == 0 {
             self.diagnostic(
                 "recovery",
                 format!("token={} result=retained reason=gone", record.token),
             );
             return;
         }
-        let sent = send_input_count(&inputs);
-        finish_retained_recovery(&self.metrics, record.token, sent, inputs.len());
-        self.finish_recovery(record.token, explicit, sent, inputs.len());
+        self.finish_recovery(record.token, explicit, sent, requested);
+    }
+
+    /// The input target of a retained Enter changed before the Enter could go back: it is not
+    /// typed into another window, nor later into its own, where the user may have gone on with
+    /// something else. It waits for Pause like any other held key, and the tray says so.
+    fn keep_enter_for_the_user(&self, token: u64) {
+        if let Some(input) = self
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .filter(|input| input.token == token)
+        {
+            input.auto_recover = false;
+        }
+        self.diagnostic(
+            "recovery",
+            format!("token={token} result=retained reason=input-target"),
+        );
+        if self.gate_window != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.gate_window as *mut c_void)),
+                    RECOVERY_NOTICE_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    /// Sends the keys of a recovery. Tests collect them.
+    fn send_recovery_inputs(&self, inputs: &[INPUT]) -> usize {
+        #[cfg(test)]
+        if let Some(sent) = &self.recovery_inputs {
+            let taken = inputs.len().min(self.recovery_input_limit);
+            sent.borrow_mut().extend_from_slice(&inputs[..taken]);
+            if let Some(event) = &self.during_recovery_send {
+                event();
+            }
+            return taken;
+        }
+        send_input_count(inputs)
     }
 
     /// Bookkeeping after a recovery sent `sent` of `requested` inputs. The replayed keys bypass
@@ -10408,7 +10699,8 @@ impl InputProcessor {
     }
 
     /// Ends the gate of a conversion or an undo. Its held keys are replayed, unless the edit may
-    /// have left the word selected: then they are kept for recovery, as they would type over it.
+    /// have left the word selected: then they are kept for recovery, as they would type over it
+    /// (an Enter among them goes back after the word is unselected).
     fn end_conversion_gate(&mut self, token: u64) {
         if self.held_keys_kept_for.take() == Some(token) {
             self.request_gate_retention(token);
@@ -11364,7 +11656,8 @@ impl InputProcessor {
             TextEditAttempt::SelectionLeft => {
                 // The field may still show the word selected: the keys the gate holds would type
                 // over it, so they are kept for recovery instead of being replayed, and come back
-                // only when the user asks for them.
+                // only when the user asks for them, or after the word is unselected when an Enter
+                // is among them.
                 self.held_keys_kept_for = Some(sequence);
                 self.metrics
                     .selection_left_token
@@ -12643,6 +12936,20 @@ fn build_held_replay_inputs(held: &[RawKeyEvent], fence_marker: usize) -> Option
         fence_marker,
     ));
     Some(inputs)
+}
+
+/// A Right arrow: it takes a selection away, to its end, and deletes nothing. The agent's own, so
+/// that the hooks do not see it.
+fn selection_release_inputs() -> [INPUT; 2] {
+    const RIGHT_ARROW_SCAN_CODE: u16 = 0x4d;
+    [Default::default(), KEYEVENTF_KEYUP].map(|flags| {
+        keyboard_input_with_marker(
+            VK_RIGHT,
+            RIGHT_ARROW_SCAN_CODE,
+            flags | KEYEVENTF_EXTENDEDKEY,
+            INJECTED_EVENT_MARKER,
+        )
+    })
 }
 
 fn build_recovery_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
@@ -14474,6 +14781,7 @@ mod tests {
             pending_key_releases: Vec::new(),
             pending_held_replay: Vec::new(),
             pending_hand_back: None,
+            pending_selection_release: false,
             announced_clipboard_failures: 0,
             typed_input: 0,
         };
@@ -15484,6 +15792,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
@@ -15608,17 +15917,28 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
         metrics.recovery_armed.store(true, Ordering::Release);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime - Duration::from_millis(1));
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime - Duration::from_millis(1),
+            Some(test_foreground()),
+            true,
+        );
         assert!(has_retained_input(&metrics), "kept for its whole lifetime");
         assert!(metrics.recovery_armed.load(Ordering::Acquire));
         assert!(receiver.try_recv().is_err());
-        expire_retained_input(HWND::default(), start + lifetime);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
         assert!(!has_retained_input(&metrics));
         assert!(!metrics.recovery_armed.load(Ordering::Acquire));
         // The worker is told, so that automatic conversion can resume, and Exit is no longer
@@ -15631,7 +15951,12 @@ mod tests {
         assert!(state.decline_reasons().is_empty());
         // Nothing is deleted or reported twice.
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime * 2);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime * 2,
+            Some(test_foreground()),
+            true,
+        );
         assert!(receiver.try_recv().is_err());
         drop(take_app_state());
     }
@@ -15649,6 +15974,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
@@ -20739,12 +21065,18 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
         let state = take_app_state().unwrap();
         assert!(!has_retained_input(&metrics));
         assert_eq!(
@@ -20847,6 +21179,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
@@ -20892,18 +21225,24 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
-        assert!(!begin_retained_recovery(&metrics, 11));
-        assert!(begin_retained_recovery(&metrics, 10));
+        assert!(begin_retained_recovery(&metrics, 11).is_none());
+        assert!(begin_retained_recovery(&metrics, 10).is_some());
         assert!(
-            !begin_retained_recovery(&metrics, 10),
+            begin_retained_recovery(&metrics, 10).is_none(),
             "one recovery at a time"
         );
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
         assert!(has_retained_input(&metrics), "not deleted while being sent");
         // An incomplete send keeps the record for another attempt, marked uncertain.
         finish_retained_recovery(&metrics, 10, 1, 2);
@@ -20913,7 +21252,7 @@ mod tests {
             assert!(!input.recovering);
             assert!(input.delivery_uncertain);
         }
-        assert!(begin_retained_recovery(&metrics, 10));
+        assert!(begin_retained_recovery(&metrics, 10).is_some());
         finish_retained_recovery(&metrics, 10, 2, 2);
         assert!(!has_retained_input(&metrics));
         // A worker that died while sending does not keep the keys forever.
@@ -20924,11 +21263,17 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: true,
+            sending: 1,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
-        expire_retained_input(HWND::default(), start + lifetime + RETAINED_RECOVERY_GRACE);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime + RETAINED_RECOVERY_GRACE,
+            Some(test_foreground()),
+            true,
+        );
         assert!(!has_retained_input(&metrics));
         drop(take_app_state());
     }
@@ -22974,6 +23319,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: retained_at + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            sending: 0,
             retained_at,
             auto_recover: true,
             input_mark: 0,
@@ -24682,6 +25028,784 @@ mod tests {
                 .try_iter()
                 .any(|record| record.contains("result=retained reason=selection-left"))
         );
+    }
+
+    /// The scan code of the Enter, and the keys around it, in the tests of a held Enter.
+    const ENTER_SCAN: u16 = 0x1c;
+    const LETTER_SCAN: u16 = 0x22;
+    const RIGHT_ARROW_SCAN: u16 = 0x4d;
+
+    fn enter_edge(message: u32) -> RawKeyEvent {
+        RawKeyEvent {
+            scan_code: u32::from(ENTER_SCAN),
+            ..test_raw_key(message, VK_RETURN, 0, 0)
+        }
+    }
+
+    fn letter_edge(message: u32) -> RawKeyEvent {
+        RawKeyEvent {
+            scan_code: u32::from(LETTER_SCAN),
+            ..test_raw_key(message, VIRTUAL_KEY(0x47), 0, 0)
+        }
+    }
+
+    /// The keys of a gate that broke with an Enter held, for the Enter's field.
+    fn retained_enter(retained_at: Instant) -> RetainedInput {
+        RetainedInput {
+            events: vec![enter_edge(WM_KEYDOWN)],
+            ..stalled_record(retained_at)
+        }
+    }
+
+    /// A processor in the field of `record`, in which new input arrived after the recovery asked
+    /// for, and whose recoveries are collected.
+    fn processor_with_retained(record: RetainedInput) -> (InputProcessor, Receiver<String>) {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.recovery_inputs = Some(RefCell::new(Vec::new()));
+        *processor.metrics.retained_input.lock().unwrap() = Some(record);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(51, Ordering::Release);
+        (processor, receiver)
+    }
+
+    fn recovered_edges(processor: &InputProcessor) -> Vec<(u16, bool)> {
+        scan_edges(&processor.recovery_inputs.as_ref().unwrap().borrow())
+    }
+
+    fn other_input_target() -> ForegroundContext {
+        ForegroundContext {
+            hwnd: 77,
+            focus: 77,
+            ..test_foreground()
+        }
+    }
+
+    #[test]
+    fn a_held_enter_comes_back_by_itself_after_every_cause_but_a_focus_change() {
+        for (cause, comes_back) in [
+            (GateFailureCause::Deadline, true),
+            (GateFailureCause::Capacity, true),
+            (GateFailureCause::Mouse, true),
+            (GateFailureCause::ExternalInjection, true),
+            (GateFailureCause::WorkerQueue, true),
+            (GateFailureCause::ReplaySubmit, true),
+            (GateFailureCause::WorkerAck, true),
+            (GateFailureCause::DownstreamHook, true),
+            (GateFailureCause::HookReinstall, true),
+            (GateFailureCause::SelectionLeft, true),
+            (GateFailureCause::FocusChanged, false),
+        ] {
+            let (mut state, receiver) = test_gate_state(8);
+            let foreground = test_foreground();
+            state.hold_enter_for_decision(enter_edge(WM_KEYDOWN), foreground);
+            state.break_correction_gate(cause, Some(foreground));
+            let record = state.metrics.retained_input.lock().unwrap().clone();
+            let record = record.expect("retained");
+            assert_eq!(record.enter_comes_back(), comes_back, "{cause:?}");
+            let recovery = receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }));
+            assert_eq!(recovery, comes_back, "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn an_enter_held_by_the_gate_of_a_space_comes_back_as_well() {
+        let (mut state, receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(letter_edge(WM_KEYDOWN)));
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYDOWN)));
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(record.expect("retained").enter_comes_back());
+        assert!(
+            receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+        );
+    }
+
+    #[test]
+    fn held_keys_without_an_enter_still_wait_for_the_user_after_a_click() {
+        let (mut state, receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(letter_edge(WM_KEYDOWN)));
+        // A key-up of the Enter is no Enter: its key-down reached the program before the gate.
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYUP)));
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(!record.expect("retained").auto_recover);
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+        );
+    }
+
+    #[test]
+    fn new_keys_for_the_field_of_a_retained_enter_wait_behind_it() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        *state.metrics.retained_input.lock().unwrap() = Some(retained_enter(Instant::now()));
+        let typed = state.typed_input;
+        assert!(state.hold_behind_retained_enter(enter_edge(WM_KEYUP), foreground));
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYDOWN), foreground));
+        // The system never saw the first press: the second is a repeat of it.
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYDOWN), foreground));
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYUP), foreground));
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYDOWN), foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let events = record.expect("retained").events;
+        let edges: Vec<(u32, u32, bool)> = events
+            .iter()
+            .map(|event| (event.scan_code, event.message, event.repeat))
+            .collect();
+        let (enter, letter) = (u32::from(ENTER_SCAN), u32::from(LETTER_SCAN));
+        assert_eq!(
+            edges,
+            [
+                (enter, WM_KEYDOWN, false),
+                (enter, WM_KEYUP, false),
+                (letter, WM_KEYDOWN, false),
+                (letter, WM_KEYDOWN, true),
+                (letter, WM_KEYUP, false),
+                (letter, WM_KEYDOWN, false),
+            ]
+        );
+        assert_eq!(state.typed_input, typed, "the program has not seen them");
+    }
+
+    #[test]
+    fn only_keys_that_can_type_after_a_retained_enter_wait_behind_it() {
+        let foreground = test_foreground();
+        let now = Instant::now();
+        let refused = |record: RetainedInput, raw: RawKeyEvent, target, case: &str| {
+            let (mut state, _receiver) = test_gate_state(8);
+            let length = record.events.len();
+            *state.metrics.retained_input.lock().unwrap() = Some(record);
+            assert!(!state.hold_behind_retained_enter(raw, target), "{case}");
+            let record = state.metrics.retained_input.lock().unwrap().clone();
+            assert_eq!(record.unwrap().events.len(), length, "{case}");
+        };
+        let down = letter_edge(WM_KEYDOWN);
+        let record = retained_enter(now);
+        // A key pressed before the gate is released in the program: withholding that would leave
+        // it down.
+        refused(record.clone(), letter_edge(WM_KEYUP), foreground, "key-up");
+        refused(record.clone(), down, other_input_target(), "other window");
+        let waiting = RetainedInput {
+            auto_recover: false,
+            ..record.clone()
+        };
+        refused(waiting, down, foreground, "waits for Pause");
+        let uncertain = RetainedInput {
+            delivery_uncertain: true,
+            ..record.clone()
+        };
+        refused(uncertain, down, foreground, "may have been typed");
+        let no_enter = stalled_record(now);
+        refused(no_enter, down, foreground, "no Enter");
+        let mut full = record.clone();
+        full.events
+            .resize(CORRECTION_GATE_CAPACITY * 2 + 1, letter_edge(WM_KEYDOWN));
+        refused(full, down, foreground, "full");
+        // One edge short of that it still fits: a record that long can be sent.
+        let (mut state, _receiver) = test_gate_state(8);
+        let mut nearly_full = record;
+        nearly_full
+            .events
+            .resize(CORRECTION_GATE_CAPACITY * 2, letter_edge(WM_KEYDOWN));
+        *state.metrics.retained_input.lock().unwrap() = Some(nearly_full);
+        assert!(state.hold_behind_retained_enter(down, foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(build_recovery_inputs(&record.unwrap().events).is_some());
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_past_new_input() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(ENTER_SCAN, false), (ENTER_SCAN, true)]
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_with_the_keys_behind_it_in_their_order() {
+        let mut record = retained_enter(Instant::now());
+        record.events.extend([
+            enter_edge(WM_KEYUP),
+            letter_edge(WM_KEYDOWN),
+            letter_edge(WM_KEYUP),
+        ]);
+        let (mut processor, _receiver) = processor_with_retained(record);
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true),
+                (LETTER_SCAN, false),
+                (LETTER_SCAN, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_whatever_the_field_turned_out_to_be() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        processor.privacy_probe = Some(answering_probe(Some(PrivacyBlockReason::PasswordField)));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(ENTER_SCAN, false), (ENTER_SCAN, true)]
+        );
+    }
+
+    /// The recovery of a retained Enter whose gate's edit may have left the word selected.
+    fn enter_recovered_through_a_selection() -> (InputProcessor, Arc<Mutex<PasteSteps>>) {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        let (script, steps, _clipboard) = scripted_paste();
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor
+            .metrics
+            .selection_left_token
+            .store(10, Ordering::Release);
+        (processor, steps)
+    }
+
+    #[test]
+    fn a_retained_enter_follows_a_right_arrow_when_the_edit_may_have_left_the_word_selected() {
+        let (mut processor, steps) = enter_recovered_through_a_selection();
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ],
+            "a Right arrow takes the selection away and deletes nothing"
+        );
+        assert_eq!(
+            processor
+                .metrics
+                .selection_left_token
+                .load(Ordering::Acquire),
+            0,
+            "the next attempt must not press it again"
+        );
+        assert!(
+            steps.lock().unwrap().steps.is_empty(),
+            "a busy field would apply a selection set through UI Automation among its queued keys"
+        );
+    }
+
+    #[test]
+    fn keys_that_arrive_while_a_retained_enter_goes_out_follow_it() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        let metrics = Arc::clone(&processor.metrics);
+        let arrived = AtomicBool::new(false);
+        processor.during_recovery_send = Some(Box::new(move || {
+            if !arrived.swap(true, Ordering::AcqRel) {
+                let mut retained = metrics.retained_input.lock().unwrap();
+                let record = retained.as_mut().unwrap();
+                record.events.push(enter_edge(WM_KEYUP));
+                record.events.push(letter_edge(WM_KEYDOWN));
+                record.events.push(letter_edge(WM_KEYUP));
+            }
+        }));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true),
+                (ENTER_SCAN, true),
+                (LETTER_SCAN, false),
+                (LETTER_SCAN, true)
+            ]
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retained_enter_goes_out_only_as_far_as_the_record_says_and_only_once() {
+        let metrics = ObserverMetrics::default();
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(Instant::now()));
+        let events = begin_retained_recovery(&metrics, 10).expect("the record");
+        assert_eq!(events.len(), 1);
+        assert!(
+            begin_retained_recovery(&metrics, 10).is_none(),
+            "being sent"
+        );
+        metrics
+            .retained_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .events
+            .push(letter_edge(WM_KEYDOWN));
+        assert!(finish_retained_recovery(&metrics, 10, 2, 2));
+        let record = metrics.retained_input.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            record.events.len(),
+            1,
+            "the Enter is gone, the letter waits"
+        );
+        assert!(!record.recovering);
+        assert_eq!(begin_retained_recovery(&metrics, 10).unwrap().len(), 1);
+        assert!(!finish_retained_recovery(&metrics, 10, 2, 2));
+        assert!(metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_right_arrow_that_went_out_alone_is_not_pressed_again_and_the_enter_stays_certain() {
+        let (mut processor, _steps) = enter_recovered_through_a_selection();
+        processor.recovery_input_limit = 2;
+        processor.recover_retained_input(50, false);
+        let record = processor.metrics.retained_input.lock().unwrap().clone();
+        assert!(record.expect("kept").enter_comes_back());
+        processor.recovery_input_limit = usize::MAX;
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retained_enter_that_cannot_be_built_is_left_for_another_attempt() {
+        let mut record = retained_enter(Instant::now());
+        record.events.push(RawKeyEvent {
+            message: 0,
+            ..letter_edge(WM_KEYDOWN)
+        });
+        let (mut processor, _receiver) = processor_with_retained(record);
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        let record = processor.metrics.retained_input.lock().unwrap().clone();
+        assert!(!record.expect("kept").recovering);
+    }
+
+    #[test]
+    fn asked_for_keys_without_an_enter_get_no_right_arrow() {
+        let (mut processor, _receiver) = processor_with_retained(RetainedInput {
+            events: vec![letter_edge(WM_KEYDOWN), letter_edge(WM_KEYUP)],
+            ..stalled_record(Instant::now())
+        });
+        processor
+            .metrics
+            .selection_left_token
+            .store(10, Ordering::Release);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        processor.recover_retained_input(50, true);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(LETTER_SCAN, false), (LETTER_SCAN, true)]
+        );
+    }
+
+    #[test]
+    fn the_right_arrow_is_the_agents_own_and_an_extended_key() {
+        let inputs = selection_release_inputs();
+        for (input, key_up) in inputs.iter().zip([false, true]) {
+            let key = unsafe { input.Anonymous.ki };
+            assert_eq!(key.wVk, VK_RIGHT);
+            assert_eq!(key.dwExtraInfo, INJECTED_EVENT_MARKER);
+            assert!(key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+            assert!(!key.dwFlags.contains(KEYEVENTF_SCANCODE));
+            assert_eq!(key.dwFlags.contains(KEYEVENTF_KEYUP), key_up);
+        }
+    }
+
+    #[test]
+    fn a_retained_enter_is_not_typed_into_another_window_or_after_coming_back_to_its_own() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        processor.foreground_override = Some(other_input_target());
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        let record = processor.metrics.retained_input.lock().unwrap().clone();
+        assert!(
+            !record.expect("kept for Pause").enter_comes_back(),
+            "the user went on with something else"
+        );
+        processor.foreground_override = Some(test_foreground());
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        // Pause still brings it back.
+        processor.recover_retained_input(50, true);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(ENTER_SCAN, false), (ENTER_SCAN, true)]
+        );
+    }
+
+    #[test]
+    fn an_enter_that_may_have_gone_out_is_not_sent_again_unasked() {
+        let (mut processor, _receiver) = processor_with_retained(RetainedInput {
+            delivery_uncertain: true,
+            ..retained_enter(Instant::now())
+        });
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        assert!(processor.metrics.retained_input.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_partly_sent_record_keeps_the_enter_only_if_it_did_not_go_out() {
+        let edges = |record: &RetainedInput| -> Vec<u32> {
+            record.events.iter().map(|event| event.scan_code).collect()
+        };
+        let finish = |events: Vec<RawKeyEvent>, sent, requested| {
+            let metrics = ObserverMetrics::default();
+            *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+                events,
+                ..stalled_record(Instant::now())
+            });
+            assert!(begin_retained_recovery(&metrics, 10).is_some());
+            finish_retained_recovery(&metrics, 10, sent, requested);
+            let record = metrics.retained_input.lock().unwrap().clone();
+            record
+        };
+        let (enter, letter) = (u32::from(ENTER_SCAN), u32::from(LETTER_SCAN));
+        // Nothing went out: everything is sent again.
+        let events = vec![enter_edge(WM_KEYDOWN), letter_edge(WM_KEYDOWN)];
+        let record = finish(events, 0, 3).expect("kept");
+        assert_eq!(edges(&record), [enter, letter]);
+        assert!(record.enter_comes_back());
+        assert!(!record.recovering);
+        // The letter before the Enter went out, the Enter did not.
+        let events = vec![letter_edge(WM_KEYDOWN), enter_edge(WM_KEYDOWN)];
+        let record = finish(events, 1, 4).expect("kept");
+        assert_eq!(edges(&record), [enter]);
+        assert!(record.enter_comes_back());
+        // The Enter went out: it must not go twice.
+        let events = vec![enter_edge(WM_KEYDOWN), letter_edge(WM_KEYDOWN)];
+        let record = finish(events, 1, 4).expect("kept");
+        assert!(record.delivery_uncertain);
+        assert!(!record.enter_comes_back());
+        // All of it went out.
+        let events = vec![enter_edge(WM_KEYDOWN)];
+        assert!(finish(events, 2, 2).is_none());
+    }
+
+    #[test]
+    fn a_failed_drain_keeps_only_the_edges_that_did_not_go_out_when_an_enter_is_among_them() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYUP)));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN), enter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        let edges: Vec<u32> = record.events.iter().map(|event| event.scan_code).collect();
+        assert_eq!(edges, [u32::from(ENTER_SCAN), u32::from(ENTER_SCAN)]);
+        assert!(record.enter_comes_back());
+
+        // The gate broke while SendInput was returning, and nothing else was held.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN), enter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        assert_eq!(record.events.len(), 1);
+        assert!(record.enter_comes_back());
+
+        // The Enter is still held by the gate, behind the batch.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYDOWN)));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        assert_eq!(record.events.len(), 1);
+        assert!(record.enter_comes_back());
+
+        // The gate broke with the Enter held while SendInput was returning.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYDOWN)));
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        assert_eq!(record.events.len(), 1);
+        assert!(record.enter_comes_back());
+
+        // The Enter went out with the batch: the rest stays with the user.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        state.retain_failed_drain(7, vec![enter_edge(WM_KEYDOWN), letter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(record.expect("retained").delivery_uncertain);
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_past_a_stalled_worker_whatever_would_keep_other_keys() {
+        let foreground = test_foreground();
+        let now = Instant::now();
+        let record = retained_enter(now);
+        let ready = HandBackFacts {
+            now: now + Duration::from_millis(STALLED_WORKER_HAND_BACK_MS),
+            worker_stalled: true,
+            typed_input: 0,
+            selection_left_token: 0,
+            modifiers_released: true,
+            current: Some(foreground),
+            privacy: None,
+        };
+        for (case, facts) in [
+            (
+                "a click",
+                HandBackFacts {
+                    typed_input: 1,
+                    ..ready
+                },
+            ),
+            (
+                "a selection",
+                HandBackFacts {
+                    selection_left_token: record.token,
+                    ..ready
+                },
+            ),
+            (
+                "a password field",
+                HandBackFacts {
+                    privacy: Some(PrivacyBlockReason::PasswordField),
+                    ..ready
+                },
+            ),
+        ] {
+            assert!(stalled_worker_may_hand_back(&record, facts), "{case}");
+        }
+        for (case, facts) in [
+            ("too early", HandBackFacts { now, ..ready }),
+            (
+                "worker not stalled",
+                HandBackFacts {
+                    worker_stalled: false,
+                    ..ready
+                },
+            ),
+            (
+                "modifier held",
+                HandBackFacts {
+                    modifiers_released: false,
+                    ..ready
+                },
+            ),
+            (
+                "another window",
+                HandBackFacts {
+                    current: Some(other_input_target()),
+                    ..ready
+                },
+            ),
+        ] {
+            assert!(!stalled_worker_may_hand_back(&record, facts), "{case}");
+        }
+    }
+
+    #[test]
+    fn an_enter_handed_back_from_a_left_selection_follows_a_right_arrow() {
+        let (state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(retained_at));
+        metrics.selection_left_token.store(10, Ordering::Release);
+        metrics.worker_busy.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let mut state = take_app_state().unwrap();
+        let held = take_held_keys_return(&mut state).expect("handed back");
+        assert_eq!(
+            scan_edges(&held.inputs),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+        assert_eq!(held.handed_back, Some(10));
+    }
+
+    #[test]
+    fn a_retained_enter_is_handed_back_at_the_end_of_its_lifetime_instead_of_deleted() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(start));
+        metrics.selection_left_token.store(10, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        // A modifier held now would change what the Enter does: it waits for the release.
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            false,
+        );
+        assert!(has_retained_input(&metrics));
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
+        assert!(!has_retained_input(&metrics));
+        let mut state = take_app_state().unwrap();
+        let held = take_held_keys_return(&mut state).expect("handed back");
+        assert_eq!(
+            scan_edges(&held.inputs),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RetainedInputExpired))
+        );
+    }
+
+    #[test]
+    fn a_retained_enter_the_worker_died_sending_is_deleted_past_its_grace() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            recovering: true,
+            ..retained_enter(start)
+        });
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        let end = start + lifetime + RETAINED_RECOVERY_GRACE;
+        expire_retained_input(HWND::default(), end, Some(test_foreground()), true);
+        assert!(!has_retained_input(&metrics));
+        let mut state = take_app_state().unwrap();
+        assert!(take_held_keys_return(&mut state).is_none(), "maybe typed");
+        assert!(
+            receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RetainedInputExpired))
+        );
+    }
+
+    #[test]
+    fn a_retained_enter_in_another_window_is_deleted_at_the_end_of_its_lifetime() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(start));
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(other_input_target()),
+            true,
+        );
+        assert!(!has_retained_input(&metrics));
+        let mut state = take_app_state().unwrap();
+        assert!(take_held_keys_return(&mut state).is_none());
+        assert!(
+            receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RetainedInputExpired))
+        );
+    }
+
+    #[test]
+    fn the_timer_asks_the_idle_worker_again_for_a_retained_enter() {
+        let now = Instant::now();
+        let asked = |record: Option<RetainedInput>, busy: bool| {
+            let (state, receiver) = test_gate_state(8);
+            *state.metrics.retained_input.lock().unwrap() = record;
+            state.metrics.worker_busy.store(busy, Ordering::Release);
+            state
+                .metrics
+                .observed_input_sequence
+                .store(33, Ordering::Release);
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            retry_retained_enter();
+            drop(take_app_state());
+            receiver
+                .try_iter()
+                .filter_map(|queued| match queued.event {
+                    RawInputEvent::RecoverInput { sequence, explicit } => {
+                        Some((sequence, explicit))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(asked(Some(retained_enter(now)), false), [(33, false)]);
+        assert!(asked(Some(retained_enter(now)), true).is_empty(), "busy");
+        assert!(asked(None, false).is_empty(), "nothing retained");
+        assert!(
+            asked(Some(stalled_record(now)), false).is_empty(),
+            "no Enter"
+        );
+        let sending = RetainedInput {
+            recovering: true,
+            ..retained_enter(now)
+        };
+        assert!(asked(Some(sending), false).is_empty(), "being sent");
+        let waiting = RetainedInput {
+            auto_recover: false,
+            ..retained_enter(now)
+        };
+        assert!(asked(Some(waiting), false).is_empty(), "waits for Pause");
+    }
+
+    #[test]
+    fn only_keys_that_need_the_user_are_announced() {
+        let metrics = ObserverMetrics::default();
+        assert!(!retained_input_awaits_the_user(&metrics));
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(Instant::now()));
+        assert!(
+            !retained_input_awaits_the_user(&metrics),
+            "comes back alone"
+        );
+        metrics
+            .retained_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .auto_recover = false;
+        assert!(retained_input_awaits_the_user(&metrics));
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(Instant::now()));
+        assert!(retained_input_awaits_the_user(&metrics));
     }
 
     const PASTE_SEQUENCE: u64 = 5;
@@ -26791,16 +27915,68 @@ public class AklWindowlessReader : Form {
         }
     }
 
-    /// Desktop acceptance of trailing marks, the Pause token and conversion before Enter on the
-    /// test VM, with the busy field turned multiline and routed by `route`: "gjnjv/" and a Space,
-    /// "gjnjv/ghbdtn" and Pause, and twenty times "ghbdtn" and an Enter that must arrive once.
-    fn desktop_marks_tokens_and_enter(route: &str) {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetKeyboardLayoutList, MAPVK_VK_TO_VSC, MapVirtualKeyW,
-        };
-        use windows::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, WM_CLOSE, WM_INPUTLANGCHANGEREQUEST,
-        };
+    /// The busy field turned multiline, with the agent running on the desktop.
+    struct DesktopTyping {
+        field: DesktopField,
+    }
+
+    impl DesktopTyping {
+        /// Types `keys` with the acceptance marker: the agent's hook takes them for the user's.
+        fn type_keys(&self, keys: &[VIRTUAL_KEY]) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+            for key in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                for flags in [Default::default(), KEYEVENTF_KEYUP] {
+                    let input =
+                        keyboard_input_with_marker(*key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                    assert!(send_input_batch(&[input]));
+                    thread::sleep(Duration::from_millis(40));
+                }
+            }
+        }
+
+        fn to_english(&self) {
+            use windows::Win32::UI::WindowsAndMessaging::WM_INPUTLANGCHANGEREQUEST;
+            let english = 0x0409_0409usize;
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.field.context.hwnd as *mut c_void)),
+                    WM_INPUTLANGCHANGEREQUEST,
+                    WPARAM(0),
+                    LPARAM(english as isize),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while current_foreground_context().is_none_or(|context| context.layout != english)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            // A loaded VM shows the switch to this process before the field's keys carry it:
+            // keys typed in between look like a manual switch to the agent, which starts a new
+            // token at the first key in the new layout.
+            thread::sleep(Duration::from_millis(1500));
+        }
+
+        /// The field's text once it settled. A RichEdit control ends its lines with "\r" or
+        /// "\r\n".
+        fn text(&self, before: &str) -> String {
+            self.field
+                .settled_text(before)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+        }
+    }
+
+    /// Runs `scenario` on the test VM with conversion before Enter on and the field routed by
+    /// `route`, then prints the agent's record of it. Each outcome is a case, the field's text and
+    /// the text expected.
+    fn on_the_desktop_with_conversion_on_enter(
+        route: &str,
+        scenario: impl FnOnce(&DesktopTyping) -> Vec<(String, String, String)>,
+    ) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutList;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_CLOSE};
         let mut layouts = [HKL::default(); 16];
         let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) }.max(0) as usize;
         let languages: Vec<usize> = layouts[..count.min(layouts.len())]
@@ -26834,7 +28010,9 @@ public class AklWindowlessReader : Form {
         }
         let script =
             DESKTOP_FIELD_SCRIPT.replace("box.Multiline = false;", "box.Multiline = true;");
-        let field = DesktopField::start_script(&script, w!("AutoKeyboardLayot busy field"));
+        let typing = DesktopTyping {
+            field: DesktopField::start_script(&script, w!("AutoKeyboardLayot busy field")),
+        };
         let agent = thread::spawn(run);
         let deadline = Instant::now() + Duration::from_secs(10);
         let agent_window = loop {
@@ -26846,112 +28024,27 @@ public class AklWindowlessReader : Form {
         };
         drop(std::panic::take_hook());
         thread::sleep(Duration::from_secs(2));
-        let type_keys = |keys: &[VIRTUAL_KEY]| {
-            for key in keys {
-                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
-                for flags in [Default::default(), KEYEVENTF_KEYUP] {
-                    let input =
-                        keyboard_input_with_marker(*key, scan, flags, ACCEPTANCE_TYPING_MARKER);
-                    assert!(send_input_batch(&[input]));
-                    thread::sleep(Duration::from_millis(40));
-                }
-            }
-        };
-        let english = 0x0409_0409usize;
-        let to_english = || {
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(field.context.hwnd as *mut c_void)),
-                    WM_INPUTLANGCHANGEREQUEST,
-                    WPARAM(0),
-                    LPARAM(english as isize),
-                );
-            }
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while current_foreground_context().is_none_or(|context| context.layout != english)
-                && Instant::now() < deadline
-            {
-                thread::sleep(Duration::from_millis(50));
-            }
-            // A loaded VM shows the switch to this process before the field's keys carry it:
-            // keys typed in between look like a manual switch to the agent, which starts a new
-            // token at the first key in the new layout.
-            thread::sleep(Duration::from_millis(1500));
-        };
-        // A RichEdit control ends its lines with "\r" or "\r\n".
-        let text = |before: &str| {
-            field
-                .settled_text(before)
-                .replace("\r\n", "\n")
-                .replace('\r', "\n")
-        };
-        let (g, j, n, v, h, b, d, t) = (
-            VIRTUAL_KEY(0x47),
-            VIRTUAL_KEY(0x4A),
-            VIRTUAL_KEY(0x4E),
-            VIRTUAL_KEY(0x56),
-            VIRTUAL_KEY(0x48),
-            VIRTUAL_KEY(0x42),
-            VIRTUAL_KEY(0x44),
-            VIRTUAL_KEY(0x54),
-        );
-        let slash = VIRTUAL_KEY(0xBF);
-        let mut outcomes: Vec<(String, String, String)> = Vec::new();
-        // A trailing mark: "потом." typed in the English layout.
-        field.set_text("");
-        to_english();
-        type_keys(&[g, j, n, j, v, slash, VK_SPACE]);
-        let marked = text("gjnjv/ ");
-        eprintln!("mark: converted={}", marked == "потом. ");
-        outcomes.push(("mark".to_owned(), marked, "потом. ".to_owned()));
-        // The whole token since the last Space, converted by Pause.
-        field.set_text("");
-        to_english();
-        type_keys(&[g, j, n, j, v, slash, g, h, b, d, t, n]);
-        let typed = text("");
-        type_keys(&[VK_PAUSE]);
-        let token = text(&typed);
-        eprintln!("token: converted={}", token == "потом.привет");
-        outcomes.push(("token".to_owned(), token, "потом.привет".to_owned()));
-        // Twenty words before an Enter: each converted, each Enter delivered once.
-        field.set_text("");
-        let mut expected = String::new();
-        for round in 0..20 {
-            to_english();
-            let before = text("");
-            type_keys(&[g, h, b, d, t, n, VK_RETURN]);
-            expected.push_str("привет\n");
-            let after = text(&before);
-            if after != expected {
-                eprintln!(
-                    "enter: round {round} differs, {} chars",
-                    after.chars().count()
-                );
-            }
+        let outcomes = scenario(&typing);
+        let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+        for line in log.lines().filter(|line| {
+            [
+                "event=paste",
+                "event=conversion",
+                "event=word",
+                "event=hotkey",
+                "event=context",
+                "event=recovery",
+                "phase=armed",
+                "phase=release_forced",
+                "phase=abort",
+                "phase=returned",
+                "phase=recovery_handed_back",
+            ]
+            .iter()
+            .any(|kind| line.contains(kind))
+        }) {
+            eprintln!("  {line}");
         }
-        let lines = text("");
-        eprintln!(
-            "enter: converted_lines={} newlines={} of 20",
-            lines.matches("привет\n").count(),
-            lines.matches('\n').count()
-        );
-        outcomes.push(("enter".to_owned(), lines, expected));
-        let record = |filter: &dyn Fn(&str) -> bool| {
-            let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
-            for line in log.lines().filter(|line| filter(line)) {
-                eprintln!("  {line}");
-            }
-        };
-        record(&|line| {
-            line.contains("event=paste")
-                || line.contains("event=conversion")
-                || line.contains("event=word")
-                || line.contains("event=hotkey")
-                || line.contains("event=context")
-                || line.contains("phase=armed")
-                || line.contains("phase=release_forced")
-                || line.contains("phase=abort")
-        });
         let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
         while !agent.is_finished() && Instant::now() < deadline {
             unsafe {
@@ -26961,7 +28054,7 @@ public class AklWindowlessReader : Form {
         }
         assert!(agent.is_finished(), "the agent declined to stop");
         let stopped = agent.join();
-        drop(field);
+        drop(typing);
         let _ = fs::remove_dir_all(&profile);
         assert!(
             matches!(stopped, Ok(Ok(()))),
@@ -26970,6 +28063,122 @@ public class AklWindowlessReader : Form {
         for (case, text, expected) in outcomes {
             assert_eq!(text, expected, "{route} {case}");
         }
+    }
+
+    const KEYS_G_H_B_D_T_N: [VIRTUAL_KEY; 6] = [
+        VIRTUAL_KEY(0x47),
+        VIRTUAL_KEY(0x48),
+        VIRTUAL_KEY(0x42),
+        VIRTUAL_KEY(0x44),
+        VIRTUAL_KEY(0x54),
+        VIRTUAL_KEY(0x4E),
+    ];
+
+    /// Desktop acceptance of trailing marks, the Pause token and conversion before Enter on the
+    /// test VM, with the busy field turned multiline and routed by `route`: "gjnjv/" and a Space,
+    /// "gjnjv/ghbdtn" and Pause, and twenty times "ghbdtn" and an Enter that must arrive once.
+    fn desktop_marks_tokens_and_enter(route: &str) {
+        on_the_desktop_with_conversion_on_enter(route, |typing| {
+            let (g, j, n, v) = (
+                VIRTUAL_KEY(0x47),
+                VIRTUAL_KEY(0x4A),
+                VIRTUAL_KEY(0x4E),
+                VIRTUAL_KEY(0x56),
+            );
+            let slash = VIRTUAL_KEY(0xBF);
+            let mut outcomes: Vec<(String, String, String)> = Vec::new();
+            // A trailing mark: "потом." typed in the English layout.
+            typing.field.set_text("");
+            typing.to_english();
+            typing.type_keys(&[g, j, n, j, v, slash, VK_SPACE]);
+            let marked = typing.text("gjnjv/ ");
+            eprintln!("mark: converted={}", marked == "потом. ");
+            outcomes.push(("mark".to_owned(), marked, "потом. ".to_owned()));
+            // The whole token since the last Space, converted by Pause.
+            typing.field.set_text("");
+            typing.to_english();
+            typing.type_keys(&[g, j, n, j, v, slash]);
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            let typed = typing.text("");
+            typing.type_keys(&[VK_PAUSE]);
+            let token = typing.text(&typed);
+            eprintln!("token: converted={}", token == "потом.привет");
+            outcomes.push(("token".to_owned(), token, "потом.привет".to_owned()));
+            // Twenty words before an Enter: each converted, each Enter delivered once.
+            typing.field.set_text("");
+            let mut expected = String::new();
+            for round in 0..20 {
+                typing.to_english();
+                let before = typing.text("");
+                typing.type_keys(&KEYS_G_H_B_D_T_N);
+                typing.type_keys(&[VK_RETURN]);
+                expected.push_str("привет\n");
+                let after = typing.text(&before);
+                if after != expected {
+                    eprintln!(
+                        "enter: round {round} differs, {} chars",
+                        after.chars().count()
+                    );
+                }
+            }
+            let lines = typing.text("");
+            eprintln!(
+                "enter: converted_lines={} newlines={} of 20",
+                lines.matches("привет\n").count(),
+                lines.matches('\n').count()
+            );
+            outcomes.push(("enter".to_owned(), lines, expected));
+            outcomes
+        });
+    }
+
+    /// Desktop acceptance of an Enter held when its conversion fails: the field is busy for
+    /// `busy_ms` when the replacement arrives, so the paste cannot be confirmed and the word may
+    /// stay selected. Typing goes on past the failure; the failed edit pauses automatic conversion,
+    /// so each run has one failure.
+    fn desktop_held_enter_after_a_failed_conversion(busy_ms: usize) {
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            typing.field.set_text("");
+            typing.to_english();
+            typing.field.configure(busy_ms, 0);
+            thread::sleep(Duration::from_millis(500));
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            let (k, l) = (VIRTUAL_KEY(0x4B), VIRTUAL_KEY(0x4C));
+            typing.type_keys(&[VK_RETURN]);
+            for _ in 0..12 {
+                typing.type_keys(&[k, l]);
+            }
+            let text = typing.text("ghbdtn");
+            eprintln!(
+                "busy_ms={busy_ms} newlines={} after_enter={:?} word_kept={}",
+                text.matches('\n').count(),
+                text.split_once('\n').map(|(_, after)| after),
+                text.starts_with("привет") || text.starts_with("ghbdtn")
+            );
+            vec![(
+                format!("busy_ms={busy_ms}"),
+                text,
+                format!("привет\n{}", "kl".repeat(12)),
+            )]
+        });
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_from_a_field_busy_for_a_second() {
+        desktop_held_enter_after_a_failed_conversion(1_000);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_from_a_field_busy_for_two_seconds() {
+        desktop_held_enter_after_a_failed_conversion(2_000);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_from_a_field_busy_for_three_seconds() {
+        desktop_held_enter_after_a_failed_conversion(3_000);
     }
 
     #[test]
