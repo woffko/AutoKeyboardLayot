@@ -25644,8 +25644,7 @@ mod tests {
             });
             assert!(begin_retained_recovery(&metrics, 10).is_some());
             finish_retained_recovery(&metrics, 10, sent, requested);
-            let record = metrics.retained_input.lock().unwrap().clone();
-            record
+            metrics.retained_input.into_inner().unwrap()
         };
         let (enter, letter) = (u32::from(ENTER_SCAN), u32::from(LETTER_SCAN));
         // Nothing went out: everything is sent again.
