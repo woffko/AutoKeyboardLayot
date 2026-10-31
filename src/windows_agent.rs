@@ -11634,12 +11634,7 @@ impl InputProcessor {
         }
         let now = Instant::now();
         let margin = Duration::from_millis(PASTE_UIA_MARGIN_MS);
-        let poll_end = now
-            + budget.wait_within(
-                now,
-                Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-                margin,
-            );
+        let poll_end = now + budget.target_commit_poll(now);
         let target_commit = self.paste_commit(
             foreground,
             input_sequence,
@@ -12976,6 +12971,17 @@ impl PasteBudget {
         self.remaining(now).map_or(limit, |remaining| {
             remaining.saturating_sub(reserve).min(limit)
         })
+    }
+
+    /// How long the second commit check polls: what the gate has left past the margin, but never
+    /// less than its least, as a check that does not run would count a paste made as a failure.
+    fn target_commit_poll(self, now: Instant) -> Duration {
+        self.wait_within(
+            now,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+            Duration::from_millis(PASTE_UIA_MARGIN_MS),
+        )
+        .max(Duration::from_millis(PASTE_TARGET_COMMIT_MIN_MS))
     }
 
     /// Until when a commit check whose poll ends at `poll_end` waits for the field's late answer:
@@ -24861,6 +24867,26 @@ mod tests {
         // The Ctrl+V needs what must fit after it in hand.
         assert!(at(PASTE_AFTER_SUBMIT_LEAST_MS).allows_submit(now));
         assert!(!at(PASTE_AFTER_SUBMIT_LEAST_MS - 1).allows_submit(now));
+    }
+
+    #[test]
+    fn the_second_commit_check_always_gets_its_least() {
+        let now = Instant::now();
+        let at = |ms: u64| PasteBudget {
+            deadline: Some(now + Duration::from_millis(ms)),
+        };
+        let least = Duration::from_millis(PASTE_TARGET_COMMIT_MIN_MS);
+        let poll = Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        assert_eq!(PasteBudget { deadline: None }.target_commit_poll(now), poll);
+        assert_eq!(at(1_000).target_commit_poll(now), poll);
+        // What is left past the margin, once that is more than the least.
+        assert_eq!(
+            at(PASTE_UIA_MARGIN_MS + 80).target_commit_poll(now),
+            Duration::from_millis(80)
+        );
+        // No time left: the check still runs, or a paste already made would count as failed.
+        assert_eq!(at(PASTE_UIA_MARGIN_MS).target_commit_poll(now), least);
+        assert_eq!(at(0).target_commit_poll(now), least);
     }
 
     #[test]
