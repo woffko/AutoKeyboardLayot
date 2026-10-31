@@ -523,12 +523,20 @@ the reasons that blocked a shutdown, and one result for every typed word that wa
 not converted (`event=word result=` `no-candidate`, `manual-only`,
 `suppressed`, `no-language`, or `not-attempted` for a candidate with `reason=`
 `boundary` when Tab or Enter ended it, `automatic-off`, `shift`, `caps-lock` or
-`keys`), never the word. While privacy blocks the field (a
+`keys`), never the word. A word dropped on the way leaves `event=word_discard` with
+its category and length, and a candidate that does not start, or stops before its
+edit, leaves `event=word_left reason=` `stale-boundary`, `automatic-off`, `privacy`,
+`profiles`, `guard`, `source-settle`, `observe-only`, `enter-context`, `given-up`,
+`capability-mismatch` or `capability-unsupported`. While privacy blocks the field (a
 password field, or an excluded, elevated or uninspectable program or field),
 nothing about the typing there is written at all: no key, word, candidate, Pause,
 queue or field-check line, and switching to a blocked program leaves no line
 either, because even a counter or a timestamp per key would tell a secret's length
-and rhythm. An excluded or elevated program is blocked from its first key there,
+and rhythm. The one exception is a field that merely could not be inspected, where
+nothing is known to be secret and a word would otherwise vanish unexplained: the
+start of such a block is written once (`event=privacy_state`), and a word lost to it
+leaves its category alone, with no length and at most one line a word
+(`event=word_reset reason=`). A positive finding writes neither. An excluded or elevated program is blocked from its first key there,
 whatever key it is (a shortcut, Space, Backspace), and from a configuration reload
 that excludes it; a Space there arms no correction gate, also before the worker has
 seen the program; a shortcut is written only once its field was checked (Tab may
@@ -650,7 +658,8 @@ abandoned and replaced by a fresh one on a new thread, at most three times; the
 diagnostics log records `event=probe respawned=N`, and the hung thread is never
 joined. The text barrier's reads (whether the text before the caret is the word an
 edit is about to replace) also run on a provider thread of their own: the worker waits
-for an answer no longer than the barrier's deadline, at most 150 ms per read, a read left
+for an answer no longer than the barrier's deadline, 150 ms unless a field that does not
+answer gets more (below), a read left
 behind changes nothing in the field, the barrier report then names `stage=Provider`, and a
 provider that keeps the queue busy for 2 seconds is replaced, at most three times. Each
 check reads the field afresh: the late answer of a read left behind describes the field as
@@ -661,7 +670,14 @@ answers UI Automation only once it has handled it): the check goes on reading it
 from the gate's time only what the steps after it need at the least (the layout switch, a
 50 ms second check and a margin): the restore of the user's clipboard then waits only for
 what is left and otherwise finishes on its own, and so does the second check. A field that
-answers without the replacement is not waited for longer.
+answers without the replacement is not waited for longer. When the check has given up and
+the collapse of the selection finds it gone, the field answers again, and one more read
+settles it: the replacement in the field is proof that the paste went through, so the edit
+counts as done and automatic conversion stays on. Before an edit, the read that waits for
+the field to show the word (`event=source_settle`, also the capability route's own read)
+treats a field that does not answer the same way: it may go on for as long as the edit can
+spare of the gate, up to 350 ms from the gate's start in all, as one slow read would
+otherwise cost the word. A field that answers with other text is refused at once.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
 keys typed meanwhile. This is deliberate (audit finding E-new-3, kept as it is): if a
