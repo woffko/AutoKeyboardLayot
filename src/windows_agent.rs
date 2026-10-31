@@ -6724,6 +6724,17 @@ impl PastePatience {
     }
 }
 
+/// Whether a privacy block only says that the field could not be inspected, with nothing found.
+const fn inspection_failed(reason: Option<PrivacyBlockReason>) -> bool {
+    matches!(
+        reason,
+        Some(
+            PrivacyBlockReason::InspectionUnavailable
+                | PrivacyBlockReason::FieldInspectionUnavailable
+        )
+    )
+}
+
 /// Held keys are the user's own input for the field they were typed in, so handing them back is
 /// refused only on a positive finding: a password field, or an excluded or elevated process. A
 /// field that cannot be inspected right now (a hung or busy window) does not keep them back, as
@@ -8291,7 +8302,7 @@ impl InputProcessor {
         if update == ProfileUpdate::Bindings {
             self.invalidate_conversion_state();
             if self.session.buffered_character_count() != 0 {
-                self.suppress_session();
+                self.suppress_session("profiles");
             }
             self.replay_keys.clear();
             self.layout_switch_in_flight = None;
@@ -8594,7 +8605,7 @@ impl InputProcessor {
                 self.last_word_reset = "external-input";
                 self.pause_keys.clear();
                 self.invalidate_conversion_state();
-                self.suppress_session();
+                self.suppress_session("external-input");
                 self.mark_privacy_dirty(true);
             }
             RawInputEvent::Key(event) => self.process_key(event),
@@ -8654,6 +8665,7 @@ impl InputProcessor {
 
     fn apply_configuration_reload(&mut self, result: std::io::Result<RuntimeConfiguration>) {
         self.invalidate_conversion_state();
+        self.log_word_discard("configuration-reload", WordDiscardDetail::None);
         self.session.clear();
         self.replay_keys.clear();
         let configuration = match result {
@@ -8979,7 +8991,7 @@ impl InputProcessor {
     /// the next boundary, also across the epoch reset that an automatic resume causes.
     fn finish_recovery(&mut self, token: u64, explicit: bool, sent: usize, requested: usize) {
         self.invalidate_conversion_state();
-        self.suppress_session();
+        self.suppress_session("recovery");
         self.recovered_mid_word = true;
         self.diagnostic("recovery", format!("token={token} explicit={explicit} submitted={sent} requested={requested} evidence=input-submitted-text-unverified"));
         // Only the automatic recovery of a gate abort, and only when every held key was handed
@@ -9235,6 +9247,7 @@ impl InputProcessor {
                 "input",
                 format!("result=suppressed reason=shortcut kind={kind}"),
             );
+            self.log_word_discard("shortcut", WordDiscardDetail::None);
             self.session
                 .handle(InputEvent::Shortcut, language, &self.detector);
             self.mark_privacy_dirty(true);
@@ -9372,10 +9385,11 @@ impl InputProcessor {
                 if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
-                    // Nothing is logged here: one line per key would give a secret's length.
+                    // Only a word that was there is logged: one line per key would give a
+                    // secret's length.
                     self.last_word_reset = "privacy";
                     self.pause_keys.clear();
-                    self.suppress_session();
+                    self.suppress_session("privacy");
                     return;
                 }
                 if language.is_none() {
@@ -9490,7 +9504,13 @@ impl InputProcessor {
                         // original and replacement text are dropped without logs.
                         self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
                     }
-                    SessionAction::Reset(_) => self.replay_keys.clear(),
+                    SessionAction::Reset(reason) => {
+                        self.log_word_discard(
+                            "session-reset",
+                            WordDiscardDetail::Rule(reason.category()),
+                        );
+                        self.replay_keys.clear();
+                    }
                     SessionAction::None => {}
                 }
                 if matches!(
@@ -9501,7 +9521,7 @@ impl InputProcessor {
                     if let Some(key) = replay_key_from_event(event, self.modifiers) {
                         self.replay_keys.push(key);
                     } else {
-                        self.suppress_session();
+                        self.suppress_session("replay-key");
                     }
                 }
                 if let Some(keys) = token_keys {
@@ -9739,7 +9759,11 @@ impl InputProcessor {
                     (true, false) => "manual-only cause=resumed",
                     (false, _) => "privacy",
                 };
-                self.diagnostic("word", format!("result={result}"));
+                if self.privacy_reason.is_some() {
+                    self.log_word_reset(result);
+                } else {
+                    self.diagnostic("word", format!("result={result}"));
+                }
             }
             self.session.clear();
             None
@@ -9764,6 +9788,9 @@ impl InputProcessor {
             && self.last_foreground == Some(foreground_identity_key(event.foreground))
             && !self.modifiers.has_shortcut_modifier()
             && !self.modifiers.shift();
+        if !applies && !self.replay_keys.is_empty() {
+            self.log_word_left("enter-context");
+        }
         if applies
             && let Some((transaction, replay_keys)) =
                 self.handle_boundary_with(language, None, false, true)
@@ -9963,10 +9990,10 @@ impl InputProcessor {
     ) {
         self.last_boundary = None;
         self.transpose_cycle = None;
+        self.log_word_discard("switching-rule", WordDiscardDetail::Rule(event.category()));
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
-            self.log_word_discard("switching-rule", WordDiscardDetail::Rule(event.category()));
             self.session.clear();
         }
     }
@@ -9979,11 +10006,35 @@ impl InputProcessor {
             .session
             .buffered_character_count()
             .max(self.replay_keys.len());
-        if chars != 0 {
+        if chars == 0 {
+            return;
+        }
+        if self.privacy_reason.is_some() {
+            self.log_word_reset(reason);
+        } else {
             self.diagnostic(
                 "word_discard",
                 format!("reason={reason} chars={chars} {}", detail.describe()),
             );
+        }
+    }
+
+    /// Records that a word was lost while a field check does not pass: the category alone, never
+    /// its length, at most once a word, so that a missed conversion can still be explained. A
+    /// positive finding (a password field, an excluded or elevated program) stays silent, as
+    /// nothing about typing there is written.
+    fn log_word_reset(&self, reason: &str) {
+        if inspection_failed(self.privacy_reason) {
+            self.diagnostic("word_reset", format!("reason={reason}"));
+        }
+    }
+
+    /// Records why a word that was to be converted is left alone.
+    fn log_word_left(&self, reason: &'static str) {
+        if self.privacy_reason.is_some() {
+            self.log_word_reset(reason);
+        } else {
+            self.diagnostic("word_left", format!("reason={reason}"));
         }
     }
 
@@ -10128,7 +10179,7 @@ impl InputProcessor {
         {
             self.diagnostic("hotkey", "result=ignored reason=stale-word".to_owned());
             self.invalidate_conversion_state();
-            self.suppress_session();
+            self.suppress_session("stale-word");
             return;
         }
         // A press while a manual cycle is active advances it to the next layout.
@@ -10682,10 +10733,16 @@ impl InputProcessor {
         reason: Option<PrivacyBlockReason>,
         manual_exception: bool,
     ) {
+        let allowed_before = self.privacy_reason.is_none();
         self.privacy_reason = reason;
         self.metrics
             .privacy_reason
             .store(privacy_reason_code(reason), Ordering::Release);
+        if allowed_before && inspection_failed(reason) {
+            // Not about typing, and once a change: while a field check does not pass, nothing
+            // else in the log explains why words are left alone.
+            self.diagnostic("privacy_state", format!("reason={reason:?}"));
+        }
         if reason.is_some() {
             if manual_exception && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) {
                 self.manual_only_word = true;
@@ -10696,12 +10753,13 @@ impl InputProcessor {
             } else {
                 self.last_word_reset = "privacy";
                 self.invalidate_conversion_state();
-                self.suppress_session();
+                self.suppress_session("privacy");
             }
         }
     }
 
-    fn suppress_session(&mut self) {
+    fn suppress_session(&mut self, reason: &'static str) {
+        self.log_word_discard(reason, WordDiscardDetail::None);
         self.replay_keys.clear();
         self.manual_only_word = false;
         self.manual_only_inspection = false;
@@ -10732,6 +10790,7 @@ impl InputProcessor {
         if boundary_sequence != pending.space_down_sequence
             && boundary_sequence != pending.space_down_sequence.wrapping_add(1)
         {
+            self.log_word_left("stale-boundary");
             return;
         }
         let privacy_blocks = if pending.forced {
@@ -10739,11 +10798,19 @@ impl InputProcessor {
         } else {
             self.privacy_reason.is_some()
         };
-        if (!pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire))
-            || privacy_blocks
-            || !self.pending_profiles_match(&pending)
-            || !self.pre_forward_guard_is_current(pending.foreground, boundary_sequence)
-        {
+        let refused = if !pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire) {
+            Some("automatic-off")
+        } else if privacy_blocks {
+            Some("privacy")
+        } else if !self.pending_profiles_match(&pending) {
+            Some("profiles")
+        } else if !self.pre_forward_guard_is_current(pending.foreground, boundary_sequence) {
+            Some("guard")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.log_word_left(reason);
             return;
         }
         let source_settle = self.wait_for_source_input_settle(
@@ -10761,7 +10828,10 @@ impl InputProcessor {
         );
         match source_settle {
             ReplayAttempt::Applied => {}
-            ReplayAttempt::Cancelled => return,
+            ReplayAttempt::Cancelled => {
+                self.log_word_left("source-settle");
+                return;
+            }
             ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::SourceBarrier);
                 return;
@@ -10783,9 +10853,11 @@ impl InputProcessor {
             return;
         };
         if !self.edit_guard_is_current(pending.foreground, boundary_sequence) {
+            self.log_word_left("guard");
             return;
         }
         if self.text_edit_backend == TextEditBackend::ObserveOnly {
+            self.log_word_left("observe-only");
             return;
         }
         // From here an edit can submit input or fail partially. Retained text
@@ -12007,7 +12079,9 @@ impl InputProcessor {
     }
 
     fn invalidate_conversion_state(&mut self) {
-        self.pending_conversion = None;
+        if self.pending_conversion.take().is_some() {
+            self.log_word_left("given-up");
+        }
         self.deferred_drained_conversion = None;
         self.last_boundary = None;
         self.transpose_cycle = None;
@@ -12028,7 +12102,7 @@ impl InputProcessor {
             format!("result=failed reason={reason} manual=true edit=none automatic=kept"),
         );
         self.invalidate_conversion_state();
-        self.suppress_session();
+        self.suppress_session("manual-failure");
         self.layout_switch_in_flight = None;
     }
 
@@ -12041,7 +12115,7 @@ impl InputProcessor {
         // What the failed edit left in the document is uncertain, so the recent
         // words no longer describe it.
         self.recent_languages.clear();
-        self.suppress_session();
+        self.suppress_session("failed-edit");
         self.layout_switch_in_flight = None;
         if !self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
             return;
@@ -12107,6 +12181,7 @@ fn describes_typing(event: &str) -> bool {
             | "input_queue"
             | "word"
             | "word_discard"
+            | "word_left"
             | "candidate"
             | "hotkey"
             | "privacy_probe"
@@ -19490,7 +19565,7 @@ mod tests {
                 |_, _| word.map(str::to_owned),
             ));
         }
-        processor.suppress_session();
+        processor.suppress_session("test");
         let last = test_last_boundary(&processor, 6);
         assert!(!processor.erase_or_resume_word_with(
             Some(last),
@@ -22287,6 +22362,305 @@ mod tests {
             Some(PrivacyBlockReason::ExcludedProcess)
         );
         assert_eq!(processor.last_word_reset, "privacy");
+    }
+
+    /// What the worker wrote about a word: the lines since the last call.
+    fn new_log_lines(receiver: &Receiver<String>) -> Vec<String> {
+        receiver.try_iter().collect()
+    }
+
+    /// A word typed in the field the worker already follows.
+    fn word_in_progress(processor: &mut InputProcessor) {
+        processor.last_foreground = Some(foreground_identity_key(test_foreground()));
+        processor.last_layout = Some(test_foreground().layout);
+        type_letters(processor, "hel");
+    }
+
+    fn logged(lines: &[String], event: &str, details: &str) -> bool {
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("event={event} ")) && line.contains(details))
+    }
+
+    #[test]
+    fn a_privacy_block_is_logged_when_it_changes_and_only_then() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.set_privacy_reason(None);
+        new_log_lines(&receiver);
+        let reason = Some(PrivacyBlockReason::InspectionUnavailable);
+        processor.set_privacy_reason(reason);
+        processor.set_privacy_reason(reason);
+        let lines = new_log_lines(&receiver);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("event=privacy_state "))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(logged(&lines, "privacy_state", "InspectionUnavailable"));
+        // A positive finding is not written, nor the end of a block.
+        processor.set_privacy_reason(None);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        assert!(new_log_lines(&receiver).is_empty());
+    }
+
+    #[test]
+    fn a_word_lost_to_a_positive_finding_leaves_no_line() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.set_privacy_reason(None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        assert!(new_log_lines(&receiver).is_empty());
+    }
+
+    #[test]
+    fn a_word_privacy_takes_away_is_logged_without_its_length() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.set_privacy_reason(None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::InspectionUnavailable));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_reset", "reason=privacy"), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("chars=")),
+            "{lines:?}"
+        );
+        // An empty buffer has nothing to report: no line per key in a password field.
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        assert!(
+            !logged(&new_log_lines(&receiver), "word_reset", ""),
+            "nothing was dropped"
+        );
+    }
+
+    #[test]
+    fn a_word_blocked_at_its_boundary_is_logged_without_its_length() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        // The block arrives as a field check at the boundary would set it, with the word kept.
+        processor.privacy_reason = Some(PrivacyBlockReason::InspectionUnavailable);
+        new_log_lines(&receiver);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_reset", "reason=privacy"), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("chars=")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn injected_input_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.process(QueuedInputEvent {
+            epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+            captured_at: Instant::now(),
+            event: RawInputEvent::ExternalInjection,
+            configuration: None,
+        });
+        let lines = new_log_lines(&receiver);
+        // Injected input also asks for a new field check, which blocks until it passes.
+        assert!(
+            logged(&lines, "word_discard", "reason=external-input chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_shortcut_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        word_in_progress(&mut processor);
+        new_log_lines(&receiver);
+        processor.modifiers = Modifiers::default();
+        let control = RawKeyEvent {
+            held_modifiers: 1 << 2,
+            ..letter(0x43, 1)
+        };
+        processor.process(queued_key(&processor, control, Duration::ZERO));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=shortcut chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_of_the_layouts_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.suppress_session("profiles");
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=profiles chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_reloaded_configuration_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.apply_configuration_reload(Err(std::io::Error::other("test")));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(
+                &lines,
+                "word_discard",
+                "reason=configuration-reload chars=3"
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.record_conversion_failure(ConversionFailureReason::TextCommit);
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=failed-edit chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_suppresses_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.handle_switching_rule(InputEvent::Delete, Some(Language::English), true);
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=switching-rule chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_part_of_a_word_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        word_in_progress(&mut processor);
+        new_log_lines(&receiver);
+        // F1 types nothing the session can keep.
+        processor.process(queued_key(&processor, letter(0x70, 1), Duration::ZERO));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_discard", "chars=3"), "{lines:?}");
+    }
+
+    /// A conversion that waits to start, in a processor at `sequence` in the field.
+    fn pending_word(processor: &mut InputProcessor, sequence: u64) {
+        let foreground = processor.foreground_override.unwrap();
+        processor.pending_conversion = Some(PendingConversion {
+            transaction: ConversionTransaction::without_delimiter(&Detection {
+                original: "ghbdtn".to_owned(),
+                replacement: "привет".to_owned(),
+                source_language: Language::English,
+                target_language: Language::Russian,
+                source_score: 0.0,
+                target_score: 20.0,
+            })
+            .unwrap(),
+            foreground,
+            source_layout: 0x0409,
+            profile_generation: processor.input_profiles.generation(),
+            space_down_sequence: sequence,
+            replay_keys: Vec::new(),
+            forced: false,
+            cycle_order: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn a_conversion_that_does_not_start_says_why() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        new_log_lines(&receiver);
+        pending_word(&mut processor, 5);
+        processor.execute_pending_conversion_inner(9);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=stale-boundary"
+        ));
+
+        pending_word(&mut processor, 5);
+        processor
+            .metrics
+            .auto_enabled
+            .store(false, Ordering::Release);
+        processor.execute_pending_conversion_inner(5);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=automatic-off"
+        ));
+
+        // A layout no profile knows.
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, 5);
+        processor.pending_conversion.as_mut().unwrap().source_layout = 4;
+        processor.execute_pending_conversion_inner(5);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=profiles"
+        ));
+
+        // Its gate was cancelled: the edit's guard does not hold.
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .cancelled_gate_token
+            .store(5, Ordering::Release);
+        pending_word(&mut processor, 5);
+        processor.execute_pending_conversion_inner(5);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=guard"
+        ));
+
+        processor
+            .metrics
+            .cancelled_gate_token
+            .store(0, Ordering::Release);
+        pending_word(&mut processor, 5);
+        processor.privacy_reason = Some(PrivacyBlockReason::InspectionUnavailable);
+        processor.execute_pending_conversion_inner(5);
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_reset", "reason=privacy"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_conversion_given_up_says_so() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        new_log_lines(&receiver);
+        pending_word(&mut processor, 5);
+        processor.invalidate_conversion_state();
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_left", "reason=given-up"), "{lines:?}");
+        // Nothing was waiting: nothing to say.
+        processor.invalidate_conversion_state();
+        assert!(new_log_lines(&receiver).is_empty());
     }
 
     #[test]
@@ -28252,6 +28626,9 @@ public class AklWindowlessReader : Form {
         for line in log.lines() {
             eprintln!("  {line}");
         }
+        for word in ["ghbdtn", "привет", "gjnjv", "потом", "klkl"] {
+            assert!(!log.contains(word), "the log holds a typed word");
+        }
         let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
         while !agent.is_finished() && Instant::now() < deadline {
             unsafe {
@@ -29402,6 +29779,7 @@ public class AklPrivacyForm : Form {
                     "event=input ",
                     "event=word ",
                     "event=word_discard ",
+                    "chars=",
                     "event=candidate ",
                     "event=hotkey ",
                     "event=privacy_probe ",

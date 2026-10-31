@@ -18,6 +18,24 @@ pub enum ResetReason {
     QueueOverflow,
 }
 
+impl ResetReason {
+    /// A name for diagnostics.
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::Backspace => "backspace",
+            Self::Delete => "delete",
+            Self::Navigation => "navigation",
+            Self::Mouse => "mouse",
+            Self::FocusChanged => "focus",
+            Self::LayoutChanged => "layout",
+            Self::Shortcut => "shortcut",
+            Self::UnsupportedInput => "unsupported",
+            Self::Composition => "composition",
+            Self::QueueOverflow => "queue-overflow",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
     Printable(char),
