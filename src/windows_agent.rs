@@ -229,6 +229,11 @@ const PASTE_AFTER_SETTLE_MS: u64 =
 /// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
 /// the user's clipboard, the layout switch, the second commit and the UI Automation calls between.
 const PASTE_AFTER_SUBMIT_MS: u64 = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_COMMIT_MS;
+/// What must fit after a Ctrl+V at the least: the commit's poll and the steps after it. The restore
+/// of the clipboard and the second commit check take only what is left, so a paste that has this
+/// much in hand ends before the gate does.
+const PASTE_AFTER_SUBMIT_LEAST_MS: u64 =
+    NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_LATE_COMMIT_MS;
 /// What a protected paste needs after the commit of the replacement: the restore of the user's
 /// clipboard, the layout switch, the second commit and the UI Automation calls between.
 const PASTE_AFTER_COMMIT_MS: u64 = CLIPBOARD_RESTORE_WAIT_MS
@@ -8146,9 +8151,12 @@ impl InputProcessor {
         status
     }
 
-    /// Whether the provider answered the last barrier read, Match or not.
+    /// Whether the field answered the last barrier read, Match or not. A field too busy to name
+    /// its focus to UI Automation has not answered either.
     fn barrier_answered(&self) -> bool {
-        self.privacy_guard.last_barrier_report().stage != TextBarrierStage::Provider
+        let report = self.privacy_guard.last_barrier_report();
+        report.stage != TextBarrierStage::Provider
+            && report.resolver_reason != EditableResolverReason::FocusUnavailable
     }
 
     /// One read of a paste's commit check, answered by `until`: its status and whether the field
@@ -11181,8 +11189,12 @@ impl InputProcessor {
                 deadline: self.edit_deadline.get(),
             }
             .commit_late_until(poll_end, Duration::from_millis(PASTE_AFTER_SETTLE_MS));
-            return match poll_text_commit(poll_end, late_until, stop, |until| {
-                self.settle_read(foreground.process_id, expected_text, until)
+            return match poll_text_commit(poll_end, late_until, stop, |_| {
+                self.settle_read(
+                    foreground.process_id,
+                    expected_text,
+                    late_until.max(poll_end),
+                )
             }) {
                 ReplayAttempt::Failed => ReplayAttempt::Cancelled,
                 settled => settled,
@@ -11252,8 +11264,8 @@ impl InputProcessor {
             {
                 return TextBarrierStatus::Mismatch;
             }
-            let (status, answered) =
-                self.commit_read(foreground.process_id, expected_text, deadline);
+            let until = late_until.max(deadline);
+            let (status, answered) = self.commit_read(foreground.process_id, expected_text, until);
             match status {
                 TextBarrierStatus::Match => return TextBarrierStatus::Match,
                 TextBarrierStatus::Mismatch => saw_mismatch = true,
@@ -12906,7 +12918,7 @@ fn conversion_gate_budget_ms(
 /// The time an automatic protected paste needs from the gate: its settle (and a capability
 /// probe's text barrier), one confirmed selection, the least installation of the replacement and
 /// everything after the Ctrl+V. The paste shortens its own waits to what the gate has left and
-/// never sends the Ctrl+V without `PASTE_AFTER_SUBMIT_MS` in hand (`PasteBudget`).
+/// never sends the Ctrl+V without `PASTE_AFTER_SUBMIT_LEAST_MS` in hand (`PasteBudget`).
 const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
     let settle = if capability_probe {
         INPUT_SETTLE_AFTER_FORWARD_MS + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
@@ -12952,7 +12964,7 @@ impl PasteBudget {
     /// everything after the Ctrl+V still fit. Pause's second attempt is asked again.
     fn allows_selection(self, now: Instant, patience: PastePatience) -> bool {
         let needed = patience.confirm_timeout()
-            + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS);
+            + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_LEAST_MS);
         self.remaining(now)
             .is_none_or(|remaining| remaining >= needed)
     }
@@ -12965,14 +12977,14 @@ impl PasteBudget {
         let Some(remaining) = self.remaining(now) else {
             return Some(limit);
         };
-        let left = remaining.checked_sub(Duration::from_millis(PASTE_AFTER_SUBMIT_MS))?;
+        let left = remaining.checked_sub(Duration::from_millis(PASTE_AFTER_SUBMIT_LEAST_MS))?;
         (left >= Duration::from_millis(PASTE_MIN_INSTALL_MS)).then_some(left.min(limit))
     }
 
     /// Whether the Ctrl+V may be sent: everything after it fits before the gate lets the keys go.
     fn allows_submit(self, now: Instant) -> bool {
         self.remaining(now)
-            .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
+            .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_LEAST_MS))
     }
 
     /// How long a step may wait: `limit`, shortened so that `reserve`, what the steps after it
@@ -15350,8 +15362,8 @@ mod tests {
         let budget = PasteBudget {
             deadline: Some(armed + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS)),
         };
-        // The settle step took 38 ms and the barrier matched at 165 ms: the selection starts.
-        let selecting = armed + Duration::from_millis(203);
+        // A slow field: the settle step and the barrier took 450 ms: the selection starts.
+        let selecting = armed + Duration::from_millis(450);
         assert!(budget.allows_selection(selecting, PastePatience::Manual));
         // The field did not show it; a second attempt would no longer leave the rest its time.
         let not_shown = SelectionAttempt {
@@ -23189,7 +23201,7 @@ mod tests {
     fn pause_selects_a_field_that_did_not_show_it_again_only_with_time_for_it() {
         // The field never shows one selection; with a gate holding a second attempt's time the
         // word is selected twice, without it once.
-        for (left_ms, attempts) in [(None, 2), (Some(900), 1)] {
+        for (left_ms, attempts) in [(None, 2), (Some(750), 1)] {
             let budget = PasteBudget {
                 deadline: left_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
             };
@@ -24799,6 +24811,7 @@ mod tests {
             deadline: Some(now + Duration::from_millis(ms)),
         };
         assert_eq!(PASTE_AFTER_SUBMIT_MS, 750);
+        assert_eq!(PASTE_AFTER_SUBMIT_LEAST_MS, 550);
         // Without a gate nothing is cut short.
         let unbounded = PasteBudget { deadline: None };
         assert!(unbounded.allows_selection(now, PastePatience::Manual));
@@ -24820,22 +24833,23 @@ mod tests {
         );
         assert_eq!(
             fresh.install_timeout(now, PastePatience::Manual),
-            Some(Duration::from_millis(1_050 - PASTE_AFTER_SUBMIT_MS))
+            Some(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
         );
-        // The selection starts only with its confirmation, the least installation and
-        // everything after the Ctrl+V in hand.
+        // The selection starts only with its confirmation, the least installation and what must
+        // fit after the Ctrl+V in hand.
         let automatic =
-            UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+            UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_LEAST_MS;
         assert!(at(automatic).allows_selection(now, PastePatience::Automatic));
         assert!(!at(automatic - 1).allows_selection(now, PastePatience::Automatic));
         // Pause starts as soon as one attempt fits; a second one has to fit again (see
         // a_pause_selects_again_only_while_another_attempt_fits).
-        let manual =
-            UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+        let manual = UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS
+            + PASTE_MIN_INSTALL_MS
+            + PASTE_AFTER_SUBMIT_LEAST_MS;
         assert!(at(manual).allows_selection(now, PastePatience::Manual));
         assert!(!at(manual - 1).allows_selection(now, PastePatience::Manual));
         // Less than the least installation is no installation.
-        let least = PASTE_AFTER_SUBMIT_MS + PASTE_MIN_INSTALL_MS;
+        let least = PASTE_AFTER_SUBMIT_LEAST_MS + PASTE_MIN_INSTALL_MS;
         assert_eq!(
             at(least).install_timeout(now, PastePatience::Automatic),
             Some(Duration::from_millis(PASTE_MIN_INSTALL_MS))
@@ -24844,9 +24858,9 @@ mod tests {
             at(least - 1).install_timeout(now, PastePatience::Automatic),
             None
         );
-        // The Ctrl+V needs everything after it in hand.
-        assert!(at(PASTE_AFTER_SUBMIT_MS).allows_submit(now));
-        assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
+        // The Ctrl+V needs what must fit after it in hand.
+        assert!(at(PASTE_AFTER_SUBMIT_LEAST_MS).allows_submit(now));
+        assert!(!at(PASTE_AFTER_SUBMIT_LEAST_MS - 1).allows_submit(now));
     }
 
     #[test]
@@ -27788,9 +27802,9 @@ mod tests {
         let (attempt, steps, _) = paste(0, None);
         assert_eq!(attempt, TextEditAttempt::Cancelled);
         assert!(steps.steps.is_empty(), "{:?}", steps.steps);
-        // Time for the selection and a shortened installation (the gate's 900 ms less everything
-        // after the Ctrl+V leave 150 ms of the usual 200).
-        let (attempt, steps, _) = paste(900, None);
+        // Time for the selection and a shortened installation (the gate's 700 ms less what must
+        // fit after the Ctrl+V leave 150 ms of the usual 200).
+        let (attempt, steps, _) = paste(700, None);
         assert_eq!(attempt, TextEditAttempt::Applied);
         let install = steps.install_timeout.unwrap();
         assert!(
@@ -27799,13 +27813,13 @@ mod tests {
             "{install:?}"
         );
         // A slow selection leaves no time for the installation: the clipboard is not touched.
-        let (attempt, steps, state) = paste(1_000, Some("select"));
+        let (attempt, steps, state) = paste(800, Some("select"));
         assert_eq!(attempt, TextEditAttempt::Cancelled);
         assert_eq!(steps.steps, ["select", "collapse"]);
         assert_eq!(state.lock().unwrap().empties, 0);
         // A slow installation leaves no time for what follows the Ctrl+V: it is not sent, and the
         // user's clipboard comes back at once.
-        let (attempt, steps, state) = paste(1_000, Some("begin"));
+        let (attempt, steps, state) = paste(800, Some("begin"));
         assert_eq!(attempt, TextEditAttempt::Cancelled);
         assert_eq!(steps.steps, ["select", "begin", "collapse"]);
         assert_eq!(state.lock().unwrap().text, "password");
@@ -27861,7 +27875,7 @@ mod tests {
     }
 
     /// A processor on the capability route in a field whose reads the provider answers as `read`
-    /// says, the first of them after `slow`, with the word to convert waiting.
+    /// says, each after `slow`, with the word to convert waiting.
     fn capability_processor(
         read: fn() -> (TextBarrierStatus, TextBarrierReport),
         slow: Duration,
@@ -27880,11 +27894,8 @@ mod tests {
             .set(Some(Instant::now() + WHOLE_GATE));
         *processor.barrier_probe.borrow_mut() = Some(
             BoundedProbe::spawn("barrier-capability-test", move || {
-                let mut first = true;
                 move |_: BarrierRead| {
-                    if core::mem::take(&mut first) {
-                        thread::sleep(slow);
-                    }
+                    thread::sleep(slow);
                     read()
                 }
             })
@@ -27966,10 +27977,64 @@ mod tests {
     }
 
     #[test]
+    fn a_field_slow_at_every_read_passes_the_source_settle() {
+        let mut processor =
+            capability_processor(|| marked_barrier_answer(41), Duration::from_millis(200));
+        processor.paste_seam = None;
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        let foreground = processor.foreground_override.unwrap();
+        assert_eq!(
+            processor.wait_for_source_input_settle(
+                foreground,
+                PASTE_SEQUENCE,
+                foreground.layout,
+                "ghbdtn",
+            ),
+            ReplayAttempt::Applied,
+            "one read that waits, not a second one behind it"
+        );
+    }
+
+    #[test]
     fn a_slow_field_passes_the_capability_barrier() {
         let processor =
             capability_processor(|| marked_barrier_answer(41), Duration::from_millis(200));
         let foreground = processor.foreground_override.unwrap();
+        let barrier = processor.wait_for_capability_text_barrier(
+            foreground,
+            PASTE_SEQUENCE,
+            foreground.layout,
+            "ghbdtn",
+        );
+        assert_eq!(barrier, TextBarrierStatus::Match);
+    }
+
+    #[test]
+    fn a_field_too_busy_to_name_its_focus_has_not_answered() {
+        let processor = capability_processor(|| marked_barrier_answer(41), Duration::ZERO);
+        let foreground = processor.foreground_override.unwrap();
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-focus-test", move || {
+                let mut reads = 0;
+                move |_: BarrierRead| {
+                    reads += 1;
+                    if reads == 1 {
+                        // The answer comes after the plain poll, so only a late one can help.
+                        thread::sleep(Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 20));
+                        return (
+                            TextBarrierStatus::Unavailable,
+                            TextBarrierReport {
+                                stage: TextBarrierStage::Resolver,
+                                resolver_reason: EditableResolverReason::FocusUnavailable,
+                                ..TextBarrierReport::default()
+                            },
+                        );
+                    }
+                    marked_barrier_answer(41)
+                }
+            })
+            .expect("barrier provider"),
+        );
         let barrier = processor.wait_for_capability_text_barrier(
             foreground,
             PASTE_SEQUENCE,
@@ -28273,6 +28338,10 @@ public class AklBusyField : Form {
             m.Result = new IntPtr(1);
             return;
         }
+        if (m.Msg == 0x8041) {
+            Thread.Sleep(m.WParam.ToInt32());
+            return;
+        }
         if (m.Msg == 0x031D) {
             StringBuilder owner = new StringBuilder(128);
             GetClassName(GetClipboardOwner(), owner, owner.Capacity);
@@ -28514,6 +28583,19 @@ public class AklWindowlessReader : Form {
                 busy_ms,
                 read_then_busy_ms,
             );
+        }
+
+        /// Keeps the field busy for `busy_ms` from now, whatever it does next.
+        fn stay_busy(&self, busy_ms: usize) {
+            const BUSY_NOW: u32 = 0x8041;
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.context.hwnd as *mut c_void)),
+                    BUSY_NOW,
+                    WPARAM(busy_ms),
+                    LPARAM(0),
+                );
+            }
         }
 
         /// The field's text once it changed from `before` and stopped changing (a busy field
@@ -29098,6 +29180,28 @@ public class AklWindowlessReader : Form {
                 text,
                 format!("{word}\n{}", "kl".repeat(12)),
             )]
+        });
+    }
+
+    /// Desktop acceptance of a word whose field is busy when it ends: the read before the edit
+    /// finds no answer in its first 150 ms, and the word must not be lost to that.
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_a_word_its_field_is_too_busy_to_show_at_once() {
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            let mut outcomes = Vec::new();
+            for round in 0..3 {
+                typing.field.set_text("");
+                typing.to_english();
+                typing.type_keys(&KEYS_G_H_B_D_T_N);
+                typing.field.stay_busy(220);
+                thread::sleep(Duration::from_millis(10));
+                typing.type_keys(&[VK_SPACE]);
+                let text = typing.text("ghbdtn ");
+                eprintln!("round {round}: converted={}", text == "привет ");
+                outcomes.push((format!("round {round}"), text, "привет ".to_owned()));
+            }
+            outcomes
         });
     }
 

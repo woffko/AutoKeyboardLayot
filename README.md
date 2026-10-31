@@ -677,7 +677,11 @@ counts as done and automatic conversion stays on. Before an edit, the read that 
 the field to show the word (`event=source_settle`, also the capability route's own read)
 treats a field that does not answer the same way: it may go on for as long as the edit can
 spare of the gate, up to 350 ms from the gate's start in all, as one slow read would
-otherwise cost the word. A field that answers with other text is refused at once.
+otherwise cost the word. A field too busy to name its focus to UI Automation
+(`FocusUnavailable`) has not answered either. A field that answers with other text is
+refused at once. An edit also goes on with only what must fit after its Ctrl+V in hand
+(the commit's poll, the layout switch, the second check's least and a margin, 550 ms):
+the restore of the clipboard and the rest of the second check take only what is left.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
 keys typed meanwhile. This is deliberate (audit finding E-new-3, kept as it is): if a
