@@ -13028,7 +13028,9 @@ fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<IN
         } else {
             KEYEVENTF_SCANCODE
         };
-        if event.extended {
+        // The hook reports Right Shift as extended, yet its scan code has no E0 prefix: with one
+        // the key-up would release nothing, and Shift would stay down for the whole system.
+        if event.extended && event.virtual_key != u32::from(VK_RSHIFT.0) {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
         if matches!(event.message, WM_KEYUP | WM_SYSKEYUP) {
@@ -23469,6 +23471,39 @@ mod tests {
     }
 
     #[test]
+    fn a_right_shift_goes_out_as_the_key_it_is() {
+        let edge = |message, key, scan_code, extended| RawKeyEvent {
+            scan_code,
+            extended,
+            ..test_raw_key(message, key, 0, 0)
+        };
+        // The hook reports Right Shift as extended, but its scan code has no E0 prefix: with one,
+        // the key-up is no release and Shift stays down for the whole system.
+        let inputs = build_raw_replay_inputs(
+            &[
+                edge(WM_KEYDOWN, VK_RSHIFT, 0x36, true),
+                edge(WM_KEYUP, VK_RSHIFT, 0x36, true),
+                edge(WM_KEYUP, VK_RCONTROL, 0x1d, true),
+            ],
+            INJECTED_EVENT_MARKER,
+        )
+        .unwrap();
+        let shift_down = unsafe { inputs[0].Anonymous.ki };
+        let shift_up = unsafe { inputs[1].Anonymous.ki };
+        let control_up = unsafe { inputs[2].Anonymous.ki };
+        assert_eq!(shift_down.wScan, 0x36);
+        assert_eq!(shift_up.wScan, 0x36);
+        assert!(shift_up.dwFlags.contains(KEYEVENTF_SCANCODE));
+        assert!(shift_up.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert!(!shift_down.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(!shift_up.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(
+            control_up.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
+            "the other extended keys keep their prefix"
+        );
+    }
+
+    #[test]
     fn held_keys_the_ui_thread_returns_leave_no_key_down() {
         let (mut state, _receiver) = test_gate_state(8);
         let edge = |message, key, scan_code| RawKeyEvent {
@@ -28212,24 +28247,9 @@ public class AklWindowlessReader : Form {
         drop(std::panic::take_hook());
         thread::sleep(Duration::from_secs(2));
         let outcomes = scenario(&typing);
+        // All of it: a word that was not converted is explained by what is around its gate.
         let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
-        for line in log.lines().filter(|line| {
-            [
-                "event=paste",
-                "event=conversion",
-                "event=word",
-                "event=hotkey",
-                "event=context",
-                "event=recovery",
-                "phase=armed",
-                "phase=release_forced",
-                "phase=abort",
-                "phase=returned",
-                "phase=recovery_handed_back",
-            ]
-            .iter()
-            .any(|kind| line.contains(kind))
-        }) {
+        for line in log.lines() {
             eprintln!("  {line}");
         }
         let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
@@ -28348,6 +28368,62 @@ public class AklWindowlessReader : Form {
                 format!("привет\n{}", "kl".repeat(12)),
             )]
         });
+    }
+
+    /// Desktop acceptance of a Shift released while the gate of a Space holds the input: the
+    /// key-down reached the system, so the key-up that comes out of the gate must release it. The
+    /// Space and the key-up go out together, so that the gate is up when the key-up arrives.
+    fn desktop_shift_released_in_a_gate(shift: VIRTUAL_KEY, scan_code: u16) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            KEYBD_EVENT_FLAGS, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+        };
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            let key = |scan: u16, flags: KEYBD_EVENT_FLAGS| {
+                keyboard_input_with_marker(
+                    VIRTUAL_KEY(0),
+                    scan,
+                    KEYEVENTF_SCANCODE | flags,
+                    ACCEPTANCE_TYPING_MARKER,
+                )
+            };
+            let space = unsafe { MapVirtualKeyW(u32::from(VK_SPACE.0), MAPVK_VK_TO_VSC) } as u16;
+            typing.field.set_text("");
+            typing.to_english();
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            assert!(send_input_batch(&[key(scan_code, Default::default())]));
+            thread::sleep(Duration::from_millis(100));
+            let is_down = || unsafe { GetAsyncKeyState(i32::from(shift.0)) } as u16 & 0x8000 != 0;
+            let down_before = is_down();
+            assert!(send_input_batch(&[
+                key(space, Default::default()),
+                key(scan_code, KEYEVENTF_KEYUP)
+            ]));
+            thread::sleep(Duration::from_millis(40));
+            assert!(send_input_batch(&[key(space, KEYEVENTF_KEYUP)]));
+            thread::sleep(Duration::from_secs(1));
+            let down_after = is_down();
+            eprintln!("shift down_before={down_before} down_after={down_after}");
+            // Leaves the session as it found it, whatever the test shows.
+            assert!(send_input_batch(&[key(scan_code, KEYEVENTF_KEYUP)]));
+            thread::sleep(Duration::from_millis(100));
+            vec![(
+                format!("key {:#x}", shift.0),
+                format!("down_before={down_before} down_after={down_after}"),
+                "down_before=true down_after=false".to_owned(),
+            )]
+        });
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_lets_go_of_a_right_shift_released_in_a_gate() {
+        desktop_shift_released_in_a_gate(VK_RSHIFT, 0x36);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_lets_go_of_a_left_shift_released_in_a_gate() {
+        desktop_shift_released_in_a_gate(VK_LSHIFT, 0x2a);
     }
 
     /// Desktop acceptance of an Enter whose gate runs out before the edit has ended, with typing
