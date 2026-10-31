@@ -8107,23 +8107,6 @@ impl InputProcessor {
         self.commit_read(process_id, expected_text, until)
     }
 
-    /// Whether the text before the caret is `expected_text`, as the barrier's provider thread
-    /// reads it, waited for until `deadline` at most. Without a provider the barrier is
-    /// unavailable, and no edit that needs it goes ahead.
-    fn barrier_text_status(
-        &self,
-        process_id: u32,
-        expected_text: &str,
-        deadline: Instant,
-    ) -> TextBarrierStatus {
-        let read = self.next_barrier_read(process_id, expected_text);
-        self.answer_barrier_read(
-            read,
-            deadline,
-            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-        )
-    }
-
     /// A new barrier check of `expected_text` before the caret of `process_id`'s field.
     fn next_barrier_read(&self, process_id: u32, expected_text: &str) -> BarrierRead {
         self.barrier_checks
@@ -23453,15 +23436,23 @@ mod tests {
             })
             .expect("barrier provider"),
         );
-        let first =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_millis(30));
+        let first = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_millis(30),
+        );
         assert_eq!(first, TextBarrierStatus::Unavailable);
         // Its answer arrives just after that check ended.
         release.send(()).unwrap();
         thread::sleep(Duration::from_millis(20));
         // The next check of the same word reads the field again.
-        let next =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        let next = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_secs(5),
+        );
         assert_eq!(next, TextBarrierStatus::Match);
         assert_eq!(
             processor.privacy_guard.last_barrier_report().expected_chars,
@@ -23525,8 +23516,12 @@ mod tests {
             })
             .expect("barrier provider"),
         );
-        let status =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        let status = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_secs(5),
+        );
         assert_eq!(status, TextBarrierStatus::Match);
         assert_eq!(
             processor.privacy_guard.last_barrier_report().expected_chars,
@@ -23534,8 +23529,12 @@ mod tests {
         );
         // Without a provider the barrier is unavailable, never a match.
         *processor.barrier_probe.borrow_mut() = None;
-        let status =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        let status = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_secs(5),
+        );
         assert_eq!(status, TextBarrierStatus::Unavailable);
         assert_eq!(
             processor.privacy_guard.last_barrier_report().stage,
@@ -27872,6 +27871,21 @@ mod tests {
             steps.lock().unwrap().steps,
             ["select", "begin", "submit:4", "commit", "collapse"]
         );
+    }
+
+    /// One barrier read of `expected_text` in `process_id`'s field, answered by `deadline`.
+    fn barrier_read(
+        processor: &InputProcessor,
+        process_id: u32,
+        expected_text: &str,
+        deadline: Instant,
+    ) -> TextBarrierStatus {
+        let read = processor.next_barrier_read(process_id, expected_text);
+        processor.answer_barrier_read(
+            read,
+            deadline,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+        )
     }
 
     /// A processor on the capability route in a field whose reads the provider answers as `read`
