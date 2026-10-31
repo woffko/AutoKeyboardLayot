@@ -29086,10 +29086,17 @@ public class AklWindowlessReader : Form {
                 text.split_once('\n').map(|(_, after)| after),
                 text.starts_with("привет") || text.starts_with("ghbdtn")
             );
+            // The paste may have gone out, or been called off for lack of time: that the word is
+            // still there, once, is the point.
+            let word = if text.starts_with("привет") {
+                "привет"
+            } else {
+                "ghbdtn"
+            };
             vec![(
                 format!("busy_ms={busy_ms}"),
                 text,
-                format!("привет\n{}", "kl".repeat(12)),
+                format!("{word}\n{}", "kl".repeat(12)),
             )]
         });
     }
