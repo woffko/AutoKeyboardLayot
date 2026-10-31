@@ -222,6 +222,10 @@ const UNCONFIRMED_PASTE_WAIT_MS: u64 = 5_000;
 const TARGET_READ_GRACE_MS: u64 = 500;
 /// The least time worth giving the installation of a paste's replacement.
 const PASTE_MIN_INSTALL_MS: u64 = 50;
+/// What an edit needs after the source settle: the selection's confirmation, the least
+/// installation and everything after the Ctrl+V.
+const PASTE_AFTER_SETTLE_MS: u64 =
+    UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
 /// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
 /// the user's clipboard, the layout switch, the second commit and the UI Automation calls between.
 const PASTE_AFTER_SUBMIT_MS: u64 = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_COMMIT_MS;
@@ -8084,19 +8088,18 @@ impl InputProcessor {
         current_foreground_context()
     }
 
-    /// Whether the text before the caret is the word an edit is about to replace, as its settle
-    /// step reads it. Tests script it.
-    fn settle_text_status(
+    /// One read of the source settle, as `commit_read`. Tests script it.
+    fn settle_read(
         &self,
         process_id: u32,
         expected_text: &str,
-        deadline: Instant,
-    ) -> TextBarrierStatus {
+        until: Instant,
+    ) -> (TextBarrierStatus, bool) {
         #[cfg(test)]
         if let Some(seam) = &self.paste_seam {
             return seam.borrow_mut().settle();
         }
-        self.barrier_text_status(process_id, expected_text, deadline)
+        self.commit_read(process_id, expected_text, until)
     }
 
     /// Whether the text before the caret is `expected_text`, as the barrier's provider thread
@@ -11161,37 +11164,36 @@ impl InputProcessor {
             return ReplayAttempt::Cancelled;
         }
 
-        let settle_ms = if self.text_edit_backend.requires_text_barrier() {
-            NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
-        } else {
-            INPUT_SETTLE_AFTER_FORWARD_MS
+        let stop = || {
+            (!self.edit_guard_is_current(foreground, input_sequence)
+                || self
+                    .current_foreground()
+                    .is_none_or(|current| current.layout != source_layout))
+            .then_some(ReplayAttempt::Cancelled)
         };
-        let settle_deadline = Instant::now() + Duration::from_millis(settle_ms);
+        if self.text_edit_backend.requires_text_barrier() {
+            // A single read that takes too long must not cost the word: a field that does not
+            // answer is busy, not showing something else, and the edit can spare a little.
+            let poll_end = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+            let late_until = PasteBudget {
+                deadline: self.edit_deadline.get(),
+            }
+            .commit_late_until(poll_end, Duration::from_millis(PASTE_AFTER_SETTLE_MS));
+            return match poll_text_commit(poll_end, late_until, stop, |until| {
+                self.settle_read(foreground.process_id, expected_text, until)
+            }) {
+                ReplayAttempt::Failed => ReplayAttempt::Cancelled,
+                settled => settled,
+            };
+        }
+        let settle_deadline = Instant::now() + Duration::from_millis(INPUT_SETTLE_AFTER_FORWARD_MS);
         while Instant::now() < settle_deadline {
-            if !self.edit_guard_is_current(foreground, input_sequence) {
-                return ReplayAttempt::Cancelled;
-            }
-            if self
-                .current_foreground()
-                .is_none_or(|current| current.layout != source_layout)
-            {
-                return ReplayAttempt::Cancelled;
-            }
-            if self.text_edit_backend.requires_text_barrier()
-                && matches!(
-                    self.settle_text_status(foreground.process_id, expected_text, settle_deadline),
-                    TextBarrierStatus::Match
-                )
-            {
-                return ReplayAttempt::Applied;
+            if let Some(stopped) = stop() {
+                return stopped;
             }
             thread::sleep(Duration::from_millis(2));
         }
-        if self.text_edit_backend.requires_text_barrier() {
-            ReplayAttempt::Cancelled
-        } else {
-            ReplayAttempt::Applied
-        }
+        ReplayAttempt::Applied
     }
 
     /// Waits until `deadline` for the field to show a paste's `expected_text`
@@ -12906,7 +12908,7 @@ const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
 /// keyboard layout, as tests script them.
 #[cfg(test)]
 trait PasteSeam {
-    fn settle(&mut self) -> TextBarrierStatus;
+    fn settle(&mut self) -> (TextBarrierStatus, bool);
     fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>);
     fn begin<'a>(
         &mut self,
@@ -26459,6 +26461,8 @@ mod tests {
     struct ScriptedPaste {
         steps: Arc<Mutex<PasteSteps>>,
         settled: TextBarrierStatus,
+        /// Until when the field does not answer the settle's reads.
+        silent_until: Option<Instant>,
         selection: (TextBarrierStatus, Option<SelectionCleanup>),
         clipboard: PasteClipboard,
         taken: Option<usize>,
@@ -26475,6 +26479,7 @@ mod tests {
             let script = Self {
                 steps: Arc::clone(&steps),
                 settled: TextBarrierStatus::Match,
+                silent_until: None,
                 selection: (TextBarrierStatus::Match, None),
                 clipboard,
                 taken: None,
@@ -26502,9 +26507,12 @@ mod tests {
     }
 
     impl PasteSeam for ScriptedPaste {
-        fn settle(&mut self) -> TextBarrierStatus {
+        fn settle(&mut self) -> (TextBarrierStatus, bool) {
             self.step("settle");
-            self.settled
+            match self.silent_until {
+                Some(until) if Instant::now() < until => (TextBarrierStatus::Unavailable, false),
+                _ => (self.settled, true),
+            }
         }
 
         fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>) {
@@ -27815,6 +27823,76 @@ mod tests {
         assert_eq!(
             steps.lock().unwrap().steps,
             ["select", "begin", "submit:4", "commit", "collapse"]
+        );
+    }
+
+    /// The source settle of a paste whose field acts as `script` says, with a gate that gives it
+    /// `gate_left` from now, and how long the settle took.
+    fn settle_with(script: ScriptedPaste, gate_left: Duration) -> (ReplayAttempt, Duration) {
+        let mut processor = paste_processor(test_foreground(), |_| script);
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        // The gate is armed already, so the window is not asked.
+        processor.gate_window = 1;
+        processor
+            .edit_deadline
+            .set(Some(Instant::now() + gate_left));
+        let foreground = processor.foreground_override.unwrap();
+        let started = Instant::now();
+        let settle = processor.wait_for_source_input_settle(
+            foreground,
+            PASTE_SEQUENCE,
+            foreground.layout,
+            "ghbdtn",
+        );
+        (settle, started.elapsed())
+    }
+
+    const WHOLE_GATE: Duration = Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS);
+
+    #[test]
+    fn a_field_that_answers_the_source_settle_late_still_gets_its_word_converted() {
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        let silent = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 80;
+        script.silent_until = Some(Instant::now() + Duration::from_millis(silent));
+        let (settle, took) = settle_with(script, WHOLE_GATE);
+        assert_eq!(settle, ReplayAttempt::Applied);
+        assert!(took > Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn a_field_that_shows_something_else_gets_no_longer_to_settle() {
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.settled = TextBarrierStatus::Mismatch;
+        let (settle, took) = settle_with(script, WHOLE_GATE);
+        assert_eq!(settle, ReplayAttempt::Cancelled);
+        assert!(took < Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 50));
+    }
+
+    #[test]
+    fn a_silent_field_gets_only_the_time_the_edit_can_spare() {
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.silent_until = Some(Instant::now() + Duration::from_secs(5));
+        let (settle, took) = settle_with(script, WHOLE_GATE);
+        assert_eq!(settle, ReplayAttempt::Cancelled);
+        assert!(took >= Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 100));
+        // What the edit needs after the settle stays: the wait ends with that much of the gate.
+        assert!(
+            took <= WHOLE_GATE
+                - Duration::from_millis(
+                    paste_gate_budget_ms(false) - NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+                )
+                + Duration::from_millis(40),
+            "{took:?}"
+        );
+        // A gate that has no time to spare ends the wait where the plain poll ends.
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.silent_until = Some(Instant::now() + Duration::from_secs(5));
+        let tight = Duration::from_millis(paste_gate_budget_ms(false));
+        let (settle, took) = settle_with(script, tight);
+        assert_eq!(settle, ReplayAttempt::Cancelled);
+        assert!(
+            took < Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 50),
+            "{took:?}"
         );
     }
 
