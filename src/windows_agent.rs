@@ -10953,12 +10953,14 @@ impl InputProcessor {
                         self.metrics
                             .backend_status
                             .store(BACKEND_CAPABILITY_MISMATCH, Ordering::Release);
+                        self.log_word_left("capability-mismatch");
                         return;
                     }
                     CapabilityDecision::Unsupported => {
                         self.metrics
                             .backend_status
                             .store(BACKEND_CAPABILITY_UNSUPPORTED, Ordering::Release);
+                        self.log_word_left("capability-unsupported");
                         return;
                     }
                     CapabilityDecision::PhysicalReplay => {
@@ -11235,19 +11237,30 @@ impl InputProcessor {
         expected_layout: usize,
         expected_text: &str,
     ) -> TextBarrierStatus {
-        let deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        let mut deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        // A field that does not answer gets what the edit can spare, as in the source settle.
+        let late_until = PasteBudget {
+            deadline: self.edit_deadline.get(),
+        }
+        .commit_late_until(deadline, Duration::from_millis(PASTE_AFTER_SETTLE_MS));
         let mut saw_mismatch = false;
         while Instant::now() < deadline {
             if !self.edit_guard_is_current(foreground, input_sequence)
-                || current_foreground_context()
+                || self
+                    .current_foreground()
                     .is_none_or(|current| current.layout != expected_layout)
             {
                 return TextBarrierStatus::Mismatch;
             }
-            match self.barrier_text_status(foreground.process_id, expected_text, deadline) {
+            let (status, answered) =
+                self.commit_read(foreground.process_id, expected_text, deadline);
+            match status {
                 TextBarrierStatus::Match => return TextBarrierStatus::Match,
                 TextBarrierStatus::Mismatch => saw_mismatch = true,
                 TextBarrierStatus::Unavailable => {}
+            }
+            if !answered {
+                deadline = deadline.max(late_until);
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -11577,7 +11590,7 @@ impl InputProcessor {
             // puts the clipboard back as for any deferred paste.
             let now = Instant::now();
             let once = now + Duration::from_millis(PASTE_UIA_MARGIN_MS);
-            let late = (paste_commit == ReplayAttempt::Failed && outcome == failed).then(|| {
+            let late = (outcome == failed).then(|| {
                 self.paste_commit(
                     foreground,
                     input_sequence,
@@ -12208,7 +12221,6 @@ fn describes_typing(event: &str) -> bool {
             | "input_queue"
             | "word"
             | "word_discard"
-            | "word_left"
             | "candidate"
             | "hotkey"
             | "privacy_probe"
@@ -22584,6 +22596,21 @@ mod tests {
         assert!(logged(&lines, "word_discard", "chars=3"), "{lines:?}");
     }
 
+    #[test]
+    fn only_a_field_that_could_not_be_inspected_counts_as_a_failed_inspection() {
+        assert!(inspection_failed(Some(
+            PrivacyBlockReason::InspectionUnavailable
+        )));
+        assert!(inspection_failed(Some(
+            PrivacyBlockReason::FieldInspectionUnavailable
+        )));
+        assert!(!inspection_failed(Some(PrivacyBlockReason::PasswordField)));
+        assert!(!inspection_failed(Some(
+            PrivacyBlockReason::ExcludedProcess
+        )));
+        assert!(!inspection_failed(None));
+    }
+
     /// A conversion that waits to start, in a processor at `sequence` in the field.
     fn pending_word(processor: &mut InputProcessor, sequence: u64) {
         let foreground = processor.foreground_override.unwrap();
@@ -27826,6 +27853,173 @@ mod tests {
         );
     }
 
+    /// A processor on the capability route in a field whose reads the provider answers as `read`
+    /// says, the first of them after `slow`, with the word to convert waiting.
+    fn capability_processor(
+        read: fn() -> (TextBarrierStatus, TextBarrierReport),
+        slow: Duration,
+    ) -> InputProcessor {
+        let foreground = ForegroundContext {
+            layout: 0x0409,
+            ..test_foreground()
+        };
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.selection = (TextBarrierStatus::Mismatch, None);
+        let mut processor = paste_processor(foreground, |_| script);
+        processor.text_edit_backend = TextEditBackend::CapabilityProbe;
+        processor.gate_window = 1;
+        processor
+            .edit_deadline
+            .set(Some(Instant::now() + WHOLE_GATE));
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-capability-test", move || {
+                let mut first = true;
+                move |_: BarrierRead| {
+                    if core::mem::take(&mut first) {
+                        thread::sleep(slow);
+                    }
+                    read()
+                }
+            })
+            .expect("barrier provider"),
+        );
+        processor
+    }
+
+    /// A processor on the capability route with diagnostics on and a word to convert waiting.
+    fn capability_word(
+        read: fn() -> (TextBarrierStatus, TextBarrierReport),
+    ) -> (InputProcessor, Receiver<String>) {
+        let (sender, diagnostics) = sync_channel(64);
+        let mut processor = capability_processor(read, Duration::ZERO);
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, PASTE_SEQUENCE);
+        (processor, diagnostics)
+    }
+
+    #[test]
+    fn a_word_the_field_never_shows_says_so() {
+        let (mut processor, diagnostics) = capability_word(|| marked_barrier_answer(41));
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.settled = TextBarrierStatus::Mismatch;
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=source-settle"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_whose_input_moved_on_after_the_settle_says_so() {
+        let (mut processor, diagnostics) = capability_word(|| marked_barrier_answer(41));
+        let (script, _steps, _clipboard) = scripted_paste();
+        let script = script.after("settle", user_clicks(&processor.metrics));
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(logged(&lines, "word_left", "reason=guard"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_word_in_a_program_only_observed_says_so() {
+        let (mut processor, diagnostics) = capability_word(|| marked_barrier_answer(41));
+        processor.text_edit_backend = TextEditBackend::ObserveOnly;
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=observe-only"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_before_an_enter_that_cannot_convert_it_says_so() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.settings.convert_on_enter = false;
+        word_in_progress(&mut processor);
+        new_log_lines(&receiver);
+        processor.convert_before_held_enter(enter_edge(WM_KEYDOWN));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_left", "reason=enter-context"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_slow_field_passes_the_capability_barrier() {
+        let processor =
+            capability_processor(|| marked_barrier_answer(41), Duration::from_millis(200));
+        let foreground = processor.foreground_override.unwrap();
+        let barrier = processor.wait_for_capability_text_barrier(
+            foreground,
+            PASTE_SEQUENCE,
+            foreground.layout,
+            "ghbdtn",
+        );
+        assert_eq!(barrier, TextBarrierStatus::Match);
+    }
+
+    #[test]
+    fn a_word_the_capability_route_leaves_alone_says_why() {
+        let (sender, diagnostics) = sync_channel(64);
+        let mut processor = capability_processor(
+            || (TextBarrierStatus::Mismatch, TextBarrierReport::default()),
+            Duration::ZERO,
+        );
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, PASTE_SEQUENCE);
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=capability-mismatch"),
+            "{lines:?}"
+        );
+
+        let (sender, diagnostics) = sync_channel(64);
+        let mut processor = capability_processor(
+            || (TextBarrierStatus::Unavailable, TextBarrierReport::default()),
+            Duration::ZERO,
+        );
+        processor.settings.physical_fallback_for_unsupported_apps = false;
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, PASTE_SEQUENCE);
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=capability-unsupported"),
+            "{lines:?}"
+        );
+    }
+
     /// The source settle of a paste whose field acts as `script` says, with a gate that gives it
     /// `gate_left` from now, and how long the settle took.
     fn settle_with(script: ScriptedPaste, gate_left: Duration) -> (ReplayAttempt, Duration) {
@@ -29925,6 +30119,7 @@ public class AklPrivacyForm : Form {
                     "event=input ",
                     "event=word ",
                     "event=word_discard ",
+                    "event=word_left ",
                     "chars=",
                     "event=candidate ",
                     "event=hotkey ",
