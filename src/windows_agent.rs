@@ -10822,8 +10822,10 @@ impl InputProcessor {
         self.diagnostic(
             "source_settle",
             format!(
-                "sequence={boundary_sequence} result={source_settle:?} route={:?} forced={}",
-                self.text_edit_backend, pending.forced
+                "sequence={boundary_sequence} result={source_settle:?} route={:?} forced={} report={}",
+                self.text_edit_backend,
+                pending.forced,
+                format_text_barrier_report(self.privacy_guard.last_barrier_report())
             ),
         );
         match source_settle {
@@ -11557,6 +11559,7 @@ impl InputProcessor {
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
+        let mut clipboard_restored = true;
         if clipboard_after_paste(paste_commit) == ClipboardAfterPaste::Defer {
             clipboard.defer();
             self.diagnostic(
@@ -11565,21 +11568,43 @@ impl InputProcessor {
             );
             // The paste may not have replaced the selected word: do not leave our selection
             // behind, unless the user has already moved on.
-            return self.abandon_selection(
-                foreground,
-                input_sequence,
-                TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
+            let failed = TextEditAttempt::Failed(ConversionFailureReason::TextCommit);
+            let outcome = self.abandon_selection(foreground, input_sequence, failed);
+            // A field busy past the check answered the cleanup, so it can answer this too: the
+            // replacement in the field is proof that the paste went through. Its target's read
+            // puts the clipboard back as for any deferred paste.
+            let now = Instant::now();
+            let once = now + Duration::from_millis(PASTE_UIA_MARGIN_MS);
+            let late = (paste_commit == ReplayAttempt::Failed && outcome == failed).then(|| {
+                self.paste_commit(
+                    foreground,
+                    input_sequence,
+                    source_layout,
+                    replacement,
+                    (once, once),
+                )
+            });
+            self.diagnostic(
+                "paste",
+                format!(
+                    "sequence={input_sequence} phase=late_commit result={late:?} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
             );
-        }
-        let owned_before_restore = clipboard.is_current();
-        let clipboard_restored = clipboard.restore_waiting(budget.wait_within(
-            Instant::now(),
-            Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS),
-            Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS),
-        ));
-        self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
-        if !clipboard_restored && !clipboard.restore_pending() {
-            self.count_clipboard_not_restored();
+            if late != Some(ReplayAttempt::Applied) {
+                return outcome;
+            }
+        } else {
+            let owned_before_restore = clipboard.is_current();
+            clipboard_restored = clipboard.restore_waiting(budget.wait_within(
+                Instant::now(),
+                Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS),
+                Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS),
+            ));
+            self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
+            if !clipboard_restored && !clipboard.restore_pending() {
+                self.count_clipboard_not_restored();
+            }
         }
         let switched = self.paste_switch_layout(foreground, target_layout, input_sequence);
         self.diagnostic(
@@ -26641,7 +26666,7 @@ mod tests {
             Arc::clone(&state),
             Duration::from_millis(100),
         ));
-        script.commits = vec![ReplayAttempt::Failed].into();
+        script.commits = vec![ReplayAttempt::Failed, ReplayAttempt::Failed].into();
         let processor = paste_processor(test_foreground(), |_| script);
         assert_eq!(
             run_paste(&processor, PastePatience::Automatic),
@@ -26708,9 +26733,11 @@ mod tests {
         for (taken, commits, reason, expected) in [
             (
                 None,
-                vec![ReplayAttempt::Failed],
+                vec![ReplayAttempt::Failed, ReplayAttempt::Failed],
                 ConversionFailureReason::TextCommit,
-                &["select", "begin", "submit:4", "commit", "collapse"][..],
+                &[
+                    "select", "begin", "submit:4", "commit", "collapse", "commit",
+                ][..],
             ),
             (
                 Some(2),
@@ -27792,6 +27819,45 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_the_field_shows_right_after_its_check_is_no_failure() {
+        // Busy past the check, the field answers the cleanup, and it shows the replacement.
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([
+            ReplayAttempt::Failed,
+            ReplayAttempt::Applied,
+            ReplayAttempt::Applied,
+        ]);
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            [
+                "select", "begin", "submit:4", "commit", "collapse", "commit", "layout", "commit"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paste_the_field_still_does_not_show_after_its_check_stays_failed() {
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Failed, ReplayAttempt::Failed]);
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            [
+                "select", "begin", "submit:4", "commit", "collapse", "commit"
+            ]
+        );
+    }
+
+    #[test]
     #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
     fn a_paste_on_the_real_clipboard_gives_a_late_field_the_replacement_and_the_user_their_clipboard()
      {
@@ -27836,7 +27902,7 @@ mod tests {
         // A busy field that handles its Ctrl+V only after the paste stopped waiting: it gets the
         // replacement, never the user's clipboard, which comes back right after.
         let (mut script, steps) = ScriptedPaste::new(PasteClipboard::System);
-        script.commits = VecDeque::from([ReplayAttempt::Failed]);
+        script.commits = VecDeque::from([ReplayAttempt::Failed, ReplayAttempt::Failed]);
         let processor = paste_processor(foreground, |_| script);
         assert_eq!(
             run_paste(&processor, PastePatience::Manual),
@@ -27844,7 +27910,9 @@ mod tests {
         );
         assert_eq!(
             steps.lock().unwrap().steps,
-            ["select", "begin", "submit:4", "commit", "collapse"]
+            [
+                "select", "begin", "submit:4", "commit", "collapse", "commit"
+            ]
         );
         assert!(processor.clipboard_brokers.busy());
         assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
