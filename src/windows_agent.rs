@@ -22617,11 +22617,12 @@ mod tests {
     fn pending_word(processor: &mut InputProcessor, sequence: u64) {
         let foreground = processor.foreground_override.unwrap();
         processor.pending_conversion = Some(PendingConversion {
+            // English: its profile is there in every build.
             transaction: ConversionTransaction::without_delimiter(&Detection {
-                original: "ghbdtn".to_owned(),
-                replacement: "привет".to_owned(),
-                source_language: Language::English,
-                target_language: Language::Russian,
+                original: "руддщ".to_owned(),
+                replacement: "hello".to_owned(),
+                source_language: Language::Russian,
+                target_language: Language::English,
                 source_score: 0.0,
                 target_score: 20.0,
             })
