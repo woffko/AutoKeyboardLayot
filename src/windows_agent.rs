@@ -22590,10 +22590,17 @@ mod tests {
         let (mut processor, receiver) = processor_in_field(EDITOR, None);
         word_in_progress(&mut processor);
         new_log_lines(&receiver);
-        // F1 types nothing the session can keep.
-        processor.process(queued_key(&processor, letter(0x70, 1), Duration::ZERO));
+        // A media key types nothing, and it is no key that moves the focus.
+        let media_key = RawKeyEvent {
+            scan_code: 0,
+            ..letter(0xad, 1)
+        };
+        processor.process(queued_key(&processor, media_key, Duration::ZERO));
         let lines = new_log_lines(&receiver);
-        assert!(logged(&lines, "word_discard", "chars=3"), "{lines:?}");
+        assert!(
+            logged(&lines, "word_discard", "reason=session-reset chars=3"),
+            "{lines:?}"
+        );
     }
 
     #[test]
