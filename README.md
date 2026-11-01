@@ -670,7 +670,8 @@ answers UI Automation only once it has handled it): the check goes on reading it
 from the gate's time only what the steps after it need at the least (the layout switch, a
 50 ms second check and a margin): the restore of the user's clipboard then waits only for
 what is left and otherwise finishes on its own, and so does the second check. A field that
-answers without the replacement is not waited for longer. When the check has given up and
+answers without the replacement is not waited for longer. A second check that gets no answer
+leaves a paste the first check confirmed done; only other text in the field fails it. When the check has given up and
 the collapse of the selection finds it gone, the field answers again, and one more read
 settles it: the replacement in the field is proof that the paste went through, so the edit
 counts as done and automatic conversion stays on. Before an edit, the read that waits for

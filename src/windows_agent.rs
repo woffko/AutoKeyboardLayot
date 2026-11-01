@@ -8243,6 +8243,15 @@ impl InputProcessor {
         )
     }
 
+    /// Whether the field answered the last commit check. Tests script it.
+    fn paste_commit_answered(&self) -> bool {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().commit_answered();
+        }
+        self.barrier_answered()
+    }
+
     /// Switches the layout after a paste. Tests script it.
     fn paste_switch_layout(
         &self,
@@ -11644,8 +11653,11 @@ impl InputProcessor {
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=target_commit result={target_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
+        // The field showed the replacement already: when it does not answer now, it is busy, and
+        // that contradicts nothing. Only a field that shows something else makes this a failure.
+        let silent = target_commit == ReplayAttempt::Failed && !self.paste_commit_answered();
         protected_paste_outcome(
-            matches!(target_commit, ReplayAttempt::Applied),
+            target_commit == ReplayAttempt::Applied || silent,
             clipboard_restored,
         )
     }
@@ -12921,6 +12933,8 @@ trait PasteSeam {
     ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure>;
     fn submit(&mut self, requested: usize) -> usize;
     fn commit(&mut self) -> ReplayAttempt;
+    /// Whether the field answered the last commit check, whatever it showed.
+    fn commit_answered(&mut self) -> bool;
     fn switch_layout(&mut self) -> ReplayAttempt;
     fn collapse(&mut self) -> SelectionCleanup;
 }
@@ -26537,6 +26551,8 @@ mod tests {
         settled: TextBarrierStatus,
         /// Until when the field does not answer the settle's reads.
         silent_until: Option<Instant>,
+        /// The field does not answer the commit checks.
+        silent_commit: bool,
         selection: (TextBarrierStatus, Option<SelectionCleanup>),
         clipboard: PasteClipboard,
         taken: Option<usize>,
@@ -26554,6 +26570,7 @@ mod tests {
                 steps: Arc::clone(&steps),
                 settled: TextBarrierStatus::Match,
                 silent_until: None,
+                silent_commit: false,
                 selection: (TextBarrierStatus::Match, None),
                 clipboard,
                 taken: None,
@@ -26635,6 +26652,10 @@ mod tests {
         fn commit(&mut self) -> ReplayAttempt {
             self.step("commit");
             self.commits.pop_front().unwrap_or(ReplayAttempt::Applied)
+        }
+
+        fn commit_answered(&mut self) -> bool {
+            !self.silent_commit
         }
 
         fn switch_layout(&mut self) -> ReplayAttempt {
@@ -28226,6 +28247,47 @@ mod tests {
     }
 
     #[test]
+    fn a_second_check_without_an_answer_leaves_a_confirmed_paste_done() {
+        // The field showed the replacement once, and is busy when asked again.
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Applied, ReplayAttempt::Failed]);
+        script.silent_commit = true;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout", "commit"]
+        );
+    }
+
+    #[test]
+    fn a_second_check_cut_short_stays_a_failure() {
+        // The input or the focus moved on: that is no silent field.
+        let (mut script, _steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Applied, ReplayAttempt::Cancelled]);
+        script.silent_commit = true;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+    }
+
+    #[test]
+    fn a_second_check_that_shows_other_text_stays_a_failure() {
+        let (mut script, _steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Applied, ReplayAttempt::Failed]);
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+    }
+
+    #[test]
     fn a_paste_the_field_still_does_not_show_after_its_check_stays_failed() {
         let (mut script, steps, _state) = scripted_paste();
         script.commits = VecDeque::from([ReplayAttempt::Failed, ReplayAttempt::Failed]);
@@ -28626,6 +28688,30 @@ public class AklWindowlessReader : Form {
             );
         }
 
+        /// The window class of `window`, or what stands for it.
+        fn window_class(window: usize) -> String {
+            use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+            let mut name = [0u16; 128];
+            let length = unsafe { GetClassNameW(HWND(window as *mut c_void), &mut name) };
+            String::from_utf16_lossy(&name[..length.max(0) as usize])
+        }
+
+        /// What the field looks like to the test: the window it writes to and reads from, the one
+        /// that has the keyboard focus now, and whether the field's window is hung.
+        fn describe(&self) -> String {
+            use windows::Win32::UI::WindowsAndMessaging::{IsHungAppWindow, IsWindow};
+            let now = current_foreground_context();
+            format!(
+                "field: target_class={:?} target_is_window={} focus_now_class={:?} focus_now_is_target={} foreground_is_field={} hung={}",
+                Self::window_class(self.context.focus),
+                unsafe { IsWindow(Some(HWND(self.context.focus as *mut c_void))) }.as_bool(),
+                now.map(|now| Self::window_class(now.focus)),
+                now.is_some_and(|now| now.focus == self.context.focus),
+                now.is_some_and(|now| now.process_id == self.context.process_id),
+                unsafe { IsHungAppWindow(HWND(self.context.hwnd as *mut c_void)) }.as_bool(),
+            )
+        }
+
         /// Keeps the field busy for `busy_ms` from now, whatever it does next.
         fn stay_busy(&self, busy_ms: usize) {
             const BUSY_NOW: u32 = 0x8041;
@@ -28865,6 +28951,7 @@ public class AklWindowlessReader : Form {
             std::env::set_var("LOCALAPPDATA", &profile);
         }
         let field = DesktopField::start();
+        eprintln!("{}", field.describe());
         let probe = clipboard_test_window(w!("AutoKeyboardLayot agent acceptance probe"));
         let agent = thread::spawn(run);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -28925,6 +29012,9 @@ public class AklWindowlessReader : Form {
                 VK_SPACE,
             ]);
             let text = field.settled_text("ghbdtn ");
+            if text.is_empty() {
+                eprintln!("{}", field.describe());
+            }
             let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(4));
             eprintln!(
                 "busy_ms={busy_ms} converted={} clipboard_back={} text_chars={}",
@@ -29079,6 +29169,7 @@ public class AklWindowlessReader : Form {
         let typing = DesktopTyping {
             field: DesktopField::start_script(&script, w!("AutoKeyboardLayot busy field")),
         };
+        eprintln!("{}", typing.field.describe());
         let agent = thread::spawn(run);
         let deadline = Instant::now() + Duration::from_secs(10);
         let agent_window = loop {
@@ -29091,6 +29182,7 @@ public class AklWindowlessReader : Form {
         drop(std::panic::take_hook());
         thread::sleep(Duration::from_secs(2));
         let outcomes = scenario(&typing);
+        eprintln!("{}", typing.field.describe());
         // All of it: a word that was not converted is explained by what is around its gate.
         let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
         for line in log.lines() {
