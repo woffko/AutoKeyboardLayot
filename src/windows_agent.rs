@@ -28549,21 +28549,23 @@ public class AklWindowlessReader : Form {
 
         /// Starts the field and brings it to the front. Started by this process it may not take
         /// the foreground by itself, and Start's search window can keep it after a first sign-in:
-        /// the search is dismissed and the field is clicked, as the user would.
+        /// the search is dismissed and the field is clicked, as the user would. Only the field
+        /// itself is clicked: a click goes to whatever lies on that point, and a Windows Terminal
+        /// window there opened a new tab on its "+" button.
         fn start() -> Self {
             Self::start_script(DESKTOP_FIELD_SCRIPT, w!("AutoKeyboardLayot busy field"))
         }
 
         /// Starts the field of `source`, whose window has the title `title`.
         fn start_script(source: &str, title: PCWSTR) -> Self {
-            use windows::Win32::Foundation::RECT;
+            use windows::Win32::Foundation::{POINT, RECT};
             use windows::Win32::UI::Input::KeyboardAndMouse::{
                 INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
                 MOUSEEVENTF_MOVE, MOUSEINPUT,
             };
             use windows::Win32::UI::WindowsAndMessaging::{
-                AllowSetForegroundWindow, FindWindowW, GetSystemMetrics, GetWindowRect,
-                SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow,
+                AllowSetForegroundWindow, FindWindowW, GA_ROOT, GetAncestor, GetSystemMetrics,
+                GetWindowRect, SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow, WindowFromPoint,
             };
             let escape = [
                 keyboard_input(VK_ESCAPE, 0, Default::default()),
@@ -28612,12 +28614,16 @@ public class AklWindowlessReader : Form {
                     if unsafe { GetWindowRect(window, &mut rect) }.is_ok() {
                         let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(2);
                         let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(2);
+                        let centre = POINT {
+                            x: (rect.left + rect.right) / 2,
+                            y: (rect.top + rect.bottom) / 2,
+                        };
                         let mouse = |flags| INPUT {
                             r#type: INPUT_MOUSE,
                             Anonymous: INPUT_0 {
                                 mi: MOUSEINPUT {
-                                    dx: (rect.left + rect.right) / 2 * 65_535 / (width - 1),
-                                    dy: (rect.top + rect.bottom) / 2 * 65_535 / (height - 1),
+                                    dx: centre.x * 65_535 / (width - 1),
+                                    dy: centre.y * 65_535 / (height - 1),
                                     dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
                                     ..Default::default()
                                 },
@@ -28628,7 +28634,15 @@ public class AklWindowlessReader : Form {
                             mouse(MOUSEEVENTF_LEFTDOWN),
                             mouse(MOUSEEVENTF_LEFTUP),
                         ];
-                        assert!(send_input_batch(&click));
+                        let under = unsafe { GetAncestor(WindowFromPoint(centre), GA_ROOT) };
+                        if under == window {
+                            assert!(send_input_batch(&click));
+                        } else {
+                            eprintln!(
+                                "field: not clicked, covered by {:?}",
+                                Self::window_class(under.0 as usize)
+                            );
+                        }
                     }
                 }
                 assert!(
@@ -28710,6 +28724,17 @@ public class AklWindowlessReader : Form {
                 now.is_some_and(|now| now.process_id == self.context.process_id),
                 unsafe { IsHungAppWindow(HWND(self.context.hwnd as *mut c_void)) }.as_bool(),
             )
+        }
+
+        /// Stops a run whose keys would go to another window: it tested nothing, and the empty
+        /// field it ends with reads as a failure of the agent.
+        fn assert_in_front(&self) {
+            assert!(
+                current_foreground_context()
+                    .is_some_and(|now| now.process_id == self.context.process_id),
+                "the field lost the foreground, this run tested nothing: {}",
+                self.describe()
+            );
         }
 
         /// Keeps the field busy for `busy_ms` from now, whatever it does next.
@@ -28967,6 +28992,7 @@ public class AklWindowlessReader : Form {
         // The worker reads the configuration and the layouts.
         thread::sleep(Duration::from_secs(2));
         let type_keys = |keys: &[VIRTUAL_KEY]| {
+            field.assert_in_front();
             for key in keys {
                 let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
                 for flags in [Default::default(), KEYEVENTF_KEYUP] {
@@ -29080,6 +29106,7 @@ public class AklWindowlessReader : Form {
         /// Types `keys` with the acceptance marker: the agent's hook takes them for the user's.
         fn type_keys(&self, keys: &[VIRTUAL_KEY]) {
             use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+            self.field.assert_in_front();
             for key in keys {
                 let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
                 for flags in [Default::default(), KEYEVENTF_KEYUP] {
