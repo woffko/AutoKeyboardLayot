@@ -70,17 +70,13 @@ impl Detection {
     /// Moves the target to the newest of the `recent` layouts of the field that gives the same
     /// text: the word does not need any other, and the user stays in the one they were using.
     pub fn prefer_layouts(&mut self, readings: &[(Language, String)], recent: &[Language]) {
-        for &language in recent {
-            if language == self.target_language {
-                return;
-            }
-            let same_text = readings
+        let same_text = |language: &&Language| {
+            readings
                 .iter()
-                .any(|(reader, text)| *reader == language && *text == self.replacement);
-            if same_text {
-                self.target_language = language;
-                return;
-            }
+                .any(|(reader, text)| reader == *language && *text == self.replacement)
+        };
+        if let Some(&language) = recent.iter().find(same_text) {
+            self.target_language = language;
         }
     }
 
