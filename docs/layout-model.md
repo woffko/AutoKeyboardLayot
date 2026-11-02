@@ -131,6 +131,14 @@ their own (`v'he`, the Estonian `vähe`) convert in every context. The context
 is cleared when the focused window or field changes, so the first word typed
 there has none.
 
+**The model picks a language, which is not always a layout to switch to.** A word
+the layout in use already types stays as it is, in that layout, and counts in the
+language it reads in for the words after it. A word typed in another alphabet
+that two layouts read alike goes to the one of them the field used last, and
+counts in the model's language all the same; the model picks the layout only for
+a field that has used neither. The cases are generated the same way: a word that
+reads the same keeps the layout it was typed in.
+
 **Punctuation next to a word is left to the dictionaries.** The model reads
 every key as a letter of some layout: on its own it turned `don't` into the
 Estonian-looking `donät`, `it.` into the Russian `шею`, a quoted `"Tallinn`
@@ -337,7 +345,7 @@ takes about a minute on a GPU and longer on a CPU).
 | `tools/layout_model/train.py` | Features, training, prediction |
 | `tools/layout_model/export.py` | Binary export and reference check |
 | `tools/layout_model/score.py`, `combine.py` | Evaluation |
-| `examples/evaluate_layout_detection.rs` | Runs the agent's detector on test cases |
+| `examples/evaluate_layout_detection.rs` | Runs the agent's detector on test cases and settles each decision as the agent does; `--sequences` replays the cases as typing, `--flip-same-text` as the agent did before it kept the layout |
 | `examples/measure_token_false_positives.rs` | Counts unwanted conversions on developer tokens or random strings |
 | `tests/dev_tokens.rs`, `tests/fixtures/dev-tokens.txt` | Budget for those conversions on 1 659 real tokens |
 | `tests/fixtures/punctuated-english.txt` | The same for 3 016 English words with punctuation |
