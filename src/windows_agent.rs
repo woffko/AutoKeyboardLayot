@@ -543,6 +543,37 @@ impl Default for ObserverMetrics {
     }
 }
 
+/// How many fields keep the layouts they were last used in.
+const REMEMBERED_FIELDS: usize = 16;
+
+/// The layouts of recent fields, newest first in each: a word two layouts read alike goes to the
+/// one its field used last. It holds window identities and languages, nothing about the text.
+#[derive(Debug, Default)]
+struct FieldLayouts {
+    fields: std::collections::VecDeque<((usize, usize, u32), Vec<Language>)>,
+}
+
+impl FieldLayouts {
+    fn note(&mut self, field: (usize, usize, u32), language: Language) {
+        let known = self.fields.iter().position(|(known, _)| *known == field);
+        let entry = known.and_then(|index| self.fields.remove(index));
+        self.fields.truncate(REMEMBERED_FIELDS - 1);
+        self.fields.push_front(entry.unwrap_or((field, Vec::new())));
+        let layouts = &mut self.fields[0].1;
+        if layouts.first() != Some(&language) {
+            layouts.retain(|&known| known != language);
+            layouts.insert(0, language);
+        }
+    }
+
+    fn of(&self, field: Option<(usize, usize, u32)>) -> &[Language] {
+        self.fields
+            .iter()
+            .find(|(known, _)| Some(*known) == field)
+            .map_or(&[], |(_, layouts)| layouts.as_slice())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ForegroundContext {
     hwnd: usize,
@@ -7860,6 +7891,7 @@ struct InputProcessor {
     // Languages (never text) of the most recent completed words, for the
     // optional layout model. Cleared when the input target changes.
     recent_languages: Vec<Language>,
+    field_layouts: FieldLayouts,
     last_boundary: Option<LastBoundary>,
     transpose_cycle: Option<TransposeCycle>,
     // The last word of up to REMEMBERED_WORD_WINDOWS input targets the agent stopped tracking,
@@ -8044,6 +8076,7 @@ impl InputProcessor {
             manual_token_start_known: false,
             last_word_reset: "none",
             recent_languages: Vec::new(),
+            field_layouts: FieldLayouts::default(),
             last_boundary: None,
             transpose_cycle: None,
             remembered_words: Vec::new(),
@@ -9147,6 +9180,9 @@ impl InputProcessor {
         }
 
         self.last_key_foreground = Some(event.foreground);
+        if let Some(language) = language {
+            self.field_layouts.note(foreground_key, language);
+        }
 
         let key_down = matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let key_up = matches!(event.message, WM_KEYUP | WM_SYSKEYUP);
@@ -9682,13 +9718,24 @@ impl InputProcessor {
             })
             .unwrap_or_default();
         let transaction = if self.privacy_reason.is_none() && !manual_only {
-            if let SessionAction::Candidate(detection) = self.session.finish_boundary_in_context(
+            let action = self.session.finish_boundary_in_context(
                 language,
                 &self.detector,
                 &candidates,
                 &self.recent_languages,
-            ) {
+            );
+            if let SessionAction::Candidate(detection) = &action
+                && !detection.changes_text()
+            {
+                // The layout in use already types this word: there is nothing to edit, and it
+                // is no reason to leave the layout. The following words still see its language.
+                self.remember_word_language(detection.target_language);
+                self.diagnostic("word", "result=same-text".to_owned());
+                None
+            } else if let SessionAction::Candidate(mut detection) = action {
                 self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
+                let word_language = detection.target_language;
+                detection.prefer_layouts(&candidates, self.field_layouts.of(self.last_foreground));
                 // Only the stage is logged, never the word.
                 let stage = if self.detector.layout_model_enabled()
                     && self
@@ -9729,7 +9776,10 @@ impl InputProcessor {
                 // The following words see this one as typed until its conversion is applied
                 // (finish_applied_conversion).
                 self.remember_word_language(detection.source_language);
-                transaction
+                transaction.map(|transaction| ConversionTransaction {
+                    word_language,
+                    ..transaction
+                })
             } else {
                 // A suppressed token (digits, text after a shortcut) is no word of a language.
                 if !suppressed
@@ -10998,8 +11048,12 @@ impl InputProcessor {
             && let Some(last) = self.recent_languages.last_mut()
             && *last == pending.transaction.source_language
         {
-            *last = pending.transaction.target_language;
+            *last = pending.transaction.word_language;
         }
+        self.field_layouts.note(
+            foreground_identity_key(pending.foreground),
+            pending.transaction.target_language,
+        );
         self.commit_confirmed_layout(target_layout.0 as usize);
         self.session.clear();
         self.renew_recent_privacy_ok(pending.foreground);
@@ -11423,7 +11477,7 @@ impl InputProcessor {
         // The applied conversion made the word count as the target language for the following
         // words (finish_applied_conversion); undone, it counts as typed again.
         if let Some(last) = self.recent_languages.last_mut()
-            && *last == record.transaction.target_language
+            && *last == record.transaction.word_language
         {
             *last = record.transaction.source_language;
         }
@@ -18065,8 +18119,17 @@ mod tests {
     /// with the test keyboard and automatic conversion on.
     fn processor_typing_in(layout: usize) -> (InputProcessor, ForegroundContext) {
         let metrics = Arc::new(ObserverMetrics::default());
-        metrics.auto_enabled.store(true, Ordering::Release);
         let mut processor = InputProcessor::new(metrics, 0);
+        let foreground = typing_in(&mut processor, layout);
+        (processor, foreground)
+    }
+
+    /// Makes `processor` type as `processor_typing_in` says.
+    fn typing_in(processor: &mut InputProcessor, layout: usize) -> ForegroundContext {
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
         let foreground = ForegroundContext {
             layout,
             ..test_foreground()
@@ -18079,7 +18142,7 @@ mod tests {
         processor.current_integrity_level = Some(0x2000);
         processor.privacy_probe = Some(answering_probe(None));
         processor.privacy_needs_check = true;
-        (processor, foreground)
+        foreground
     }
 
     /// Types the keys with these scan codes.
@@ -18147,6 +18210,200 @@ mod tests {
         assert_eq!(pending.transaction.original, "огые");
         assert_eq!(pending.transaction.replacement, "just");
         assert_eq!(pending.transaction.target_language, Language::English);
+    }
+
+    /// The same field after the user switched it to `layout` by hand. The word typed next is
+    /// converted, as with the setting that keeps a word after a manual switch off.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn in_layout(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        layout: usize,
+    ) -> ForegroundContext {
+        let foreground = ForegroundContext {
+            layout,
+            ..foreground
+        };
+        processor.settings.suppress_after_manual_layout_change = false;
+        processor.foreground_override = Some(foreground);
+        foreground
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    const KINDEL: [u32; 6] = [0x25, 0x17, 0x31, 0x20, 0x12, 0x26];
+    #[cfg(feature = "legacy-bundled-input")]
+    const THE: [u32; 3] = [0x14, 0x23, 0x12];
+    #[cfg(feature = "legacy-bundled-input")]
+    const JUST: [u32; 4] = [0x24, 0x16, 0x1f, 0x14];
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn an_estonian_word_the_english_layout_types_alike_keeps_the_layout() {
+        // "kindel" has no letter of its own: there is nothing to edit, and the layout stays.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        assert!(processor.pending_conversion.is_none());
+        assert!(processor.layout_switch_in_flight.is_none());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn an_english_word_the_estonian_layout_types_alike_keeps_the_layout() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys_and_drained_space(&mut processor, foreground, &THE);
+        assert!(processor.pending_conversion.is_none());
+        assert!(processor.layout_switch_in_flight.is_none());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_that_needs_a_letter_of_the_other_latin_layout_is_still_converted() {
+        // "k;;k" is "köök" typed with the English layout, right after a word it types alike.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x25, 0x27, 0x27, 0x25]);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "k;;k");
+        assert_eq!(pending.transaction.replacement, "köök");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_two_latin_layouts_read_alike_goes_to_the_latin_layout_of_its_field() {
+        // "just" scores best in English, but this field was last typed in with Estonian.
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys(&mut processor, foreground, &THE);
+        let foreground = in_layout(&mut processor, foreground, 0x0419);
+        type_keys_and_drained_space(&mut processor, foreground, &JUST);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.replacement, "just");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_latin_layout_of_one_field_says_nothing_about_another() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys(&mut processor, foreground, &THE);
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            layout: 0x0419,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        type_keys_and_drained_space(&mut processor, other, &JUST);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.target_language, Language::English);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_field_keeps_its_latin_layout_across_a_visit_to_another() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys(&mut processor, foreground, &THE);
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            layout: 0x0409,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        type_keys(&mut processor, other, &THE);
+        let back = in_layout(&mut processor, foreground, 0x0419);
+        type_keys_and_drained_space(&mut processor, back, &JUST);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_the_layout_types_alike_counts_in_its_language_for_the_next_words() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        assert_eq!(processor.recent_languages, [Language::Estonian]);
+        assert_eq!(processor.metrics.candidates.load(Ordering::Relaxed), 0);
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word", "result=same-text"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("kindel")));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_that_stays_in_the_layout_of_its_field_counts_in_its_own_language() {
+        // "just" reads best in English and goes to Estonian, the layout this field uses.
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        type_keys(&mut processor, foreground, &THE);
+        let foreground = in_layout(&mut processor, foreground, 0x0419);
+        type_keys_and_drained_space(&mut processor, foreground, &JUST);
+        assert_eq!(processor.recent_languages, [Language::Russian]);
+        let pending = processor.pending_conversion.take().expect("a conversion");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+        assert_eq!(pending.transaction.word_language, Language::English);
+        processor.finish_applied_conversion(
+            pending,
+            5,
+            HKL(0x0425 as *mut c_void),
+            EditStrategy::ProtectedPaste,
+        );
+        assert_eq!(processor.recent_languages, [Language::English]);
+        let field = processor.last_foreground;
+        assert_eq!(processor.field_layouts.of(field)[0], Language::Estonian);
+        let record = processor.undo_record.take().expect("an undo");
+        processor.finish_applied_undo(&record);
+        assert_eq!(processor.recent_languages, [Language::Russian]);
+    }
+
+    #[test]
+    fn a_field_lists_its_layouts_newest_first_without_repeating_them() {
+        let mut layouts = FieldLayouts::default();
+        let field = Some((1, 2, 3));
+        assert_eq!(layouts.of(field), []);
+        layouts.note((1, 2, 3), Language::English);
+        layouts.note((1, 2, 3), Language::Russian);
+        layouts.note((1, 2, 3), Language::Estonian);
+        layouts.note((1, 2, 3), Language::English);
+        assert_eq!(
+            layouts.of(field),
+            [Language::English, Language::Estonian, Language::Russian]
+        );
+        assert_eq!(layouts.of(None), []);
+        assert_eq!(layouts.of(Some((1, 2, 4))), []);
+    }
+
+    #[test]
+    fn the_field_used_longest_ago_is_forgotten_first() {
+        let mut layouts = FieldLayouts::default();
+        for field in 0..REMEMBERED_FIELDS {
+            layouts.note((field, 0, 0), Language::Estonian);
+        }
+        // Used again, the oldest one is no longer the oldest.
+        layouts.note((0, 0, 0), Language::English);
+        layouts.note((REMEMBERED_FIELDS, 0, 0), Language::Russian);
+        assert_eq!(layouts.fields.len(), REMEMBERED_FIELDS);
+        assert_eq!(
+            layouts.of(Some((0, 0, 0))),
+            [Language::English, Language::Estonian]
+        );
+        assert_eq!(layouts.of(Some((1, 0, 0))), []);
+        assert_eq!(
+            layouts.of(Some((REMEMBERED_FIELDS, 0, 0))),
+            [Language::Russian]
+        );
     }
 
     #[cfg(feature = "legacy-bundled-input")]
@@ -19881,6 +20138,7 @@ mod tests {
                 transaction: ConversionTransaction {
                     source_language: Language::English,
                     target_language: Language::Russian,
+                    word_language: Language::Russian,
                     original: "ghbdtn".to_owned(),
                     replacement: "привет".to_owned(),
                     delimiter: Some(' '),
@@ -29119,18 +29377,21 @@ public class AklWindowlessReader : Form {
         }
 
         fn to_english(&self) {
+            self.to_layout(0x0409_0409);
+        }
+
+        fn to_layout(&self, layout: usize) {
             use windows::Win32::UI::WindowsAndMessaging::WM_INPUTLANGCHANGEREQUEST;
-            let english = 0x0409_0409usize;
             unsafe {
                 let _ = PostMessageW(
                     Some(HWND(self.field.context.hwnd as *mut c_void)),
                     WM_INPUTLANGCHANGEREQUEST,
                     WPARAM(0),
-                    LPARAM(english as isize),
+                    LPARAM(layout as isize),
                 );
             }
             let deadline = Instant::now() + Duration::from_secs(3);
-            while current_foreground_context().is_none_or(|context| context.layout != english)
+            while current_foreground_context().is_none_or(|context| context.layout != layout)
                 && Instant::now() < deadline
             {
                 thread::sleep(Duration::from_millis(50));
@@ -29215,7 +29476,16 @@ public class AklWindowlessReader : Form {
         for line in log.lines() {
             eprintln!("  {line}");
         }
-        for word in ["ghbdtn", "привет", "gjnjv", "потом", "klkl"] {
+        for word in [
+            "ghbdtn",
+            "привет",
+            "gjnjv",
+            "потом",
+            "klkl",
+            "kindel",
+            "people",
+            "köök",
+        ] {
             assert!(!log.contains(word), "the log holds a typed word");
         }
         let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
@@ -29489,6 +29759,170 @@ public class AklWindowlessReader : Form {
     #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
     fn the_agent_on_the_desktop_converts_marks_tokens_and_words_before_enter_by_replay() {
         desktop_marks_tokens_and_enter("physical-replay");
+    }
+
+    /// A keyboard layout loaded for a test: the VM's account has only English and Russian.
+    struct LoadedLayout(HKL);
+
+    impl LoadedLayout {
+        fn new(name: PCWSTR) -> Self {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                ACTIVATE_KEYBOARD_LAYOUT_FLAGS, LoadKeyboardLayoutW,
+            };
+            let flags = ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0);
+            Self(unsafe { LoadKeyboardLayoutW(name, flags) }.expect("load the layout"))
+        }
+    }
+
+    impl Drop for LoadedLayout {
+        fn drop(&mut self) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::UnloadKeyboardLayout;
+            let _ = unsafe { UnloadKeyboardLayout(self.0) };
+        }
+    }
+
+    /// The keys of a word of ASCII letters.
+    fn keys_of_letters(word: &str) -> Vec<VIRTUAL_KEY> {
+        word.bytes()
+            .map(|letter| VIRTUAL_KEY(u16::from(letter.to_ascii_uppercase())))
+            .collect()
+    }
+
+    const ESTONIAN_WORDS: [&str; 20] = [
+        "kindel", "selles", "tere", "aitab", "maja", "kodu", "kool", "tuli", "vesi", "suur",
+        "linn", "laps", "raamat", "inimene", "sellel", "palju", "kuidas", "miks", "siis", "veel",
+    ];
+    const ENGLISH_WORDS: [&str; 20] = [
+        "the",
+        "only",
+        "organizations",
+        "refers",
+        "hello",
+        "window",
+        "house",
+        "water",
+        "people",
+        "green",
+        "small",
+        "letter",
+        "simple",
+        "world",
+        "friend",
+        "should",
+        "would",
+        "about",
+        "there",
+        "their",
+    ];
+
+    /// Desktop acceptance of words two Latin layouts type alike on the test VM, with the field
+    /// routed by `route`: twenty Estonian words in the English layout and twenty English words in
+    /// the Estonian one change neither the text nor the layout, a word that needs a letter of the
+    /// other layout is converted, and a word typed in Russian goes to the Latin layout the field
+    /// used last, whichever that is.
+    fn desktop_words_two_layouts_type_alike(route: &str) {
+        const ENGLISH: usize = 0x0409_0409;
+        const RUSSIAN: usize = 0x0419_0419;
+        const ESTONIAN: usize = 0x0425_0425;
+        let _estonian = LoadedLayout::new(w!("00000425"));
+        on_the_desktop_with_conversion_on_enter(route, |typing| {
+            let layout_now = || current_foreground_context().map(|context| context.layout);
+            let mut outcomes: Vec<(String, String, String)> = Vec::new();
+            for (case, layout, words) in [
+                ("estonian in english", ENGLISH, ESTONIAN_WORDS),
+                ("english in estonian", ESTONIAN, ENGLISH_WORDS),
+            ] {
+                typing.field.set_text("");
+                typing.to_layout(layout);
+                let mut changes = 0;
+                let mut expected = String::new();
+                for word in words {
+                    typing.type_keys(&keys_of_letters(word));
+                    typing.type_keys(&[VK_SPACE]);
+                    let before = expected.clone();
+                    expected.push_str(word);
+                    expected.push(' ');
+                    // An edit would change the text and the layout within this wait.
+                    typing.text(&before);
+                    if layout_now() != Some(layout) {
+                        changes += 1;
+                        typing.to_layout(layout);
+                    }
+                }
+                let text = typing.text("");
+                eprintln!(
+                    "alike: case={case} words={} layout_changes={changes}",
+                    words.len()
+                );
+                outcomes.push((case.to_owned(), text, expected));
+                outcomes.push((
+                    format!("{case}: layout changes"),
+                    changes.to_string(),
+                    "0".to_owned(),
+                ));
+            }
+            // A letter of the other layout: "köök" and "tütar" typed in the English layout.
+            let semicolon = VIRTUAL_KEY(0xBA);
+            let bracket = VIRTUAL_KEY(0xDB);
+            let [k, t, a, r] = [0x4B, 0x54, 0x41, 0x52].map(VIRTUAL_KEY);
+            for (keys, typed, expected) in [
+                (vec![k, semicolon, semicolon, k], "k;;k ", "köök "),
+                (vec![t, bracket, t, a, r], "t[tar ", "tütar "),
+            ] {
+                typing.field.set_text("");
+                typing.to_english();
+                typing.type_keys(&keys);
+                typing.type_keys(&[VK_SPACE]);
+                let text = typing.text(typed);
+                eprintln!("letter: converted={}", text == expected);
+                outcomes.push((expected.to_owned(), text, expected.to_owned()));
+                outcomes.push((
+                    format!("{expected}: layout"),
+                    format!("{:x?}", layout_now()),
+                    format!("{:x?}", Some(ESTONIAN)),
+                ));
+            }
+            // "just" typed in Russian stays in the Latin layout this field used last.
+            for (case, latin, word) in [
+                ("after english", ENGLISH, "people"),
+                ("after estonian", ESTONIAN, "kindel"),
+            ] {
+                typing.field.set_text("");
+                typing.to_layout(latin);
+                typing.type_keys(&keys_of_letters(word));
+                typing.type_keys(&[VK_SPACE]);
+                let before = format!("{word} ");
+                typing.text("");
+                typing.to_layout(RUSSIAN);
+                typing.type_keys(&keys_of_letters("just"));
+                typing.type_keys(&[VK_SPACE]);
+                let typed = format!("{before}огые ");
+                let text = typing.text(&typed);
+                eprintln!(
+                    "russian: case={case} converted={}",
+                    text == format!("{before}just ")
+                );
+                outcomes.push((case.to_owned(), text, format!("{before}just ")));
+                outcomes.push((
+                    format!("{case}: layout"),
+                    format!("{:x?}", layout_now()),
+                    format!("{:x?}", Some(latin)),
+                ));
+            }
+            outcomes
+        });
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_keeps_the_layout_of_words_two_layouts_type_alike_by_paste() {
+        desktop_words_two_layouts_type_alike("protected-paste");
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_keeps_the_layout_of_words_two_layouts_type_alike_by_replay() {
+        desktop_words_two_layouts_type_alike("physical-replay");
     }
 
     // Tray acceptance on the desktop of the test VM: the real notification area and Explorer.

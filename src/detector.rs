@@ -61,6 +61,29 @@ pub struct Detection {
 }
 
 impl Detection {
+    /// Whether the conversion changes the text. Latin layouts read most keys alike, so a word of
+    /// another language may need no edit at all: all that is left of it would flip the layout.
+    pub fn changes_text(&self) -> bool {
+        self.original != self.replacement
+    }
+
+    /// Moves the target to the newest of the `recent` layouts of the field that gives the same
+    /// text: the word does not need any other, and the user stays in the one they were using.
+    pub fn prefer_layouts(&mut self, readings: &[(Language, String)], recent: &[Language]) {
+        for &language in recent {
+            if language == self.target_language {
+                return;
+            }
+            let same_text = readings
+                .iter()
+                .any(|(reader, text)| *reader == language && *text == self.replacement);
+            if same_text {
+                self.target_language = language;
+                return;
+            }
+        }
+    }
+
     pub fn score_margin(&self) -> f32 {
         self.target_score - self.source_score
     }
@@ -1130,6 +1153,59 @@ mod tests {
             )
             .expect("the model converts it");
         assert_eq!(detection.replacement, "küsimusele!");
+    }
+
+    fn detection_of(original: &str, replacement: &str, target_language: Language) -> Detection {
+        Detection {
+            source_language: Language::Russian,
+            target_language,
+            original: original.to_owned(),
+            replacement: replacement.to_owned(),
+            source_score: 0.0,
+            target_score: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_detection_changes_the_text_unless_both_layouts_type_the_word_alike() {
+        assert!(detection_of("огые", "just", Language::English).changes_text());
+        assert!(!detection_of("kindel", "kindel", Language::Estonian).changes_text());
+        assert!(detection_of("Kindel", "kindel", Language::Estonian).changes_text());
+    }
+
+    #[test]
+    fn the_layout_a_field_used_last_takes_a_word_it_reads_alike() {
+        let alike = mapped(&[(Language::English, "just"), (Language::Estonian, "just")]);
+        let recent = [Language::Russian, Language::Estonian, Language::English];
+        let mut detection = detection_of("огые", "just", Language::English);
+        detection.prefer_layouts(&alike, &recent);
+        assert_eq!(detection.target_language, Language::Estonian);
+        // The newest of them wins, whichever the target was.
+        let recent = [Language::Russian, Language::English, Language::Estonian];
+        let mut detection = detection_of("огые", "just", Language::Estonian);
+        detection.prefer_layouts(&alike, &recent);
+        assert_eq!(detection.target_language, Language::English);
+    }
+
+    #[test]
+    fn a_layout_that_reads_the_word_otherwise_does_not_take_it() {
+        let different = mapped(&[(Language::English, "k;;k"), (Language::Estonian, "köök")]);
+        let mut detection = detection_of("л;;л", "köök", Language::Estonian);
+        detection.prefer_layouts(&different, &[Language::English, Language::Estonian]);
+        assert_eq!(detection.target_language, Language::Estonian);
+    }
+
+    #[test]
+    fn a_field_without_a_layout_of_the_word_leaves_the_target() {
+        let alike = mapped(&[(Language::English, "just"), (Language::Estonian, "just")]);
+        let mut detection = detection_of("огые", "just", Language::Estonian);
+        detection.prefer_layouts(&alike, &[]);
+        assert_eq!(detection.target_language, Language::Estonian);
+        detection.prefer_layouts(&alike, &[Language::Russian]);
+        assert_eq!(detection.target_language, Language::Estonian);
+        // The target itself came first: an older layout does not take the word from it.
+        detection.prefer_layouts(&alike, &[Language::Estonian, Language::English]);
+        assert_eq!(detection.target_language, Language::Estonian);
     }
 
     #[test]

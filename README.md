@@ -184,12 +184,22 @@ even when another pack also contains a plausible word.
 Two dictionary targets that differ in text are ambiguous and the word stays as
 typed. Two that give the same text are not: a word typed in the Russian layout
 that reads the same Latin letters in English and Estonian (`огые` is `just`,
-`зщду` is `pole`) is converted. The layout to switch to comes from the layout
-model when it is on and sure, as it knows the words before this one, and otherwise
-from the target whose word scores best. On the layout model's 200 000 evaluation
-cases this converts 278 more words with the layout model and single-letter words
-on (651 with the dictionaries alone), makes no case worse, adds no false
-conversion and leaves every target the layout model chose before unchanged.
+`зщду` is `pole`) is converted. It goes to the layout of the two that the field
+used last. A field that has used neither takes the layout from the layout model
+when it is on and sure, as it knows the words before this one, and otherwise from
+the target whose word scores best. On the layout model's 200 000 evaluation cases
+this converts 278 more words with the layout model and single-letter words on
+(651 with the dictionaries alone), makes no case worse and adds no false
+conversion.
+
+A word the layout in use already types is left alone: `kindel` in the English
+layout and `people` in the Estonian one need no edit, so the layout stays, and the
+words after them still count as Estonian and English for the layout model. The
+layout moves between English and Estonian only when a word needs a letter the
+current one lacks: `k;;k` becomes `köök` and leaves the Estonian layout on.
+Replaying the same 200 000 cases as typing, with the layout model and single-letter
+words on, this cuts the switches between the two from 10 717 to 989 and removes all
+9 706 edits that changed no text, and 53 fewer words end up wrong.
 
 Punctuation right after a word that the other layouts read as punctuation too
 stays with the word until the Space, and the word is converted with it:
