@@ -9761,7 +9761,9 @@ impl InputProcessor {
         let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
         let keys_seen = core::mem::take(&mut self.word_keys_seen);
         let gap = core::mem::take(&mut self.key_gap_seen);
-        if !had_word && (keys_seen || gap) {
+        // A suppressed word is written as such below, in a field the check let through.
+        let explained = suppressed && self.privacy_reason.is_none() && !manual_only;
+        if !had_word && !explained && (keys_seen || gap) {
             self.log_word_lost(language, keys_seen, gap);
         }
         let map_to_layout = self.key_mapper();
@@ -18606,6 +18608,20 @@ mod tests {
         assert!(logged(&lines, "word_lost", "reset=privacy"), "{lines:?}");
         assert!(logged(&lines, "word_lost", "keys=seen"), "{lines:?}");
         assert!(!lines.iter().any(|line| line.contains("kindel")));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_suppressed_word_is_written_once() {
+        // After a failed edit the next word is suppressed, and that line explains it.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.suppress_session("failed-edit");
+        type_keys(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 7, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word", "result=suppressed"), "{lines:?}");
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
     }
 
     #[cfg(feature = "legacy-bundled-input")]
