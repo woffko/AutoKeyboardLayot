@@ -18564,6 +18564,32 @@ mod tests {
         let lines = new_log_lines(&receiver);
         assert!(logged(&lines, "word_lost", "gap=true"), "{lines:?}");
         assert!(logged(&lines, "word_lost", "keys=none"), "{lines:?}");
+        // One missing event is a gap too.
+        processor.process_event(queued(space_key(foreground, 16, 0)));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "gap=true"), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_late_key_up_with_an_older_number_leaves_no_gap() {
+        // Key-ups of keys pressed before a gate are delivered after it with their own numbers.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        let queued = |event| QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        };
+        processor.process_event(queued(space_key(foreground, 10, 0)));
+        processor.process_event(queued(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x4B), 5, 0)
+        }));
+        processor.process_event(queued(space_key(foreground, 11, 0)));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
     }
 
     #[cfg(feature = "legacy-bundled-input")]
@@ -18578,6 +18604,7 @@ mod tests {
         processor.process_key(space_key(foreground, 7, 0));
         let lines = new_log_lines(&receiver);
         assert!(logged(&lines, "word_lost", "reset=privacy"), "{lines:?}");
+        assert!(logged(&lines, "word_lost", "keys=seen"), "{lines:?}");
         assert!(!lines.iter().any(|line| line.contains("kindel")));
     }
 
