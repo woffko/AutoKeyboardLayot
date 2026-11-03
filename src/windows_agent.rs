@@ -2570,6 +2570,9 @@ struct AppState {
     /// programs, counted by the hooks. Retained keys are handed back past a busy worker only when
     /// none came after them, as they would land after that newer input.
     typed_input: u64,
+    /// Why the last Space got no gate, as logged; cleared when a gate is armed. A reason is logged
+    /// when it changes, not at every Space.
+    last_gate_refusal: Option<&'static str>,
 }
 
 impl AppState {
@@ -3032,6 +3035,7 @@ impl AppState {
     /// Arms the decision gate with `token`, the Space or Enter that ends a word in `foreground`.
     fn arm_decision_gate(&mut self, token: u64, foreground: ForegroundContext) {
         self.correction_gate.activate(token);
+        self.last_gate_refusal = None;
         self.gate_diagnostic("armed", format!("token={token}"));
         self.correction_gate.origin = Some(foreground);
         self.metrics
@@ -3213,6 +3217,14 @@ impl AppState {
             retained.delivery_uncertain |= sent != 0;
         }
         self.record_gate_failure_without_worker();
+    }
+
+    /// Logs why a Space got no gate, when the reason differs from the last one logged.
+    fn note_gate_refusal(&mut self, reason: &'static str) {
+        if self.last_gate_refusal != Some(reason) {
+            self.last_gate_refusal = Some(reason);
+            self.gate_diagnostic("not_armed", format!("reason={reason}"));
+        }
     }
 
     fn gate_diagnostic(&self, phase: &str, details: String) {
@@ -5005,6 +5017,7 @@ pub fn run() -> Result<()> {
                 pending_selection_release: false,
                 announced_clipboard_failures: 0,
                 typed_input: 0,
+                last_gate_refusal: None,
             });
         });
         // The agent starts with the session, possibly before the taskbar exists. It works without
@@ -5644,6 +5657,26 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         state.hold_enter_for_decision(raw, foreground);
                         held_enter = true;
                         swallow = true;
+                    } else if let Some(reason) = space_gate_refusal(SpaceGateFacts {
+                        drained,
+                        key_down,
+                        virtual_key: event.vkCode as u16,
+                        auto_enabled: state.metrics.auto_enabled.load(Ordering::Acquire),
+                        privacy_reason: privacy,
+                        privacy_of_another_process: state
+                            .metrics
+                            .privacy_process_id
+                            .load(Ordering::Acquire)
+                            != foreground.process_id,
+                        gate_active: state.correction_gate.active,
+                        shortcut_modifiers_released: shortcut_modifiers_released(),
+                        retained_input: has_retained_input(&state.metrics),
+                        configuration_pending: state
+                            .metrics
+                            .configuration_pending
+                            .load(Ordering::Acquire),
+                    }) {
+                        state.note_gate_refusal(reason);
                     }
                     let queued = if held_enter {
                         state.enqueue(RawInputEvent::EnterDecision(raw))
@@ -7888,6 +7921,11 @@ struct InputProcessor {
     // Coarse category of the last event that discarded or blocked the word
     // buffer. It never contains typed text and only explains ignored hotkeys.
     last_word_reset: &'static str,
+    // Whether a key of a word reached this worker since the last boundary, and whether keyboard
+    // events the hook counted since then never did: a boundary with no word then says which.
+    word_keys_seen: bool,
+    last_key_sequence: u64,
+    key_gap_seen: bool,
     // Languages (never text) of the most recent completed words, for the
     // optional layout model. Cleared when the input target changes.
     recent_languages: Vec<Language>,
@@ -8075,6 +8113,9 @@ impl InputProcessor {
             manual_only_inspection: false,
             manual_token_start_known: false,
             last_word_reset: "none",
+            word_keys_seen: false,
+            last_key_sequence: 0,
+            key_gap_seen: false,
             recent_languages: Vec::new(),
             field_layouts: FieldLayouts::default(),
             last_boundary: None,
@@ -8638,14 +8679,22 @@ impl InputProcessor {
                 self.mark_privacy_dirty(false);
             }
             RawInputEvent::ExternalInjection => {
+                // The hook counts injected keys it does not pass on: no gap after them.
+                self.last_key_sequence = 0;
                 self.last_word_reset = "external-input";
                 self.pause_keys.clear();
                 self.invalidate_conversion_state();
                 self.suppress_session("external-input");
                 self.mark_privacy_dirty(true);
             }
-            RawInputEvent::Key(event) => self.process_key(event),
-            RawInputEvent::EnterDecision(event) => self.convert_before_held_enter(event),
+            RawInputEvent::Key(event) => {
+                self.note_key_sequence(event.sequence);
+                self.process_key(event);
+            }
+            RawInputEvent::EnterDecision(event) => {
+                self.note_key_sequence(event.sequence);
+                self.convert_before_held_enter(event);
+            }
             RawInputEvent::ProfileRefresh => {
                 // Like the privacy refresh, never in the way of a fence acknowledgement.
                 if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
@@ -9110,6 +9159,8 @@ impl InputProcessor {
             }
             self.last_word_reset = "focus";
             self.recovered_mid_word = false;
+            self.word_keys_seen = false;
+            self.key_gap_seen = false;
             self.recent_languages.clear();
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -9421,6 +9472,7 @@ impl InputProcessor {
                 self.session.mark_line_start();
             }
             _ => {
+                self.word_keys_seen = true;
                 if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
@@ -9702,6 +9754,11 @@ impl InputProcessor {
         // missed conversion can be explained from the log without recording the word.
         let suppressed = self.session.is_suppressed();
         let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
+        let keys_seen = core::mem::take(&mut self.word_keys_seen);
+        let gap = core::mem::take(&mut self.key_gap_seen);
+        if !had_word && (keys_seen || gap) {
+            self.log_word_lost(language, keys_seen, gap);
+        }
         let map_to_layout = self.key_mapper();
         let candidates = language
             .map(|language| {
@@ -10080,6 +10137,37 @@ impl InputProcessor {
         if inspection_failed(self.privacy_reason) {
             self.diagnostic("word_reset", format!("reason={reason}"));
         }
+    }
+
+    /// Notes the hook's sequence number of a key event: one that skips numbers means keyboard
+    /// events the hook counted never reached this worker.
+    fn note_key_sequence(&mut self, sequence: u64) {
+        if self.last_key_sequence != 0 && sequence > self.last_key_sequence + 1 {
+            self.key_gap_seen = true;
+        }
+        self.last_key_sequence = self.last_key_sequence.max(sequence);
+    }
+
+    /// Records that keys were typed since the last boundary but no word is there at this one:
+    /// without this line such a word leaves none. What last reset the word, whether the layout
+    /// had a language, and whether keys never reached the worker; never the text or its length.
+    fn log_word_lost(&self, language: Option<Language>, keys_seen: bool, gap: bool) {
+        if self.privacy_reason.is_some() && !inspection_failed(self.privacy_reason) {
+            return;
+        }
+        self.diagnostic(
+            "word_lost",
+            format!(
+                "reset={} layout={} keys={} gap={gap}",
+                self.last_word_reset,
+                if language.is_some() {
+                    "known"
+                } else {
+                    "unknown"
+                },
+                if keys_seen { "seen" } else { "none" },
+            ),
+        );
     }
 
     /// Records why a word that was to be converted is left alone.
@@ -10795,6 +10883,17 @@ impl InputProcessor {
             // Not about typing, and once a change: while a field check does not pass, nothing
             // else in the log explains why words are left alone.
             self.diagnostic("privacy_state", format!("reason={reason:?}"));
+        }
+        // A desktop test typing into fields that are not private asks for positive findings
+        // too: a word lost there can then be told from one in a field wrongly found private.
+        // The agent itself writes nothing about them.
+        #[cfg(test)]
+        if allowed_before
+            && reason.is_some()
+            && !inspection_failed(reason)
+            && tests::LOG_POSITIVE_PRIVACY.load(Ordering::Acquire)
+        {
+            self.diagnostic("privacy_state", format!("reason={reason:?} test_only=true"));
         }
         if reason.is_some() {
             if manual_exception && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) {
@@ -12615,6 +12714,52 @@ const fn should_arm_space_decision_gate(
         && privacy_reason == PRIVACY_ALLOWED
         && !gate_active
         && shortcut_modifiers_released
+}
+
+/// What the hook knows about a key when it decides on a Space gate.
+#[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct SpaceGateFacts {
+    drained: bool,
+    key_down: bool,
+    virtual_key: u16,
+    auto_enabled: bool,
+    privacy_reason: u8,
+    privacy_of_another_process: bool,
+    gate_active: bool,
+    shortcut_modifiers_released: bool,
+    retained_input: bool,
+    configuration_pending: bool,
+}
+
+/// Why a typed Space gets no gate, as a category, so that a word it leaves unconverted is
+/// explained in the log. None for any other key and when a gate is armed. A field the privacy
+/// check found positive (a password field, an excluded or elevated program) stays silent, as
+/// nothing about typing there is written.
+const fn space_gate_refusal(facts: SpaceGateFacts) -> Option<&'static str> {
+    if facts.drained || !facts.key_down || facts.virtual_key != VK_SPACE.0 {
+        return None;
+    }
+    if facts.privacy_reason != PRIVACY_ALLOWED && facts.privacy_reason != PRIVACY_UNAVAILABLE {
+        return None;
+    }
+    Some(if facts.configuration_pending {
+        "configuration"
+    } else if facts.retained_input {
+        "retained-input"
+    } else if facts.gate_active {
+        "gate-active"
+    } else if !facts.shortcut_modifiers_released {
+        "modifiers"
+    } else if !facts.auto_enabled {
+        "automatic-off"
+    } else if facts.privacy_reason == PRIVACY_UNAVAILABLE && facts.privacy_of_another_process {
+        "field-of-another-process"
+    } else if facts.privacy_reason == PRIVACY_UNAVAILABLE {
+        "field-unchecked"
+    } else {
+        return None;
+    })
 }
 
 /// With `convert_on_enter`, a plain Enter (no Ctrl, Alt, Windows key or Shift) arms the gate as
@@ -14985,6 +15130,7 @@ mod tests {
             pending_selection_release: false,
             announced_clipboard_failures: 0,
             typed_input: 0,
+            last_gate_refusal: None,
         };
         (state, receiver)
     }
@@ -18235,6 +18381,224 @@ mod tests {
     const THE: [u32; 3] = [0x14, 0x23, 0x12];
     #[cfg(feature = "legacy-bundled-input")]
     const JUST: [u32; 4] = [0x24, 0x16, 0x1f, 0x14];
+
+    /// Set by desktop tests whose fields are not private: see `set_privacy_reason_with_manual_exception`.
+    pub(super) static LOG_POSITIVE_PRIVACY: AtomicBool = AtomicBool::new(false);
+
+    fn space_facts() -> SpaceGateFacts {
+        SpaceGateFacts {
+            drained: false,
+            key_down: true,
+            virtual_key: VK_SPACE.0,
+            auto_enabled: true,
+            privacy_reason: PRIVACY_ALLOWED,
+            privacy_of_another_process: false,
+            gate_active: false,
+            shortcut_modifiers_released: true,
+            retained_input: false,
+            configuration_pending: false,
+        }
+    }
+
+    #[test]
+    fn a_space_without_a_gate_says_why() {
+        let base = space_facts();
+        assert_eq!(space_gate_refusal(base), None, "a gate is armed");
+        for (facts, reason) in [
+            (
+                SpaceGateFacts {
+                    configuration_pending: true,
+                    ..base
+                },
+                "configuration",
+            ),
+            (
+                SpaceGateFacts {
+                    retained_input: true,
+                    ..base
+                },
+                "retained-input",
+            ),
+            (
+                SpaceGateFacts {
+                    gate_active: true,
+                    ..base
+                },
+                "gate-active",
+            ),
+            (
+                SpaceGateFacts {
+                    shortcut_modifiers_released: false,
+                    ..base
+                },
+                "modifiers",
+            ),
+            (
+                SpaceGateFacts {
+                    auto_enabled: false,
+                    ..base
+                },
+                "automatic-off",
+            ),
+            (
+                SpaceGateFacts {
+                    privacy_reason: PRIVACY_UNAVAILABLE,
+                    ..base
+                },
+                "field-unchecked",
+            ),
+            (
+                SpaceGateFacts {
+                    privacy_reason: PRIVACY_UNAVAILABLE,
+                    privacy_of_another_process: true,
+                    ..base
+                },
+                "field-of-another-process",
+            ),
+        ] {
+            assert_eq!(space_gate_refusal(facts), Some(reason));
+        }
+    }
+
+    #[test]
+    fn only_a_typed_space_outside_a_private_field_is_explained() {
+        let base = SpaceGateFacts {
+            configuration_pending: true,
+            ..space_facts()
+        };
+        for facts in [
+            SpaceGateFacts {
+                drained: true,
+                ..base
+            },
+            SpaceGateFacts {
+                key_down: false,
+                ..base
+            },
+            SpaceGateFacts {
+                virtual_key: VK_RETURN.0,
+                ..base
+            },
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_PASSWORD,
+                ..base
+            },
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_EXCLUDED,
+                ..base
+            },
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_ELEVATED,
+                ..base
+            },
+        ] {
+            assert_eq!(space_gate_refusal(facts), None);
+        }
+    }
+
+    #[test]
+    fn the_hook_logs_a_reason_for_a_space_without_a_gate_once() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let (sender, diagnostics) = sync_channel(16);
+        state.diagnostic_sender = Some(sender);
+        state
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        state
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        let Some(foreground) = current_foreground_context() else {
+            return;
+        };
+        state
+            .metrics
+            .privacy_process_id
+            .store(foreground.process_id, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        let space = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_SPACE.0),
+            scanCode: 0x39,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let _ = unsafe {
+                keyboard_hook_body(
+                    0,
+                    WPARAM(WM_KEYDOWN as usize),
+                    LPARAM(core::ptr::from_ref(&space) as isize),
+                )
+            };
+        }
+        drop(take_app_state());
+        let lines: Vec<String> = diagnostics.try_iter().collect();
+        let refusals = lines
+            .iter()
+            .filter(|line| {
+                line.contains("phase=not_armed") && line.contains("reason=configuration")
+            })
+            .count();
+        assert_eq!(refusals, 1, "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_whose_keys_never_reached_the_worker_is_explained() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        let queued = |event| QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        };
+        processor.process_event(queued(space_key(foreground, 1, 0)));
+        // Events 2 to 13 were counted by the hook and never queued.
+        processor.process_event(queued(space_key(foreground, 14, 0)));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "gap=true"), "{lines:?}");
+        assert!(logged(&lines, "word_lost", "keys=none"), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_whose_keys_the_field_check_kept_out_is_explained() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(
+            PrivacyBlockReason::InspectionUnavailable,
+        )));
+        type_keys(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 7, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "reset=privacy"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("kindel")));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_in_a_password_field_stays_unexplained() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(PrivacyBlockReason::PasswordField)));
+        type_keys(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 7, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn two_spaces_in_a_row_lose_no_word() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 8, 0));
+        processor.process_key(space_key(foreground, 9, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
@@ -29233,6 +29597,7 @@ public class AklWindowlessReader : Form {
         unsafe {
             std::env::set_var("LOCALAPPDATA", &profile);
         }
+        LOG_POSITIVE_PRIVACY.store(true, Ordering::Release);
         let field = DesktopField::start();
         eprintln!("{}", field.describe());
         let probe = clipboard_test_window(w!("AutoKeyboardLayot agent acceptance probe"));
@@ -29452,6 +29817,7 @@ public class AklWindowlessReader : Form {
         unsafe {
             std::env::set_var("LOCALAPPDATA", &profile);
         }
+        LOG_POSITIVE_PRIVACY.store(true, Ordering::Release);
         let script =
             DESKTOP_FIELD_SCRIPT.replace("box.Multiline = false;", "box.Multiline = true;");
         let typing = DesktopTyping {
@@ -30832,6 +31198,7 @@ public class AklPrivacyForm : Form {
                     "event=word ",
                     "event=word_discard ",
                     "event=word_left ",
+                    "event=word_lost ",
                     "chars=",
                     "event=candidate ",
                     "event=hotkey ",
