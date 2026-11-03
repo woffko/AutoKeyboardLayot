@@ -7926,6 +7926,9 @@ struct InputProcessor {
     word_keys_seen: bool,
     last_key_sequence: u64,
     key_gap_seen: bool,
+    // Desktop tests whose fields are not private also log positive field findings.
+    #[cfg(test)]
+    log_positive_privacy: bool,
     // Languages (never text) of the most recent completed words, for the
     // optional layout model. Cleared when the input target changes.
     recent_languages: Vec<Language>,
@@ -8116,6 +8119,8 @@ impl InputProcessor {
             word_keys_seen: false,
             last_key_sequence: 0,
             key_gap_seen: false,
+            #[cfg(test)]
+            log_positive_privacy: tests::LOG_POSITIVE_PRIVACY.load(Ordering::Acquire),
             recent_languages: Vec::new(),
             field_layouts: FieldLayouts::default(),
             last_boundary: None,
@@ -10891,7 +10896,7 @@ impl InputProcessor {
         if allowed_before
             && reason.is_some()
             && !inspection_failed(reason)
-            && tests::LOG_POSITIVE_PRIVACY.load(Ordering::Acquire)
+            && self.log_positive_privacy
         {
             self.diagnostic("privacy_state", format!("reason={reason:?} test_only=true"));
         }
@@ -23080,6 +23085,89 @@ mod tests {
         processor.set_privacy_reason(None);
         processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
         assert!(new_log_lines(&receiver).is_empty());
+    }
+
+    #[test]
+    fn a_desktop_test_hears_of_a_field_found_private() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.log_positive_privacy = true;
+        processor.set_privacy_reason(None);
+        new_log_lines(&receiver);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        let lines = new_log_lines(&receiver);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(logged(
+            &lines,
+            "privacy_state",
+            "PasswordField) test_only=true"
+        ));
+        // A field that cannot be checked is written as it always is, once.
+        processor.set_privacy_reason(None);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::InspectionUnavailable));
+        let lines = new_log_lines(&receiver);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!logged(&lines, "privacy_state", "test_only"));
+    }
+
+    #[test]
+    fn a_refusal_is_logged_again_after_a_gate() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let (sender, diagnostics) = sync_channel(16);
+        state.diagnostic_sender = Some(sender);
+        state
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        state.note_gate_refusal("configuration");
+        state.note_gate_refusal("configuration");
+        state.arm_decision_gate(5, test_foreground());
+        state.note_gate_refusal("configuration");
+        state.note_gate_refusal("modifiers");
+        let refusals: Vec<String> = diagnostics
+            .try_iter()
+            .filter(|line| line.contains("phase=not_armed"))
+            .collect();
+        assert_eq!(refusals.len(), 3, "{refusals:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_first_key_and_a_held_enter_are_no_gap() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        let queued = |event| QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event,
+            configuration: None,
+        };
+        // The worker starts after keys the hook counted elsewhere: the first number is no gap.
+        processor.process_event(queued(RawInputEvent::Key(space_key(foreground, 40, 0))));
+        processor.process_event(queued(RawInputEvent::EnterDecision(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_RETURN, 41, 0)
+        })));
+        processor.process_event(queued(RawInputEvent::Key(space_key(foreground, 42, 0))));
+        // Keys another program injected are counted by the hook and never queued.
+        processor.process_event(queued(RawInputEvent::ExternalInjection));
+        processor.process_event(queued(RawInputEvent::Key(space_key(foreground, 50, 0))));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+        // A key typed after a focus change starts the field's word afresh.
+        processor.process_event(queued(RawInputEvent::Key(RawKeyEvent {
+            scan_code: 0x25,
+            foreground,
+            ..letter(0x4B, 51)
+        })));
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        processor.process_event(queued(RawInputEvent::Key(space_key(other, 52, 0))));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
     }
 
     #[test]
