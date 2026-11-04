@@ -8672,6 +8672,7 @@ impl InputProcessor {
 
         match queued.event {
             RawInputEvent::Mouse => {
+                self.note_click();
                 if let Some(target) = self.last_key_foreground {
                     self.remember_word(target, self.last_layout, Instant::now());
                 }
@@ -10198,11 +10199,20 @@ impl InputProcessor {
 
     /// Remembers why the worker dropped a key event unhandled, for the lost-word line.
     fn note_dropped_key(&mut self, event: &RawInputEvent, reason: &'static str) {
-        if matches!(
-            event,
-            RawInputEvent::Key(_) | RawInputEvent::EnterDecision(_)
-        ) {
-            self.key_drop_reason = Some(reason);
+        match event {
+            RawInputEvent::Key(_) | RawInputEvent::EnterDecision(_) => {
+                self.key_drop_reason = Some(reason);
+            }
+            RawInputEvent::Mouse => self.note_click(),
+            _ => {}
+        }
+    }
+
+    /// The mouse hook counts a click in the same sequence as keys, one number each, in order: a
+    /// click is no key the worker missed.
+    fn note_click(&mut self) {
+        if self.last_key_sequence != 0 {
+            self.last_key_sequence += 1;
         }
     }
 
@@ -18725,6 +18735,7 @@ mod tests {
             .metrics
             .configuration_pending
             .store(true, Ordering::Release);
+        // The click takes number 2 and is dropped with the keys of a loading configuration.
         processor.process_event(QueuedInputEvent {
             epoch: 0,
             captured_at: Instant::now(),
@@ -18735,12 +18746,47 @@ mod tests {
             .metrics
             .configuration_pending
             .store(false, Ordering::Release);
-        processor.process_event(queued_in_epoch(space_key(foreground, 3, 0), 0));
+        processor.process_event(queued_in_epoch(space_key(foreground, 5, 0), 0));
         let lines = new_log_lines(&receiver);
         assert!(
-            logged(&lines, "word_lost", "dropped=none missing=1"),
+            logged(&lines, "word_lost", "dropped=none missing=2"),
             "{lines:?}"
         );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_click_before_the_first_key_is_no_gap() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        processor.process_event(queued_in_epoch(space_key(foreground, 10, 0), 0));
+        processor.process_event(queued_in_epoch(space_key(foreground, 11, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_click_between_keys_is_no_gap() {
+        // The mouse hook counts a click as an input event: it is no key the worker missed.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor.process_event(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        processor.process_event(queued_in_epoch(space_key(foreground, 3, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
     }
 
     #[cfg(feature = "legacy-bundled-input")]
