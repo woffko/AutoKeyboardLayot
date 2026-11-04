@@ -18643,6 +18643,7 @@ mod tests {
         assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
     }
 
+    #[cfg(feature = "legacy-bundled-input")]
     fn queued_in_epoch(event: RawKeyEvent, epoch: u64) -> QueuedInputEvent {
         QueuedInputEvent {
             epoch,
