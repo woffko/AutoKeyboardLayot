@@ -5663,11 +5663,6 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                         virtual_key: event.vkCode as u16,
                         auto_enabled: state.metrics.auto_enabled.load(Ordering::Acquire),
                         privacy_reason: privacy,
-                        privacy_of_another_process: state
-                            .metrics
-                            .privacy_process_id
-                            .load(Ordering::Acquire)
-                            != foreground.process_id,
                         gate_active: state.correction_gate.active,
                         shortcut_modifiers_released: shortcut_modifiers_released(),
                         retained_input: has_retained_input(&state.metrics),
@@ -12732,7 +12727,6 @@ struct SpaceGateFacts {
     virtual_key: u16,
     auto_enabled: bool,
     privacy_reason: u8,
-    privacy_of_another_process: bool,
     gate_active: bool,
     shortcut_modifiers_released: bool,
     retained_input: bool,
@@ -12740,14 +12734,15 @@ struct SpaceGateFacts {
 }
 
 /// Why a typed Space gets no gate, as a category, so that a word it leaves unconverted is
-/// explained in the log. None for any other key and when a gate is armed. A field the privacy
-/// check found positive (a password field, an excluded or elevated program) stays silent, as
-/// nothing about typing there is written.
+/// explained in the log. None for any other key and when a gate is armed. Only a field the
+/// privacy check let through says anything: the hook cannot tell a field that could not be
+/// checked from one still being checked, which may be a password field, and nothing about
+/// typing there is written. The worker explains words lost in a field that could not be checked.
 const fn space_gate_refusal(facts: SpaceGateFacts) -> Option<&'static str> {
     if facts.drained || !facts.key_down || facts.virtual_key != VK_SPACE.0 {
         return None;
     }
-    if facts.privacy_reason != PRIVACY_ALLOWED && facts.privacy_reason != PRIVACY_UNAVAILABLE {
+    if facts.privacy_reason != PRIVACY_ALLOWED {
         return None;
     }
     Some(if facts.configuration_pending {
@@ -12760,10 +12755,6 @@ const fn space_gate_refusal(facts: SpaceGateFacts) -> Option<&'static str> {
         "modifiers"
     } else if !facts.auto_enabled {
         "automatic-off"
-    } else if facts.privacy_reason == PRIVACY_UNAVAILABLE && facts.privacy_of_another_process {
-        "field-of-another-process"
-    } else if facts.privacy_reason == PRIVACY_UNAVAILABLE {
-        "field-unchecked"
     } else {
         return None;
     })
@@ -18399,7 +18390,6 @@ mod tests {
             virtual_key: VK_SPACE.0,
             auto_enabled: true,
             privacy_reason: PRIVACY_ALLOWED,
-            privacy_of_another_process: false,
             gate_active: false,
             shortcut_modifiers_released: true,
             retained_input: false,
@@ -18447,21 +18437,6 @@ mod tests {
                 },
                 "automatic-off",
             ),
-            (
-                SpaceGateFacts {
-                    privacy_reason: PRIVACY_UNAVAILABLE,
-                    ..base
-                },
-                "field-unchecked",
-            ),
-            (
-                SpaceGateFacts {
-                    privacy_reason: PRIVACY_UNAVAILABLE,
-                    privacy_of_another_process: true,
-                    ..base
-                },
-                "field-of-another-process",
-            ),
         ] {
             assert_eq!(space_gate_refusal(facts), Some(reason));
         }
@@ -18484,6 +18459,12 @@ mod tests {
             },
             SpaceGateFacts {
                 virtual_key: VK_RETURN.0,
+                ..base
+            },
+            // A field still being checked, or checked for another process, may be a password
+            // field: the hook cannot tell it from one that could not be checked.
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_UNAVAILABLE,
                 ..base
             },
             SpaceGateFacts {
@@ -18523,6 +18504,10 @@ mod tests {
             .metrics
             .privacy_process_id
             .store(foreground.process_id, Ordering::Release);
+        state
+            .metrics
+            .privacy_reason
+            .store(PRIVACY_ALLOWED, Ordering::Release);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
         let space = KBDLLHOOKSTRUCT {
             vkCode: u32::from(VK_SPACE.0),

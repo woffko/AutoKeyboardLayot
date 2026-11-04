@@ -541,9 +541,10 @@ edit, leaves `event=word_left reason=` `stale-boundary`, `automatic-off`, `priva
 left no word at it write `event=word_lost` with what last reset the word (`reset=`), whether
 the layout had a language, whether a key reached the worker at all (`keys=`) and whether
 keyboard events the hook counted never reached it (`gap=`). A typed Space that arms no
-correction gate writes `event=gate phase=not_armed reason=` `configuration`,
-`retained-input`, `gate-active`, `modifiers`, `automatic-off`, `field-unchecked` or
-`field-of-another-process`, once until the reason changes or a gate is armed. While privacy blocks the field (a
+correction gate in a field the privacy check let through writes `event=gate phase=not_armed
+reason=` `configuration`, `retained-input`, `gate-active`, `modifiers` or `automatic-off`,
+once until the reason changes or a gate is armed; in a field not let through yet the hook cannot
+tell a check that failed from one still running, so it writes nothing. While privacy blocks the field (a
 password field, or an excluded, elevated or uninspectable program or field),
 nothing about the typing there is written at all: no key, word, candidate, Pause,
 queue or field-check line, and switching to a blocked program leaves no line
