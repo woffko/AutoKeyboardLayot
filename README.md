@@ -539,8 +539,11 @@ edit, leaves `event=word_left reason=` `stale-boundary`, `automatic-off`, `priva
 `profiles`, `guard`, `source-settle`, `observe-only`, `enter-context`, `given-up`,
 `capability-mismatch` or `capability-unsupported`. Keys typed since the last boundary that
 left no word at it write `event=word_lost` with what last reset the word (`reset=`), whether
-the layout had a language, whether a key reached the worker at all (`keys=`) and whether
-keyboard events the hook counted never reached it (`gap=`). A typed Space that arms no
+the layout had a language, whether a letter key reached the worker at all (`keys=`), whether
+keyboard events the hook counted never reached its key handling (`gap=`, with their number in
+`missing=`), and why the worker dropped such events itself (`dropped=` `configuration` while a
+configuration loads, `epoch` for input of an older queue epoch, or `none`); a token of marks or
+digits alone writes nothing. A typed Space that arms no
 correction gate in a field the privacy check let through writes `event=gate phase=not_armed
 reason=` `configuration`, `retained-input`, `gate-active`, `modifiers` or `automatic-off`,
 once until the reason changes or a gate is armed; in a field not let through yet the hook cannot

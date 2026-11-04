@@ -7921,6 +7921,10 @@ struct InputProcessor {
     word_keys_seen: bool,
     last_key_sequence: u64,
     key_gap_seen: bool,
+    // How many keyboard events the hook counted never reached the key handling since the last
+    // boundary, and why the worker itself dropped some (a configuration loading, an old epoch).
+    missing_key_events: u64,
+    key_drop_reason: Option<&'static str>,
     // Desktop tests whose fields are not private also log positive field findings.
     #[cfg(test)]
     log_positive_privacy: bool,
@@ -8114,6 +8118,8 @@ impl InputProcessor {
             word_keys_seen: false,
             last_key_sequence: 0,
             key_gap_seen: false,
+            missing_key_events: 0,
+            key_drop_reason: None,
             #[cfg(test)]
             log_positive_privacy: tests::LOG_POSITIVE_PRIVACY.load(Ordering::Acquire),
             recent_languages: Vec::new(),
@@ -8630,6 +8636,7 @@ impl InputProcessor {
             if self.last_input_epoch != current_epoch {
                 self.reset_for_epoch(current_epoch);
             }
+            self.note_dropped_key(&queued.event, "epoch");
             if let RawInputEvent::GateDrainReady {
                 token,
                 drained_count,
@@ -8654,6 +8661,7 @@ impl InputProcessor {
         }
 
         if self.metrics.configuration_pending.load(Ordering::Acquire) {
+            self.note_dropped_key(&queued.event, "configuration");
             self.log_word_discard("configuration", WordDiscardDetail::None);
             self.invalidate_conversion_state();
             self.session.clear();
@@ -9161,6 +9169,8 @@ impl InputProcessor {
             self.recovered_mid_word = false;
             self.word_keys_seen = false;
             self.key_gap_seen = false;
+            self.missing_key_events = 0;
+            self.key_drop_reason = None;
             self.recent_languages.clear();
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -9472,7 +9482,8 @@ impl InputProcessor {
                 self.session.mark_line_start();
             }
             _ => {
-                self.word_keys_seen = true;
+                // A letter key: a token of marks or digits alone is no word.
+                self.word_keys_seen |= (0x41..=0x5A).contains(&(event.virtual_key as u16));
                 if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
@@ -9756,10 +9767,12 @@ impl InputProcessor {
         let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
         let keys_seen = core::mem::take(&mut self.word_keys_seen);
         let gap = core::mem::take(&mut self.key_gap_seen);
+        let missing = core::mem::take(&mut self.missing_key_events);
+        let dropped = self.key_drop_reason.take();
         // A suppressed word is written as such below, in a field the check let through.
         let explained = suppressed && self.privacy_reason.is_none() && !manual_only;
         if !had_word && !explained && (keys_seen || gap) {
-            self.log_word_lost(language, keys_seen, gap);
+            self.log_word_lost(language, keys_seen, gap, missing, dropped);
         }
         let map_to_layout = self.key_mapper();
         let candidates = language
@@ -10146,6 +10159,9 @@ impl InputProcessor {
     fn note_key_sequence(&mut self, sequence: u64) {
         if self.last_key_sequence != 0 && sequence > self.last_key_sequence + 1 {
             self.key_gap_seen = true;
+            self.missing_key_events = self
+                .missing_key_events
+                .saturating_add(sequence - self.last_key_sequence - 1);
         }
         self.last_key_sequence = self.last_key_sequence.max(sequence);
     }
@@ -10153,14 +10169,21 @@ impl InputProcessor {
     /// Records that keys were typed since the last boundary but no word is there at this one:
     /// without this line such a word leaves none. What last reset the word, whether the layout
     /// had a language, and whether keys never reached the worker; never the text or its length.
-    fn log_word_lost(&self, language: Option<Language>, keys_seen: bool, gap: bool) {
+    fn log_word_lost(
+        &self,
+        language: Option<Language>,
+        keys_seen: bool,
+        gap: bool,
+        missing: u64,
+        dropped: Option<&str>,
+    ) {
         if self.privacy_reason.is_some() && !inspection_failed(self.privacy_reason) {
             return;
         }
         self.diagnostic(
             "word_lost",
             format!(
-                "reset={} layout={} keys={} gap={gap}",
+                "reset={} layout={} keys={} gap={gap} dropped={} missing={missing}",
                 self.last_word_reset,
                 if language.is_some() {
                     "known"
@@ -10168,8 +10191,19 @@ impl InputProcessor {
                     "unknown"
                 },
                 if keys_seen { "seen" } else { "none" },
+                dropped.unwrap_or("none"),
             ),
         );
+    }
+
+    /// Remembers why the worker dropped a key event unhandled, for the lost-word line.
+    fn note_dropped_key(&mut self, event: &RawInputEvent, reason: &'static str) {
+        if matches!(
+            event,
+            RawInputEvent::Key(_) | RawInputEvent::EnterDecision(_)
+        ) {
+            self.key_drop_reason = Some(reason);
+        }
     }
 
     /// Records why a word that was to be converted is left alone.
@@ -18606,6 +18640,94 @@ mod tests {
         processor.process_key(space_key(foreground, 7, 0));
         let lines = new_log_lines(&receiver);
         assert!(logged(&lines, "word", "result=suppressed"), "{lines:?}");
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    fn queued_in_epoch(event: RawKeyEvent, epoch: u64) -> QueuedInputEvent {
+        QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn keys_dropped_while_the_configuration_loads_are_named() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        for sequence in 2..=5 {
+            processor.process_event(queued_in_epoch(
+                RawKeyEvent {
+                    scan_code: 0x25,
+                    foreground,
+                    ..letter(0x4B, sequence)
+                },
+                0,
+            ));
+        }
+        processor
+            .metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
+        processor.process_event(queued_in_epoch(space_key(foreground, 6, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=configuration missing=4"),
+            "{lines:?}"
+        );
+        // The next lost word starts its own account.
+        processor.process_event(queued_in_epoch(space_key(foreground, 8, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=none missing=1"),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn keys_of_an_older_epoch_are_named() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor.metrics.input_epoch.store(1, Ordering::Release);
+        processor.process_event(queued_in_epoch(
+            RawKeyEvent {
+                scan_code: 0x25,
+                foreground,
+                ..letter(0x4B, 2)
+            },
+            0,
+        ));
+        processor.process_event(queued_in_epoch(space_key(foreground, 3, 0), 1));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=epoch missing=1"),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_token_of_marks_alone_is_no_lost_word() {
+        // "/" typed between two Spaces, as in a shell command: no letter, so no word.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_key(space_key(foreground, 1, 0));
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x35,
+            foreground,
+            ..letter(0xBF, 2)
+        });
+        processor.process_key(space_key(foreground, 3, 0));
+        let lines = new_log_lines(&receiver);
         assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
     }
 
