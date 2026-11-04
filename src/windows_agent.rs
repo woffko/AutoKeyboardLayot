@@ -18716,6 +18716,67 @@ mod tests {
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
+    fn a_dropped_click_names_no_key() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        processor.process_event(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        processor
+            .metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
+        processor.process_event(queued_in_epoch(space_key(foreground, 3, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=none missing=1"),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn another_field_starts_its_own_count_of_missing_keys() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        // Three events of this field never reached the worker before the switch.
+        processor.process_event(queued_in_epoch(
+            RawKeyEvent {
+                scan_code: 0x25,
+                foreground,
+                ..letter(0x4B, 5)
+            },
+            0,
+        ));
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        processor.process_event(queued_in_epoch(
+            RawKeyEvent {
+                scan_code: 0x39,
+                foreground: other,
+                ..letter(0x4B, 6)
+            },
+            0,
+        ));
+        processor.process_event(queued_in_epoch(space_key(other, 8, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "missing=1"), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
     fn a_token_of_marks_alone_is_no_lost_word() {
         // "/" typed between two Spaces, as in a shell command: no letter, so no word.
         let (mut processor, receiver) = processor_with_diagnostics();
