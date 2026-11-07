@@ -73,6 +73,7 @@ ACCEPTED_ADVISORIES = {
     'RUSTSEC-2026-0370',  # zvariant, Linux accessibility bridge of Slint (AT-SPI)
     'RUSTSEC-2026-0371',  # zbus_names, same path
     'RUSTSEC-2026-0372',  # zvariant_derive, same path
+    'RUSTSEC-2026-0441',  # pin-utils, build-time dependency of slint-build (spin_on)
 }
 
 
