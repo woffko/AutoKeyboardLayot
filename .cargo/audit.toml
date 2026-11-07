@@ -1,6 +1,6 @@
 # Policy for `cargo audit --deny warnings` (CI step "Dependency advisories").
 #
-# Exactly seven notices are ignored. All seven are "unmaintained" advisories for
+# Exactly eight notices are ignored. All eight are "unmaintained" advisories for
 # transitive dependencies of the Slint UI toolkit: none is a vulnerability and
 # none has a patched version to move to. Any other advisory, or a new crate with
 # a notice, fails the check until it has been reviewed.
@@ -25,6 +25,11 @@
 #                      5.15.0             backend (accesskit_winit). Built only
 #                                         for Linux targets, never into the
 #                                         Windows agent. Added 2026-10-24.
+#   RUSTSEC-2026-0441  pin-utils 0.1.0    Through spin_on, which slint-build uses
+#                                         to compile the user interface at build
+#                                         time; nothing we ship contains it, and
+#                                         no maintained release replaces it in
+#                                         slint-build 1.17. Added 2026-11-07.
 [advisories]
 ignore = [
     "RUSTSEC-2025-0141",
@@ -34,4 +39,5 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    "RUSTSEC-2026-0441",
 ]
