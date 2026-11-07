@@ -97,9 +97,9 @@ use windows::{
                 GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
                 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO,
                 MAPVK_VSC_TO_VK_EX, MapVirtualKeyExW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_APPS,
-                VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-                VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
-                VK_MENU, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
+                VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+                VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
+                VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
                 VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
                 VK_UP,
             },
@@ -222,9 +222,18 @@ const UNCONFIRMED_PASTE_WAIT_MS: u64 = 5_000;
 const TARGET_READ_GRACE_MS: u64 = 500;
 /// The least time worth giving the installation of a paste's replacement.
 const PASTE_MIN_INSTALL_MS: u64 = 50;
+/// What an edit needs after the source settle: the selection's confirmation, the least
+/// installation and everything after the Ctrl+V.
+const PASTE_AFTER_SETTLE_MS: u64 =
+    UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
 /// What a protected paste needs after its Ctrl+V: the commit of the replacement, the restore of
 /// the user's clipboard, the layout switch, the second commit and the UI Automation calls between.
 const PASTE_AFTER_SUBMIT_MS: u64 = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_COMMIT_MS;
+/// What must fit after a Ctrl+V at the least: the commit's poll and the steps after it. The restore
+/// of the clipboard and the second commit check take only what is left, so a paste that has this
+/// much in hand ends before the gate does.
+const PASTE_AFTER_SUBMIT_LEAST_MS: u64 =
+    NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + PASTE_AFTER_LATE_COMMIT_MS;
 /// What a protected paste needs after the commit of the replacement: the restore of the user's
 /// clipboard, the layout switch, the second commit and the UI Automation calls between.
 const PASTE_AFTER_COMMIT_MS: u64 = CLIPBOARD_RESTORE_WAIT_MS
@@ -253,6 +262,10 @@ const LAYOUT_SWITCH_TIMEOUT_MS: u64 = 250;
 const LAYOUT_STABLE_MS: u64 = 50;
 const REPLAY_COMMIT_MS: u64 = 50;
 const CORRECTION_GATE_MAX_HOLD_MS: u64 = 1_200;
+/// The desktop acceptance ends a gate early on the UI thread, while the worker still counts on all
+/// of it: what a worker that overruns the deadline looks like.
+#[cfg(test)]
+static TEST_GATE_HOLD_MS: AtomicU64 = AtomicU64::new(CORRECTION_GATE_MAX_HOLD_MS);
 const CORRECTION_GATE_CAPACITY: usize = 256;
 /// Held keys that could not be handed back wait this long in memory for an explicit recovery and
 /// are then deleted, so that they cannot keep automatic conversion paused and Exit declined for
@@ -435,6 +448,8 @@ struct ObserverMetrics {
     // another process meets a verdict that is not its own.
     privacy_process_id: AtomicU32,
     auto_enabled: AtomicBool,
+    /// The `convert_on_enter` setting, for the hook.
+    convert_on_enter: AtomicBool,
     safety_paused: AtomicBool,
     pause_break_undo: AtomicBool,
     force_hotkey_virtual_key: AtomicU32,
@@ -492,6 +507,7 @@ impl Default for ObserverMetrics {
             privacy_reason: AtomicU8::new(PRIVACY_UNAVAILABLE),
             privacy_process_id: AtomicU32::new(0),
             auto_enabled: AtomicBool::new(false),
+            convert_on_enter: AtomicBool::new(false),
             safety_paused: AtomicBool::new(false),
             pause_break_undo: AtomicBool::new(true),
             force_hotkey_virtual_key: AtomicU32::new(u32::from(Hotkey::default().virtual_key)),
@@ -524,6 +540,37 @@ impl Default for ObserverMetrics {
             privacy_probe_cost_ms: AtomicU64::new(0),
             foreground_full_screen: AtomicBool::new(false),
         }
+    }
+}
+
+/// How many fields keep the layouts they were last used in.
+const REMEMBERED_FIELDS: usize = 16;
+
+/// The layouts of recent fields, newest first in each: a word two layouts read alike goes to the
+/// one its field used last. It holds window identities and languages, nothing about the text.
+#[derive(Debug, Default)]
+struct FieldLayouts {
+    fields: std::collections::VecDeque<((usize, usize, u32), Vec<Language>)>,
+}
+
+impl FieldLayouts {
+    fn note(&mut self, field: (usize, usize, u32), language: Language) {
+        let known = self.fields.iter().position(|(known, _)| *known == field);
+        let entry = known.and_then(|index| self.fields.remove(index));
+        self.fields.truncate(REMEMBERED_FIELDS - 1);
+        self.fields.push_front(entry.unwrap_or((field, Vec::new())));
+        let layouts = &mut self.fields[0].1;
+        if layouts.first() != Some(&language) {
+            layouts.retain(|&known| known != language);
+            layouts.insert(0, language);
+        }
+    }
+
+    fn of(&self, field: Option<(usize, usize, u32)>) -> &[Language] {
+        self.fields
+            .iter()
+            .find(|(known, _)| Some(*known) == field)
+            .map_or(&[], |(_, layouts)| layouts.as_slice())
     }
 }
 
@@ -634,6 +681,9 @@ struct RetainedInput {
     expires_at: Instant,
     /// The worker is sending these keys right now; the lifetime timer leaves the record alone.
     recovering: bool,
+    /// How many of `events`, from the first, that sending covers: keys that wait behind an Enter
+    /// join the record meanwhile.
+    sending: usize,
     /// When the keys were retained.
     retained_at: Instant,
     /// The gate broke for a cause that hands its keys back without being asked (see
@@ -641,6 +691,24 @@ struct RetainedInput {
     auto_recover: bool,
     /// `AppState::typed_input` when the keys were retained.
     input_mark: u64,
+}
+
+impl RetainedInput {
+    /// An Enter is among the keys and must reach its program: nothing the user does in that
+    /// program keeps it back, what they type waits behind it, and a word the edit may have left
+    /// selected is unselected first. Only a change of the input target stops it, and an Enter
+    /// that may have gone out already is not sent again unasked.
+    fn enter_comes_back(&self) -> bool {
+        self.auto_recover && !self.delivery_uncertain && holds_enter(&self.events)
+    }
+}
+
+/// Whether `events` press an Enter.
+fn holds_enter(events: &[RawKeyEvent]) -> bool {
+    events.iter().any(|event| {
+        event.virtual_key == u32::from(VK_RETURN.0)
+            && matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+    })
 }
 
 struct CorrectionGate {
@@ -712,7 +780,7 @@ impl CorrectionGate {
         self.held.clear();
         self.origin = None;
         self.pending_hotkey = None;
-        self.deadline = Instant::now() + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS);
+        self.deadline = Instant::now() + Duration::from_millis(correction_gate_hold_ms());
     }
 
     fn hold(&mut self, event: RawKeyEvent) -> bool {
@@ -790,6 +858,9 @@ impl CorrectionGate {
 #[derive(Debug, Clone, Copy)]
 enum RawInputEvent {
     Key(RawKeyEvent),
+    /// The Enter that ends a word with `convert_on_enter` on: the gate it armed holds it, and the
+    /// worker converts the word before it and then lets it go (`convert_before_held_enter`).
+    EnterDecision(RawKeyEvent),
     Mouse,
     ExternalInjection,
     PrivacyRefresh(ForegroundContext),
@@ -2491,12 +2562,17 @@ struct AppState {
     /// The token of the retained record the UI thread handed back past a stalled worker: once its
     /// keys were sent, the worker finishes the recovery.
     pending_hand_back: Option<u64>,
+    /// A Right arrow goes before the keys handed back: their word may still be selected.
+    pending_selection_release: bool,
     /// `ObserverMetrics::clipboard_restore_failures` as last announced to the user.
     announced_clipboard_failures: u64,
     /// Physical key-downs that reached the application, clicks and input injected by other
     /// programs, counted by the hooks. Retained keys are handed back past a busy worker only when
     /// none came after them, as they would land after that newer input.
     typed_input: u64,
+    /// Why the last Space got no gate, as logged; cleared when a gate is armed. A reason is logged
+    /// when it changes, not at every Space.
+    last_gate_refusal: Option<&'static str>,
 }
 
 impl AppState {
@@ -2827,6 +2903,8 @@ impl AppState {
         };
         let returned = releases.len();
         self.pending_key_releases.extend(releases);
+        let enter_comes_back = holds_enter(&held) && cause != GateFailureCause::FocusChanged;
+        let auto_recover = enter_comes_back || hands_held_keys_back_automatically(cause);
         let mut retained = false;
         if !held.is_empty() {
             // There cannot be a second gate while recovery is outstanding.
@@ -2849,11 +2927,15 @@ impl AppState {
                         })
                         .unwrap_or(fallback),
                     events: held,
-                    delivery_uncertain: cause == GateFailureCause::DownstreamHook,
+                    // The edge a downstream hook consumed was not one of these keys. Only an
+                    // Enter goes on regardless: it is what the user is waiting for.
+                    delivery_uncertain: cause == GateFailureCause::DownstreamHook
+                        && !enter_comes_back,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                     recovering: false,
+                    sending: 0,
                     retained_at: Instant::now(),
-                    auto_recover: hands_held_keys_back_automatically(cause),
+                    auto_recover,
                     input_mark: self.typed_input,
                 });
                 retained = true;
@@ -2887,7 +2969,7 @@ impl AppState {
             drained_count: 0,
             replay_succeeded: false,
         });
-        if retained && hands_held_keys_back_automatically(cause) {
+        if retained && auto_recover {
             let _ = self.enqueue(RawInputEvent::RecoverInput {
                 sequence,
                 explicit: false,
@@ -2925,6 +3007,21 @@ impl AppState {
         }
     }
 
+    /// Queues the keys of `record` for the window procedure, which reports them to the worker. A
+    /// word the edit of an Enter's gate may have left selected is unselected first.
+    fn hand_back_retained_input(&mut self, record: RetainedInput) {
+        self.metrics.recovery_armed.store(false, Ordering::Release);
+        self.gate_diagnostic(
+            "recovery_handed_back",
+            format!("token={} held={}", record.token, record.events.len()),
+        );
+        self.pending_selection_release =
+            self.metrics.selection_left_token.load(Ordering::Acquire) == record.token;
+        self.pending_held_replay.extend(record.events);
+        self.pending_hand_back = Some(record.token);
+        self.post_held_keys_return();
+    }
+
     /// Queues the key-ups that leave with a record of retained input (see
     /// split_delivered_key_releases).
     fn queue_delivered_key_releases(&mut self, releases: Vec<RawKeyEvent>) {
@@ -2933,6 +3030,69 @@ impl AppState {
         }
         self.pending_key_releases.extend(releases);
         self.post_held_keys_return();
+    }
+
+    /// Arms the decision gate with `token`, the Space or Enter that ends a word in `foreground`.
+    fn arm_decision_gate(&mut self, token: u64, foreground: ForegroundContext) {
+        self.correction_gate.activate(token);
+        self.last_gate_refusal = None;
+        self.gate_diagnostic("armed", format!("token={token}"));
+        self.correction_gate.origin = Some(foreground);
+        self.metrics
+            .active_gate_token
+            .store(token, Ordering::Release);
+        self.metrics
+            .cancelled_gate_token
+            .store(0, Ordering::Release);
+    }
+
+    /// Arms the gate on an Enter (`convert_on_enter`) and holds the Enter itself: it reaches the
+    /// program when the gate lets its keys go, after the word before it is converted. A gate that
+    /// breaks hands it back (`RetainedInput::enter_comes_back`).
+    fn hold_enter_for_decision(&mut self, enter: RawKeyEvent, foreground: ForegroundContext) {
+        self.arm_decision_gate(enter.sequence, foreground);
+        let held = self.correction_gate.hold(enter);
+        debug_assert!(held, "a gate just armed holds its first key");
+    }
+
+    /// Holds an edge for `foreground` behind a retained Enter on its way back to that input
+    /// target, so that new typing cannot overtake the Enter. Not an edge for another target, nor
+    /// a key-up of a key pressed before the record: it types nothing, and withholding it would
+    /// leave the key pressed. False when the edge passes.
+    fn hold_behind_retained_enter(
+        &mut self,
+        mut raw: RawKeyEvent,
+        foreground: ForegroundContext,
+    ) -> bool {
+        let mut retained = self
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(input) = retained.as_mut() else {
+            return false;
+        };
+        let key = (raw.virtual_key, raw.scan_code, raw.extended);
+        let key_up = matches!(raw.message, WM_KEYUP | WM_SYSKEYUP);
+        if !input.enter_comes_back()
+            || input.events.len() > CORRECTION_GATE_CAPACITY * 2
+            || !same_input_target(input.foreground, foreground)
+            || (key_up
+                && !input
+                    .events
+                    .iter()
+                    .any(|event| (event.virtual_key, event.scan_code, event.extended) == key))
+        {
+            return false;
+        }
+        if !key_up {
+            raw.repeat = gated_key_down_repeats(&input.events, &raw, || {
+                let key_state = unsafe { GetAsyncKeyState(raw.virtual_key as i32) };
+                key_state as u16 & 0x8000 != 0
+            });
+        }
+        input.events.push(raw);
+        true
     }
 
     /// Holds an edge that arrived while the gate is active. A gate that is full or past its
@@ -2995,6 +3155,23 @@ impl AppState {
             "submit_failed",
             format!("token={token} submitted={sent} raw_edges={}", prefix.len()),
         );
+        // The edges SendInput took are in the program. An Enter after them was not typed: it
+        // still comes back, and only the edges before it may not go twice.
+        let enter_unsent = prefix.get(sent..).is_some_and(holds_enter)
+            || holds_enter(&self.correction_gate.held)
+            || self
+                .metrics
+                .retained_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|input| holds_enter(&input.events));
+        let sent = if enter_unsent {
+            prefix.drain(..sent.min(prefix.len()));
+            0
+        } else {
+            sent
+        };
         if self.correction_gate.active {
             prefix.append(&mut self.correction_gate.held);
             self.correction_gate.held = prefix;
@@ -3023,6 +3200,7 @@ impl AppState {
                     delivery_uncertain: sent != 0,
                     expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
                     recovering: false,
+                    sending: 0,
                     retained_at: Instant::now(),
                     auto_recover: false,
                     input_mark: self.typed_input,
@@ -3035,9 +3213,18 @@ impl AppState {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(retained) = retained.as_mut() {
+            retained.auto_recover |= enter_unsent;
             retained.delivery_uncertain |= sent != 0;
         }
         self.record_gate_failure_without_worker();
+    }
+
+    /// Logs why a Space got no gate, when the reason differs from the last one logged.
+    fn note_gate_refusal(&mut self, reason: &'static str) {
+        if self.last_gate_refusal != Some(reason) {
+            self.last_gate_refusal = Some(reason);
+            self.gate_diagnostic("not_armed", format!("reason={reason}"));
+        }
     }
 
     fn gate_diagnostic(&self, phase: &str, details: String) {
@@ -3883,9 +4070,9 @@ fn prepare_retained_recovery(metrics: &ObserverMetrics, token: u64, now: Instant
 /// in the middle must not keep the keys, the pause and the declined Exit forever.
 const RETAINED_RECOVERY_GRACE: Duration = Duration::from_secs(5);
 
-/// Marks the retained record `token` as being sent by the worker. False when it is gone (expired,
-/// discarded or replaced) or another recovery is already sending it.
-fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> bool {
+/// Marks the retained record `token` as being sent by the worker and returns its keys. None when
+/// it is gone (expired, discarded or replaced) or another recovery is already sending it.
+fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> Option<Vec<RawKeyEvent>> {
     let mut retained = metrics
         .retained_input
         .lock()
@@ -3893,15 +4080,23 @@ fn begin_retained_recovery(metrics: &ObserverMetrics, token: u64) -> bool {
     match retained.as_mut() {
         Some(input) if input.token == token && !input.recovering => {
             input.recovering = true;
-            true
+            input.sending = input.events.len();
+            Some(input.events.clone())
         }
-        _ => false,
+        _ => None,
     }
 }
 
-/// Ends a recovery that sent `sent` of `requested` inputs: a complete one removes the record, an
-/// incomplete one keeps it for another attempt, marked uncertain when part of it went out.
-fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, requested: usize) {
+/// Ends a recovery that sent `sent` of `requested` inputs: a complete one removes the keys it sent
+/// and the record with them, an incomplete one keeps it for another attempt, marked uncertain when
+/// part of it went out. An Enter that did not go out stays certain: the edges SendInput took are
+/// removed instead. True when keys that came meanwhile wait to be sent now.
+fn finish_retained_recovery(
+    metrics: &ObserverMetrics,
+    token: u64,
+    sent: usize,
+    requested: usize,
+) -> bool {
     let mut retained = metrics
         .retained_input
         .lock()
@@ -3909,13 +4104,20 @@ fn finish_retained_recovery(metrics: &ObserverMetrics, token: u64, sent: usize, 
     if let Some(input) = retained.as_mut()
         && input.token == token
     {
+        input.recovering = false;
         if sent == requested {
+            input.events.drain(..input.sending);
+            if !input.events.is_empty() {
+                return true;
+            }
             *retained = None;
+        } else if input.events.get(sent..).is_some_and(holds_enter) {
+            input.events.drain(..sent);
         } else {
-            input.recovering = false;
             input.delivery_uncertain |= sent != 0;
         }
     }
+    false
 }
 
 /// Deletes the held keys the user confirmed deleting. True when they were deleted: their lifetime
@@ -3994,6 +4196,9 @@ fn toggle_auto_enabled() {
 }
 
 fn store_hotkey_configuration(metrics: &ObserverMetrics, settings: &Settings) {
+    metrics
+        .convert_on_enter
+        .store(settings.convert_on_enter, Ordering::Release);
     let hotkey = settings.force_hotkey();
     metrics
         .force_hotkey_virtual_key
@@ -4809,8 +5014,10 @@ pub fn run() -> Result<()> {
                 pending_key_releases: Vec::new(),
                 pending_held_replay: Vec::new(),
                 pending_hand_back: None,
+                pending_selection_release: false,
                 announced_clipboard_failures: 0,
                 typed_input: 0,
+                last_gate_refusal: None,
             });
         });
         // The agent starts with the session, possibly before the taskbar exists. It works without
@@ -4949,13 +5156,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             finish_configuration_load(hwnd);
             finish_lexicon_saves(hwnd);
             expire_correction_gate();
-            expire_retained_input(hwnd, Instant::now());
+            expire_retained_input(
+                hwnd,
+                Instant::now(),
+                current_foreground_context(),
+                physical_modifiers_released(),
+            );
             announce_clipboard_failures(hwnd);
             hand_back_stalled_retained_input(
                 current_foreground_context(),
                 physical_modifiers_released(),
                 Instant::now(),
             );
+            retry_retained_enter();
             // In case the message that normally sends them could not be posted.
             send_pending_held_keys();
             expire_lexicon_candidate();
@@ -5057,7 +5270,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // A stopped worker gets its own notice; recovery would be an empty promise.
             if APP_STATE.with(|slot| {
                 slot.borrow().as_ref().is_some_and(|state| {
-                    has_retained_input(&state.metrics)
+                    retained_input_awaits_the_user(&state.metrics)
                         && !state.metrics.worker_dead.load(Ordering::Acquire)
                 })
             }) {
@@ -5390,6 +5603,13 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             return;
                         }
                     }
+                    if !drained
+                        && !claimed_hotkey
+                        && state.hold_behind_retained_enter(raw, foreground)
+                    {
+                        swallow = true;
+                        return;
+                    }
 
                     if key_down && !drained {
                         state.typed_input = state.typed_input.wrapping_add(1);
@@ -5407,30 +5627,55 @@ unsafe fn keyboard_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESU
                             .explicit_hotkey_sequence
                             .store(sequence, Ordering::Release);
                     }
+                    let may_arm = !has_retained_input(&state.metrics)
+                        && !state.metrics.configuration_pending.load(Ordering::Acquire);
+                    let privacy = hook_privacy_reason(&state.metrics, foreground.process_id);
+                    let mut held_enter = false;
                     if should_arm_space_decision_gate(
                         drained,
                         key_down,
                         event.vkCode as u16,
                         state.metrics.auto_enabled.load(Ordering::Acquire),
-                        hook_privacy_reason(&state.metrics, foreground.process_id),
+                        privacy,
                         state.correction_gate.active,
                         shortcut_modifiers_released(),
-                    ) && !has_retained_input(&state.metrics)
-                        && !state.metrics.configuration_pending.load(Ordering::Acquire)
+                    ) && may_arm
                     {
-                        state.correction_gate.activate(sequence);
-                        state.gate_diagnostic("armed", format!("token={sequence}"));
-                        state.correction_gate.origin = Some(foreground);
-                        state
+                        state.arm_decision_gate(sequence, foreground);
+                    } else if should_arm_enter_decision_gate(
+                        drained,
+                        key_down,
+                        event.vkCode as u16,
+                        state.metrics.convert_on_enter.load(Ordering::Acquire),
+                        state.metrics.auto_enabled.load(Ordering::Acquire),
+                        privacy,
+                        state.correction_gate.active,
+                        shortcut_modifiers_released(),
+                        shift_released(),
+                    ) && may_arm
+                    {
+                        state.hold_enter_for_decision(raw, foreground);
+                        held_enter = true;
+                        swallow = true;
+                    } else if let Some(reason) = space_gate_refusal(SpaceGateFacts {
+                        drained,
+                        key_down,
+                        virtual_key: event.vkCode as u16,
+                        auto_enabled: state.metrics.auto_enabled.load(Ordering::Acquire),
+                        privacy_reason: privacy,
+                        gate_active: state.correction_gate.active,
+                        shortcut_modifiers_released: shortcut_modifiers_released(),
+                        retained_input: has_retained_input(&state.metrics),
+                        configuration_pending: state
                             .metrics
-                            .active_gate_token
-                            .store(sequence, Ordering::Release);
-                        state
-                            .metrics
-                            .cancelled_gate_token
-                            .store(0, Ordering::Release);
+                            .configuration_pending
+                            .load(Ordering::Acquire),
+                    }) {
+                        state.note_gate_refusal(reason);
                     }
-                    let queued = if claimed_hotkey && has_retained_input(&state.metrics) {
+                    let queued = if held_enter {
+                        state.enqueue(RawInputEvent::EnterDecision(raw))
+                    } else if claimed_hotkey && has_retained_input(&state.metrics) {
                         let armed = state.metrics.recovery_armed.swap(false, Ordering::AcqRel);
                         if !armed {
                             state.gate_diagnostic(
@@ -5525,7 +5770,7 @@ unsafe fn mouse_hook_body(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT 
 }
 
 /// A mouse button went down. A click, physical or injected by another program, may move the caret,
-/// so held keys must not be replayed after it: the gate breaks either way.
+/// so held keys other than an Enter must not be replayed after it: the gate breaks either way.
 fn observe_mouse_button(state: &mut AppState, injected: bool) {
     state.typed_input = state.typed_input.wrapping_add(1);
     state
@@ -5693,8 +5938,13 @@ fn take_held_keys_return(state: &mut AppState) -> Option<HeldKeysReturn> {
     }
     let mut events = core::mem::take(&mut state.pending_held_replay);
     events.append(&mut state.pending_key_releases);
+    let mut inputs = Vec::new();
+    if core::mem::take(&mut state.pending_selection_release) {
+        inputs.extend(selection_release_inputs());
+    }
+    inputs.extend(build_balanced_replay_inputs(&events).unwrap_or_default());
     Some(HeldKeysReturn {
-        inputs: build_balanced_replay_inputs(&events).unwrap_or_default(),
+        inputs,
         handed_back: state.pending_hand_back.take(),
     })
 }
@@ -5855,7 +6105,7 @@ const fn hands_held_keys_back_automatically(cause: GateFailureCause) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct HandBackFacts {
     now: Instant,
-    /// The worker is busy, and not inside an edit that may have selected or typed text.
+    /// The worker is gone, or busy and not inside an edit that may have selected or typed text.
     worker_stalled: bool,
     /// `AppState::typed_input` now.
     typed_input: u64,
@@ -5881,8 +6131,9 @@ fn hand_back_stalled_retained_input(
         };
         let facts = HandBackFacts {
             now,
-            worker_stalled: state.metrics.worker_busy.load(Ordering::Acquire)
-                && !state.metrics.edit_in_flight.load(Ordering::Acquire),
+            worker_stalled: state.metrics.worker_dead.load(Ordering::Acquire)
+                || (state.metrics.worker_busy.load(Ordering::Acquire)
+                    && !state.metrics.edit_in_flight.load(Ordering::Acquire)),
             typed_input: state.typed_input,
             selection_left_token: state.metrics.selection_left_token.load(Ordering::Acquire),
             modifiers_released,
@@ -5907,37 +6158,81 @@ fn hand_back_stalled_retained_input(
         let Some(record) = record else {
             return;
         };
-        state.metrics.recovery_armed.store(false, Ordering::Release);
-        state.gate_diagnostic(
-            "recovery_handed_back",
-            format!("token={} held={}", record.token, record.events.len()),
-        );
-        state.pending_held_replay.extend(record.events);
-        state.pending_hand_back = Some(record.token);
-        state.post_held_keys_return();
+        state.hand_back_retained_input(record);
     });
 }
 
 /// Whether the UI thread hands a retained record back itself: the record is one that comes back
 /// automatically, is not being sent and was certainly never typed; the worker has been busy for
 /// `STALLED_WORKER_HAND_BACK_MS` since the keys were retained, but not inside an edit that may
-/// have selected or typed text; nothing was typed or clicked since, and no modifier is held; no
-/// paste of its gate may have left the word selected; the input target is still the record's;
-/// and no positive privacy finding keeps the keys back.
+/// have selected or typed text; no modifier is held; the input target is still the record's. Keys
+/// other than an Enter also need that nothing was typed or clicked since, that no paste of their
+/// gate may have left the word selected, and that no positive privacy finding keeps them back
+/// (see `RetainedInput::enter_comes_back`).
 fn stalled_worker_may_hand_back(input: &RetainedInput, facts: HandBackFacts) -> bool {
     input.auto_recover
         && !input.recovering
         && !input.delivery_uncertain
         && facts.worker_stalled
-        && facts.typed_input == input.input_mark
-        && facts.selection_left_token != input.token
+        && (input.enter_comes_back()
+            || (facts.typed_input == input.input_mark
+                && facts.selection_left_token != input.token
+                && recovery_privacy_allows(facts.privacy)))
         && facts.modifiers_released
         && facts.now.saturating_duration_since(input.retained_at)
             >= Duration::from_millis(STALLED_WORKER_HAND_BACK_MS)
         && facts
             .current
             .is_some_and(|current| same_input_target(input.foreground, current))
-        && recovery_privacy_allows(facts.privacy)
+}
+
+/// Asks the idle worker again for a retained Enter it could not send yet: a modifier was held, its
+/// queue was full, or SendInput refused the keys.
+fn retry_retained_enter() {
+    APP_STATE.with(|slot| {
+        let borrowed = slot.borrow();
+        let Some(state) = borrowed.as_ref() else {
+            return;
+        };
+        let waiting = state
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|input| input.enter_comes_back() && !input.recovering);
+        if waiting && !state.metrics.worker_busy.load(Ordering::Acquire) {
+            let sequence = state
+                .metrics
+                .observed_input_sequence
+                .load(Ordering::Acquire);
+            let _ = state.enqueue(RawInputEvent::RecoverInput {
+                sequence,
+                explicit: false,
+            });
+        }
+    });
+}
+
+/// Whether held keys wait for the user to bring them back; those of an Enter come back alone.
+fn retained_input_awaits_the_user(metrics: &ObserverMetrics) -> bool {
+    metrics
+        .retained_input
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|input| !input.enter_comes_back())
+}
+
+/// How long a gate holds its keys on the UI thread.
+#[cfg(not(test))]
+const fn correction_gate_hold_ms() -> u64 {
+    CORRECTION_GATE_MAX_HOLD_MS
+}
+
+#[cfg(test)]
+fn correction_gate_hold_ms() -> u64 {
+    TEST_GATE_HOLD_MS.load(Ordering::Acquire)
 }
 
 /// The cause a worker's fail-open request names in its LPARAM: a selection the edit may have
@@ -5953,8 +6248,14 @@ const fn fail_open_cause(code: isize) -> GateFailureCause {
 /// Deletes held keys that were neither handed back nor recovered within their lifetime. They were
 /// never typed, and keeping them would keep automatic conversion paused, the gate disarmed and
 /// Exit declined until someone acted on the tray notice. The worker then decides whether
-/// automatic conversion resumes, under the budget of a recovered gate abort (policy D1).
-fn expire_retained_input(hwnd: HWND, now: Instant) {
+/// automatic conversion resumes, under the budget of a recovered gate abort (policy D1). An Enter
+/// still in its input target `current` is handed back instead, once no modifier is held.
+fn expire_retained_input(
+    hwnd: HWND,
+    now: Instant,
+    current: Option<ForegroundContext>,
+    modifiers_released: bool,
+) {
     let expired = APP_STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         let state = state.as_mut()?;
@@ -5971,15 +6272,29 @@ fn expire_retained_input(hwnd: HWND, now: Instant) {
                     input.expires_at
                 }
             };
-            if retained
-                .as_ref()
-                .is_some_and(|input| now >= deadline(input))
-            {
-                retained.take()
-            } else {
-                None
+            let goes_back = |input: &RetainedInput| {
+                input.enter_comes_back()
+                    && !input.recovering
+                    && current.is_some_and(|target| same_input_target(input.foreground, target))
+            };
+            match retained.as_ref() {
+                Some(input) if now >= deadline(input) => {
+                    if !goes_back(input) {
+                        retained.take().map(|record| (record, false))
+                    } else if modifiers_released {
+                        retained.take().map(|record| (record, true))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }
-        }?;
+        };
+        let (expired, goes_back) = expired?;
+        if goes_back {
+            state.hand_back_retained_input(expired);
+            return None;
+        }
         state.metrics.recovery_armed.store(false, Ordering::Release);
         state.gate_diagnostic(
             "recovery_discarded",
@@ -6475,6 +6790,17 @@ impl PastePatience {
             Self::Manual => CLIPBOARD_BROKER_TIMEOUT_MS,
         })
     }
+}
+
+/// Whether a privacy block only says that the field could not be inspected, with nothing found.
+const fn inspection_failed(reason: Option<PrivacyBlockReason>) -> bool {
+    matches!(
+        reason,
+        Some(
+            PrivacyBlockReason::InspectionUnavailable
+                | PrivacyBlockReason::FieldInspectionUnavailable
+        )
+    )
 }
 
 /// Held keys are the user's own input for the field they were typed in, so handing them back is
@@ -7527,6 +7853,15 @@ struct InputProcessor {
     // SendInput and the keyboard layout.
     #[cfg(test)]
     paste_seam: Option<RefCell<Box<dyn PasteSeam + Send>>>,
+    // Tests collect what a recovery sends, instead of typing it into the window in front.
+    #[cfg(test)]
+    recovery_inputs: Option<RefCell<Vec<INPUT>>>,
+    // Tests make SendInput take only this many keys of a recovery.
+    #[cfg(test)]
+    recovery_input_limit: usize,
+    // Tests let keys arrive while a recovery is being sent.
+    #[cfg(test)]
+    during_recovery_send: Option<Box<dyn Fn() + Send>>,
     // Tests give what each key prints in each layout (by handle), instead of the layouts Windows
     // has loaded.
     #[cfg(test)]
@@ -7560,6 +7895,10 @@ struct InputProcessor {
     last_process_id: Option<u32>,
     current_integrity_level: Option<u32>,
     replay_keys: Vec<ReplayKey>,
+    /// Every key typed since the last Space, Tab or Enter in this field, whatever it printed
+    /// (letters, digits, punctuation): what Pause converts. A key that may move the caret or
+    /// change other text, a click and a field change end it; Backspace erases its last key.
+    pause_keys: Vec<ReplayKey>,
     // Field-inspection fallback authorizes manual input only, until a check of the
     // same field passes before the word ends (`manual_only_inspection`); the
     // recent-good rule's softened failure is no such check.
@@ -7577,9 +7916,22 @@ struct InputProcessor {
     // Coarse category of the last event that discarded or blocked the word
     // buffer. It never contains typed text and only explains ignored hotkeys.
     last_word_reset: &'static str,
+    // Whether a key of a word reached this worker since the last boundary, and whether keyboard
+    // events the hook counted since then never did: a boundary with no word then says which.
+    word_keys_seen: bool,
+    last_key_sequence: u64,
+    key_gap_seen: bool,
+    // How many keyboard events the hook counted never reached the key handling since the last
+    // boundary, and why the worker itself dropped some (a configuration loading, an old epoch).
+    missing_key_events: u64,
+    key_drop_reason: Option<&'static str>,
+    // Desktop tests whose fields are not private also log positive field findings.
+    #[cfg(test)]
+    log_positive_privacy: bool,
     // Languages (never text) of the most recent completed words, for the
     // optional layout model. Cleared when the input target changes.
     recent_languages: Vec<Language>,
+    field_layouts: FieldLayouts,
     last_boundary: Option<LastBoundary>,
     transpose_cycle: Option<TransposeCycle>,
     // The last word of up to REMEMBERED_WORD_WINDOWS input targets the agent stopped tracking,
@@ -7694,6 +8046,12 @@ impl InputProcessor {
             #[cfg(test)]
             paste_seam: None,
             #[cfg(test)]
+            recovery_inputs: None,
+            #[cfg(test)]
+            recovery_input_limit: usize::MAX,
+            #[cfg(test)]
+            during_recovery_send: None,
+            #[cfg(test)]
             test_keyboard: None,
             session,
             modifiers: Modifiers::default(),
@@ -7752,11 +8110,20 @@ impl InputProcessor {
             last_process_id: None,
             current_integrity_level: process_integrity_level(unsafe { GetCurrentProcessId() }),
             replay_keys: Vec::new(),
+            pause_keys: Vec::new(),
             manual_only_word: false,
             manual_only_inspection: false,
             manual_token_start_known: false,
             last_word_reset: "none",
+            word_keys_seen: false,
+            last_key_sequence: 0,
+            key_gap_seen: false,
+            missing_key_events: 0,
+            key_drop_reason: None,
+            #[cfg(test)]
+            log_positive_privacy: tests::LOG_POSITIVE_PRIVACY.load(Ordering::Acquire),
             recent_languages: Vec::new(),
+            field_layouts: FieldLayouts::default(),
             last_boundary: None,
             transpose_cycle: None,
             remembered_words: Vec::new(),
@@ -7806,36 +8173,18 @@ impl InputProcessor {
         current_foreground_context()
     }
 
-    /// Whether the text before the caret is the word an edit is about to replace, as its settle
-    /// step reads it. Tests script it.
-    fn settle_text_status(
+    /// One read of the source settle, as `commit_read`. Tests script it.
+    fn settle_read(
         &self,
         process_id: u32,
         expected_text: &str,
-        deadline: Instant,
-    ) -> TextBarrierStatus {
+        until: Instant,
+    ) -> (TextBarrierStatus, bool) {
         #[cfg(test)]
         if let Some(seam) = &self.paste_seam {
             return seam.borrow_mut().settle();
         }
-        self.barrier_text_status(process_id, expected_text, deadline)
-    }
-
-    /// Whether the text before the caret is `expected_text`, as the barrier's provider thread
-    /// reads it, waited for until `deadline` at most. Without a provider the barrier is
-    /// unavailable, and no edit that needs it goes ahead.
-    fn barrier_text_status(
-        &self,
-        process_id: u32,
-        expected_text: &str,
-        deadline: Instant,
-    ) -> TextBarrierStatus {
-        let read = self.next_barrier_read(process_id, expected_text);
-        self.answer_barrier_read(
-            read,
-            deadline,
-            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-        )
+        self.commit_read(process_id, expected_text, until)
     }
 
     /// A new barrier check of `expected_text` before the caret of `process_id`'s field.
@@ -7865,9 +8214,12 @@ impl InputProcessor {
         status
     }
 
-    /// Whether the provider answered the last barrier read, Match or not.
+    /// Whether the field answered the last barrier read, Match or not. A field too busy to name
+    /// its focus to UI Automation has not answered either.
     fn barrier_answered(&self) -> bool {
-        self.privacy_guard.last_barrier_report().stage != TextBarrierStage::Provider
+        let report = self.privacy_guard.last_barrier_report();
+        report.stage != TextBarrierStage::Provider
+            && report.resolver_reason != EditableResolverReason::FocusUnavailable
     }
 
     /// One read of a paste's commit check, answered by `until`: its status and whether the field
@@ -7971,6 +8323,15 @@ impl InputProcessor {
         )
     }
 
+    /// Whether the field answered the last commit check. Tests script it.
+    fn paste_commit_answered(&self) -> bool {
+        #[cfg(test)]
+        if let Some(seam) = &self.paste_seam {
+            return seam.borrow_mut().commit_answered();
+        }
+        self.barrier_answered()
+    }
+
     /// Switches the layout after a paste. Tests script it.
     fn paste_switch_layout(
         &self,
@@ -8024,7 +8385,7 @@ impl InputProcessor {
         if update == ProfileUpdate::Bindings {
             self.invalidate_conversion_state();
             if self.session.buffered_character_count() != 0 {
-                self.suppress_session();
+                self.suppress_session("profiles");
             }
             self.replay_keys.clear();
             self.layout_switch_in_flight = None;
@@ -8144,12 +8505,16 @@ impl InputProcessor {
 
     /// The gate token when this event is the Space key-down that armed the decision gate, else 0.
     fn armed_gate_token(&self, queued: &QueuedInputEvent) -> u64 {
-        let RawInputEvent::Key(key) = &queued.event else {
-            return 0;
+        let (key, armed_by) = match &queued.event {
+            RawInputEvent::Key(key) => (
+                key,
+                matches!(key.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+                    && key.virtual_key == u32::from(VK_SPACE.0),
+            ),
+            RawInputEvent::EnterDecision(key) => (key, true),
+            _ => return 0,
         };
-        let is_space_down = matches!(key.message, WM_KEYDOWN | WM_SYSKEYDOWN)
-            && key.virtual_key == u32::from(VK_SPACE.0);
-        if is_space_down
+        if armed_by
             && key.drain_token == 0
             && key.sequence != 0
             && self.metrics.active_gate_token.load(Ordering::Acquire) == key.sequence
@@ -8184,6 +8549,7 @@ impl InputProcessor {
         {
             let kind = match queued.event {
                 RawInputEvent::Key(_) => "key",
+                RawInputEvent::EnterDecision(_) => "enter",
                 RawInputEvent::GateDrainReady { .. } => "gate_ack",
                 RawInputEvent::PrivacyRefresh(_) => "privacy",
                 RawInputEvent::ProfileRefresh => "profiles",
@@ -8270,6 +8636,7 @@ impl InputProcessor {
             if self.last_input_epoch != current_epoch {
                 self.reset_for_epoch(current_epoch);
             }
+            self.note_dropped_key(&queued.event, "epoch");
             if let RawInputEvent::GateDrainReady {
                 token,
                 drained_count,
@@ -8294,15 +8661,18 @@ impl InputProcessor {
         }
 
         if self.metrics.configuration_pending.load(Ordering::Acquire) {
+            self.note_dropped_key(&queued.event, "configuration");
             self.log_word_discard("configuration", WordDiscardDetail::None);
             self.invalidate_conversion_state();
             self.session.clear();
             self.replay_keys.clear();
+            self.pause_keys.clear();
             return;
         }
 
         match queued.event {
             RawInputEvent::Mouse => {
+                self.note_click();
                 if let Some(target) = self.last_key_foreground {
                     self.remember_word(target, self.last_layout, Instant::now());
                 }
@@ -8311,18 +8681,29 @@ impl InputProcessor {
                 self.recovered_mid_word = false;
                 self.invalidate_conversion_state();
                 self.replay_keys.clear();
+                self.pause_keys.clear();
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.session.handle(InputEvent::Mouse, None, &self.detector);
                 self.mark_privacy_dirty(false);
             }
             RawInputEvent::ExternalInjection => {
+                // The hook counts injected keys it does not pass on: no gap after them.
+                self.last_key_sequence = 0;
                 self.last_word_reset = "external-input";
+                self.pause_keys.clear();
                 self.invalidate_conversion_state();
-                self.suppress_session();
+                self.suppress_session("external-input");
                 self.mark_privacy_dirty(true);
             }
-            RawInputEvent::Key(event) => self.process_key(event),
+            RawInputEvent::Key(event) => {
+                self.note_key_sequence(event.sequence);
+                self.process_key(event);
+            }
+            RawInputEvent::EnterDecision(event) => {
+                self.note_key_sequence(event.sequence);
+                self.convert_before_held_enter(event);
+            }
             RawInputEvent::ProfileRefresh => {
                 // Like the privacy refresh, never in the way of a fence acknowledgement.
                 if self.metrics.active_gate_token.load(Ordering::Acquire) == 0 {
@@ -8378,6 +8759,7 @@ impl InputProcessor {
 
     fn apply_configuration_reload(&mut self, result: std::io::Result<RuntimeConfiguration>) {
         self.invalidate_conversion_state();
+        self.log_word_discard("configuration-reload", WordDiscardDetail::None);
         self.session.clear();
         self.replay_keys.clear();
         let configuration = match result {
@@ -8522,6 +8904,7 @@ impl InputProcessor {
             self.session.clear();
         }
         self.replay_keys.clear();
+        self.pause_keys.clear();
         self.modifiers = Modifiers::default();
         self.resync_modifiers = true;
         self.metrics
@@ -8545,12 +8928,15 @@ impl InputProcessor {
         let Some(record) = record else {
             return;
         };
-        if record.delivery_uncertain && !explicit {
+        if !explicit && (record.delivery_uncertain || !record.auto_recover) {
             return;
         }
+        let enter = record.enter_comes_back();
+        let selection_left =
+            self.metrics.selection_left_token.load(Ordering::Acquire) == record.token;
         // The paste of this gate may have left the word selected: replaying the keys would type
-        // over it, so only the user brings them back.
-        if !explicit && self.metrics.selection_left_token.load(Ordering::Acquire) == record.token {
+        // over it, so only the user brings them back. An Enter unselects the word instead.
+        if selection_left && !explicit && !enter {
             self.diagnostic(
                 "recovery",
                 format!(
@@ -8560,7 +8946,9 @@ impl InputProcessor {
             );
             return;
         }
-        if !self.input_sequence_is_current(sequence) || !self.foreground_matches(record.foreground)
+        if !enter
+            && (!self.input_sequence_is_current(sequence)
+                || !self.foreground_matches(record.foreground))
         {
             self.diagnostic(
                 "recovery",
@@ -8578,37 +8966,118 @@ impl InputProcessor {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        self.privacy_needs_check = true;
-        self.ensure_privacy(record.foreground, ProbeTrigger::Recovery);
-        if !recovery_privacy_allows(self.privacy_reason) {
-            self.diagnostic(
-                "recovery",
-                format!("token={} result=retained reason=privacy", record.token),
-            );
-            return;
+        if enter {
+            if !self.foreground_matches(record.foreground) {
+                self.keep_enter_for_the_user(record.token);
+                return;
+            }
+        } else {
+            self.privacy_needs_check = true;
+            self.ensure_privacy(record.foreground, ProbeTrigger::Recovery);
+            if !recovery_privacy_allows(self.privacy_reason) {
+                self.diagnostic(
+                    "recovery",
+                    format!("token={} result=retained reason=privacy", record.token),
+                );
+                return;
+            }
+            if !self.input_sequence_is_current(sequence)
+                || self.metrics.input_epoch.load(Ordering::Acquire) != self.last_input_epoch
+                || self
+                    .current_foreground()
+                    .is_none_or(|current| current != record.foreground)
+                || !physical_modifiers_released()
+            {
+                return;
+            }
         }
-        let Some(inputs) = build_recovery_inputs(&record.events) else {
-            return;
+        // A key in the input stream, not a selection set through UI Automation: a busy field
+        // would apply that later, among the keys it has queued, and they would land elsewhere.
+        let mut selection_keys = if selection_left && holds_enter(&record.events) {
+            selection_release_inputs().to_vec()
+        } else {
+            Vec::new()
         };
-        if !self.input_sequence_is_current(sequence)
-            || self.metrics.input_epoch.load(Ordering::Acquire) != self.last_input_epoch
-            || current_foreground_context().is_none_or(|current| current != record.foreground)
-            || !physical_modifiers_released()
-        {
-            return;
-        }
+        let (mut sent, mut requested) = (0, 0);
         // Marked under the lock before sending, so that the lifetime timer cannot report keys as
-        // deleted while they are being typed.
-        if !begin_retained_recovery(&self.metrics, record.token) {
+        // deleted while they are being typed. Keys that come behind an Enter meanwhile go next.
+        while let Some(events) = begin_retained_recovery(&self.metrics, record.token) {
+            let Some(replay) = build_recovery_inputs(&events) else {
+                finish_retained_recovery(&self.metrics, record.token, 0, 1);
+                return;
+            };
+            let unsent_keys = core::mem::take(&mut selection_keys);
+            let lead = unsent_keys.len();
+            let inputs = [unsent_keys, replay].concat();
+            let accepted = self.send_recovery_inputs(&inputs);
+            sent += accepted;
+            requested += inputs.len();
+            if accepted != 0 {
+                self.metrics
+                    .selection_left_token
+                    .store(0, Ordering::Release);
+            }
+            if !finish_retained_recovery(
+                &self.metrics,
+                record.token,
+                accepted.saturating_sub(lead),
+                inputs.len() - lead,
+            ) {
+                break;
+            }
+        }
+        if requested == 0 {
             self.diagnostic(
                 "recovery",
                 format!("token={} result=retained reason=gone", record.token),
             );
             return;
         }
-        let sent = send_input_count(&inputs);
-        finish_retained_recovery(&self.metrics, record.token, sent, inputs.len());
-        self.finish_recovery(record.token, explicit, sent, inputs.len());
+        self.finish_recovery(record.token, explicit, sent, requested);
+    }
+
+    /// The input target of a retained Enter changed before the Enter could go back: it is not
+    /// typed into another window, nor later into its own, where the user may have gone on with
+    /// something else. It waits for Pause like any other held key, and the tray says so.
+    fn keep_enter_for_the_user(&self, token: u64) {
+        if let Some(input) = self
+            .metrics
+            .retained_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .filter(|input| input.token == token)
+        {
+            input.auto_recover = false;
+        }
+        self.diagnostic(
+            "recovery",
+            format!("token={token} result=retained reason=input-target"),
+        );
+        if self.gate_window != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.gate_window as *mut c_void)),
+                    RECOVERY_NOTICE_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    /// Sends the keys of a recovery. Tests collect them.
+    fn send_recovery_inputs(&self, inputs: &[INPUT]) -> usize {
+        #[cfg(test)]
+        if let Some(sent) = &self.recovery_inputs {
+            let taken = inputs.len().min(self.recovery_input_limit);
+            sent.borrow_mut().extend_from_slice(&inputs[..taken]);
+            if let Some(event) = &self.during_recovery_send {
+                event();
+            }
+            return taken;
+        }
+        send_input_count(inputs)
     }
 
     /// Bookkeeping after a recovery sent `sent` of `requested` inputs. The replayed keys bypass
@@ -8616,7 +9085,7 @@ impl InputProcessor {
     /// the next boundary, also across the epoch reset that an automatic resume causes.
     fn finish_recovery(&mut self, token: u64, explicit: bool, sent: usize, requested: usize) {
         self.invalidate_conversion_state();
-        self.suppress_session();
+        self.suppress_session("recovery");
         self.recovered_mid_word = true;
         self.diagnostic("recovery", format!("token={token} explicit={explicit} submitted={sent} requested={requested} evidence=input-submitted-text-unverified"));
         // Only the automatic recovery of a gate abort, and only when every held key was handed
@@ -8677,6 +9146,7 @@ impl InputProcessor {
             if let Some(previous) = self.last_key_foreground {
                 self.remember_word(previous, self.last_layout, Instant::now());
             }
+            self.pause_keys.clear();
             // A new window may belong to a new process that reuses the previous one's ID: its
             // image, integrity and exclusion are read again instead of taken from the cache. A
             // blocked program is blocked before anything about this key is written.
@@ -8698,6 +9168,10 @@ impl InputProcessor {
             }
             self.last_word_reset = "focus";
             self.recovered_mid_word = false;
+            self.word_keys_seen = false;
+            self.key_gap_seen = false;
+            self.missing_key_events = 0;
+            self.key_drop_reason = None;
             self.recent_languages.clear();
             self.layout_switch_in_flight = None;
             self.invalidate_conversion_state();
@@ -8727,7 +9201,13 @@ impl InputProcessor {
                 // A manual switch ends automatic conversion of this word, not Pause: the word
                 // typed so far, or else the last completed word, stays available to the hotkey
                 // and is read in the layout it was typed in. Any other key drops it as usual.
+                let pause_keys = core::mem::take(&mut self.pause_keys);
                 let typed = core::mem::take(&mut self.replay_keys);
+                let typed = if pause_keys.is_empty() {
+                    typed
+                } else {
+                    pause_keys
+                };
                 let kept = match self.last_layout {
                     Some(typed_layout) if !typed.is_empty() => Some(LastBoundary {
                         replay_keys: typed,
@@ -8762,6 +9242,9 @@ impl InputProcessor {
         }
 
         self.last_key_foreground = Some(event.foreground);
+        if let Some(language) = language {
+            self.field_layouts.note(foreground_key, language);
+        }
 
         let key_down = matches!(event.message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let key_up = matches!(event.message, WM_KEYUP | WM_SYSKEYUP);
@@ -8845,6 +9328,7 @@ impl InputProcessor {
         if self.modifiers.has_shortcut_modifier() {
             self.last_word_reset = "shortcut";
             self.replay_keys.clear();
+            self.pause_keys.clear();
             self.last_boundary = None;
             self.transpose_cycle = None;
             if event.virtual_key as u16 == VK_BACK.0
@@ -8864,6 +9348,7 @@ impl InputProcessor {
                 "input",
                 format!("result=suppressed reason=shortcut kind={kind}"),
             );
+            self.log_word_discard("shortcut", WordDiscardDetail::None);
             self.session
                 .handle(InputEvent::Shortcut, language, &self.detector);
             self.mark_privacy_dirty(true);
@@ -8872,6 +9357,7 @@ impl InputProcessor {
 
         match event.virtual_key as u16 {
             key if key == VK_BACK.0 => {
+                self.erase_pause_key(previous_boundary.as_ref(), event);
                 if self.settings.suppress_after_backspace
                     || !self.erase_or_resume_word(previous_boundary, event, language)
                 {
@@ -8909,7 +9395,13 @@ impl InputProcessor {
                 self.navigate(language, self.settings.suppress_after_home_end);
             }
             key if key == VK_SPACE.0 => {
-                let last_keys = self.replay_keys.clone();
+                // Pause converts the whole token, the automatic conversion only its last word.
+                let pause_keys = core::mem::take(&mut self.pause_keys);
+                let last_keys = if pause_keys.is_empty() {
+                    self.replay_keys.clone()
+                } else {
+                    pause_keys
+                };
                 self.transpose_cycle = None;
                 // A second space invalidates adjacency too. Record the source
                 // before attempting an edit so a partial failure cannot restore
@@ -8970,6 +9462,7 @@ impl InputProcessor {
                 }
             }
             key if key == VK_TAB.0 => {
+                self.pause_keys.clear();
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
@@ -8982,6 +9475,7 @@ impl InputProcessor {
                 self.navigate(language, true);
             }
             key if key == VK_RETURN.0 => {
+                self.pause_keys.clear();
                 self.last_boundary = None;
                 self.transpose_cycle = None;
                 self.handle_boundary(language, None, true);
@@ -8989,18 +9483,23 @@ impl InputProcessor {
                 self.session.mark_line_start();
             }
             _ => {
+                // A letter key: a token of marks or digits alone is no word.
+                self.word_keys_seen |= (0x41..=0x5A).contains(&(event.virtual_key as u16));
                 if !self.ensure_privacy(event.foreground, ProbeTrigger::Typing)
                     && !self.manual_privacy_allows_current(event.foreground)
                 {
-                    // Nothing is logged here: one line per key would give a secret's length.
+                    // Only a word that was there is logged: one line per key would give a
+                    // secret's length.
                     self.last_word_reset = "privacy";
-                    self.suppress_session();
+                    self.pause_keys.clear();
+                    self.suppress_session("privacy");
                     return;
                 }
                 if language.is_none() {
                     self.diagnostic("input", "result=suppressed reason=language".to_owned());
                 }
                 let printable = self.printable_character(event);
+                self.extend_pause_keys(printable, event);
                 // A letter the offline tables place needs no readings. Any other key is judged by
                 // what it prints in the target layouts, such as the Estonian "ü" typed as "[" in
                 // the English layout, or the keypad's "." that prints "," in Russian where the
@@ -9017,7 +9516,7 @@ impl InputProcessor {
                     }
                     _ => Vec::new(),
                 };
-                let input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
+                let mut input_event = printable.map_or(InputEvent::UnsupportedInput, |character| {
                     if language.is_some_and(|language| {
                         self.detector
                             .can_extend_word_with_readings(character, language, &readings)
@@ -9029,6 +9528,37 @@ impl InputProcessor {
                         InputEvent::UnsupportedInput
                     }
                 });
+                // Punctuation right after a word stays with it until the Space ("gjnjv/" is
+                // "потом."): the target layouts read the key as no letter either, or it would
+                // continue the word as one.
+                // A keypad key is no mark: the keypad's "." prints "," in Russian, which is not
+                // what a full stop typed there meant.
+                if let Some(character) = printable
+                    && input_event == InputEvent::Boundary
+                    && !character.is_whitespace()
+                    && !is_keypad_key(event.virtual_key)
+                    && self.session.buffered_character_count() != 0
+                    && !self.session.is_suppressed()
+                {
+                    input_event = InputEvent::TrailingMark(character);
+                }
+                if self.session.ends_with_marks()
+                    && !matches!(input_event, InputEvent::TrailingMark(_))
+                {
+                    // Anything else after the marks ends the word unconverted, as the boundary
+                    // at its first mark did before.
+                    self.log_word_discard("punctuation", WordDiscardDetail::None);
+                    if let SessionAction::Candidate(_) =
+                        self.session
+                            .handle(InputEvent::Boundary, language, &self.detector)
+                    {
+                        self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.replay_keys.clear();
+                    self.last_word_reset = "boundary";
+                    self.recovered_mid_word = false;
+                    self.privacy_needs_check = true;
+                }
                 // Before the reset below is overwritten: a token may start with a digit right
                 // after a shortcut or a manual layout switch.
                 let buffered_before = self.session.buffered_character_count();
@@ -9044,7 +9574,10 @@ impl InputProcessor {
                         ),
                     );
                 }
-                if matches!(input_event, InputEvent::Printable(_)) {
+                if matches!(
+                    input_event,
+                    InputEvent::Printable(_) | InputEvent::TrailingMark(_)
+                ) {
                     // A new word has started; the previous word is no longer the
                     // one adjacent to the caret.
                     self.last_boundary = None;
@@ -9074,16 +9607,24 @@ impl InputProcessor {
                         // original and replacement text are dropped without logs.
                         self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
                     }
-                    SessionAction::Reset(_) => self.replay_keys.clear(),
+                    SessionAction::Reset(reason) => {
+                        self.log_word_discard(
+                            "session-reset",
+                            WordDiscardDetail::Rule(reason.category()),
+                        );
+                        self.replay_keys.clear();
+                    }
                     SessionAction::None => {}
                 }
-                if matches!(input_event, InputEvent::Printable(_))
-                    && self.session.buffered_character_count() == buffered_before + 1
+                if matches!(
+                    input_event,
+                    InputEvent::Printable(_) | InputEvent::TrailingMark(_)
+                ) && self.session.buffered_character_count() == buffered_before + 1
                 {
                     if let Some(key) = replay_key_from_event(event, self.modifiers) {
                         self.replay_keys.push(key);
                     } else {
-                        self.suppress_session();
+                        self.suppress_session("replay-key");
                     }
                 }
                 if let Some(keys) = token_keys {
@@ -9094,6 +9635,36 @@ impl InputProcessor {
                     self.privacy_needs_check = true;
                 }
             }
+        }
+    }
+
+    /// Adds a key that typed `printable` to the token Pause converts. A key that types nothing
+    /// or whitespace ends the token, and so does one more key than a token may hold.
+    fn extend_pause_keys(&mut self, printable: Option<char>, event: RawKeyEvent) {
+        match (
+            printable.filter(|character| !character.is_whitespace()),
+            replay_key_from_event(event, self.modifiers),
+        ) {
+            (Some(_), Some(key)) if self.pause_keys.len() < MANUAL_TOKEN_MAX_KEYS => {
+                self.pause_keys.push(key);
+            }
+            _ => self.pause_keys.clear(),
+        }
+    }
+
+    /// Backspace erases the last key of the token Pause converts; right after the Space that
+    /// ended a token in this field, erasing the Space returns to that token.
+    fn erase_pause_key(&mut self, previous_boundary: Option<&LastBoundary>, event: RawKeyEvent) {
+        if self.pause_keys.pop().is_some() {
+            return;
+        }
+        if let Some(last) = previous_boundary.filter(|last| {
+            last.delimiter.is_some()
+                && same_input_target(last.foreground, event.foreground)
+                && last.foreground.layout == event.foreground.layout
+                && last.epoch == self.metrics.input_epoch.load(Ordering::Acquire)
+        }) {
+            self.pause_keys = last.replay_keys.clone();
         }
     }
 
@@ -9175,6 +9746,18 @@ impl InputProcessor {
         delimiter: Option<char>,
         may_change_focus: bool,
     ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
+        self.handle_boundary_with(language, delimiter, may_change_focus, false)
+    }
+
+    /// As `handle_boundary`; `without_delimiter` converts the word with no delimiter after it,
+    /// for an Enter the gate holds (`convert_before_held_enter`).
+    fn handle_boundary_with(
+        &mut self,
+        language: Option<Language>,
+        delimiter: Option<char>,
+        may_change_focus: bool,
+        without_delimiter: bool,
+    ) -> Option<(ConversionTransaction, Vec<ReplayKey>)> {
         let replay_keys = core::mem::take(&mut self.replay_keys);
         let manual_only = core::mem::take(&mut self.manual_only_word);
         // A boundary ends the unknown word a recovery may have left.
@@ -9183,6 +9766,15 @@ impl InputProcessor {
         // missed conversion can be explained from the log without recording the word.
         let suppressed = self.session.is_suppressed();
         let had_word = !replay_keys.is_empty() || self.session.buffered_character_count() != 0;
+        let keys_seen = core::mem::take(&mut self.word_keys_seen);
+        let gap = core::mem::take(&mut self.key_gap_seen);
+        let missing = core::mem::take(&mut self.missing_key_events);
+        let dropped = self.key_drop_reason.take();
+        // A suppressed word is written as such below, in a field the check let through.
+        let explained = suppressed && self.privacy_reason.is_none() && !manual_only;
+        if !had_word && !explained && (keys_seen || gap) {
+            self.log_word_lost(language, keys_seen, gap, missing, dropped);
+        }
         let map_to_layout = self.key_mapper();
         let candidates = language
             .map(|language| {
@@ -9199,13 +9791,24 @@ impl InputProcessor {
             })
             .unwrap_or_default();
         let transaction = if self.privacy_reason.is_none() && !manual_only {
-            if let SessionAction::Candidate(detection) = self.session.finish_boundary_in_context(
+            let action = self.session.finish_boundary_in_context(
                 language,
                 &self.detector,
                 &candidates,
                 &self.recent_languages,
-            ) {
+            );
+            if let SessionAction::Candidate(detection) = &action
+                && !detection.changes_text()
+            {
+                // The layout in use already types this word: there is nothing to edit, and it
+                // is no reason to leave the layout. The following words still see its language.
+                self.remember_word_language(detection.target_language);
+                self.diagnostic("word", "result=same-text".to_owned());
+                None
+            } else if let SessionAction::Candidate(mut detection) = action {
                 self.metrics.candidates.fetch_add(1, Ordering::Relaxed);
+                let word_language = detection.target_language;
+                detection.prefer_layouts(&candidates, self.field_layouts.of(self.last_foreground));
                 // Only the stage is logged, never the word.
                 let stage = if self.detector.layout_model_enabled()
                     && self
@@ -9233,16 +9836,23 @@ impl InputProcessor {
                         self.text_edit_backend,
                     ),
                 );
-                let transaction = delimiter
-                    .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter));
-                if transaction.is_none() {
+                let transaction = if without_delimiter {
+                    ConversionTransaction::without_delimiter(&detection)
+                } else {
+                    delimiter
+                        .and_then(|delimiter| ConversionTransaction::new(&detection, delimiter))
+                };
+                if transaction.is_none() && !without_delimiter {
                     // Tab or Enter: the edit could not put the word back before them.
                     self.diagnostic("word", "result=not-attempted reason=boundary".to_owned());
                 }
                 // The following words see this one as typed until its conversion is applied
                 // (finish_applied_conversion).
                 self.remember_word_language(detection.source_language);
-                transaction
+                transaction.map(|transaction| ConversionTransaction {
+                    word_language,
+                    ..transaction
+                })
             } else {
                 // A suppressed token (digits, text after a shortcut) is no word of a language.
                 if !suppressed
@@ -9275,7 +9885,11 @@ impl InputProcessor {
                     (true, false) => "manual-only cause=resumed",
                     (false, _) => "privacy",
                 };
-                self.diagnostic("word", format!("result={result}"));
+                if self.privacy_reason.is_some() {
+                    self.log_word_reset(result);
+                } else {
+                    self.diagnostic("word", format!("result={result}"));
+                }
             }
             self.session.clear();
             None
@@ -9288,6 +9902,51 @@ impl InputProcessor {
             self.mark_privacy_dirty(false);
         }
         transaction.map(|transaction| (transaction, replay_keys))
+    }
+
+    /// The Enter that armed the gate is held (`convert_on_enter`): the word before it is
+    /// converted as at a Space, but without a delimiter, and the gate then lets the Enter go.
+    /// Nothing else about Enter happens here: the held Enter comes back through the hook as a
+    /// drained key and ends the word as usual.
+    fn convert_before_held_enter(&mut self, event: RawKeyEvent) {
+        let language = self.language_for_layout(event.foreground.layout);
+        let applies = self.settings.convert_on_enter
+            && self.last_foreground == Some(foreground_identity_key(event.foreground))
+            && !self.modifiers.has_shortcut_modifier()
+            && !self.modifiers.shift();
+        if !applies && !self.replay_keys.is_empty() {
+            self.log_word_left("enter-context");
+        }
+        if applies
+            && let Some((transaction, replay_keys)) =
+                self.handle_boundary_with(language, None, false, true)
+        {
+            if replay_keys.len() != transaction.original.chars().count() {
+                self.diagnostic("word", "result=not-attempted reason=keys".to_owned());
+            } else if replay_keys
+                .iter()
+                .any(|key| key.caps_lock != event.caps_lock)
+            {
+                self.diagnostic("word", "result=not-attempted reason=caps-lock".to_owned());
+            } else {
+                // The keys before the Enter reached the program; the Enter itself is held, as a
+                // Pause press is swallowed.
+                self.metrics
+                    .forwarded_input_sequence
+                    .fetch_max(event.sequence, Ordering::AcqRel);
+                self.pending_conversion = Some(PendingConversion {
+                    transaction,
+                    foreground: event.foreground,
+                    source_layout: event.foreground.layout,
+                    profile_generation: self.input_profiles.generation(),
+                    space_down_sequence: event.sequence,
+                    replay_keys,
+                    forced: false,
+                    cycle_order: Vec::new(),
+                });
+            }
+        }
+        self.execute_pending_conversion(event.sequence);
     }
 
     fn remember_word_language(&mut self, language: Language) {
@@ -9444,6 +10103,7 @@ impl InputProcessor {
     fn navigate(&mut self, language: Option<Language>, suppress_until_boundary: bool) {
         self.last_word_reset = "navigation";
         self.replay_keys.clear();
+        self.pause_keys.clear();
         self.handle_switching_rule(InputEvent::Navigation, language, suppress_until_boundary);
         self.mark_privacy_dirty(false);
     }
@@ -9456,10 +10116,10 @@ impl InputProcessor {
     ) {
         self.last_boundary = None;
         self.transpose_cycle = None;
+        self.log_word_discard("switching-rule", WordDiscardDetail::Rule(event.category()));
         if suppress_until_boundary {
             self.session.handle(event, language, &self.detector);
         } else {
-            self.log_word_discard("switching-rule", WordDiscardDetail::Rule(event.category()));
             self.session.clear();
         }
     }
@@ -9472,11 +10132,96 @@ impl InputProcessor {
             .session
             .buffered_character_count()
             .max(self.replay_keys.len());
-        if chars != 0 {
+        if chars == 0 {
+            return;
+        }
+        if self.privacy_reason.is_some() {
+            self.log_word_reset(reason);
+        } else {
             self.diagnostic(
                 "word_discard",
                 format!("reason={reason} chars={chars} {}", detail.describe()),
             );
+        }
+    }
+
+    /// Records that a word was lost while a field check does not pass: the category alone, never
+    /// its length, at most once a word, so that a missed conversion can still be explained. A
+    /// positive finding (a password field, an excluded or elevated program) stays silent, as
+    /// nothing about typing there is written.
+    fn log_word_reset(&self, reason: &str) {
+        if inspection_failed(self.privacy_reason) {
+            self.diagnostic("word_reset", format!("reason={reason}"));
+        }
+    }
+
+    /// Notes the hook's sequence number of a key event: one that skips numbers means keyboard
+    /// events the hook counted never reached this worker.
+    fn note_key_sequence(&mut self, sequence: u64) {
+        if self.last_key_sequence != 0 && sequence > self.last_key_sequence + 1 {
+            self.key_gap_seen = true;
+            self.missing_key_events = self
+                .missing_key_events
+                .saturating_add(sequence - self.last_key_sequence - 1);
+        }
+        self.last_key_sequence = self.last_key_sequence.max(sequence);
+    }
+
+    /// Records that keys were typed since the last boundary but no word is there at this one:
+    /// without this line such a word leaves none. What last reset the word, whether the layout
+    /// had a language, and whether keys never reached the worker; never the text or its length.
+    fn log_word_lost(
+        &self,
+        language: Option<Language>,
+        keys_seen: bool,
+        gap: bool,
+        missing: u64,
+        dropped: Option<&str>,
+    ) {
+        if self.privacy_reason.is_some() && !inspection_failed(self.privacy_reason) {
+            return;
+        }
+        self.diagnostic(
+            "word_lost",
+            format!(
+                "reset={} layout={} keys={} gap={gap} dropped={} missing={missing}",
+                self.last_word_reset,
+                if language.is_some() {
+                    "known"
+                } else {
+                    "unknown"
+                },
+                if keys_seen { "seen" } else { "none" },
+                dropped.unwrap_or("none"),
+            ),
+        );
+    }
+
+    /// Remembers why the worker dropped a key event unhandled, for the lost-word line.
+    fn note_dropped_key(&mut self, event: &RawInputEvent, reason: &'static str) {
+        match event {
+            RawInputEvent::Key(_) | RawInputEvent::EnterDecision(_) => {
+                self.key_drop_reason = Some(reason);
+            }
+            RawInputEvent::Mouse => self.note_click(),
+            _ => {}
+        }
+    }
+
+    /// The mouse hook counts a click in the same sequence as keys, one number each, in order: a
+    /// click is no key the worker missed.
+    fn note_click(&mut self) {
+        if self.last_key_sequence != 0 {
+            self.last_key_sequence += 1;
+        }
+    }
+
+    /// Records why a word that was to be converted is left alone.
+    fn log_word_left(&self, reason: &'static str) {
+        if self.privacy_reason.is_some() {
+            self.log_word_reset(reason);
+        } else {
+            self.diagnostic("word_left", format!("reason={reason}"));
         }
     }
 
@@ -9489,11 +10234,16 @@ impl InputProcessor {
         typed_layout: Option<usize>,
         now: Instant,
     ) {
-        let word = if self.replay_keys.is_empty() {
+        let keys = if self.pause_keys.is_empty() {
+            &self.replay_keys
+        } else {
+            &self.pause_keys
+        };
+        let word = if keys.is_empty() {
             self.last_boundary.clone()
         } else {
             typed_layout.map(|layout| LastBoundary {
-                replay_keys: self.replay_keys.clone(),
+                replay_keys: keys.clone(),
                 delimiter: None,
                 foreground: ForegroundContext { layout, ..target },
                 epoch: self.last_input_epoch,
@@ -9536,6 +10286,7 @@ impl InputProcessor {
             || self.transpose_cycle.is_some()
             || self.last_boundary.is_some()
             || !self.replay_keys.is_empty()
+            || !self.pause_keys.is_empty()
         {
             return None;
         }
@@ -9575,6 +10326,11 @@ impl InputProcessor {
         &self,
         event: RawKeyEvent,
     ) -> Option<(Vec<ReplayKey>, Option<char>, usize)> {
+        // A manual layout switch moves the token to `last_boundary`, so these keys were typed in
+        // the layout the field has now.
+        if !self.pause_keys.is_empty() {
+            return Some((self.pause_keys.clone(), None, event.foreground.layout));
+        }
         if !self.replay_keys.is_empty() {
             return Some((self.replay_keys.clone(), None, event.foreground.layout));
         }
@@ -9610,7 +10366,7 @@ impl InputProcessor {
         {
             self.diagnostic("hotkey", "result=ignored reason=stale-word".to_owned());
             self.invalidate_conversion_state();
-            self.suppress_session();
+            self.suppress_session("stale-word");
             return;
         }
         // A press while a manual cycle is active advances it to the next layout.
@@ -9881,27 +10637,11 @@ impl InputProcessor {
         reason: Option<PrivacyBlockReason>,
         foreground: ForegroundContext,
     ) -> bool {
-        let terminal = self.process_reason.is_none()
-            && self.last_process_id == Some(foreground.process_id)
-            && self.text_edit_backend == TextEditBackend::PhysicalReplay
-            && self
-                .process_facts(foreground.process_id)
-                .0
-                .is_some_and(|path| {
-                    matches!(
-                        path.rsplit(['/', '\\'])
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_lowercase()
-                            .as_str(),
-                        "windowsterminal.exe" | "openconsole.exe" | "conhost.exe"
-                    )
-                });
-        autokeyboardlayot::privacy::manual_conversion_allowed(
-            reason,
-            self.settings.manual_terminal_uia_fallback,
-            terminal,
-        )
+        // The owner's decision (2026-10-25): a field that cannot be inspected allows Pause in any
+        // program whose process passed its own checks, not only in terminals.
+        let verified_process =
+            self.process_reason.is_none() && self.last_process_id == Some(foreground.process_id);
+        autokeyboardlayot::privacy::manual_conversion_allowed(reason, verified_process)
     }
 
     /// Records each replacement of a stuck privacy provider once.
@@ -10180,10 +10920,27 @@ impl InputProcessor {
         reason: Option<PrivacyBlockReason>,
         manual_exception: bool,
     ) {
+        let allowed_before = self.privacy_reason.is_none();
         self.privacy_reason = reason;
         self.metrics
             .privacy_reason
             .store(privacy_reason_code(reason), Ordering::Release);
+        if allowed_before && inspection_failed(reason) {
+            // Not about typing, and once a change: while a field check does not pass, nothing
+            // else in the log explains why words are left alone.
+            self.diagnostic("privacy_state", format!("reason={reason:?}"));
+        }
+        // A desktop test typing into fields that are not private asks for positive findings
+        // too: a word lost there can then be told from one in a field wrongly found private.
+        // The agent itself writes nothing about them.
+        #[cfg(test)]
+        if allowed_before
+            && reason.is_some()
+            && !inspection_failed(reason)
+            && self.log_positive_privacy
+        {
+            self.diagnostic("privacy_state", format!("reason={reason:?} test_only=true"));
+        }
         if reason.is_some() {
             if manual_exception && reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) {
                 self.manual_only_word = true;
@@ -10194,12 +10951,13 @@ impl InputProcessor {
             } else {
                 self.last_word_reset = "privacy";
                 self.invalidate_conversion_state();
-                self.suppress_session();
+                self.suppress_session("privacy");
             }
         }
     }
 
-    fn suppress_session(&mut self) {
+    fn suppress_session(&mut self, reason: &'static str) {
+        self.log_word_discard(reason, WordDiscardDetail::None);
         self.replay_keys.clear();
         self.manual_only_word = false;
         self.manual_only_inspection = false;
@@ -10213,7 +10971,8 @@ impl InputProcessor {
     }
 
     /// Ends the gate of a conversion or an undo. Its held keys are replayed, unless the edit may
-    /// have left the word selected: then they are kept for recovery, as they would type over it.
+    /// have left the word selected: then they are kept for recovery, as they would type over it
+    /// (an Enter among them goes back after the word is unselected).
     fn end_conversion_gate(&mut self, token: u64) {
         if self.held_keys_kept_for.take() == Some(token) {
             self.request_gate_retention(token);
@@ -10229,6 +10988,7 @@ impl InputProcessor {
         if boundary_sequence != pending.space_down_sequence
             && boundary_sequence != pending.space_down_sequence.wrapping_add(1)
         {
+            self.log_word_left("stale-boundary");
             return;
         }
         let privacy_blocks = if pending.forced {
@@ -10236,11 +10996,19 @@ impl InputProcessor {
         } else {
             self.privacy_reason.is_some()
         };
-        if (!pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire))
-            || privacy_blocks
-            || !self.pending_profiles_match(&pending)
-            || !self.pre_forward_guard_is_current(pending.foreground, boundary_sequence)
-        {
+        let refused = if !pending.forced && !self.metrics.auto_enabled.load(Ordering::Acquire) {
+            Some("automatic-off")
+        } else if privacy_blocks {
+            Some("privacy")
+        } else if !self.pending_profiles_match(&pending) {
+            Some("profiles")
+        } else if !self.pre_forward_guard_is_current(pending.foreground, boundary_sequence) {
+            Some("guard")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.log_word_left(reason);
             return;
         }
         let source_settle = self.wait_for_source_input_settle(
@@ -10252,13 +11020,18 @@ impl InputProcessor {
         self.diagnostic(
             "source_settle",
             format!(
-                "sequence={boundary_sequence} result={source_settle:?} route={:?} forced={}",
-                self.text_edit_backend, pending.forced
+                "sequence={boundary_sequence} result={source_settle:?} route={:?} forced={} report={}",
+                self.text_edit_backend,
+                pending.forced,
+                format_text_barrier_report(self.privacy_guard.last_barrier_report())
             ),
         );
         match source_settle {
             ReplayAttempt::Applied => {}
-            ReplayAttempt::Cancelled => return,
+            ReplayAttempt::Cancelled => {
+                self.log_word_left("source-settle");
+                return;
+            }
             ReplayAttempt::Failed | ReplayAttempt::LayoutSwitchFailed => {
                 self.record_conversion_failure(ConversionFailureReason::SourceBarrier);
                 return;
@@ -10280,9 +11053,11 @@ impl InputProcessor {
             return;
         };
         if !self.edit_guard_is_current(pending.foreground, boundary_sequence) {
+            self.log_word_left("guard");
             return;
         }
         if self.text_edit_backend == TextEditBackend::ObserveOnly {
+            self.log_word_left("observe-only");
             return;
         }
         // From here an edit can submit input or fail partially. Retained text
@@ -10373,12 +11148,14 @@ impl InputProcessor {
                         self.metrics
                             .backend_status
                             .store(BACKEND_CAPABILITY_MISMATCH, Ordering::Release);
+                        self.log_word_left("capability-mismatch");
                         return;
                     }
                     CapabilityDecision::Unsupported => {
                         self.metrics
                             .backend_status
                             .store(BACKEND_CAPABILITY_UNSUPPORTED, Ordering::Release);
+                        self.log_word_left("capability-unsupported");
                         return;
                     }
                     CapabilityDecision::PhysicalReplay => {
@@ -10416,8 +11193,12 @@ impl InputProcessor {
             && let Some(last) = self.recent_languages.last_mut()
             && *last == pending.transaction.source_language
         {
-            *last = pending.transaction.target_language;
+            *last = pending.transaction.word_language;
         }
+        self.field_layouts.note(
+            foreground_identity_key(pending.foreground),
+            pending.transaction.target_language,
+        );
         self.commit_confirmed_layout(target_layout.0 as usize);
         self.session.clear();
         self.renew_recent_privacy_ok(pending.foreground);
@@ -10434,6 +11215,9 @@ impl InputProcessor {
             });
         }
         if pending.forced {
+            // The field shows the converted token now; the cycle goes on from its own keys, and
+            // keys typed next start a new token.
+            self.pause_keys.clear();
             self.transpose_cycle = Some(TransposeCycle {
                 replay_keys: pending.replay_keys.clone(),
                 delimiter: pending.transaction.delimiter,
@@ -10581,37 +11365,40 @@ impl InputProcessor {
             return ReplayAttempt::Cancelled;
         }
 
-        let settle_ms = if self.text_edit_backend.requires_text_barrier() {
-            NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
-        } else {
-            INPUT_SETTLE_AFTER_FORWARD_MS
+        let stop = || {
+            (!self.edit_guard_is_current(foreground, input_sequence)
+                || self
+                    .current_foreground()
+                    .is_none_or(|current| current.layout != source_layout))
+            .then_some(ReplayAttempt::Cancelled)
         };
-        let settle_deadline = Instant::now() + Duration::from_millis(settle_ms);
-        while Instant::now() < settle_deadline {
-            if !self.edit_guard_is_current(foreground, input_sequence) {
-                return ReplayAttempt::Cancelled;
+        if self.text_edit_backend.requires_text_barrier() {
+            // A single read that takes too long must not cost the word: a field that does not
+            // answer is busy, not showing something else, and the edit can spare a little.
+            let poll_end = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+            let late_until = PasteBudget {
+                deadline: self.edit_deadline.get(),
             }
-            if self
-                .current_foreground()
-                .is_none_or(|current| current.layout != source_layout)
-            {
-                return ReplayAttempt::Cancelled;
-            }
-            if self.text_edit_backend.requires_text_barrier()
-                && matches!(
-                    self.settle_text_status(foreground.process_id, expected_text, settle_deadline),
-                    TextBarrierStatus::Match
+            .commit_late_until(poll_end, Duration::from_millis(PASTE_AFTER_SETTLE_MS));
+            return match poll_text_commit(poll_end, late_until, stop, |_| {
+                self.settle_read(
+                    foreground.process_id,
+                    expected_text,
+                    late_until.max(poll_end),
                 )
-            {
-                return ReplayAttempt::Applied;
+            }) {
+                ReplayAttempt::Failed => ReplayAttempt::Cancelled,
+                settled => settled,
+            };
+        }
+        let settle_deadline = Instant::now() + Duration::from_millis(INPUT_SETTLE_AFTER_FORWARD_MS);
+        while Instant::now() < settle_deadline {
+            if let Some(stopped) = stop() {
+                return stopped;
             }
             thread::sleep(Duration::from_millis(2));
         }
-        if self.text_edit_backend.requires_text_barrier() {
-            ReplayAttempt::Cancelled
-        } else {
-            ReplayAttempt::Applied
-        }
+        ReplayAttempt::Applied
     }
 
     /// Waits until `deadline` for the field to show a paste's `expected_text`
@@ -10653,19 +11440,30 @@ impl InputProcessor {
         expected_layout: usize,
         expected_text: &str,
     ) -> TextBarrierStatus {
-        let deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        let mut deadline = Instant::now() + Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        // A field that does not answer gets what the edit can spare, as in the source settle.
+        let late_until = PasteBudget {
+            deadline: self.edit_deadline.get(),
+        }
+        .commit_late_until(deadline, Duration::from_millis(PASTE_AFTER_SETTLE_MS));
         let mut saw_mismatch = false;
         while Instant::now() < deadline {
             if !self.edit_guard_is_current(foreground, input_sequence)
-                || current_foreground_context()
+                || self
+                    .current_foreground()
                     .is_none_or(|current| current.layout != expected_layout)
             {
                 return TextBarrierStatus::Mismatch;
             }
-            match self.barrier_text_status(foreground.process_id, expected_text, deadline) {
+            let until = late_until.max(deadline);
+            let (status, answered) = self.commit_read(foreground.process_id, expected_text, until);
+            match status {
                 TextBarrierStatus::Match => return TextBarrierStatus::Match,
                 TextBarrierStatus::Mismatch => saw_mismatch = true,
                 TextBarrierStatus::Unavailable => {}
+            }
+            if !answered {
+                deadline = deadline.max(late_until);
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -10824,7 +11622,7 @@ impl InputProcessor {
         // The applied conversion made the word count as the target language for the following
         // words (finish_applied_conversion); undone, it counts as typed again.
         if let Some(last) = self.recent_languages.last_mut()
-            && *last == record.transaction.target_language
+            && *last == record.transaction.word_language
         {
             *last = record.transaction.source_language;
         }
@@ -10979,6 +11777,7 @@ impl InputProcessor {
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=text_commit result={paste_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
+        let mut clipboard_restored = true;
         if clipboard_after_paste(paste_commit) == ClipboardAfterPaste::Defer {
             clipboard.defer();
             self.diagnostic(
@@ -10987,21 +11786,43 @@ impl InputProcessor {
             );
             // The paste may not have replaced the selected word: do not leave our selection
             // behind, unless the user has already moved on.
-            return self.abandon_selection(
-                foreground,
-                input_sequence,
-                TextEditAttempt::Failed(ConversionFailureReason::TextCommit),
+            let failed = TextEditAttempt::Failed(ConversionFailureReason::TextCommit);
+            let outcome = self.abandon_selection(foreground, input_sequence, failed);
+            // A field busy past the check answered the cleanup, so it can answer this too: the
+            // replacement in the field is proof that the paste went through. Its target's read
+            // puts the clipboard back as for any deferred paste.
+            let now = Instant::now();
+            let once = now + Duration::from_millis(PASTE_UIA_MARGIN_MS);
+            let late = (outcome == failed).then(|| {
+                self.paste_commit(
+                    foreground,
+                    input_sequence,
+                    source_layout,
+                    replacement,
+                    (once, once),
+                )
+            });
+            self.diagnostic(
+                "paste",
+                format!(
+                    "sequence={input_sequence} phase=late_commit result={late:?} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                ),
             );
-        }
-        let owned_before_restore = clipboard.is_current();
-        let clipboard_restored = clipboard.restore_waiting(budget.wait_within(
-            Instant::now(),
-            Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS),
-            Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS),
-        ));
-        self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
-        if !clipboard_restored && !clipboard.restore_pending() {
-            self.count_clipboard_not_restored();
+            if late != Some(ReplayAttempt::Applied) {
+                return outcome;
+            }
+        } else {
+            let owned_before_restore = clipboard.is_current();
+            clipboard_restored = clipboard.restore_waiting(budget.wait_within(
+                Instant::now(),
+                Duration::from_millis(CLIPBOARD_RESTORE_WAIT_MS),
+                Duration::from_millis(PASTE_AFTER_LATE_COMMIT_MS),
+            ));
+            self.diagnostic("paste", format!("sequence={input_sequence} phase=clipboard_restore result={clipboard_restored} owned_before={owned_before_restore} elapsed_ms={}", started.elapsed().as_millis()));
+            if !clipboard_restored && !clipboard.restore_pending() {
+                self.count_clipboard_not_restored();
+            }
         }
         let switched = self.paste_switch_layout(foreground, target_layout, input_sequence);
         self.diagnostic(
@@ -11021,12 +11842,7 @@ impl InputProcessor {
         }
         let now = Instant::now();
         let margin = Duration::from_millis(PASTE_UIA_MARGIN_MS);
-        let poll_end = now
-            + budget.wait_within(
-                now,
-                Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
-                margin,
-            );
+        let poll_end = now + budget.target_commit_poll(now);
         let target_commit = self.paste_commit(
             foreground,
             input_sequence,
@@ -11036,8 +11852,11 @@ impl InputProcessor {
         );
         self.diagnostic("paste", format!("sequence={input_sequence} phase=target_commit result={target_commit:?} elapsed_ms={} report={}",
             started.elapsed().as_millis(), format_text_barrier_report(self.privacy_guard.last_barrier_report())));
+        // The field showed the replacement already: when it does not answer now, it is busy, and
+        // that contradicts nothing. Only a field that shows something else makes this a failure.
+        let silent = target_commit == ReplayAttempt::Failed && !self.paste_commit_answered();
         protected_paste_outcome(
-            matches!(target_commit, ReplayAttempt::Applied),
+            target_commit == ReplayAttempt::Applied || silent,
             clipboard_restored,
         )
     }
@@ -11166,7 +11985,8 @@ impl InputProcessor {
             TextEditAttempt::SelectionLeft => {
                 // The field may still show the word selected: the keys the gate holds would type
                 // over it, so they are kept for recovery instead of being replayed, and come back
-                // only when the user asks for them.
+                // only when the user asks for them, or after the word is unselected when an Enter
+                // is among them.
                 self.held_keys_kept_for = Some(sequence);
                 self.metrics
                     .selection_left_token
@@ -11500,7 +12320,9 @@ impl InputProcessor {
     }
 
     fn invalidate_conversion_state(&mut self) {
-        self.pending_conversion = None;
+        if self.pending_conversion.take().is_some() {
+            self.log_word_left("given-up");
+        }
         self.deferred_drained_conversion = None;
         self.last_boundary = None;
         self.transpose_cycle = None;
@@ -11521,7 +12343,7 @@ impl InputProcessor {
             format!("result=failed reason={reason} manual=true edit=none automatic=kept"),
         );
         self.invalidate_conversion_state();
-        self.suppress_session();
+        self.suppress_session("manual-failure");
         self.layout_switch_in_flight = None;
     }
 
@@ -11534,7 +12356,7 @@ impl InputProcessor {
         // What the failed edit left in the document is uncertain, so the recent
         // words no longer describe it.
         self.recent_languages.clear();
-        self.suppress_session();
+        self.suppress_session("failed-edit");
         self.layout_switch_in_flight = None;
         if !self.metrics.auto_enabled.swap(false, Ordering::AcqRel) {
             return;
@@ -11940,6 +12762,79 @@ const fn should_arm_space_decision_gate(
         && shortcut_modifiers_released
 }
 
+/// What the hook knows about a key when it decides on a Space gate.
+#[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct SpaceGateFacts {
+    drained: bool,
+    key_down: bool,
+    virtual_key: u16,
+    auto_enabled: bool,
+    privacy_reason: u8,
+    gate_active: bool,
+    shortcut_modifiers_released: bool,
+    retained_input: bool,
+    configuration_pending: bool,
+}
+
+/// Why a typed Space gets no gate, as a category, so that a word it leaves unconverted is
+/// explained in the log. None for any other key and when a gate is armed. Only a field the
+/// privacy check let through says anything: the hook cannot tell a field that could not be
+/// checked from one still being checked, which may be a password field, and nothing about
+/// typing there is written. The worker explains words lost in a field that could not be checked.
+const fn space_gate_refusal(facts: SpaceGateFacts) -> Option<&'static str> {
+    if facts.drained || !facts.key_down || facts.virtual_key != VK_SPACE.0 {
+        return None;
+    }
+    if facts.privacy_reason != PRIVACY_ALLOWED {
+        return None;
+    }
+    Some(if facts.configuration_pending {
+        "configuration"
+    } else if facts.retained_input {
+        "retained-input"
+    } else if facts.gate_active {
+        "gate-active"
+    } else if !facts.shortcut_modifiers_released {
+        "modifiers"
+    } else if !facts.auto_enabled {
+        "automatic-off"
+    } else {
+        return None;
+    })
+}
+
+/// With `convert_on_enter`, a plain Enter (no Ctrl, Alt, Windows key or Shift) arms the gate as
+/// the Space does, and the gate holds the Enter itself, so the word before it can be converted
+/// before the Enter reaches the program. Shift+Enter is left alone: Shift, held by the gate,
+/// would turn the edit's letters into capitals and its paste into Ctrl+Shift+V.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+const fn should_arm_enter_decision_gate(
+    drained: bool,
+    key_down: bool,
+    virtual_key: u16,
+    convert_on_enter: bool,
+    auto_enabled: bool,
+    privacy_reason: u8,
+    gate_active: bool,
+    shortcut_modifiers_released: bool,
+    shift_released: bool,
+) -> bool {
+    !drained
+        && key_down
+        && virtual_key == VK_RETURN.0
+        && convert_on_enter
+        && auto_enabled
+        && privacy_reason == PRIVACY_ALLOWED
+        && !gate_active
+        && shortcut_modifiers_released
+        && shift_released
+}
+
+fn shift_released() -> bool {
+    unsafe { GetAsyncKeyState(i32::from(VK_SHIFT.0)) as u16 & 0x8000 == 0 }
+}
+
 /// The deadline of a gate handed over to a conversion: `answer` is what the gate had left when
 /// the UI thread was asked at `asked_at` (0: it cannot be handed over). An answer short of
 /// `required_ms` refuses it as well.
@@ -12254,7 +13149,7 @@ fn conversion_gate_budget_ms(
 /// The time an automatic protected paste needs from the gate: its settle (and a capability
 /// probe's text barrier), one confirmed selection, the least installation of the replacement and
 /// everything after the Ctrl+V. The paste shortens its own waits to what the gate has left and
-/// never sends the Ctrl+V without `PASTE_AFTER_SUBMIT_MS` in hand (`PasteBudget`).
+/// never sends the Ctrl+V without `PASTE_AFTER_SUBMIT_LEAST_MS` in hand (`PasteBudget`).
 const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
     let settle = if capability_probe {
         INPUT_SETTLE_AFTER_FORWARD_MS + NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
@@ -12268,7 +13163,7 @@ const fn paste_gate_budget_ms(capability_probe: bool) -> u64 {
 /// keyboard layout, as tests script them.
 #[cfg(test)]
 trait PasteSeam {
-    fn settle(&mut self) -> TextBarrierStatus;
+    fn settle(&mut self) -> (TextBarrierStatus, bool);
     fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>);
     fn begin<'a>(
         &mut self,
@@ -12279,6 +13174,8 @@ trait PasteSeam {
     ) -> core::result::Result<ProtectedClipboard<'a>, ClipboardBeginFailure>;
     fn submit(&mut self, requested: usize) -> usize;
     fn commit(&mut self) -> ReplayAttempt;
+    /// Whether the field answered the last commit check, whatever it showed.
+    fn commit_answered(&mut self) -> bool;
     fn switch_layout(&mut self) -> ReplayAttempt;
     fn collapse(&mut self) -> SelectionCleanup;
 }
@@ -12300,7 +13197,7 @@ impl PasteBudget {
     /// everything after the Ctrl+V still fit. Pause's second attempt is asked again.
     fn allows_selection(self, now: Instant, patience: PastePatience) -> bool {
         let needed = patience.confirm_timeout()
-            + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS);
+            + Duration::from_millis(PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_LEAST_MS);
         self.remaining(now)
             .is_none_or(|remaining| remaining >= needed)
     }
@@ -12313,14 +13210,14 @@ impl PasteBudget {
         let Some(remaining) = self.remaining(now) else {
             return Some(limit);
         };
-        let left = remaining.checked_sub(Duration::from_millis(PASTE_AFTER_SUBMIT_MS))?;
+        let left = remaining.checked_sub(Duration::from_millis(PASTE_AFTER_SUBMIT_LEAST_MS))?;
         (left >= Duration::from_millis(PASTE_MIN_INSTALL_MS)).then_some(left.min(limit))
     }
 
     /// Whether the Ctrl+V may be sent: everything after it fits before the gate lets the keys go.
     fn allows_submit(self, now: Instant) -> bool {
         self.remaining(now)
-            .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_MS))
+            .is_none_or(|remaining| remaining >= Duration::from_millis(PASTE_AFTER_SUBMIT_LEAST_MS))
     }
 
     /// How long a step may wait: `limit`, shortened so that `reserve`, what the steps after it
@@ -12329,6 +13226,17 @@ impl PasteBudget {
         self.remaining(now).map_or(limit, |remaining| {
             remaining.saturating_sub(reserve).min(limit)
         })
+    }
+
+    /// How long the second commit check polls: what the gate has left past the margin, but never
+    /// less than its least, as a check that does not run would count a paste made as a failure.
+    fn target_commit_poll(self, now: Instant) -> Duration {
+        self.wait_within(
+            now,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+            Duration::from_millis(PASTE_UIA_MARGIN_MS),
+        )
+        .max(Duration::from_millis(PASTE_TARGET_COMMIT_MIN_MS))
     }
 
     /// Until when a commit check whose poll ends at `poll_end` waits for the field's late answer:
@@ -12416,6 +13324,20 @@ fn build_held_replay_inputs(held: &[RawKeyEvent], fence_marker: usize) -> Option
     Some(inputs)
 }
 
+/// A Right arrow: it takes a selection away, to its end, and deletes nothing. The agent's own, so
+/// that the hooks do not see it.
+fn selection_release_inputs() -> [INPUT; 2] {
+    const RIGHT_ARROW_SCAN_CODE: u16 = 0x4d;
+    [Default::default(), KEYEVENTF_KEYUP].map(|flags| {
+        keyboard_input_with_marker(
+            VK_RIGHT,
+            RIGHT_ARROW_SCAN_CODE,
+            flags | KEYEVENTF_EXTENDEDKEY,
+            INJECTED_EVENT_MARKER,
+        )
+    })
+}
+
 fn build_recovery_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
     if held.is_empty() || held.len() > CORRECTION_GATE_CAPACITY * 2 + 1 {
         return None;
@@ -12445,6 +13367,11 @@ fn build_balanced_replay_inputs(held: &[RawKeyEvent]) -> Option<Vec<INPUT>> {
 }
 
 /// Whether a virtual key is a keypad digit or the keypad decimal key.
+/// A key of the numeric keypad: a digit, its decimal key or an operator.
+fn is_keypad_key(virtual_key: u32) -> bool {
+    (u32::from(VK_NUMPAD0.0)..=u32::from(VK_DIVIDE.0)).contains(&virtual_key)
+}
+
 fn is_keypad_digit_key(virtual_key: u32) -> bool {
     u16::try_from(virtual_key)
         .is_ok_and(|key| (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&key) || key == VK_DECIMAL.0)
@@ -12471,7 +13398,9 @@ fn build_raw_replay_inputs(held: &[RawKeyEvent], marker: usize) -> Option<Vec<IN
         } else {
             KEYEVENTF_SCANCODE
         };
-        if event.extended {
+        // The hook reports Right Shift as extended, yet its scan code has no E0 prefix: with one
+        // the key-up would release nothing, and Shift would stay down for the whole system.
+        if event.extended && event.virtual_key != u32::from(VK_RSHIFT.0) {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
         if matches!(event.message, WM_KEYUP | WM_SYSKEYUP) {
@@ -14240,8 +15169,10 @@ mod tests {
             pending_key_releases: Vec::new(),
             pending_held_replay: Vec::new(),
             pending_hand_back: None,
+            pending_selection_release: false,
             announced_clipboard_failures: 0,
             typed_input: 0,
+            last_gate_refusal: None,
         };
         (state, receiver)
     }
@@ -14676,8 +15607,8 @@ mod tests {
         let budget = PasteBudget {
             deadline: Some(armed + Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS)),
         };
-        // The settle step took 38 ms and the barrier matched at 165 ms: the selection starts.
-        let selecting = armed + Duration::from_millis(203);
+        // A slow field: the settle step and the barrier took 450 ms: the selection starts.
+        let selecting = armed + Duration::from_millis(450);
         assert!(budget.allows_selection(selecting, PastePatience::Manual));
         // The field did not show it; a second attempt would no longer leave the rest its time.
         let not_shown = SelectionAttempt {
@@ -15250,6 +16181,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
@@ -15374,17 +16306,28 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
         metrics.recovery_armed.store(true, Ordering::Release);
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime - Duration::from_millis(1));
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime - Duration::from_millis(1),
+            Some(test_foreground()),
+            true,
+        );
         assert!(has_retained_input(&metrics), "kept for its whole lifetime");
         assert!(metrics.recovery_armed.load(Ordering::Acquire));
         assert!(receiver.try_recv().is_err());
-        expire_retained_input(HWND::default(), start + lifetime);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
         assert!(!has_retained_input(&metrics));
         assert!(!metrics.recovery_armed.load(Ordering::Acquire));
         // The worker is told, so that automatic conversion can resume, and Exit is no longer
@@ -15397,7 +16340,12 @@ mod tests {
         assert!(state.decline_reasons().is_empty());
         // Nothing is deleted or reported twice.
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime * 2);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime * 2,
+            Some(test_foreground()),
+            true,
+        );
         assert!(receiver.try_recv().is_err());
         drop(take_app_state());
     }
@@ -15415,6 +16363,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
@@ -17358,8 +18307,17 @@ mod tests {
     /// with the test keyboard and automatic conversion on.
     fn processor_typing_in(layout: usize) -> (InputProcessor, ForegroundContext) {
         let metrics = Arc::new(ObserverMetrics::default());
-        metrics.auto_enabled.store(true, Ordering::Release);
         let mut processor = InputProcessor::new(metrics, 0);
+        let foreground = typing_in(&mut processor, layout);
+        (processor, foreground)
+    }
+
+    /// Makes `processor` type as `processor_typing_in` says.
+    fn typing_in(processor: &mut InputProcessor, layout: usize) -> ForegroundContext {
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
         let foreground = ForegroundContext {
             layout,
             ..test_foreground()
@@ -17372,7 +18330,7 @@ mod tests {
         processor.current_integrity_level = Some(0x2000);
         processor.privacy_probe = Some(answering_probe(None));
         processor.privacy_needs_check = true;
-        (processor, foreground)
+        foreground
     }
 
     /// Types the keys with these scan codes.
@@ -17425,6 +18383,722 @@ mod tests {
         assert_eq!(pending.transaction.original, ",skj");
         assert_eq!(pending.transaction.replacement, "было");
         assert_eq!(pending.transaction.target_language, Language::Russian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_two_layouts_read_alike_is_converted() {
+        // "just" typed in the Russian layout: English and Estonian read the same known letters.
+        let (mut processor, foreground) = processor_typing_in(0x0419);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x24, 0x16, 0x1f, 0x14]);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "огые");
+        assert_eq!(pending.transaction.replacement, "just");
+        assert_eq!(pending.transaction.target_language, Language::English);
+    }
+
+    /// The same field after the user switched it to `layout` by hand. The word typed next is
+    /// converted, as with the setting that keeps a word after a manual switch off.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn in_layout(
+        processor: &mut InputProcessor,
+        foreground: ForegroundContext,
+        layout: usize,
+    ) -> ForegroundContext {
+        let foreground = ForegroundContext {
+            layout,
+            ..foreground
+        };
+        processor.settings.suppress_after_manual_layout_change = false;
+        processor.foreground_override = Some(foreground);
+        foreground
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    const KINDEL: [u32; 6] = [0x25, 0x17, 0x31, 0x20, 0x12, 0x26];
+    #[cfg(feature = "legacy-bundled-input")]
+    const THE: [u32; 3] = [0x14, 0x23, 0x12];
+    #[cfg(feature = "legacy-bundled-input")]
+    const JUST: [u32; 4] = [0x24, 0x16, 0x1f, 0x14];
+
+    /// Set by desktop tests whose fields are not private: see `set_privacy_reason_with_manual_exception`.
+    pub(super) static LOG_POSITIVE_PRIVACY: AtomicBool = AtomicBool::new(false);
+
+    fn space_facts() -> SpaceGateFacts {
+        SpaceGateFacts {
+            drained: false,
+            key_down: true,
+            virtual_key: VK_SPACE.0,
+            auto_enabled: true,
+            privacy_reason: PRIVACY_ALLOWED,
+            gate_active: false,
+            shortcut_modifiers_released: true,
+            retained_input: false,
+            configuration_pending: false,
+        }
+    }
+
+    #[test]
+    fn a_space_without_a_gate_says_why() {
+        let base = space_facts();
+        assert_eq!(space_gate_refusal(base), None, "a gate is armed");
+        for (facts, reason) in [
+            (
+                SpaceGateFacts {
+                    configuration_pending: true,
+                    ..base
+                },
+                "configuration",
+            ),
+            (
+                SpaceGateFacts {
+                    retained_input: true,
+                    ..base
+                },
+                "retained-input",
+            ),
+            (
+                SpaceGateFacts {
+                    gate_active: true,
+                    ..base
+                },
+                "gate-active",
+            ),
+            (
+                SpaceGateFacts {
+                    shortcut_modifiers_released: false,
+                    ..base
+                },
+                "modifiers",
+            ),
+            (
+                SpaceGateFacts {
+                    auto_enabled: false,
+                    ..base
+                },
+                "automatic-off",
+            ),
+        ] {
+            assert_eq!(space_gate_refusal(facts), Some(reason));
+        }
+    }
+
+    #[test]
+    fn only_a_typed_space_outside_a_private_field_is_explained() {
+        let base = SpaceGateFacts {
+            configuration_pending: true,
+            ..space_facts()
+        };
+        for facts in [
+            SpaceGateFacts {
+                drained: true,
+                ..base
+            },
+            SpaceGateFacts {
+                key_down: false,
+                ..base
+            },
+            SpaceGateFacts {
+                virtual_key: VK_RETURN.0,
+                ..base
+            },
+            // A field still being checked, or checked for another process, may be a password
+            // field: the hook cannot tell it from one that could not be checked.
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_UNAVAILABLE,
+                ..base
+            },
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_PASSWORD,
+                ..base
+            },
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_EXCLUDED,
+                ..base
+            },
+            SpaceGateFacts {
+                privacy_reason: PRIVACY_ELEVATED,
+                ..base
+            },
+        ] {
+            assert_eq!(space_gate_refusal(facts), None);
+        }
+    }
+
+    #[test]
+    fn the_hook_logs_a_reason_for_a_space_without_a_gate_once() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let (sender, diagnostics) = sync_channel(16);
+        state.diagnostic_sender = Some(sender);
+        state
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        state
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        let Some(foreground) = current_foreground_context() else {
+            return;
+        };
+        state
+            .metrics
+            .privacy_process_id
+            .store(foreground.process_id, Ordering::Release);
+        state
+            .metrics
+            .privacy_reason
+            .store(PRIVACY_ALLOWED, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        let space = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_SPACE.0),
+            scanCode: 0x39,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let _ = unsafe {
+                keyboard_hook_body(
+                    0,
+                    WPARAM(WM_KEYDOWN as usize),
+                    LPARAM(core::ptr::from_ref(&space) as isize),
+                )
+            };
+        }
+        drop(take_app_state());
+        let lines: Vec<String> = diagnostics.try_iter().collect();
+        let refusals = lines
+            .iter()
+            .filter(|line| {
+                line.contains("phase=not_armed") && line.contains("reason=configuration")
+            })
+            .count();
+        assert_eq!(refusals, 1, "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_whose_keys_never_reached_the_worker_is_explained() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        let queued = |event| QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        };
+        processor.process_event(queued(space_key(foreground, 1, 0)));
+        // Events 2 to 13 were counted by the hook and never queued.
+        processor.process_event(queued(space_key(foreground, 14, 0)));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "gap=true"), "{lines:?}");
+        assert!(logged(&lines, "word_lost", "keys=none"), "{lines:?}");
+        // One missing event is a gap too.
+        processor.process_event(queued(space_key(foreground, 16, 0)));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "gap=true"), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_late_key_up_with_an_older_number_leaves_no_gap() {
+        // Key-ups of keys pressed before a gate are delivered after it with their own numbers.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        let queued = |event| QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        };
+        processor.process_event(queued(space_key(foreground, 10, 0)));
+        processor.process_event(queued(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYUP, VIRTUAL_KEY(0x4B), 5, 0)
+        }));
+        processor.process_event(queued(space_key(foreground, 11, 0)));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_whose_keys_the_field_check_kept_out_is_explained() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(
+            PrivacyBlockReason::InspectionUnavailable,
+        )));
+        type_keys(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 7, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "reset=privacy"), "{lines:?}");
+        assert!(logged(&lines, "word_lost", "keys=seen"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("kindel")));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_suppressed_word_is_written_once() {
+        // After a failed edit the next word is suppressed, and that line explains it.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.suppress_session("failed-edit");
+        type_keys(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 7, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word", "result=suppressed"), "{lines:?}");
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    fn queued_in_epoch(event: RawKeyEvent, epoch: u64) -> QueuedInputEvent {
+        QueuedInputEvent {
+            epoch,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Key(event),
+            configuration: None,
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn keys_dropped_while_the_configuration_loads_are_named() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        for sequence in 2..=5 {
+            processor.process_event(queued_in_epoch(
+                RawKeyEvent {
+                    scan_code: 0x25,
+                    foreground,
+                    ..letter(0x4B, sequence)
+                },
+                0,
+            ));
+        }
+        processor
+            .metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
+        processor.process_event(queued_in_epoch(space_key(foreground, 6, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=configuration missing=4"),
+            "{lines:?}"
+        );
+        // The next lost word starts its own account.
+        processor.process_event(queued_in_epoch(space_key(foreground, 8, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=none missing=1"),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn keys_of_an_older_epoch_are_named() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor.metrics.input_epoch.store(1, Ordering::Release);
+        processor.process_event(queued_in_epoch(
+            RawKeyEvent {
+                scan_code: 0x25,
+                foreground,
+                ..letter(0x4B, 2)
+            },
+            0,
+        ));
+        processor.process_event(queued_in_epoch(space_key(foreground, 3, 0), 1));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=epoch missing=1"),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_dropped_click_names_no_key() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor
+            .metrics
+            .configuration_pending
+            .store(true, Ordering::Release);
+        // The click takes number 2 and is dropped with the keys of a loading configuration.
+        processor.process_event(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        processor
+            .metrics
+            .configuration_pending
+            .store(false, Ordering::Release);
+        processor.process_event(queued_in_epoch(space_key(foreground, 5, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_lost", "dropped=none missing=2"),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_click_before_the_first_key_is_no_gap() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        processor.process_event(queued_in_epoch(space_key(foreground, 10, 0), 0));
+        processor.process_event(queued_in_epoch(space_key(foreground, 11, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_click_between_keys_is_no_gap() {
+        // The mouse hook counts a click as an input event: it is no key the worker missed.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        processor.process_event(QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event: RawInputEvent::Mouse,
+            configuration: None,
+        });
+        processor.process_event(queued_in_epoch(space_key(foreground, 3, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn another_field_starts_its_own_count_of_missing_keys() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_event(queued_in_epoch(space_key(foreground, 1, 0), 0));
+        // Three events of this field never reached the worker before the switch.
+        processor.process_event(queued_in_epoch(
+            RawKeyEvent {
+                scan_code: 0x25,
+                foreground,
+                ..letter(0x4B, 5)
+            },
+            0,
+        ));
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        processor.process_event(queued_in_epoch(
+            RawKeyEvent {
+                scan_code: 0x39,
+                foreground: other,
+                ..letter(0x4B, 6)
+            },
+            0,
+        ));
+        processor.process_event(queued_in_epoch(space_key(other, 8, 0), 0));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_lost", "missing=1"), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_token_of_marks_alone_is_no_lost_word() {
+        // "/" typed between two Spaces, as in a shell command: no letter, so no word.
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.process_key(space_key(foreground, 1, 0));
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x35,
+            foreground,
+            ..letter(0xBF, 2)
+        });
+        processor.process_key(space_key(foreground, 3, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_in_a_password_field_stays_unexplained() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(PrivacyBlockReason::PasswordField)));
+        type_keys(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 7, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn two_spaces_in_a_row_lose_no_word() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        processor.process_key(space_key(foreground, 8, 0));
+        processor.process_key(space_key(foreground, 9, 0));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn an_estonian_word_the_english_layout_types_alike_keeps_the_layout() {
+        // "kindel" has no letter of its own: there is nothing to edit, and the layout stays.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        assert!(processor.pending_conversion.is_none());
+        assert!(processor.layout_switch_in_flight.is_none());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn an_english_word_the_estonian_layout_types_alike_keeps_the_layout() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys_and_drained_space(&mut processor, foreground, &THE);
+        assert!(processor.pending_conversion.is_none());
+        assert!(processor.layout_switch_in_flight.is_none());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_that_needs_a_letter_of_the_other_latin_layout_is_still_converted() {
+        // "k;;k" is "köök" typed with the English layout, right after a word it types alike.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        type_keys_and_drained_space(&mut processor, foreground, &[0x25, 0x27, 0x27, 0x25]);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "k;;k");
+        assert_eq!(pending.transaction.replacement, "köök");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_two_latin_layouts_read_alike_goes_to_the_latin_layout_of_its_field() {
+        // "just" scores best in English, but this field was last typed in with Estonian.
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys(&mut processor, foreground, &THE);
+        let foreground = in_layout(&mut processor, foreground, 0x0419);
+        type_keys_and_drained_space(&mut processor, foreground, &JUST);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.replacement, "just");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_latin_layout_of_one_field_says_nothing_about_another() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys(&mut processor, foreground, &THE);
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            layout: 0x0419,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        type_keys_and_drained_space(&mut processor, other, &JUST);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.target_language, Language::English);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_field_keeps_its_latin_layout_across_a_visit_to_another() {
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        type_keys(&mut processor, foreground, &THE);
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            layout: 0x0409,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        type_keys(&mut processor, other, &THE);
+        let back = in_layout(&mut processor, foreground, 0x0419);
+        type_keys_and_drained_space(&mut processor, back, &JUST);
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_the_layout_types_alike_counts_in_its_language_for_the_next_words() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        type_keys_and_drained_space(&mut processor, foreground, &KINDEL);
+        assert_eq!(processor.recent_languages, [Language::Estonian]);
+        assert_eq!(processor.metrics.candidates.load(Ordering::Relaxed), 0);
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word", "result=same-text"), "{lines:?}");
+        assert!(!lines.iter().any(|line| line.contains("kindel")));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_that_stays_in_the_layout_of_its_field_counts_in_its_own_language() {
+        // "just" reads best in English and goes to Estonian, the layout this field uses.
+        let (mut processor, foreground) = processor_typing_in(0x0425);
+        processor.settings.conversion_sound = false;
+        processor.settings.offer_dictionary_after_forced_conversion = false;
+        type_keys(&mut processor, foreground, &THE);
+        let foreground = in_layout(&mut processor, foreground, 0x0419);
+        type_keys_and_drained_space(&mut processor, foreground, &JUST);
+        assert_eq!(processor.recent_languages, [Language::Russian]);
+        let pending = processor.pending_conversion.take().expect("a conversion");
+        assert_eq!(pending.transaction.target_language, Language::Estonian);
+        assert_eq!(pending.transaction.word_language, Language::English);
+        processor.finish_applied_conversion(
+            pending,
+            5,
+            HKL(0x0425 as *mut c_void),
+            EditStrategy::ProtectedPaste,
+        );
+        assert_eq!(processor.recent_languages, [Language::English]);
+        let field = processor.last_foreground;
+        assert_eq!(processor.field_layouts.of(field)[0], Language::Estonian);
+        let record = processor.undo_record.take().expect("an undo");
+        processor.finish_applied_undo(&record);
+        assert_eq!(processor.recent_languages, [Language::Russian]);
+    }
+
+    #[test]
+    fn a_field_lists_its_layouts_newest_first_without_repeating_them() {
+        let mut layouts = FieldLayouts::default();
+        let field = Some((1, 2, 3));
+        assert_eq!(layouts.of(field), []);
+        layouts.note((1, 2, 3), Language::English);
+        layouts.note((1, 2, 3), Language::Russian);
+        layouts.note((1, 2, 3), Language::Estonian);
+        layouts.note((1, 2, 3), Language::English);
+        assert_eq!(
+            layouts.of(field),
+            [Language::English, Language::Estonian, Language::Russian]
+        );
+        assert_eq!(layouts.of(None), []);
+        assert_eq!(layouts.of(Some((1, 2, 4))), []);
+    }
+
+    #[test]
+    fn the_field_used_longest_ago_is_forgotten_first() {
+        let mut layouts = FieldLayouts::default();
+        for field in 0..REMEMBERED_FIELDS {
+            layouts.note((field, 0, 0), Language::Estonian);
+        }
+        // Used again, the oldest one is no longer the oldest.
+        layouts.note((0, 0, 0), Language::English);
+        layouts.note((REMEMBERED_FIELDS, 0, 0), Language::Russian);
+        assert_eq!(layouts.fields.len(), REMEMBERED_FIELDS);
+        assert_eq!(
+            layouts.of(Some((0, 0, 0))),
+            [Language::English, Language::Estonian]
+        );
+        assert_eq!(layouts.of(Some((1, 0, 0))), []);
+        assert_eq!(
+            layouts.of(Some((REMEMBERED_FIELDS, 0, 0))),
+            [Language::Russian]
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_with_a_trailing_punctuation_key_is_converted_with_it() {
+        // "gjnjv/" is "потом." typed with the English layout: the "/" key prints a full stop in
+        // Russian, so the mark stays with the word and both are converted at the Space.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(
+            &mut processor,
+            foreground,
+            &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35],
+        );
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "gjnjv/");
+        assert_eq!(pending.transaction.replacement, "потом.");
+        assert_eq!(pending.transaction.target_language, Language::Russian);
+        assert_eq!(pending.replay_keys.len(), 6);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_letter_after_a_trailing_punctuation_key_starts_a_new_word() {
+        // "gjnjv/ghbdtn": the letter after the mark ends "gjnjv/" unconverted, as before, and
+        // only "ghbdtn" ("привет") is converted at the Space.
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        type_keys_and_drained_space(
+            &mut processor,
+            foreground,
+            &[
+                0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31,
+            ],
+        );
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "ghbdtn");
+        assert_eq!(pending.transaction.replacement, "привет");
+        assert_eq!(pending.replay_keys.len(), 6);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn erasing_a_trailing_punctuation_key_keeps_the_word() {
+        let (mut processor, foreground) = processor_typing_in(0x0409);
+        // As on the owner's computer: Backspace corrects the word instead of ending it.
+        processor.settings.suppress_after_backspace = false;
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35],
+        );
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 7, 0)
+        });
+        processor.process_key(space_key(foreground, 8, 9));
+        let pending = processor
+            .pending_conversion
+            .as_ref()
+            .expect("the word is converted");
+        assert_eq!(pending.transaction.original, "gjnjv");
+        assert_eq!(pending.transaction.replacement, "потом");
+        assert_eq!(pending.replay_keys.len(), 5);
     }
 
     #[cfg(feature = "legacy-bundled-input")]
@@ -17751,6 +19425,215 @@ mod tests {
             assert_eq!(gate_request_enabled(&metrics, 0), enabled);
         }
         drop(take_app_state());
+    }
+
+    #[test]
+    fn a_plain_enter_arms_the_decision_gate_only_with_conversion_on_enter() {
+        // (drained, key down, key, conversion on Enter, automatic, privacy, gate active,
+        // modifiers released, Shift released)
+        let arms = |drained, down, key, on_enter, automatic, privacy, active, released, shift| {
+            should_arm_enter_decision_gate(
+                drained, down, key, on_enter, automatic, privacy, active, released, shift,
+            )
+        };
+        assert!(arms(
+            false,
+            true,
+            VK_RETURN.0,
+            true,
+            true,
+            PRIVACY_ALLOWED,
+            false,
+            true,
+            true
+        ));
+        for (case, armed) in [
+            (
+                "drained",
+                arms(
+                    true,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "key up",
+                arms(
+                    false,
+                    false,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "space",
+                arms(
+                    false,
+                    true,
+                    VK_SPACE.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "setting off",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    false,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "automatic off",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    false,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "privacy",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_UNAVAILABLE,
+                    false,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "gate active",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    true,
+                    true,
+                    true,
+                ),
+            ),
+            (
+                "Ctrl+Enter",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    false,
+                    true,
+                ),
+            ),
+            (
+                "Shift+Enter",
+                arms(
+                    false,
+                    true,
+                    VK_RETURN.0,
+                    true,
+                    true,
+                    PRIVACY_ALLOWED,
+                    false,
+                    true,
+                    false,
+                ),
+            ),
+        ] {
+            assert!(!armed, "{case}");
+        }
+    }
+
+    #[test]
+    fn the_hook_learns_the_conversion_on_enter_setting() {
+        let metrics = ObserverMetrics::default();
+        let mut settings = Settings::default();
+        store_hotkey_configuration(&metrics, &settings);
+        assert!(!metrics.convert_on_enter.load(Ordering::Acquire));
+        settings.convert_on_enter = true;
+        store_hotkey_configuration(&metrics, &settings);
+        assert!(metrics.convert_on_enter.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_stale_enter_decision_still_lets_its_enter_go() {
+        // An Enter decision queued before a new input epoch is not processed, but the gate it
+        // armed must still let the held Enter go.
+        let metrics = Arc::new(ObserverMetrics::default());
+        metrics.input_epoch.store(2, Ordering::Release);
+        metrics.active_gate_token.store(9, Ordering::Release);
+        let mut processor = InputProcessor::new(Arc::clone(&metrics), 0);
+        processor.process(QueuedInputEvent {
+            configuration: None,
+            captured_at: Instant::now(),
+            epoch: 1,
+            event: RawInputEvent::EnterDecision(test_raw_key(WM_KEYDOWN, VK_RETURN, 9, 0)),
+        });
+        assert_eq!(processor.last_gate_release_token, 9);
+    }
+
+    #[test]
+    fn an_enter_held_for_a_decision_arms_the_gate_with_the_enter_held() {
+        let (mut state, _receiver) = test_gate_state(4);
+        let enter = RawKeyEvent {
+            sequence: 5,
+            ..test_raw_key(WM_KEYDOWN, VK_RETURN, 5, 0)
+        };
+        state.hold_enter_for_decision(enter, enter.foreground);
+        assert!(state.correction_gate.active);
+        assert_eq!(state.correction_gate.token, 5);
+        assert_eq!(state.correction_gate.held.len(), 1);
+        assert_eq!(state.correction_gate.held[0].sequence, 5);
+        assert_eq!(
+            state.correction_gate.held[0].virtual_key,
+            u32::from(VK_RETURN.0)
+        );
+        assert!(
+            state
+                .correction_gate
+                .origin
+                .is_some_and(|origin| same_input_target(origin, enter.foreground))
+        );
+        assert_eq!(state.metrics.active_gate_token.load(Ordering::Acquire), 5);
+        assert_eq!(
+            state.metrics.cancelled_gate_token.load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]
@@ -18620,7 +20503,7 @@ mod tests {
                 |_, _| word.map(str::to_owned),
             ));
         }
-        processor.suppress_session();
+        processor.suppress_session("test");
         let last = test_last_boundary(&processor, 6);
         assert!(!processor.erase_or_resume_word_with(
             Some(last),
@@ -18882,6 +20765,7 @@ mod tests {
                 transaction: ConversionTransaction {
                     source_language: Language::English,
                     target_language: Language::Russian,
+                    word_language: Language::Russian,
                     original: "ghbdtn".to_owned(),
                     replacement: "привет".to_owned(),
                     delimiter: Some(' '),
@@ -20213,12 +22097,18 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
         let state = take_app_state().unwrap();
         assert!(!has_retained_input(&metrics));
         assert_eq!(
@@ -20321,6 +22211,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
@@ -20366,18 +22257,24 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: false,
+            sending: 0,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
-        assert!(!begin_retained_recovery(&metrics, 11));
-        assert!(begin_retained_recovery(&metrics, 10));
+        assert!(begin_retained_recovery(&metrics, 11).is_none());
+        assert!(begin_retained_recovery(&metrics, 10).is_some());
         assert!(
-            !begin_retained_recovery(&metrics, 10),
+            begin_retained_recovery(&metrics, 10).is_none(),
             "one recovery at a time"
         );
         APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
-        expire_retained_input(HWND::default(), start + lifetime);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
         assert!(has_retained_input(&metrics), "not deleted while being sent");
         // An incomplete send keeps the record for another attempt, marked uncertain.
         finish_retained_recovery(&metrics, 10, 1, 2);
@@ -20387,7 +22284,7 @@ mod tests {
             assert!(!input.recovering);
             assert!(input.delivery_uncertain);
         }
-        assert!(begin_retained_recovery(&metrics, 10));
+        assert!(begin_retained_recovery(&metrics, 10).is_some());
         finish_retained_recovery(&metrics, 10, 2, 2);
         assert!(!has_retained_input(&metrics));
         // A worker that died while sending does not keep the keys forever.
@@ -20398,11 +22295,17 @@ mod tests {
             delivery_uncertain: false,
             expires_at: start + lifetime,
             recovering: true,
+            sending: 1,
             retained_at: Instant::now(),
             auto_recover: false,
             input_mark: 0,
         });
-        expire_retained_input(HWND::default(), start + lifetime + RETAINED_RECOVERY_GRACE);
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime + RETAINED_RECOVERY_GRACE,
+            Some(test_foreground()),
+            true,
+        );
         assert!(!has_retained_input(&metrics));
         drop(take_app_state());
     }
@@ -20961,7 +22864,6 @@ mod tests {
             Some(r"C:\Program Files\WindowsApps\Terminal\WindowsTerminal.exe".to_owned()),
             Some(0x2000),
         ));
-        processor.settings.manual_terminal_uia_fallback = true;
         let checks = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&checks);
         // The field does not answer the first check, and passes the next one.
@@ -21149,31 +23051,41 @@ mod tests {
 
     #[test]
     fn the_privacy_check_of_a_key_tells_an_allowed_field_from_a_blocked_one() {
-        for (image, integrity, answer, blocked) in [
-            (EDITOR, Some(0x2000), None, false),
+        // (image, integrity, answer, blocked, manual_only): a field that cannot be inspected
+        // blocks automatic conversion but keeps the word for Pause in any program (the owner's
+        // decision, 2026-10-25).
+        for (image, integrity, answer, blocked, manual_only) in [
+            (EDITOR, Some(0x2000), None, false, false),
             (
                 EDITOR,
                 Some(0x2000),
                 Some(PrivacyBlockReason::PasswordField),
                 true,
+                false,
             ),
             (
                 EDITOR,
                 Some(0x2000),
                 Some(PrivacyBlockReason::FieldInspectionUnavailable),
                 true,
+                true,
             ),
-            (KEEPASS, Some(0x2000), None, true),
+            (KEEPASS, Some(0x2000), None, true, false),
             // An elevated program, and one whose integrity cannot be read.
-            (EDITOR, Some(0x3000), None, true),
-            (EDITOR, None, None, true),
+            (EDITOR, Some(0x3000), None, true, false),
+            (EDITOR, None, None, true, false),
         ] {
             let (mut processor, _receiver) = processor_in_field(image, answer);
             processor.process_override = Some((Some(image.to_owned()), integrity));
             processor.process_key(letter(0x41, 1));
             let case = format!("{image} {integrity:?} {answer:?}");
             assert_eq!(processor.privacy_reason.is_some(), blocked, "{case}");
-            assert_eq!(processor.last_word_reset == "privacy", blocked, "{case}");
+            assert_eq!(
+                processor.last_word_reset == "privacy",
+                blocked && !manual_only,
+                "{case}"
+            );
+            assert_eq!(processor.manual_only_word, manual_only, "{case}");
             // An allowed key goes on to the word (here a key the test layout cannot type).
             assert!(!blocked || processor.session.is_suppressed(), "{case}");
         }
@@ -21389,6 +23301,411 @@ mod tests {
             Some(PrivacyBlockReason::ExcludedProcess)
         );
         assert_eq!(processor.last_word_reset, "privacy");
+    }
+
+    /// What the worker wrote about a word: the lines since the last call.
+    fn new_log_lines(receiver: &Receiver<String>) -> Vec<String> {
+        receiver.try_iter().collect()
+    }
+
+    /// A word typed in the field the worker already follows.
+    fn word_in_progress(processor: &mut InputProcessor) {
+        processor.last_foreground = Some(foreground_identity_key(test_foreground()));
+        processor.last_layout = Some(test_foreground().layout);
+        type_letters(processor, "hel");
+    }
+
+    fn logged(lines: &[String], event: &str, details: &str) -> bool {
+        lines
+            .iter()
+            .any(|line| line.starts_with(&format!("event={event} ")) && line.contains(details))
+    }
+
+    #[test]
+    fn a_privacy_block_is_logged_when_it_changes_and_only_then() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.set_privacy_reason(None);
+        new_log_lines(&receiver);
+        let reason = Some(PrivacyBlockReason::InspectionUnavailable);
+        processor.set_privacy_reason(reason);
+        processor.set_privacy_reason(reason);
+        let lines = new_log_lines(&receiver);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("event=privacy_state "))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(logged(&lines, "privacy_state", "InspectionUnavailable"));
+        // A positive finding is not written, nor the end of a block.
+        processor.set_privacy_reason(None);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        assert!(new_log_lines(&receiver).is_empty());
+    }
+
+    #[test]
+    fn a_desktop_test_hears_of_a_field_found_private() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.log_positive_privacy = true;
+        processor.set_privacy_reason(None);
+        new_log_lines(&receiver);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        let lines = new_log_lines(&receiver);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(logged(
+            &lines,
+            "privacy_state",
+            "PasswordField) test_only=true"
+        ));
+        // A field that cannot be checked is written as it always is, once.
+        processor.set_privacy_reason(None);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::InspectionUnavailable));
+        let lines = new_log_lines(&receiver);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!logged(&lines, "privacy_state", "test_only"));
+    }
+
+    #[test]
+    fn a_refusal_is_logged_again_after_a_gate() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let (sender, diagnostics) = sync_channel(16);
+        state.diagnostic_sender = Some(sender);
+        state
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        state.note_gate_refusal("configuration");
+        state.note_gate_refusal("configuration");
+        state.arm_decision_gate(5, test_foreground());
+        state.note_gate_refusal("configuration");
+        state.note_gate_refusal("modifiers");
+        let refusals: Vec<String> = diagnostics
+            .try_iter()
+            .filter(|line| line.contains("phase=not_armed"))
+            .collect();
+        assert_eq!(refusals.len(), 3, "{refusals:?}");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_first_key_and_a_held_enter_are_no_gap() {
+        let (mut processor, receiver) = processor_with_diagnostics();
+        let foreground = typing_in(&mut processor, 0x0409);
+        let queued = |event| QueuedInputEvent {
+            epoch: 0,
+            captured_at: Instant::now(),
+            event,
+            configuration: None,
+        };
+        // The worker starts after keys the hook counted elsewhere: the first number is no gap.
+        processor.process_event(queued(RawInputEvent::Key(space_key(foreground, 40, 0))));
+        processor.process_event(queued(RawInputEvent::EnterDecision(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_RETURN, 41, 0)
+        })));
+        processor.process_event(queued(RawInputEvent::Key(space_key(foreground, 42, 0))));
+        // Keys another program injected are counted by the hook and never queued.
+        processor.process_event(queued(RawInputEvent::ExternalInjection));
+        processor.process_event(queued(RawInputEvent::Key(space_key(foreground, 50, 0))));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+        // A key typed after a focus change starts the field's word afresh.
+        processor.process_event(queued(RawInputEvent::Key(RawKeyEvent {
+            scan_code: 0x25,
+            foreground,
+            ..letter(0x4B, 51)
+        })));
+        let other = ForegroundContext {
+            focus: foreground.focus + 1,
+            ..foreground
+        };
+        processor.foreground_override = Some(other);
+        processor.process_event(queued(RawInputEvent::Key(space_key(other, 52, 0))));
+        let lines = new_log_lines(&receiver);
+        assert!(!logged(&lines, "word_lost", ""), "{lines:?}");
+    }
+
+    #[test]
+    fn a_word_lost_to_a_positive_finding_leaves_no_line() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.set_privacy_reason(None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        assert!(new_log_lines(&receiver).is_empty());
+    }
+
+    #[test]
+    fn a_word_privacy_takes_away_is_logged_without_its_length() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.set_privacy_reason(None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.set_privacy_reason(Some(PrivacyBlockReason::InspectionUnavailable));
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_reset", "reason=privacy"), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("chars=")),
+            "{lines:?}"
+        );
+        // An empty buffer has nothing to report: no line per key in a password field.
+        processor.set_privacy_reason(Some(PrivacyBlockReason::PasswordField));
+        assert!(
+            !logged(&new_log_lines(&receiver), "word_reset", ""),
+            "nothing was dropped"
+        );
+    }
+
+    #[test]
+    fn a_word_blocked_at_its_boundary_is_logged_without_its_length() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        // The block arrives as a field check at the boundary would set it, with the word kept.
+        processor.privacy_reason = Some(PrivacyBlockReason::InspectionUnavailable);
+        new_log_lines(&receiver);
+        processor.handle_boundary(Some(Language::English), Some(' '), false);
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_reset", "reason=privacy"), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| !line.contains("chars=")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn injected_input_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.process(QueuedInputEvent {
+            epoch: processor.metrics.input_epoch.load(Ordering::Acquire),
+            captured_at: Instant::now(),
+            event: RawInputEvent::ExternalInjection,
+            configuration: None,
+        });
+        let lines = new_log_lines(&receiver);
+        // Injected input also asks for a new field check, which blocks until it passes.
+        assert!(
+            logged(&lines, "word_discard", "reason=external-input chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_shortcut_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        word_in_progress(&mut processor);
+        new_log_lines(&receiver);
+        processor.modifiers = Modifiers::default();
+        let control = RawKeyEvent {
+            held_modifiers: 1 << 2,
+            ..letter(0x43, 1)
+        };
+        processor.process(queued_key(&processor, control, Duration::ZERO));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=shortcut chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_of_the_layouts_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.suppress_session("profiles");
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=profiles chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_reloaded_configuration_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.apply_configuration_reload(Err(std::io::Error::other("test")));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(
+                &lines,
+                "word_discard",
+                "reason=configuration-reload chars=3"
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.record_conversion_failure(ConversionFailureReason::TextCommit);
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=failed-edit chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_suppresses_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        type_letters(&mut processor, "hel");
+        new_log_lines(&receiver);
+        processor.handle_switching_rule(InputEvent::Delete, Some(Language::English), true);
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=switching-rule chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_part_of_a_word_logs_the_word_it_ends() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        word_in_progress(&mut processor);
+        new_log_lines(&receiver);
+        // A media key types nothing, and it is no key that moves the focus.
+        let media_key = RawKeyEvent {
+            scan_code: 0,
+            ..letter(0xad, 1)
+        };
+        processor.process(queued_key(&processor, media_key, Duration::ZERO));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_discard", "reason=session-reset chars=3"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_field_that_could_not_be_inspected_counts_as_a_failed_inspection() {
+        assert!(inspection_failed(Some(
+            PrivacyBlockReason::InspectionUnavailable
+        )));
+        assert!(inspection_failed(Some(
+            PrivacyBlockReason::FieldInspectionUnavailable
+        )));
+        assert!(!inspection_failed(Some(PrivacyBlockReason::PasswordField)));
+        assert!(!inspection_failed(Some(
+            PrivacyBlockReason::ExcludedProcess
+        )));
+        assert!(!inspection_failed(None));
+    }
+
+    /// A conversion that waits to start, in a processor at `sequence` in the field.
+    fn pending_word(processor: &mut InputProcessor, sequence: u64) {
+        let foreground = processor.foreground_override.unwrap();
+        processor.pending_conversion = Some(PendingConversion {
+            // English: its profile is there in every build.
+            transaction: ConversionTransaction::without_delimiter(&Detection {
+                original: "руддщ".to_owned(),
+                replacement: "hello".to_owned(),
+                source_language: Language::Russian,
+                target_language: Language::English,
+                source_score: 0.0,
+                target_score: 20.0,
+            })
+            .unwrap(),
+            foreground,
+            source_layout: 0x0409,
+            profile_generation: processor.input_profiles.generation(),
+            space_down_sequence: sequence,
+            replay_keys: Vec::new(),
+            forced: false,
+            cycle_order: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn a_conversion_that_does_not_start_says_why() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        new_log_lines(&receiver);
+        pending_word(&mut processor, 5);
+        processor.execute_pending_conversion_inner(9);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=stale-boundary"
+        ));
+
+        pending_word(&mut processor, 5);
+        processor
+            .metrics
+            .auto_enabled
+            .store(false, Ordering::Release);
+        processor.execute_pending_conversion_inner(5);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=automatic-off"
+        ));
+
+        // A layout no profile knows.
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, 5);
+        processor.pending_conversion.as_mut().unwrap().source_layout = 4;
+        processor.execute_pending_conversion_inner(5);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=profiles"
+        ));
+
+        // Its gate was cancelled: the edit's guard does not hold.
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .cancelled_gate_token
+            .store(5, Ordering::Release);
+        pending_word(&mut processor, 5);
+        processor.execute_pending_conversion_inner(5);
+        assert!(logged(
+            &new_log_lines(&receiver),
+            "word_left",
+            "reason=guard"
+        ));
+
+        processor
+            .metrics
+            .cancelled_gate_token
+            .store(0, Ordering::Release);
+        pending_word(&mut processor, 5);
+        processor.privacy_reason = Some(PrivacyBlockReason::InspectionUnavailable);
+        processor.execute_pending_conversion_inner(5);
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_reset", "reason=privacy"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_conversion_given_up_says_so() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        new_log_lines(&receiver);
+        pending_word(&mut processor, 5);
+        processor.invalidate_conversion_state();
+        let lines = new_log_lines(&receiver);
+        assert!(logged(&lines, "word_left", "reason=given-up"), "{lines:?}");
+        // Nothing was waiting: nothing to say.
+        processor.invalidate_conversion_state();
+        assert!(new_log_lines(&receiver).is_empty());
     }
 
     #[test]
@@ -21856,7 +24173,7 @@ mod tests {
     fn pause_selects_a_field_that_did_not_show_it_again_only_with_time_for_it() {
         // The field never shows one selection; with a gate holding a second attempt's time the
         // word is selected twice, without it once.
-        for (left_ms, attempts) in [(None, 2), (Some(900), 1)] {
+        for (left_ms, attempts) in [(None, 2), (Some(750), 1)] {
             let budget = PasteBudget {
                 deadline: left_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
             };
@@ -22108,15 +24425,23 @@ mod tests {
             })
             .expect("barrier provider"),
         );
-        let first =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_millis(30));
+        let first = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_millis(30),
+        );
         assert_eq!(first, TextBarrierStatus::Unavailable);
         // Its answer arrives just after that check ended.
         release.send(()).unwrap();
         thread::sleep(Duration::from_millis(20));
         // The next check of the same word reads the field again.
-        let next =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        let next = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_secs(5),
+        );
         assert_eq!(next, TextBarrierStatus::Match);
         assert_eq!(
             processor.privacy_guard.last_barrier_report().expected_chars,
@@ -22180,8 +24505,12 @@ mod tests {
             })
             .expect("barrier provider"),
         );
-        let status =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        let status = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_secs(5),
+        );
         assert_eq!(status, TextBarrierStatus::Match);
         assert_eq!(
             processor.privacy_guard.last_barrier_report().expected_chars,
@@ -22189,8 +24518,12 @@ mod tests {
         );
         // Without a provider the barrier is unavailable, never a match.
         *processor.barrier_probe.borrow_mut() = None;
-        let status =
-            processor.barrier_text_status(7, "привет ", Instant::now() + Duration::from_secs(5));
+        let status = barrier_read(
+            &processor,
+            7,
+            "привет ",
+            Instant::now() + Duration::from_secs(5),
+        );
         assert_eq!(status, TextBarrierStatus::Unavailable);
         assert_eq!(
             processor.privacy_guard.last_barrier_report().stage,
@@ -22439,6 +24772,7 @@ mod tests {
             delivery_uncertain: false,
             expires_at: retained_at + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS),
             recovering: false,
+            sending: 0,
             retained_at,
             auto_recover: true,
             input_mark: 0,
@@ -22569,6 +24903,39 @@ mod tests {
                 (key.wScan, key.dwFlags.contains(KEYEVENTF_KEYUP))
             })
             .collect()
+    }
+
+    #[test]
+    fn a_right_shift_goes_out_as_the_key_it_is() {
+        let edge = |message, key, scan_code, extended| RawKeyEvent {
+            scan_code,
+            extended,
+            ..test_raw_key(message, key, 0, 0)
+        };
+        // The hook reports Right Shift as extended, but its scan code has no E0 prefix: with one,
+        // the key-up is no release and Shift stays down for the whole system.
+        let inputs = build_raw_replay_inputs(
+            &[
+                edge(WM_KEYDOWN, VK_RSHIFT, 0x36, true),
+                edge(WM_KEYUP, VK_RSHIFT, 0x36, true),
+                edge(WM_KEYUP, VK_RCONTROL, 0x1d, true),
+            ],
+            INJECTED_EVENT_MARKER,
+        )
+        .unwrap();
+        let shift_down = unsafe { inputs[0].Anonymous.ki };
+        let shift_up = unsafe { inputs[1].Anonymous.ki };
+        let control_up = unsafe { inputs[2].Anonymous.ki };
+        assert_eq!(shift_down.wScan, 0x36);
+        assert_eq!(shift_up.wScan, 0x36);
+        assert!(shift_up.dwFlags.contains(KEYEVENTF_SCANCODE));
+        assert!(shift_up.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert!(!shift_down.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(!shift_up.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(
+            control_up.dwFlags.contains(KEYEVENTF_EXTENDEDKEY),
+            "the other extended keys keep their prefix"
+        );
     }
 
     #[test]
@@ -23432,6 +25799,7 @@ mod tests {
             deadline: Some(now + Duration::from_millis(ms)),
         };
         assert_eq!(PASTE_AFTER_SUBMIT_MS, 750);
+        assert_eq!(PASTE_AFTER_SUBMIT_LEAST_MS, 550);
         // Without a gate nothing is cut short.
         let unbounded = PasteBudget { deadline: None };
         assert!(unbounded.allows_selection(now, PastePatience::Manual));
@@ -23453,22 +25821,23 @@ mod tests {
         );
         assert_eq!(
             fresh.install_timeout(now, PastePatience::Manual),
-            Some(Duration::from_millis(1_050 - PASTE_AFTER_SUBMIT_MS))
+            Some(Duration::from_millis(CLIPBOARD_BROKER_TIMEOUT_MS))
         );
-        // The selection starts only with its confirmation, the least installation and
-        // everything after the Ctrl+V in hand.
+        // The selection starts only with its confirmation, the least installation and what must
+        // fit after the Ctrl+V in hand.
         let automatic =
-            UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+            UIA_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_LEAST_MS;
         assert!(at(automatic).allows_selection(now, PastePatience::Automatic));
         assert!(!at(automatic - 1).allows_selection(now, PastePatience::Automatic));
         // Pause starts as soon as one attempt fits; a second one has to fit again (see
         // a_pause_selects_again_only_while_another_attempt_fits).
-        let manual =
-            UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS + PASTE_MIN_INSTALL_MS + PASTE_AFTER_SUBMIT_MS;
+        let manual = UIA_MANUAL_SELECTION_CONFIRM_TIMEOUT_MS
+            + PASTE_MIN_INSTALL_MS
+            + PASTE_AFTER_SUBMIT_LEAST_MS;
         assert!(at(manual).allows_selection(now, PastePatience::Manual));
         assert!(!at(manual - 1).allows_selection(now, PastePatience::Manual));
         // Less than the least installation is no installation.
-        let least = PASTE_AFTER_SUBMIT_MS + PASTE_MIN_INSTALL_MS;
+        let least = PASTE_AFTER_SUBMIT_LEAST_MS + PASTE_MIN_INSTALL_MS;
         assert_eq!(
             at(least).install_timeout(now, PastePatience::Automatic),
             Some(Duration::from_millis(PASTE_MIN_INSTALL_MS))
@@ -23477,9 +25846,29 @@ mod tests {
             at(least - 1).install_timeout(now, PastePatience::Automatic),
             None
         );
-        // The Ctrl+V needs everything after it in hand.
-        assert!(at(PASTE_AFTER_SUBMIT_MS).allows_submit(now));
-        assert!(!at(PASTE_AFTER_SUBMIT_MS - 1).allows_submit(now));
+        // The Ctrl+V needs what must fit after it in hand.
+        assert!(at(PASTE_AFTER_SUBMIT_LEAST_MS).allows_submit(now));
+        assert!(!at(PASTE_AFTER_SUBMIT_LEAST_MS - 1).allows_submit(now));
+    }
+
+    #[test]
+    fn the_second_commit_check_always_gets_its_least() {
+        let now = Instant::now();
+        let at = |ms: u64| PasteBudget {
+            deadline: Some(now + Duration::from_millis(ms)),
+        };
+        let least = Duration::from_millis(PASTE_TARGET_COMMIT_MIN_MS);
+        let poll = Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS);
+        assert_eq!(PasteBudget { deadline: None }.target_commit_poll(now), poll);
+        assert_eq!(at(1_000).target_commit_poll(now), poll);
+        // What is left past the margin, once that is more than the least.
+        assert_eq!(
+            at(PASTE_UIA_MARGIN_MS + 80).target_commit_poll(now),
+            Duration::from_millis(80)
+        );
+        // No time left: the check still runs, or a paste already made would count as failed.
+        assert_eq!(at(PASTE_UIA_MARGIN_MS).target_commit_poll(now), least);
+        assert_eq!(at(0).target_commit_poll(now), least);
     }
 
     #[test]
@@ -24149,6 +26538,955 @@ mod tests {
         );
     }
 
+    /// The scan code of the Enter, and the keys around it, in the tests of a held Enter.
+    const ENTER_SCAN: u16 = 0x1c;
+    const LETTER_SCAN: u16 = 0x22;
+    const RIGHT_ARROW_SCAN: u16 = 0x4d;
+
+    fn enter_edge(message: u32) -> RawKeyEvent {
+        RawKeyEvent {
+            scan_code: u32::from(ENTER_SCAN),
+            ..test_raw_key(message, VK_RETURN, 0, 0)
+        }
+    }
+
+    fn letter_edge(message: u32) -> RawKeyEvent {
+        RawKeyEvent {
+            scan_code: u32::from(LETTER_SCAN),
+            ..test_raw_key(message, VIRTUAL_KEY(0x47), 0, 0)
+        }
+    }
+
+    /// The keys of a gate that broke with an Enter held, for the Enter's field.
+    fn retained_enter(retained_at: Instant) -> RetainedInput {
+        RetainedInput {
+            events: vec![enter_edge(WM_KEYDOWN)],
+            ..stalled_record(retained_at)
+        }
+    }
+
+    /// A processor in the field of `record`, in which new input arrived after the recovery asked
+    /// for, and whose recoveries are collected.
+    fn processor_with_retained(record: RetainedInput) -> (InputProcessor, Receiver<String>) {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.recovery_inputs = Some(RefCell::new(Vec::new()));
+        *processor.metrics.retained_input.lock().unwrap() = Some(record);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(51, Ordering::Release);
+        (processor, receiver)
+    }
+
+    fn recovered_edges(processor: &InputProcessor) -> Vec<(u16, bool)> {
+        scan_edges(&processor.recovery_inputs.as_ref().unwrap().borrow())
+    }
+
+    fn other_input_target() -> ForegroundContext {
+        ForegroundContext {
+            hwnd: 77,
+            focus: 77,
+            ..test_foreground()
+        }
+    }
+
+    #[test]
+    fn only_the_press_of_an_enter_counts_as_an_enter() {
+        assert!(holds_enter(&[enter_edge(WM_KEYDOWN)]));
+        assert!(holds_enter(&[RawKeyEvent {
+            message: WM_SYSKEYDOWN,
+            ..enter_edge(WM_KEYDOWN)
+        }]));
+        assert!(!holds_enter(&[enter_edge(WM_KEYUP)]));
+        assert!(!holds_enter(&[letter_edge(WM_KEYDOWN)]));
+        assert!(!holds_enter(&[]));
+    }
+
+    #[test]
+    fn a_held_enter_comes_back_by_itself_after_every_cause_but_a_focus_change() {
+        for (cause, comes_back) in [
+            (GateFailureCause::Deadline, true),
+            (GateFailureCause::Capacity, true),
+            (GateFailureCause::Mouse, true),
+            (GateFailureCause::ExternalInjection, true),
+            (GateFailureCause::WorkerQueue, true),
+            (GateFailureCause::ReplaySubmit, true),
+            (GateFailureCause::WorkerAck, true),
+            (GateFailureCause::DownstreamHook, true),
+            (GateFailureCause::HookReinstall, true),
+            (GateFailureCause::SelectionLeft, true),
+            (GateFailureCause::FocusChanged, false),
+        ] {
+            let (mut state, receiver) = test_gate_state(8);
+            let foreground = test_foreground();
+            state.hold_enter_for_decision(enter_edge(WM_KEYDOWN), foreground);
+            state.break_correction_gate(cause, Some(foreground));
+            let record = state.metrics.retained_input.lock().unwrap().clone();
+            let record = record.expect("retained");
+            assert_eq!(record.enter_comes_back(), comes_back, "{cause:?}");
+            let recovery = receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }));
+            assert_eq!(recovery, comes_back, "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn an_enter_held_by_the_gate_of_a_space_comes_back_as_well() {
+        let (mut state, receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(letter_edge(WM_KEYDOWN)));
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYDOWN)));
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(record.expect("retained").enter_comes_back());
+        assert!(
+            receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+        );
+    }
+
+    #[test]
+    fn held_keys_without_an_enter_still_wait_for_the_user_after_a_click() {
+        let (mut state, receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(letter_edge(WM_KEYDOWN)));
+        // A key-up of the Enter is no Enter: its key-down reached the program before the gate.
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYUP)));
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(!record.expect("retained").auto_recover);
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RecoverInput { .. }))
+        );
+    }
+
+    #[test]
+    fn new_keys_for_the_field_of_a_retained_enter_wait_behind_it() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        *state.metrics.retained_input.lock().unwrap() = Some(retained_enter(Instant::now()));
+        let typed = state.typed_input;
+        assert!(state.hold_behind_retained_enter(enter_edge(WM_KEYUP), foreground));
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYDOWN), foreground));
+        // The system never saw the first press: the second is a repeat of it.
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYDOWN), foreground));
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYUP), foreground));
+        assert!(state.hold_behind_retained_enter(letter_edge(WM_KEYDOWN), foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let events = record.expect("retained").events;
+        let edges: Vec<(u32, u32, bool)> = events
+            .iter()
+            .map(|event| (event.scan_code, event.message, event.repeat))
+            .collect();
+        let (enter, letter) = (u32::from(ENTER_SCAN), u32::from(LETTER_SCAN));
+        assert_eq!(
+            edges,
+            [
+                (enter, WM_KEYDOWN, false),
+                (enter, WM_KEYUP, false),
+                (letter, WM_KEYDOWN, false),
+                (letter, WM_KEYDOWN, true),
+                (letter, WM_KEYUP, false),
+                (letter, WM_KEYDOWN, false),
+            ]
+        );
+        assert_eq!(state.typed_input, typed, "the program has not seen them");
+    }
+
+    /// The hook's verdict on a key edge for the window in front, in a state with a retained Enter
+    /// there: the record and what the worker was told afterwards. The edge is no real input: a
+    /// verdict to pass it reaches nothing.
+    fn hook_verdict_behind_a_retained_enter(
+        event: KBDLLHOOKSTRUCT,
+        prepare: impl FnOnce(&ObserverMetrics),
+    ) -> Option<(LRESULT, RetainedInput, Vec<QueuedInputEvent>)> {
+        let foreground = current_foreground_context()?;
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            foreground,
+            ..retained_enter(Instant::now())
+        });
+        prepare(&metrics);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        let verdict = unsafe {
+            keyboard_hook_body(
+                0,
+                WPARAM(WM_KEYDOWN as usize),
+                LPARAM(core::ptr::from_ref(&event) as isize),
+            )
+        };
+        drop(take_app_state());
+        let record = metrics.retained_input.lock().unwrap().clone()?;
+        Some((verdict, record, receiver.try_iter().collect()))
+    }
+
+    #[test]
+    fn the_hook_keeps_a_new_key_from_overtaking_a_retained_enter() {
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: 0x47,
+            scanCode: u32::from(LETTER_SCAN),
+            ..Default::default()
+        };
+        // Without a window in front (a service session) there is no input target to wait for.
+        let Some((verdict, record, told)) = hook_verdict_behind_a_retained_enter(event, |_| {})
+        else {
+            return;
+        };
+        assert_eq!(verdict, LRESULT(1), "swallowed");
+        assert_eq!(record.events.len(), 2);
+        assert!(told.is_empty(), "the worker sees it when it goes out");
+    }
+
+    #[test]
+    fn the_hook_leaves_a_drained_key_alone_behind_a_retained_enter() {
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: 0x47,
+            scanCode: u32::from(LETTER_SCAN),
+            dwExtraInfo: DRAINED_EVENT_MARKER,
+            flags: LLKHF_INJECTED,
+            ..Default::default()
+        };
+        let Some((verdict, record, told)) = hook_verdict_behind_a_retained_enter(event, |_| {})
+        else {
+            return;
+        };
+        assert_ne!(verdict, LRESULT(1), "passed");
+        assert_eq!(record.events.len(), 1);
+        assert!(
+            told.iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::Key(_)))
+        );
+    }
+
+    #[test]
+    fn the_hook_leaves_the_hotkey_alone_behind_a_retained_enter() {
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: u32::from(VK_PAUSE.0),
+            scanCode: 0x45,
+            ..Default::default()
+        };
+        let verdict = hook_verdict_behind_a_retained_enter(event, |metrics| {
+            metrics.pause_break_undo.store(true, Ordering::Release);
+            metrics
+                .force_hotkey_virtual_key
+                .store(u32::from(VK_PAUSE.0), Ordering::Release);
+            metrics.force_hotkey_modifiers.store(0, Ordering::Release);
+        });
+        let Some((_, record, _)) = verdict else {
+            return;
+        };
+        assert_eq!(record.events.len(), 1, "Pause is no text behind the Enter");
+    }
+
+    #[test]
+    fn only_keys_that_can_type_after_a_retained_enter_wait_behind_it() {
+        let foreground = test_foreground();
+        let now = Instant::now();
+        let refused = |record: RetainedInput, raw: RawKeyEvent, target, case: &str| {
+            let (mut state, _receiver) = test_gate_state(8);
+            let length = record.events.len();
+            *state.metrics.retained_input.lock().unwrap() = Some(record);
+            assert!(!state.hold_behind_retained_enter(raw, target), "{case}");
+            let record = state.metrics.retained_input.lock().unwrap().clone();
+            assert_eq!(record.unwrap().events.len(), length, "{case}");
+        };
+        let down = letter_edge(WM_KEYDOWN);
+        let record = retained_enter(now);
+        // A key pressed before the gate is released in the program: withholding that would leave
+        // it down.
+        refused(record.clone(), letter_edge(WM_KEYUP), foreground, "key-up");
+        refused(record.clone(), down, other_input_target(), "other window");
+        let waiting = RetainedInput {
+            auto_recover: false,
+            ..record.clone()
+        };
+        refused(waiting, down, foreground, "waits for Pause");
+        let uncertain = RetainedInput {
+            delivery_uncertain: true,
+            ..record.clone()
+        };
+        refused(uncertain, down, foreground, "may have been typed");
+        let no_enter = stalled_record(now);
+        refused(no_enter, down, foreground, "no Enter");
+        let mut full = record.clone();
+        full.events
+            .resize(CORRECTION_GATE_CAPACITY * 2 + 1, letter_edge(WM_KEYDOWN));
+        refused(full, down, foreground, "full");
+        // One edge short of that it still fits: a record that long can be sent.
+        let (mut state, _receiver) = test_gate_state(8);
+        let mut nearly_full = record;
+        nearly_full
+            .events
+            .resize(CORRECTION_GATE_CAPACITY * 2, letter_edge(WM_KEYDOWN));
+        *state.metrics.retained_input.lock().unwrap() = Some(nearly_full);
+        assert!(state.hold_behind_retained_enter(down, foreground));
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(build_recovery_inputs(&record.unwrap().events).is_some());
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_past_new_input() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(ENTER_SCAN, false), (ENTER_SCAN, true)]
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_with_the_keys_behind_it_in_their_order() {
+        let mut record = retained_enter(Instant::now());
+        record.events.extend([
+            enter_edge(WM_KEYUP),
+            letter_edge(WM_KEYDOWN),
+            letter_edge(WM_KEYUP),
+        ]);
+        let (mut processor, _receiver) = processor_with_retained(record);
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true),
+                (LETTER_SCAN, false),
+                (LETTER_SCAN, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_whatever_the_field_turned_out_to_be() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        processor.privacy_probe = Some(answering_probe(Some(PrivacyBlockReason::PasswordField)));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(ENTER_SCAN, false), (ENTER_SCAN, true)]
+        );
+    }
+
+    /// The recovery of a retained Enter whose gate's edit may have left the word selected.
+    fn enter_recovered_through_a_selection() -> (InputProcessor, Arc<Mutex<PasteSteps>>) {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        let (script, steps, _clipboard) = scripted_paste();
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor
+            .metrics
+            .selection_left_token
+            .store(10, Ordering::Release);
+        (processor, steps)
+    }
+
+    #[test]
+    fn a_retained_enter_follows_a_right_arrow_when_the_edit_may_have_left_the_word_selected() {
+        let (mut processor, steps) = enter_recovered_through_a_selection();
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ],
+            "a Right arrow takes the selection away and deletes nothing"
+        );
+        assert_eq!(
+            processor
+                .metrics
+                .selection_left_token
+                .load(Ordering::Acquire),
+            0,
+            "the next attempt must not press it again"
+        );
+        assert!(
+            steps.lock().unwrap().steps.is_empty(),
+            "a busy field would apply a selection set through UI Automation among its queued keys"
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_right_arrow_nothing_took_is_pressed_with_the_next_attempt() {
+        let (mut processor, _steps) = enter_recovered_through_a_selection();
+        processor.recovery_input_limit = 0;
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            processor
+                .metrics
+                .selection_left_token
+                .load(Ordering::Acquire),
+            10
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_some());
+        processor.recovery_input_limit = usize::MAX;
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_right_arrow_goes_once_before_keys_that_came_while_the_enter_went_out() {
+        let (mut processor, _steps) = enter_recovered_through_a_selection();
+        let metrics = Arc::clone(&processor.metrics);
+        let arrived = AtomicBool::new(false);
+        processor.during_recovery_send = Some(Box::new(move || {
+            if !arrived.swap(true, Ordering::AcqRel) {
+                let mut retained = metrics.retained_input.lock().unwrap();
+                let record = retained.as_mut().unwrap();
+                record.events.push(letter_edge(WM_KEYDOWN));
+                record.events.push(letter_edge(WM_KEYUP));
+            }
+        }));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true),
+                (LETTER_SCAN, false),
+                (LETTER_SCAN, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_that_arrive_while_a_retained_enter_goes_out_follow_it() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        let metrics = Arc::clone(&processor.metrics);
+        let arrived = AtomicBool::new(false);
+        processor.during_recovery_send = Some(Box::new(move || {
+            if !arrived.swap(true, Ordering::AcqRel) {
+                let mut retained = metrics.retained_input.lock().unwrap();
+                let record = retained.as_mut().unwrap();
+                record.events.push(enter_edge(WM_KEYUP));
+                record.events.push(letter_edge(WM_KEYDOWN));
+                record.events.push(letter_edge(WM_KEYUP));
+            }
+        }));
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true),
+                (ENTER_SCAN, true),
+                (LETTER_SCAN, false),
+                (LETTER_SCAN, true)
+            ]
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retained_enter_goes_out_only_as_far_as_the_record_says_and_only_once() {
+        let metrics = ObserverMetrics::default();
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(Instant::now()));
+        let events = begin_retained_recovery(&metrics, 10).expect("the record");
+        assert_eq!(events.len(), 1);
+        assert!(
+            begin_retained_recovery(&metrics, 10).is_none(),
+            "being sent"
+        );
+        metrics
+            .retained_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .events
+            .push(letter_edge(WM_KEYDOWN));
+        assert!(finish_retained_recovery(&metrics, 10, 2, 2));
+        let record = metrics.retained_input.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            record.events.len(),
+            1,
+            "the Enter is gone, the letter waits"
+        );
+        assert!(!record.recovering);
+        assert_eq!(begin_retained_recovery(&metrics, 10).unwrap().len(), 1);
+        assert!(!finish_retained_recovery(&metrics, 10, 2, 2));
+        assert!(metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_right_arrow_that_went_out_alone_is_not_pressed_again_and_the_enter_stays_certain() {
+        let (mut processor, _steps) = enter_recovered_through_a_selection();
+        processor.recovery_input_limit = 2;
+        processor.recover_retained_input(50, false);
+        let record = processor.metrics.retained_input.lock().unwrap().clone();
+        assert!(record.expect("kept").enter_comes_back());
+        processor.recovery_input_limit = usize::MAX;
+        processor.recover_retained_input(50, false);
+        assert_eq!(
+            recovered_edges(&processor),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+        assert!(processor.metrics.retained_input.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retained_enter_that_cannot_be_built_is_left_for_another_attempt() {
+        let mut record = retained_enter(Instant::now());
+        record.events.push(RawKeyEvent {
+            message: 0,
+            ..letter_edge(WM_KEYDOWN)
+        });
+        let (mut processor, _receiver) = processor_with_retained(record);
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        let record = processor.metrics.retained_input.lock().unwrap().clone();
+        assert!(!record.expect("kept").recovering);
+    }
+
+    #[test]
+    fn asked_for_keys_without_an_enter_get_no_right_arrow() {
+        let (mut processor, _receiver) = processor_with_retained(RetainedInput {
+            events: vec![letter_edge(WM_KEYDOWN), letter_edge(WM_KEYUP)],
+            ..stalled_record(Instant::now())
+        });
+        processor
+            .metrics
+            .selection_left_token
+            .store(10, Ordering::Release);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        processor.recover_retained_input(50, true);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(LETTER_SCAN, false), (LETTER_SCAN, true)]
+        );
+    }
+
+    #[test]
+    fn the_right_arrow_is_the_agents_own_and_an_extended_key() {
+        let inputs = selection_release_inputs();
+        for (input, key_up) in inputs.iter().zip([false, true]) {
+            let key = unsafe { input.Anonymous.ki };
+            assert_eq!(key.wVk, VK_RIGHT);
+            assert_eq!(key.dwExtraInfo, INJECTED_EVENT_MARKER);
+            assert!(key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+            assert!(!key.dwFlags.contains(KEYEVENTF_SCANCODE));
+            assert_eq!(key.dwFlags.contains(KEYEVENTF_KEYUP), key_up);
+        }
+    }
+
+    #[test]
+    fn a_retained_enter_is_not_typed_into_another_window_or_after_coming_back_to_its_own() {
+        let (mut processor, _receiver) = processor_with_retained(retained_enter(Instant::now()));
+        processor.foreground_override = Some(other_input_target());
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        let record = processor.metrics.retained_input.lock().unwrap().clone();
+        assert!(
+            !record.expect("kept for Pause").enter_comes_back(),
+            "the user went on with something else"
+        );
+        processor.foreground_override = Some(test_foreground());
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        // Pause still brings it back.
+        processor.recover_retained_input(50, true);
+        assert_eq!(
+            recovered_edges(&processor),
+            [(ENTER_SCAN, false), (ENTER_SCAN, true)]
+        );
+    }
+
+    #[test]
+    fn an_enter_that_may_have_gone_out_is_not_sent_again_unasked() {
+        let (mut processor, _receiver) = processor_with_retained(RetainedInput {
+            delivery_uncertain: true,
+            ..retained_enter(Instant::now())
+        });
+        // Nothing else stands in its way: no new input since the request.
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(50, Ordering::Release);
+        processor.recover_retained_input(50, false);
+        assert!(recovered_edges(&processor).is_empty());
+        assert!(processor.metrics.retained_input.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_partly_sent_record_keeps_the_enter_only_if_it_did_not_go_out() {
+        let edges = |record: &RetainedInput| -> Vec<u32> {
+            record.events.iter().map(|event| event.scan_code).collect()
+        };
+        let finish = |events: Vec<RawKeyEvent>, sent, requested| {
+            let metrics = ObserverMetrics::default();
+            *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+                events,
+                ..stalled_record(Instant::now())
+            });
+            assert!(begin_retained_recovery(&metrics, 10).is_some());
+            finish_retained_recovery(&metrics, 10, sent, requested);
+            metrics.retained_input.into_inner().unwrap()
+        };
+        let (enter, letter) = (u32::from(ENTER_SCAN), u32::from(LETTER_SCAN));
+        // Nothing went out: everything is sent again.
+        let events = vec![enter_edge(WM_KEYDOWN), letter_edge(WM_KEYDOWN)];
+        let record = finish(events, 0, 3).expect("kept");
+        assert_eq!(edges(&record), [enter, letter]);
+        assert!(record.enter_comes_back());
+        assert!(!record.recovering);
+        // The letter before the Enter went out, the Enter did not.
+        let events = vec![letter_edge(WM_KEYDOWN), enter_edge(WM_KEYDOWN)];
+        let record = finish(events, 1, 4).expect("kept");
+        assert_eq!(edges(&record), [enter]);
+        assert!(record.enter_comes_back());
+        // The Enter went out: it must not go twice.
+        let events = vec![enter_edge(WM_KEYDOWN), letter_edge(WM_KEYDOWN)];
+        let record = finish(events, 1, 4).expect("kept");
+        assert!(record.delivery_uncertain);
+        assert!(!record.enter_comes_back());
+        // All of it went out.
+        let events = vec![enter_edge(WM_KEYDOWN)];
+        assert!(finish(events, 2, 2).is_none());
+    }
+
+    #[test]
+    fn a_failed_drain_keeps_only_the_edges_that_did_not_go_out_when_an_enter_is_among_them() {
+        let (mut state, _receiver) = test_gate_state(8);
+        let foreground = test_foreground();
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYUP)));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN), enter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        let edges: Vec<u32> = record.events.iter().map(|event| event.scan_code).collect();
+        assert_eq!(edges, [u32::from(ENTER_SCAN), u32::from(ENTER_SCAN)]);
+        assert!(record.enter_comes_back());
+
+        // The gate broke while SendInput was returning, and nothing else was held.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN), enter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        assert_eq!(record.events.len(), 1);
+        assert!(record.enter_comes_back());
+
+        // The Enter is still held by the gate, behind the batch.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYDOWN)));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        assert_eq!(record.events.len(), 1);
+        assert!(record.enter_comes_back());
+
+        // The gate broke with the Enter held while SendInput was returning.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        assert!(state.hold_gated_edge(enter_edge(WM_KEYDOWN)));
+        state.break_correction_gate(GateFailureCause::Mouse, Some(foreground));
+        state.retain_failed_drain(7, vec![letter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        let record = record.expect("retained");
+        assert_eq!(record.events.len(), 1);
+        assert!(record.enter_comes_back());
+
+        // The Enter went out with the batch: the rest stays with the user.
+        let (mut state, _receiver) = test_gate_state(8);
+        state.arm_decision_gate(7, foreground);
+        state.retain_failed_drain(7, vec![enter_edge(WM_KEYDOWN), letter_edge(WM_KEYDOWN)], 1);
+        let record = state.metrics.retained_input.lock().unwrap().clone();
+        assert!(record.expect("retained").delivery_uncertain);
+    }
+
+    #[test]
+    fn a_retained_enter_comes_back_past_a_stalled_worker_whatever_would_keep_other_keys() {
+        let foreground = test_foreground();
+        let now = Instant::now();
+        let record = retained_enter(now);
+        let ready = HandBackFacts {
+            now: now + Duration::from_millis(STALLED_WORKER_HAND_BACK_MS),
+            worker_stalled: true,
+            typed_input: 0,
+            selection_left_token: 0,
+            modifiers_released: true,
+            current: Some(foreground),
+            privacy: None,
+        };
+        for (case, facts) in [
+            (
+                "a click",
+                HandBackFacts {
+                    typed_input: 1,
+                    ..ready
+                },
+            ),
+            (
+                "a selection",
+                HandBackFacts {
+                    selection_left_token: record.token,
+                    ..ready
+                },
+            ),
+            (
+                "a password field",
+                HandBackFacts {
+                    privacy: Some(PrivacyBlockReason::PasswordField),
+                    ..ready
+                },
+            ),
+        ] {
+            assert!(stalled_worker_may_hand_back(&record, facts), "{case}");
+        }
+        for (case, facts) in [
+            ("too early", HandBackFacts { now, ..ready }),
+            (
+                "worker not stalled",
+                HandBackFacts {
+                    worker_stalled: false,
+                    ..ready
+                },
+            ),
+            (
+                "modifier held",
+                HandBackFacts {
+                    modifiers_released: false,
+                    ..ready
+                },
+            ),
+            (
+                "another window",
+                HandBackFacts {
+                    current: Some(other_input_target()),
+                    ..ready
+                },
+            ),
+        ] {
+            assert!(!stalled_worker_may_hand_back(&record, facts), "{case}");
+        }
+    }
+
+    #[test]
+    fn an_enter_handed_back_from_a_left_selection_follows_a_right_arrow() {
+        let (state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(retained_at));
+        metrics.selection_left_token.store(10, Ordering::Release);
+        metrics.worker_busy.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let mut state = take_app_state().unwrap();
+        let held = take_held_keys_return(&mut state).expect("handed back");
+        assert_eq!(
+            scan_edges(&held.inputs),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+        assert_eq!(held.handed_back, Some(10));
+    }
+
+    #[test]
+    fn a_worker_that_is_gone_counts_as_stalled_for_held_keys() {
+        let (state, _receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let now = Instant::now();
+        let retained_at = now - Duration::from_millis(STALLED_WORKER_HAND_BACK_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(retained_at));
+        metrics.worker_dead.store(true, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        hand_back_stalled_retained_input(Some(test_foreground()), true, now);
+        let mut state = take_app_state().unwrap();
+        assert!(!has_retained_input(&metrics));
+        assert!(take_held_keys_return(&mut state).is_some());
+    }
+
+    #[test]
+    fn a_retained_enter_is_handed_back_at_the_end_of_its_lifetime_instead_of_deleted() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(start));
+        metrics.selection_left_token.store(10, Ordering::Release);
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        // A modifier held now would change what the Enter does: it waits for the release.
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            false,
+        );
+        assert!(has_retained_input(&metrics));
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(test_foreground()),
+            true,
+        );
+        assert!(!has_retained_input(&metrics));
+        let mut state = take_app_state().unwrap();
+        let held = take_held_keys_return(&mut state).expect("handed back");
+        assert_eq!(
+            scan_edges(&held.inputs),
+            [
+                (RIGHT_ARROW_SCAN, false),
+                (RIGHT_ARROW_SCAN, true),
+                (ENTER_SCAN, false),
+                (ENTER_SCAN, true)
+            ]
+        );
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RetainedInputExpired))
+        );
+    }
+
+    #[test]
+    fn a_retained_enter_the_worker_died_sending_is_deleted_past_its_grace() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(RetainedInput {
+            recovering: true,
+            ..retained_enter(start)
+        });
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        let end = start + lifetime + RETAINED_RECOVERY_GRACE;
+        expire_retained_input(HWND::default(), end, Some(test_foreground()), true);
+        assert!(!has_retained_input(&metrics));
+        let mut state = take_app_state().unwrap();
+        assert!(take_held_keys_return(&mut state).is_none(), "maybe typed");
+        assert!(
+            receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RetainedInputExpired))
+        );
+    }
+
+    #[test]
+    fn a_retained_enter_in_another_window_is_deleted_at_the_end_of_its_lifetime() {
+        let (state, receiver) = test_gate_state(8);
+        let metrics = Arc::clone(&state.metrics);
+        let start = Instant::now();
+        let lifetime = Duration::from_millis(RETAINED_INPUT_LIFETIME_MS);
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(start));
+        APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+        expire_retained_input(
+            HWND::default(),
+            start + lifetime,
+            Some(other_input_target()),
+            true,
+        );
+        assert!(!has_retained_input(&metrics));
+        let mut state = take_app_state().unwrap();
+        assert!(take_held_keys_return(&mut state).is_none());
+        assert!(
+            receiver
+                .try_iter()
+                .any(|queued| matches!(queued.event, RawInputEvent::RetainedInputExpired))
+        );
+    }
+
+    #[test]
+    fn the_timer_asks_the_idle_worker_again_for_a_retained_enter() {
+        let now = Instant::now();
+        let asked = |record: Option<RetainedInput>, busy: bool| {
+            let (state, receiver) = test_gate_state(8);
+            *state.metrics.retained_input.lock().unwrap() = record;
+            state.metrics.worker_busy.store(busy, Ordering::Release);
+            state
+                .metrics
+                .observed_input_sequence
+                .store(33, Ordering::Release);
+            APP_STATE.with(|slot| *slot.borrow_mut() = Some(state));
+            retry_retained_enter();
+            drop(take_app_state());
+            receiver
+                .try_iter()
+                .filter_map(|queued| match queued.event {
+                    RawInputEvent::RecoverInput { sequence, explicit } => {
+                        Some((sequence, explicit))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(asked(Some(retained_enter(now)), false), [(33, false)]);
+        assert!(asked(Some(retained_enter(now)), true).is_empty(), "busy");
+        assert!(asked(None, false).is_empty(), "nothing retained");
+        assert!(
+            asked(Some(stalled_record(now)), false).is_empty(),
+            "no Enter"
+        );
+        let sending = RetainedInput {
+            recovering: true,
+            ..retained_enter(now)
+        };
+        assert!(asked(Some(sending), false).is_empty(), "being sent");
+        let waiting = RetainedInput {
+            auto_recover: false,
+            ..retained_enter(now)
+        };
+        assert!(asked(Some(waiting), false).is_empty(), "waits for Pause");
+    }
+
+    #[test]
+    fn only_keys_that_need_the_user_are_announced() {
+        let metrics = ObserverMetrics::default();
+        assert!(!retained_input_awaits_the_user(&metrics));
+        *metrics.retained_input.lock().unwrap() = Some(retained_enter(Instant::now()));
+        assert!(
+            !retained_input_awaits_the_user(&metrics),
+            "comes back alone"
+        );
+        metrics
+            .retained_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .auto_recover = false;
+        assert!(retained_input_awaits_the_user(&metrics));
+        *metrics.retained_input.lock().unwrap() = Some(stalled_record(Instant::now()));
+        assert!(retained_input_awaits_the_user(&metrics));
+    }
+
     const PASTE_SEQUENCE: u64 = 5;
 
     /// What the outside steps of a scripted paste saw: each step in order (`submit:N` for a
@@ -24179,6 +27517,10 @@ mod tests {
     struct ScriptedPaste {
         steps: Arc<Mutex<PasteSteps>>,
         settled: TextBarrierStatus,
+        /// Until when the field does not answer the settle's reads.
+        silent_until: Option<Instant>,
+        /// The field does not answer the commit checks.
+        silent_commit: bool,
         selection: (TextBarrierStatus, Option<SelectionCleanup>),
         clipboard: PasteClipboard,
         taken: Option<usize>,
@@ -24195,6 +27537,8 @@ mod tests {
             let script = Self {
                 steps: Arc::clone(&steps),
                 settled: TextBarrierStatus::Match,
+                silent_until: None,
+                silent_commit: false,
                 selection: (TextBarrierStatus::Match, None),
                 clipboard,
                 taken: None,
@@ -24222,9 +27566,12 @@ mod tests {
     }
 
     impl PasteSeam for ScriptedPaste {
-        fn settle(&mut self) -> TextBarrierStatus {
+        fn settle(&mut self) -> (TextBarrierStatus, bool) {
             self.step("settle");
-            self.settled
+            match self.silent_until {
+                Some(until) if Instant::now() < until => (TextBarrierStatus::Unavailable, false),
+                _ => (self.settled, true),
+            }
         }
 
         fn select(&mut self) -> (TextBarrierStatus, Option<SelectionCleanup>) {
@@ -24273,6 +27620,10 @@ mod tests {
         fn commit(&mut self) -> ReplayAttempt {
             self.step("commit");
             self.commits.pop_front().unwrap_or(ReplayAttempt::Applied)
+        }
+
+        fn commit_answered(&mut self) -> bool {
+            !self.silent_commit
         }
 
         fn switch_layout(&mut self) -> ReplayAttempt {
@@ -24386,7 +27737,7 @@ mod tests {
             Arc::clone(&state),
             Duration::from_millis(100),
         ));
-        script.commits = vec![ReplayAttempt::Failed].into();
+        script.commits = vec![ReplayAttempt::Failed, ReplayAttempt::Failed].into();
         let processor = paste_processor(test_foreground(), |_| script);
         assert_eq!(
             run_paste(&processor, PastePatience::Automatic),
@@ -24453,9 +27804,11 @@ mod tests {
         for (taken, commits, reason, expected) in [
             (
                 None,
-                vec![ReplayAttempt::Failed],
+                vec![ReplayAttempt::Failed, ReplayAttempt::Failed],
                 ConversionFailureReason::TextCommit,
-                &["select", "begin", "submit:4", "commit", "collapse"][..],
+                &[
+                    "select", "begin", "submit:4", "commit", "collapse", "commit",
+                ][..],
             ),
             (
                 Some(2),
@@ -24586,6 +27939,449 @@ mod tests {
     }
 
     const GHBDTN: [u32; 6] = [0x22, 0x23, 0x30, 0x20, 0x14, 0x31];
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_word_ended_by_a_letter_after_its_trailing_mark_is_logged_without_text() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22],
+        );
+        let lines: Vec<String> = diagnostics.try_iter().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("event=word_discard ")
+                    && line.contains(" reason=punctuation chars=6")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("gjnjv")),
+            "{lines:?}"
+        );
+    }
+
+    /// The keys of "gjnjv/ghbdtn", "потом.привет" typed in the English layout.
+    #[cfg(feature = "legacy-bundled-input")]
+    const GJNJV_MARK_GHBDTN: [u32; 12] = [
+        0x22, 0x24, 0x31, 0x24, 0x2f, 0x35, 0x22, 0x23, 0x30, 0x20, 0x14, 0x31,
+    ];
+
+    /// Presses Pause and returns the text the cycle left, or the diagnostics when it left none.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn pause_text(processor: &mut InputProcessor, diagnostics: &Receiver<String>) -> String {
+        let lines = press_pause(processor, diagnostics, 41);
+        processor
+            .transpose_cycle
+            .as_ref()
+            .map(|cycle| cycle.text.clone())
+            .unwrap_or_else(|| panic!("not converted: {lines:?}"))
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_everything_typed_since_the_last_space() {
+        // The mark between the words ends the automatic word, not what Pause converts.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GJNJV_MARK_GHBDTN);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_a_token_with_digits_and_punctuation() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x23, 0x30, 0x20, 0x14, 0x31, 0x02, 0x35],
+        );
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет1.");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_the_whole_last_token_after_its_space() {
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GJNJV_MARK_GHBDTN);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_keeps_the_token_after_delete() {
+        // Delete removes text after the caret; what was typed before it is still there.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_DELETE, 7, 0)
+        });
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn backspace_corrects_the_token_pause_converts() {
+        // "ghbdtnn", Backspace, "/": the token is "ghbdtn/" whether Backspace ends the automatic
+        // word (the default) or not.
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        assert!(processor.settings.suppress_after_backspace);
+        type_keys(
+            &mut processor,
+            foreground,
+            &[0x22, 0x23, 0x30, 0x20, 0x14, 0x31, 0x31],
+        );
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 8, 0)
+        });
+        processor.process_key(RawKeyEvent {
+            scan_code: 0x35,
+            foreground,
+            ..letter(0x41, 9)
+        });
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет.");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn moving_the_caret_ends_the_token() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_LEFT, 7, 0)
+        });
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        assert!(processor.transpose_cycle.is_none(), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("reason=no-word-before-caret")),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_a_word_in_a_field_that_cannot_be_inspected_in_any_program() {
+        // The owner's decision (2026-10-25): where the field cannot be inspected, which is no
+        // password field, Pause works in every program, not only in terminals. The word is not
+        // converted automatically there.
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(
+            PrivacyBlockReason::FieldInspectionUnavailable,
+        )));
+        processor.privacy_needs_check = true;
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        type_word_and_space(&mut processor, &GHBDTN);
+        assert!(processor.pending_conversion.is_none());
+        processor
+            .metrics
+            .auto_enabled
+            .store(false, Ordering::Release);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
+    }
+
+    /// The key of `g`.
+    #[cfg(feature = "legacy-bundled-input")]
+    const G: u32 = 0x22;
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_token_ends_at_more_keys_than_it_may_hold() {
+        let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &[G; MANUAL_TOKEN_MAX_KEYS]);
+        assert_eq!(processor.pause_keys.len(), MANUAL_TOKEN_MAX_KEYS);
+        type_keys(&mut processor, foreground, &[G]);
+        assert!(processor.pause_keys.is_empty());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn erasing_the_space_after_a_token_returns_to_it_for_pause() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &GJNJV_MARK_GHBDTN);
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_BACK, 14, 0)
+        });
+        assert_eq!(processor.pause_keys.len(), 12);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_shortcut_enter_a_click_and_a_new_input_epoch_end_the_token() {
+        // Each of them may change the text before the caret or move the caret.
+        let typed = || {
+            let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+            type_keys(&mut processor, foreground, &GHBDTN);
+            assert_eq!(processor.pause_keys.len(), 6);
+            (processor, foreground)
+        };
+        // Ctrl+V.
+        let (mut processor, foreground) = typed();
+        processor.process_key(RawKeyEvent {
+            foreground,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..test_raw_key(WM_KEYDOWN, VK_LCONTROL, 7, 0)
+        });
+        processor.process_key(RawKeyEvent {
+            foreground,
+            held_modifiers: held_keys(&[VK_LCONTROL]),
+            ..letter(0x56, 8)
+        });
+        assert!(processor.pause_keys.is_empty(), "shortcut");
+        // Enter.
+        let (mut processor, foreground) = typed();
+        processor.process_key(RawKeyEvent {
+            foreground,
+            ..test_raw_key(WM_KEYDOWN, VK_RETURN, 7, 0)
+        });
+        assert!(processor.pause_keys.is_empty(), "enter");
+        // A click.
+        let (mut processor, _foreground) = typed();
+        let epoch = processor.metrics.input_epoch.load(Ordering::Acquire);
+        processor.process(QueuedInputEvent {
+            configuration: None,
+            captured_at: Instant::now(),
+            epoch,
+            event: RawInputEvent::Mouse,
+        });
+        assert!(processor.pause_keys.is_empty(), "click");
+        // A new input epoch (a queue overflow, a settings Apply).
+        let (mut processor, _foreground) = typed();
+        let epoch = processor.metrics.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        processor.reset_for_epoch(epoch);
+        assert!(processor.pause_keys.is_empty(), "epoch");
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_forced_conversion_starts_a_new_token() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GHBDTN);
+        assert_eq!(pause_text(&mut processor, &diagnostics), "привет");
+        assert!(processor.pause_keys.is_empty());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_key_typed_where_the_field_turned_into_a_password_field_ends_the_token() {
+        let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        // The first check passes, the second finds a password field.
+        processor.privacy_probe = Some(
+            BoundedProbe::spawn("test-privacy-password-later", move || {
+                move |_| {
+                    (counted.fetch_add(1, Ordering::SeqCst) == 1)
+                        .then_some(PrivacyBlockReason::PasswordField)
+                }
+            })
+            .unwrap(),
+        );
+        processor.privacy_needs_check = true;
+        type_keys(&mut processor, foreground, &GHBDTN);
+        assert_eq!(processor.pause_keys.len(), 6);
+        processor.privacy_needs_check = true;
+        type_keys(&mut processor, foreground, &[G]);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(processor.pause_keys.is_empty());
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn leaving_a_field_remembers_its_whole_token() {
+        let (mut processor, _diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GJNJV_MARK_GHBDTN);
+        let other = ForegroundContext {
+            hwnd: foreground.hwnd + 1,
+            ..foreground
+        };
+        processor.process_key(RawKeyEvent {
+            scan_code: G,
+            foreground: other,
+            ..letter(0x41, 13)
+        });
+        let remembered = processor
+            .remembered_words
+            .iter()
+            .find(|entry| same_input_target(entry.target, foreground))
+            .expect("the field is remembered");
+        assert_eq!(
+            remembered.word.as_ref().map(|word| word.replay_keys.len()),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn a_token_being_typed_wins_over_a_remembered_word() {
+        let target = recent_ok_foreground();
+        let now = Instant::now();
+        let mut processor = processor_at_the_test_target();
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        processor.last_boundary = Some(test_last_boundary(&processor, 6));
+        processor.remember_word(target, Some(target.layout), now);
+        processor.last_boundary = None;
+        // A punctuation key: a token, though no word of the automatic conversion.
+        processor.pause_keys = test_last_boundary(&processor, 1).replay_keys;
+        assert!(processor.replay_keys.is_empty());
+        assert_eq!(processor.restore_remembered_word(target, now), None);
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_manual_layout_switch_keeps_the_whole_token_for_pause() {
+        let (mut processor, diagnostics, foreground, _steps) = pause_processor(0x0409);
+        type_keys(&mut processor, foreground, &GJNJV_MARK_GHBDTN);
+        // Alt+Shift: the field shows the Russian layout; the token was typed in English.
+        processor.foreground_override = Some(ForegroundContext {
+            layout: 0x0419,
+            ..foreground
+        });
+        assert_eq!(pause_text(&mut processor, &diagnostics), "потом.привет");
+    }
+
+    /// A processor in an editor with automatic conversion and conversion on Enter on, where
+    /// `scan_codes` were typed and an Enter (sequence after them) armed the gate and is held.
+    #[cfg(feature = "legacy-bundled-input")]
+    fn processor_with_a_held_enter(
+        convert_on_enter: bool,
+        scan_codes: &[u32],
+    ) -> (
+        InputProcessor,
+        Receiver<String>,
+        u64,
+        Arc<Mutex<PasteSteps>>,
+    ) {
+        let (mut processor, diagnostics, foreground, steps) = pause_processor(0x0409);
+        processor.settings.convert_on_enter = convert_on_enter;
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        type_keys(&mut processor, foreground, scan_codes);
+        let enter = scan_codes.len() as u64 + 1;
+        // The hook armed the gate on the Enter and holds it: the keys before it went on.
+        processor
+            .metrics
+            .active_gate_token
+            .store(enter, Ordering::Release);
+        processor
+            .metrics
+            .observed_input_sequence
+            .store(enter, Ordering::Release);
+        processor
+            .metrics
+            .forwarded_input_sequence
+            .store(enter - 1, Ordering::Release);
+        diagnostics.try_iter().for_each(drop);
+        let epoch = processor.metrics.input_epoch.load(Ordering::Acquire);
+        processor.process(QueuedInputEvent {
+            configuration: None,
+            captured_at: Instant::now(),
+            epoch,
+            event: RawInputEvent::EnterDecision(RawKeyEvent {
+                foreground,
+                ..test_raw_key(WM_KEYDOWN, VK_RETURN, enter, 0)
+            }),
+        });
+        (processor, diagnostics, enter, steps)
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn the_word_before_a_held_enter_is_converted_without_a_delimiter() {
+        let (processor, diagnostics, enter, steps) = processor_with_a_held_enter(true, &GHBDTN);
+        let lines: Vec<String> = diagnostics.try_iter().collect();
+        // The Enter is not in the field yet: the word is replaced with no delimiter after it.
+        assert_eq!(
+            steps.lock().unwrap().clipboard_at_submit.as_deref(),
+            Some("привет")
+        );
+        assert!(
+            lines.iter().any(
+                |line| line.starts_with("event=conversion ") && line.contains("result=applied")
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("result=not-attempted")),
+            "{lines:?}"
+        );
+        // The gate lets the Enter go after the edit.
+        assert_eq!(processor.last_gate_release_token, enter);
+        assert!(processor.metrics.undo_available.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn a_held_enter_without_a_word_to_convert_is_let_go_at_once() {
+        for (convert_on_enter, keys) in [(true, &[][..]), (false, &GHBDTN[..])] {
+            let (processor, diagnostics, enter, _steps) =
+                processor_with_a_held_enter(convert_on_enter, keys);
+            let lines: Vec<String> = diagnostics.try_iter().collect();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.starts_with("event=conversion ")),
+                "{convert_on_enter}: {lines:?}"
+            );
+            // Let go by the worker itself, not by the safety net of a forced release.
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("phase=release_forced")),
+                "{convert_on_enter}: {lines:?}"
+            );
+            assert_eq!(
+                processor.last_gate_release_token, enter,
+                "{convert_on_enter}"
+            );
+        }
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_nothing_typed_in_a_password_field() {
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        processor.privacy_probe = Some(answering_probe(Some(PrivacyBlockReason::PasswordField)));
+        processor.privacy_needs_check = true;
+        type_word_and_space(&mut processor, &GHBDTN);
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        assert!(processor.transpose_cycle.is_none(), "{lines:?}");
+        assert!(
+            processor
+                .last_boundary
+                .as_ref()
+                .is_none_or(|last| last.replay_keys.is_empty())
+        );
+    }
+
+    #[cfg(feature = "legacy-bundled-input")]
+    #[test]
+    fn pause_converts_a_word_with_a_trailing_punctuation_key() {
+        // "gjnjv/" is "потом." typed with the English layout.
+        let (mut processor, diagnostics, _foreground, _steps) = pause_processor(0x0409);
+        type_word_and_space(&mut processor, &[0x22, 0x24, 0x31, 0x24, 0x2f, 0x35]);
+        let lines = press_pause(&mut processor, &diagnostics, 41);
+        let cycle = processor
+            .transpose_cycle
+            .as_ref()
+            .unwrap_or_else(|| panic!("converted: {lines:?}"));
+        assert_eq!(cycle.language, Language::Russian);
+        assert_eq!(cycle.text, "потом.");
+    }
 
     #[cfg(feature = "legacy-bundled-input")]
     #[test]
@@ -25021,9 +28817,9 @@ mod tests {
         let (attempt, steps, _) = paste(0, None);
         assert_eq!(attempt, TextEditAttempt::Cancelled);
         assert!(steps.steps.is_empty(), "{:?}", steps.steps);
-        // Time for the selection and a shortened installation (the gate's 900 ms less everything
-        // after the Ctrl+V leave 150 ms of the usual 200).
-        let (attempt, steps, _) = paste(900, None);
+        // Time for the selection and a shortened installation (the gate's 700 ms less what must
+        // fit after the Ctrl+V leave 150 ms of the usual 200).
+        let (attempt, steps, _) = paste(700, None);
         assert_eq!(attempt, TextEditAttempt::Applied);
         let install = steps.install_timeout.unwrap();
         assert!(
@@ -25032,13 +28828,13 @@ mod tests {
             "{install:?}"
         );
         // A slow selection leaves no time for the installation: the clipboard is not touched.
-        let (attempt, steps, state) = paste(1_000, Some("select"));
+        let (attempt, steps, state) = paste(800, Some("select"));
         assert_eq!(attempt, TextEditAttempt::Cancelled);
         assert_eq!(steps.steps, ["select", "collapse"]);
         assert_eq!(state.lock().unwrap().empties, 0);
         // A slow installation leaves no time for what follows the Ctrl+V: it is not sent, and the
         // user's clipboard comes back at once.
-        let (attempt, steps, state) = paste(1_000, Some("begin"));
+        let (attempt, steps, state) = paste(800, Some("begin"));
         assert_eq!(attempt, TextEditAttempt::Cancelled);
         assert_eq!(steps.steps, ["select", "begin", "collapse"]);
         assert_eq!(state.lock().unwrap().text, "password");
@@ -25093,6 +28889,389 @@ mod tests {
         );
     }
 
+    /// One barrier read of `expected_text` in `process_id`'s field, answered by `deadline`.
+    fn barrier_read(
+        processor: &InputProcessor,
+        process_id: u32,
+        expected_text: &str,
+        deadline: Instant,
+    ) -> TextBarrierStatus {
+        let read = processor.next_barrier_read(process_id, expected_text);
+        processor.answer_barrier_read(
+            read,
+            deadline,
+            Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS),
+        )
+    }
+
+    /// A processor on the capability route in a field whose reads the provider answers as `read`
+    /// says, each after `slow`, with the word to convert waiting.
+    fn capability_processor(
+        read: fn() -> (TextBarrierStatus, TextBarrierReport),
+        slow: Duration,
+    ) -> InputProcessor {
+        let foreground = ForegroundContext {
+            layout: 0x0409,
+            ..test_foreground()
+        };
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.selection = (TextBarrierStatus::Mismatch, None);
+        let mut processor = paste_processor(foreground, |_| script);
+        processor.text_edit_backend = TextEditBackend::CapabilityProbe;
+        processor.gate_window = 1;
+        processor
+            .edit_deadline
+            .set(Some(Instant::now() + WHOLE_GATE));
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-capability-test", move || {
+                move |_: BarrierRead| {
+                    thread::sleep(slow);
+                    read()
+                }
+            })
+            .expect("barrier provider"),
+        );
+        processor
+    }
+
+    /// A processor on the capability route with diagnostics on and a word to convert waiting.
+    fn capability_word(
+        read: fn() -> (TextBarrierStatus, TextBarrierReport),
+    ) -> (InputProcessor, Receiver<String>) {
+        let (sender, diagnostics) = sync_channel(64);
+        let mut processor = capability_processor(read, Duration::ZERO);
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, PASTE_SEQUENCE);
+        (processor, diagnostics)
+    }
+
+    #[test]
+    fn a_word_the_field_never_shows_says_so() {
+        let (mut processor, diagnostics) = capability_word(|| marked_barrier_answer(41));
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.settled = TextBarrierStatus::Mismatch;
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=source-settle"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_whose_input_moved_on_after_the_settle_says_so() {
+        let (mut processor, diagnostics) = capability_word(|| marked_barrier_answer(41));
+        let (script, _steps, _clipboard) = scripted_paste();
+        let script = script.after("settle", user_clicks(&processor.metrics));
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        processor.paste_seam = Some(RefCell::new(Box::new(script)));
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(logged(&lines, "word_left", "reason=guard"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_word_in_a_program_only_observed_says_so() {
+        let (mut processor, diagnostics) = capability_word(|| marked_barrier_answer(41));
+        processor.text_edit_backend = TextEditBackend::ObserveOnly;
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=observe-only"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_before_an_enter_that_cannot_convert_it_says_so() {
+        let (mut processor, receiver) = processor_in_field(EDITOR, None);
+        processor.settings.convert_on_enter = false;
+        word_in_progress(&mut processor);
+        new_log_lines(&receiver);
+        processor.convert_before_held_enter(enter_edge(WM_KEYDOWN));
+        let lines = new_log_lines(&receiver);
+        assert!(
+            logged(&lines, "word_left", "reason=enter-context"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_slow_at_every_read_passes_the_source_settle() {
+        let mut processor =
+            capability_processor(|| marked_barrier_answer(41), Duration::from_millis(200));
+        processor.paste_seam = None;
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        let foreground = processor.foreground_override.unwrap();
+        assert_eq!(
+            processor.wait_for_source_input_settle(
+                foreground,
+                PASTE_SEQUENCE,
+                foreground.layout,
+                "ghbdtn",
+            ),
+            ReplayAttempt::Applied,
+            "one read that waits, not a second one behind it"
+        );
+    }
+
+    #[test]
+    fn a_slow_field_passes_the_capability_barrier() {
+        let processor =
+            capability_processor(|| marked_barrier_answer(41), Duration::from_millis(200));
+        let foreground = processor.foreground_override.unwrap();
+        let barrier = processor.wait_for_capability_text_barrier(
+            foreground,
+            PASTE_SEQUENCE,
+            foreground.layout,
+            "ghbdtn",
+        );
+        assert_eq!(barrier, TextBarrierStatus::Match);
+    }
+
+    #[test]
+    fn a_field_too_busy_to_name_its_focus_has_not_answered() {
+        let processor = capability_processor(|| marked_barrier_answer(41), Duration::ZERO);
+        let foreground = processor.foreground_override.unwrap();
+        *processor.barrier_probe.borrow_mut() = Some(
+            BoundedProbe::spawn("barrier-focus-test", move || {
+                let mut reads = 0;
+                move |_: BarrierRead| {
+                    reads += 1;
+                    if reads == 1 {
+                        // The answer comes after the plain poll, so only a late one can help.
+                        thread::sleep(Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 20));
+                        return (
+                            TextBarrierStatus::Unavailable,
+                            TextBarrierReport {
+                                stage: TextBarrierStage::Resolver,
+                                resolver_reason: EditableResolverReason::FocusUnavailable,
+                                ..TextBarrierReport::default()
+                            },
+                        );
+                    }
+                    marked_barrier_answer(41)
+                }
+            })
+            .expect("barrier provider"),
+        );
+        let barrier = processor.wait_for_capability_text_barrier(
+            foreground,
+            PASTE_SEQUENCE,
+            foreground.layout,
+            "ghbdtn",
+        );
+        assert_eq!(barrier, TextBarrierStatus::Match);
+    }
+
+    #[test]
+    fn a_word_the_capability_route_leaves_alone_says_why() {
+        let (sender, diagnostics) = sync_channel(64);
+        let mut processor = capability_processor(
+            || (TextBarrierStatus::Mismatch, TextBarrierReport::default()),
+            Duration::ZERO,
+        );
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, PASTE_SEQUENCE);
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=capability-mismatch"),
+            "{lines:?}"
+        );
+
+        let (sender, diagnostics) = sync_channel(64);
+        let mut processor = capability_processor(
+            || (TextBarrierStatus::Unavailable, TextBarrierReport::default()),
+            Duration::ZERO,
+        );
+        processor.settings.physical_fallback_for_unsupported_apps = false;
+        processor.diagnostic_sender = Some(sender);
+        processor
+            .metrics
+            .diagnostics_enabled
+            .store(true, Ordering::Release);
+        processor
+            .metrics
+            .auto_enabled
+            .store(true, Ordering::Release);
+        pending_word(&mut processor, PASTE_SEQUENCE);
+        processor.execute_pending_conversion_inner(PASTE_SEQUENCE);
+        let lines = new_log_lines(&diagnostics);
+        assert!(
+            logged(&lines, "word_left", "reason=capability-unsupported"),
+            "{lines:?}"
+        );
+    }
+
+    /// The source settle of a paste whose field acts as `script` says, with a gate that gives it
+    /// `gate_left` from now, and how long the settle took.
+    fn settle_with(script: ScriptedPaste, gate_left: Duration) -> (ReplayAttempt, Duration) {
+        let mut processor = paste_processor(test_foreground(), |_| script);
+        processor.text_edit_backend = TextEditBackend::ProtectedPaste;
+        // The gate is armed already, so the window is not asked.
+        processor.gate_window = 1;
+        processor
+            .edit_deadline
+            .set(Some(Instant::now() + gate_left));
+        let foreground = processor.foreground_override.unwrap();
+        let started = Instant::now();
+        let settle = processor.wait_for_source_input_settle(
+            foreground,
+            PASTE_SEQUENCE,
+            foreground.layout,
+            "ghbdtn",
+        );
+        (settle, started.elapsed())
+    }
+
+    const WHOLE_GATE: Duration = Duration::from_millis(CORRECTION_GATE_MAX_HOLD_MS);
+
+    #[test]
+    fn a_field_that_answers_the_source_settle_late_still_gets_its_word_converted() {
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        let silent = NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 80;
+        script.silent_until = Some(Instant::now() + Duration::from_millis(silent));
+        let (settle, took) = settle_with(script, WHOLE_GATE);
+        assert_eq!(settle, ReplayAttempt::Applied);
+        assert!(took > Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn a_field_that_shows_something_else_gets_no_longer_to_settle() {
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.settled = TextBarrierStatus::Mismatch;
+        let (settle, took) = settle_with(script, WHOLE_GATE);
+        assert_eq!(settle, ReplayAttempt::Cancelled);
+        assert!(took < Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 50));
+    }
+
+    #[test]
+    fn a_silent_field_gets_only_the_time_the_edit_can_spare() {
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.silent_until = Some(Instant::now() + Duration::from_secs(5));
+        let (settle, took) = settle_with(script, WHOLE_GATE);
+        assert_eq!(settle, ReplayAttempt::Cancelled);
+        assert!(took >= Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 100));
+        // What the edit needs after the settle stays: the wait ends with that much of the gate.
+        assert!(
+            took <= WHOLE_GATE
+                - Duration::from_millis(
+                    paste_gate_budget_ms(false) - NOTEPAD_TEXT_BARRIER_TIMEOUT_MS
+                )
+                + Duration::from_millis(40),
+            "{took:?}"
+        );
+        // A gate that has no time to spare ends the wait where the plain poll ends.
+        let (mut script, _steps, _clipboard) = scripted_paste();
+        script.silent_until = Some(Instant::now() + Duration::from_secs(5));
+        let tight = Duration::from_millis(paste_gate_budget_ms(false));
+        let (settle, took) = settle_with(script, tight);
+        assert_eq!(settle, ReplayAttempt::Cancelled);
+        assert!(
+            took < Duration::from_millis(NOTEPAD_TEXT_BARRIER_TIMEOUT_MS + 50),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn a_paste_the_field_shows_right_after_its_check_is_no_failure() {
+        // Busy past the check, the field answers the cleanup, and it shows the replacement.
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([
+            ReplayAttempt::Failed,
+            ReplayAttempt::Applied,
+            ReplayAttempt::Applied,
+        ]);
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            [
+                "select", "begin", "submit:4", "commit", "collapse", "commit", "layout", "commit"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_check_without_an_answer_leaves_a_confirmed_paste_done() {
+        // The field showed the replacement once, and is busy when asked again.
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Applied, ReplayAttempt::Failed]);
+        script.silent_commit = true;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Applied
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            ["select", "begin", "submit:4", "commit", "layout", "commit"]
+        );
+    }
+
+    #[test]
+    fn a_second_check_cut_short_stays_a_failure() {
+        // The input or the focus moved on: that is no silent field.
+        let (mut script, _steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Applied, ReplayAttempt::Cancelled]);
+        script.silent_commit = true;
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+    }
+
+    #[test]
+    fn a_second_check_that_shows_other_text_stays_a_failure() {
+        let (mut script, _steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Applied, ReplayAttempt::Failed]);
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+    }
+
+    #[test]
+    fn a_paste_the_field_still_does_not_show_after_its_check_stays_failed() {
+        let (mut script, steps, _state) = scripted_paste();
+        script.commits = VecDeque::from([ReplayAttempt::Failed, ReplayAttempt::Failed]);
+        let processor = paste_processor(test_foreground(), |_| script);
+        assert_eq!(
+            run_paste(&processor, PastePatience::Automatic),
+            TextEditAttempt::Failed(ConversionFailureReason::TextCommit)
+        );
+        assert_eq!(
+            steps.lock().unwrap().steps,
+            [
+                "select", "begin", "submit:4", "commit", "collapse", "commit"
+            ]
+        );
+    }
+
     #[test]
     #[ignore = "uses the real clipboard: run on the test VM with --include-ignored"]
     fn a_paste_on_the_real_clipboard_gives_a_late_field_the_replacement_and_the_user_their_clipboard()
@@ -25138,7 +29317,7 @@ mod tests {
         // A busy field that handles its Ctrl+V only after the paste stopped waiting: it gets the
         // replacement, never the user's clipboard, which comes back right after.
         let (mut script, steps) = ScriptedPaste::new(PasteClipboard::System);
-        script.commits = VecDeque::from([ReplayAttempt::Failed]);
+        script.commits = VecDeque::from([ReplayAttempt::Failed, ReplayAttempt::Failed]);
         let processor = paste_processor(foreground, |_| script);
         assert_eq!(
             run_paste(&processor, PastePatience::Manual),
@@ -25146,7 +29325,9 @@ mod tests {
         );
         assert_eq!(
             steps.lock().unwrap().steps,
-            ["select", "begin", "submit:4", "commit", "collapse"]
+            [
+                "select", "begin", "submit:4", "commit", "collapse", "commit"
+            ]
         );
         assert!(processor.clipboard_brokers.busy());
         assert_eq!(test_clipboard_unicode(window).as_deref(), Some("привет"));
@@ -25226,6 +29407,10 @@ public class AklBusyField : Form {
             busyMs = m.WParam.ToInt32();
             readThenBusyMs = m.LParam.ToInt32();
             m.Result = new IntPtr(1);
+            return;
+        }
+        if (m.Msg == 0x8041) {
+            Thread.Sleep(m.WParam.ToInt32());
             return;
         }
         if (m.Msg == 0x031D) {
@@ -25332,21 +29517,23 @@ public class AklWindowlessReader : Form {
 
         /// Starts the field and brings it to the front. Started by this process it may not take
         /// the foreground by itself, and Start's search window can keep it after a first sign-in:
-        /// the search is dismissed and the field is clicked, as the user would.
+        /// the search is dismissed and the field is clicked, as the user would. Only the field
+        /// itself is clicked: a click goes to whatever lies on that point, and a Windows Terminal
+        /// window there opened a new tab on its "+" button.
         fn start() -> Self {
             Self::start_script(DESKTOP_FIELD_SCRIPT, w!("AutoKeyboardLayot busy field"))
         }
 
         /// Starts the field of `source`, whose window has the title `title`.
         fn start_script(source: &str, title: PCWSTR) -> Self {
-            use windows::Win32::Foundation::RECT;
+            use windows::Win32::Foundation::{POINT, RECT};
             use windows::Win32::UI::Input::KeyboardAndMouse::{
                 INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
                 MOUSEEVENTF_MOVE, MOUSEINPUT,
             };
             use windows::Win32::UI::WindowsAndMessaging::{
-                AllowSetForegroundWindow, FindWindowW, GetSystemMetrics, GetWindowRect,
-                SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow,
+                AllowSetForegroundWindow, FindWindowW, GA_ROOT, GetAncestor, GetSystemMetrics,
+                GetWindowRect, SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow, WindowFromPoint,
             };
             let escape = [
                 keyboard_input(VK_ESCAPE, 0, Default::default()),
@@ -25395,12 +29582,16 @@ public class AklWindowlessReader : Form {
                     if unsafe { GetWindowRect(window, &mut rect) }.is_ok() {
                         let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(2);
                         let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(2);
+                        let centre = POINT {
+                            x: (rect.left + rect.right) / 2,
+                            y: (rect.top + rect.bottom) / 2,
+                        };
                         let mouse = |flags| INPUT {
                             r#type: INPUT_MOUSE,
                             Anonymous: INPUT_0 {
                                 mi: MOUSEINPUT {
-                                    dx: (rect.left + rect.right) / 2 * 65_535 / (width - 1),
-                                    dy: (rect.top + rect.bottom) / 2 * 65_535 / (height - 1),
+                                    dx: centre.x * 65_535 / (width - 1),
+                                    dy: centre.y * 65_535 / (height - 1),
                                     dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
                                     ..Default::default()
                                 },
@@ -25411,7 +29602,15 @@ public class AklWindowlessReader : Form {
                             mouse(MOUSEEVENTF_LEFTDOWN),
                             mouse(MOUSEEVENTF_LEFTUP),
                         ];
-                        assert!(send_input_batch(&click));
+                        let under = unsafe { GetAncestor(WindowFromPoint(centre), GA_ROOT) };
+                        if under == window {
+                            assert!(send_input_batch(&click));
+                        } else {
+                            eprintln!(
+                                "field: not clicked, covered by {:?}",
+                                Self::window_class(under.0 as usize)
+                            );
+                        }
                     }
                 }
                 assert!(
@@ -25469,6 +29668,54 @@ public class AklWindowlessReader : Form {
                 busy_ms,
                 read_then_busy_ms,
             );
+        }
+
+        /// The window class of `window`, or what stands for it.
+        fn window_class(window: usize) -> String {
+            use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+            let mut name = [0u16; 128];
+            let length = unsafe { GetClassNameW(HWND(window as *mut c_void), &mut name) };
+            String::from_utf16_lossy(&name[..length.max(0) as usize])
+        }
+
+        /// What the field looks like to the test: the window it writes to and reads from, the one
+        /// that has the keyboard focus now, and whether the field's window is hung.
+        fn describe(&self) -> String {
+            use windows::Win32::UI::WindowsAndMessaging::{IsHungAppWindow, IsWindow};
+            let now = current_foreground_context();
+            format!(
+                "field: target_class={:?} target_is_window={} focus_now_class={:?} focus_now_is_target={} foreground_is_field={} hung={}",
+                Self::window_class(self.context.focus),
+                unsafe { IsWindow(Some(HWND(self.context.focus as *mut c_void))) }.as_bool(),
+                now.map(|now| Self::window_class(now.focus)),
+                now.is_some_and(|now| now.focus == self.context.focus),
+                now.is_some_and(|now| now.process_id == self.context.process_id),
+                unsafe { IsHungAppWindow(HWND(self.context.hwnd as *mut c_void)) }.as_bool(),
+            )
+        }
+
+        /// Stops a run whose keys would go to another window: it tested nothing, and the empty
+        /// field it ends with reads as a failure of the agent.
+        fn assert_in_front(&self) {
+            assert!(
+                current_foreground_context()
+                    .is_some_and(|now| now.process_id == self.context.process_id),
+                "the field lost the foreground, this run tested nothing: {}",
+                self.describe()
+            );
+        }
+
+        /// Keeps the field busy for `busy_ms` from now, whatever it does next.
+        fn stay_busy(&self, busy_ms: usize) {
+            const BUSY_NOW: u32 = 0x8041;
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.context.hwnd as *mut c_void)),
+                    BUSY_NOW,
+                    WPARAM(busy_ms),
+                    LPARAM(0),
+                );
+            }
         }
 
         /// The field's text once it changed from `before` and stopped changing (a busy field
@@ -25696,7 +29943,9 @@ public class AklWindowlessReader : Form {
         unsafe {
             std::env::set_var("LOCALAPPDATA", &profile);
         }
+        LOG_POSITIVE_PRIVACY.store(true, Ordering::Release);
         let field = DesktopField::start();
+        eprintln!("{}", field.describe());
         let probe = clipboard_test_window(w!("AutoKeyboardLayot agent acceptance probe"));
         let agent = thread::spawn(run);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -25712,6 +29961,7 @@ public class AklWindowlessReader : Form {
         // The worker reads the configuration and the layouts.
         thread::sleep(Duration::from_secs(2));
         let type_keys = |keys: &[VIRTUAL_KEY]| {
+            field.assert_in_front();
             for key in keys {
                 let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
                 for flags in [Default::default(), KEYEVENTF_KEYUP] {
@@ -25757,6 +30007,9 @@ public class AklWindowlessReader : Form {
                 VK_SPACE,
             ]);
             let text = field.settled_text("ghbdtn ");
+            if text.is_empty() {
+                eprintln!("{}", field.describe());
+            }
             let clipboard = clipboard_once(probe, "akl-password", Duration::from_secs(4));
             eprintln!(
                 "busy_ms={busy_ms} converted={} clipboard_back={} text_chars={}",
@@ -25811,6 +30064,577 @@ public class AklWindowlessReader : Form {
                 "busy_ms={busy_ms}"
             );
         }
+    }
+
+    /// The busy field turned multiline, with the agent running on the desktop.
+    struct DesktopTyping {
+        field: DesktopField,
+    }
+
+    impl DesktopTyping {
+        /// Types `keys` with the acceptance marker: the agent's hook takes them for the user's.
+        fn type_keys(&self, keys: &[VIRTUAL_KEY]) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+            self.field.assert_in_front();
+            for key in keys {
+                let scan = unsafe { MapVirtualKeyW(u32::from(key.0), MAPVK_VK_TO_VSC) } as u16;
+                for flags in [Default::default(), KEYEVENTF_KEYUP] {
+                    let input =
+                        keyboard_input_with_marker(*key, scan, flags, ACCEPTANCE_TYPING_MARKER);
+                    assert!(send_input_batch(&[input]));
+                    thread::sleep(Duration::from_millis(40));
+                }
+            }
+        }
+
+        fn to_english(&self) {
+            self.to_layout(0x0409_0409);
+        }
+
+        fn to_layout(&self, layout: usize) {
+            use windows::Win32::UI::WindowsAndMessaging::WM_INPUTLANGCHANGEREQUEST;
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.field.context.hwnd as *mut c_void)),
+                    WM_INPUTLANGCHANGEREQUEST,
+                    WPARAM(0),
+                    LPARAM(layout as isize),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while current_foreground_context().is_none_or(|context| context.layout != layout)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            // A loaded VM shows the switch to this process before the field's keys carry it:
+            // keys typed in between look like a manual switch to the agent, which starts a new
+            // token at the first key in the new layout.
+            thread::sleep(Duration::from_millis(1500));
+        }
+
+        /// The field's text once it settled. A RichEdit control ends its lines with "\r" or
+        /// "\r\n".
+        fn text(&self, before: &str) -> String {
+            self.field
+                .settled_text(before)
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+        }
+    }
+
+    /// Runs `scenario` on the test VM with conversion before Enter on and the field routed by
+    /// `route`, then prints the agent's record of it. Each outcome is a case, the field's text and
+    /// the text expected.
+    fn on_the_desktop_with_conversion_on_enter(
+        route: &str,
+        scenario: impl FnOnce(&DesktopTyping) -> Vec<(String, String, String)>,
+    ) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutList;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_CLOSE};
+        let mut layouts = [HKL::default(); 16];
+        let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) }.max(0) as usize;
+        let languages: Vec<usize> = layouts[..count.min(layouts.len())]
+            .iter()
+            .map(|layout| layout.0 as usize & 0xffff)
+            .collect();
+        assert!(
+            languages.contains(&0x0409) && languages.contains(&0x0419),
+            "the account needs the English and Russian layouts: {languages:x?}"
+        );
+        let profile =
+            std::env::temp_dir().join(format!("akl-agent-acceptance-{}", std::process::id()));
+        let directory = profile.join("AutoKeyboardLayot");
+        fs::create_dir_all(&directory).expect("profile");
+        let mut document = ConfigurationDocument::default();
+        document.settings.diagnostics_enabled = true;
+        document.settings.suppress_after_manual_layout_change = false;
+        document.settings.convert_on_enter = true;
+        let rule = format!("powershell.exe = {route}");
+        document.backend_rules =
+            BackendRules::from_lines([rule.as_str(), "* = capability-probe"]).expect("rules");
+        fs::write(
+            directory.join("config.ini"),
+            document.to_text().expect("configuration"),
+        )
+        .expect("configuration");
+        // Run alone by its name, this is the only test in the process, and the agent's threads,
+        // which read the variable, start after it is set.
+        unsafe {
+            std::env::set_var("LOCALAPPDATA", &profile);
+        }
+        LOG_POSITIVE_PRIVACY.store(true, Ordering::Release);
+        let script =
+            DESKTOP_FIELD_SCRIPT.replace("box.Multiline = false;", "box.Multiline = true;");
+        let typing = DesktopTyping {
+            field: DesktopField::start_script(&script, w!("AutoKeyboardLayot busy field")),
+        };
+        eprintln!("{}", typing.field.describe());
+        let agent = thread::spawn(run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let agent_window = loop {
+            if let Ok(window) = unsafe { FindWindowW(WINDOW_CLASS, None) } {
+                break window;
+            }
+            assert!(Instant::now() < deadline, "the agent did not start");
+            thread::sleep(Duration::from_millis(50));
+        };
+        drop(std::panic::take_hook());
+        thread::sleep(Duration::from_secs(2));
+        let outcomes = scenario(&typing);
+        eprintln!("{}", typing.field.describe());
+        // All of it: a word that was not converted is explained by what is around its gate.
+        let log = fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+        for line in log.lines() {
+            eprintln!("  {line}");
+        }
+        for word in [
+            "ghbdtn",
+            "привет",
+            "gjnjv",
+            "потом",
+            "klkl",
+            "kindel",
+            "people",
+            "köök",
+        ] {
+            assert!(!log.contains(word), "the log holds a typed word");
+        }
+        let deadline = Instant::now() + Duration::from_millis(RETAINED_INPUT_LIFETIME_MS + 10_000);
+        while !agent.is_finished() && Instant::now() < deadline {
+            unsafe {
+                let _ = PostMessageW(Some(agent_window), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+        assert!(agent.is_finished(), "the agent declined to stop");
+        let stopped = agent.join();
+        drop(typing);
+        let _ = fs::remove_dir_all(&profile);
+        assert!(
+            matches!(stopped, Ok(Ok(()))),
+            "the agent did not stop cleanly"
+        );
+        for (case, text, expected) in outcomes {
+            assert_eq!(text, expected, "{route} {case}");
+        }
+    }
+
+    const KEYS_G_H_B_D_T_N: [VIRTUAL_KEY; 6] = [
+        VIRTUAL_KEY(0x47),
+        VIRTUAL_KEY(0x48),
+        VIRTUAL_KEY(0x42),
+        VIRTUAL_KEY(0x44),
+        VIRTUAL_KEY(0x54),
+        VIRTUAL_KEY(0x4E),
+    ];
+
+    /// Desktop acceptance of trailing marks, the Pause token and conversion before Enter on the
+    /// test VM, with the busy field turned multiline and routed by `route`: "gjnjv/" and a Space,
+    /// "gjnjv/ghbdtn" and Pause, and twenty times "ghbdtn" and an Enter that must arrive once.
+    fn desktop_marks_tokens_and_enter(route: &str) {
+        on_the_desktop_with_conversion_on_enter(route, |typing| {
+            let (g, j, n, v) = (
+                VIRTUAL_KEY(0x47),
+                VIRTUAL_KEY(0x4A),
+                VIRTUAL_KEY(0x4E),
+                VIRTUAL_KEY(0x56),
+            );
+            let slash = VIRTUAL_KEY(0xBF);
+            let mut outcomes: Vec<(String, String, String)> = Vec::new();
+            // A trailing mark: "потом." typed in the English layout.
+            typing.field.set_text("");
+            typing.to_english();
+            typing.type_keys(&[g, j, n, j, v, slash, VK_SPACE]);
+            let marked = typing.text("gjnjv/ ");
+            eprintln!("mark: converted={}", marked == "потом. ");
+            outcomes.push(("mark".to_owned(), marked, "потом. ".to_owned()));
+            // The whole token since the last Space, converted by Pause.
+            typing.field.set_text("");
+            typing.to_english();
+            typing.type_keys(&[g, j, n, j, v, slash]);
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            let typed = typing.text("");
+            typing.type_keys(&[VK_PAUSE]);
+            let token = typing.text(&typed);
+            eprintln!("token: converted={}", token == "потом.привет");
+            outcomes.push(("token".to_owned(), token, "потом.привет".to_owned()));
+            // Twenty words before an Enter: each converted, each Enter delivered once.
+            typing.field.set_text("");
+            let mut expected = String::new();
+            for round in 0..20 {
+                typing.to_english();
+                let before = typing.text("");
+                typing.type_keys(&KEYS_G_H_B_D_T_N);
+                typing.type_keys(&[VK_RETURN]);
+                expected.push_str("привет\n");
+                let after = typing.text(&before);
+                if after != expected {
+                    eprintln!(
+                        "enter: round {round} differs, {} chars",
+                        after.chars().count()
+                    );
+                }
+            }
+            let lines = typing.text("");
+            eprintln!(
+                "enter: converted_lines={} newlines={} of 20",
+                lines.matches("привет\n").count(),
+                lines.matches('\n').count()
+            );
+            outcomes.push(("enter".to_owned(), lines, expected));
+            outcomes
+        });
+    }
+
+    /// Desktop acceptance of an Enter held when its conversion fails: the field is busy for
+    /// `busy_ms` when the replacement arrives, so the paste cannot be confirmed and the word may
+    /// stay selected. Typing goes on past the failure; the failed edit pauses automatic conversion,
+    /// so each run has one failure.
+    fn desktop_held_enter_after_a_failed_conversion(busy_ms: usize) {
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            typing.field.set_text("");
+            typing.to_english();
+            typing.field.configure(busy_ms, 0);
+            thread::sleep(Duration::from_millis(500));
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            let (k, l) = (VIRTUAL_KEY(0x4B), VIRTUAL_KEY(0x4C));
+            typing.type_keys(&[VK_RETURN]);
+            for _ in 0..12 {
+                typing.type_keys(&[k, l]);
+            }
+            let text = typing.text("ghbdtn");
+            eprintln!(
+                "busy_ms={busy_ms} newlines={} after_enter={:?} word_kept={}",
+                text.matches('\n').count(),
+                text.split_once('\n').map(|(_, after)| after),
+                text.starts_with("привет") || text.starts_with("ghbdtn")
+            );
+            // The paste may have gone out, or been called off for lack of time: that the word is
+            // still there, once, is the point.
+            let word = if text.starts_with("привет") {
+                "привет"
+            } else {
+                "ghbdtn"
+            };
+            vec![(
+                format!("busy_ms={busy_ms}"),
+                text,
+                format!("{word}\n{}", "kl".repeat(12)),
+            )]
+        });
+    }
+
+    /// Desktop acceptance of a word whose field is busy when it ends: the read before the edit
+    /// finds no answer in its first 150 ms, and the word must not be lost to that.
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_a_word_its_field_is_too_busy_to_show_at_once() {
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            let mut outcomes = Vec::new();
+            for round in 0..3 {
+                typing.field.set_text("");
+                typing.to_english();
+                typing.type_keys(&KEYS_G_H_B_D_T_N);
+                typing.field.stay_busy(220);
+                thread::sleep(Duration::from_millis(10));
+                typing.type_keys(&[VK_SPACE]);
+                let text = typing.text("ghbdtn ");
+                eprintln!("round {round}: converted={}", text == "привет ");
+                outcomes.push((format!("round {round}"), text, "привет ".to_owned()));
+            }
+            outcomes
+        });
+    }
+
+    /// Desktop acceptance of a Shift released while the gate of a Space holds the input: the
+    /// key-down reached the system, so the key-up that comes out of the gate must release it. The
+    /// Space and the key-up go out together, so that the gate is up when the key-up arrives.
+    fn desktop_shift_released_in_a_gate(shift: VIRTUAL_KEY, scan_code: u16) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            KEYBD_EVENT_FLAGS, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+        };
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            let key = |scan: u16, flags: KEYBD_EVENT_FLAGS| {
+                keyboard_input_with_marker(
+                    VIRTUAL_KEY(0),
+                    scan,
+                    KEYEVENTF_SCANCODE | flags,
+                    ACCEPTANCE_TYPING_MARKER,
+                )
+            };
+            let space = unsafe { MapVirtualKeyW(u32::from(VK_SPACE.0), MAPVK_VK_TO_VSC) } as u16;
+            typing.field.set_text("");
+            typing.to_english();
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            assert!(send_input_batch(&[key(scan_code, Default::default())]));
+            thread::sleep(Duration::from_millis(100));
+            let is_down = || unsafe { GetAsyncKeyState(i32::from(shift.0)) } as u16 & 0x8000 != 0;
+            let down_before = is_down();
+            assert!(send_input_batch(&[
+                key(space, Default::default()),
+                key(scan_code, KEYEVENTF_KEYUP)
+            ]));
+            thread::sleep(Duration::from_millis(40));
+            assert!(send_input_batch(&[key(space, KEYEVENTF_KEYUP)]));
+            thread::sleep(Duration::from_secs(1));
+            let down_after = is_down();
+            eprintln!("shift down_before={down_before} down_after={down_after}");
+            // Leaves the session as it found it, whatever the test shows.
+            assert!(send_input_batch(&[key(scan_code, KEYEVENTF_KEYUP)]));
+            thread::sleep(Duration::from_millis(100));
+            vec![(
+                format!("key {:#x}", shift.0),
+                format!("down_before={down_before} down_after={down_after}"),
+                "down_before=true down_after=false".to_owned(),
+            )]
+        });
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_lets_go_of_a_right_shift_released_in_a_gate() {
+        desktop_shift_released_in_a_gate(VK_RSHIFT, 0x36);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_lets_go_of_a_left_shift_released_in_a_gate() {
+        desktop_shift_released_in_a_gate(VK_LSHIFT, 0x2a);
+    }
+
+    /// Desktop acceptance of an Enter whose gate runs out before the edit has ended, with typing
+    /// going on after it: the gate breaks on its deadline while the field still keeps the worker
+    /// waiting, and the letters typed then wait behind the Enter.
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_when_its_gate_runs_out() {
+        TEST_GATE_HOLD_MS.store(50, Ordering::Release);
+        on_the_desktop_with_conversion_on_enter("protected-paste", |typing| {
+            typing.field.set_text("");
+            typing.to_english();
+            typing.field.configure(1_000, 0);
+            thread::sleep(Duration::from_millis(500));
+            typing.type_keys(&KEYS_G_H_B_D_T_N);
+            let (k, l) = (VIRTUAL_KEY(0x4B), VIRTUAL_KEY(0x4C));
+            typing.type_keys(&[VK_RETURN]);
+            for _ in 0..12 {
+                typing.type_keys(&[k, l]);
+            }
+            let text = typing.text("ghbdtn");
+            eprintln!(
+                "newlines={} after_enter={:?} word_kept={}",
+                text.matches('\n').count(),
+                text.split_once('\n').map(|(_, after)| after),
+                text.starts_with("привет") || text.starts_with("ghbdtn")
+            );
+            // The edit gave up with the gate, so the word may be either: that it is still there,
+            // once, is the point.
+            let word = if text.starts_with("привет") {
+                "привет"
+            } else {
+                "ghbdtn"
+            };
+            vec![(
+                "deadline".to_owned(),
+                text,
+                format!("{word}\n{}", "kl".repeat(12)),
+            )]
+        });
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_from_a_field_busy_for_a_second() {
+        desktop_held_enter_after_a_failed_conversion(1_000);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_from_a_field_busy_for_two_seconds() {
+        desktop_held_enter_after_a_failed_conversion(2_000);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_delivers_a_held_enter_once_from_a_field_busy_for_three_seconds() {
+        desktop_held_enter_after_a_failed_conversion(3_000);
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_marks_tokens_and_words_before_enter_by_paste() {
+        desktop_marks_tokens_and_enter("protected-paste");
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_converts_marks_tokens_and_words_before_enter_by_replay() {
+        desktop_marks_tokens_and_enter("physical-replay");
+    }
+
+    /// A keyboard layout loaded for a test: the VM's account has only English and Russian.
+    struct LoadedLayout(HKL);
+
+    impl LoadedLayout {
+        fn new(name: PCWSTR) -> Self {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                ACTIVATE_KEYBOARD_LAYOUT_FLAGS, LoadKeyboardLayoutW,
+            };
+            let flags = ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0);
+            Self(unsafe { LoadKeyboardLayoutW(name, flags) }.expect("load the layout"))
+        }
+    }
+
+    impl Drop for LoadedLayout {
+        fn drop(&mut self) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::UnloadKeyboardLayout;
+            let _ = unsafe { UnloadKeyboardLayout(self.0) };
+        }
+    }
+
+    /// The keys of a word of ASCII letters.
+    fn keys_of_letters(word: &str) -> Vec<VIRTUAL_KEY> {
+        word.bytes()
+            .map(|letter| VIRTUAL_KEY(u16::from(letter.to_ascii_uppercase())))
+            .collect()
+    }
+
+    const ESTONIAN_WORDS: [&str; 20] = [
+        "kindel", "selles", "tere", "aitab", "maja", "kodu", "kool", "tuli", "vesi", "suur",
+        "linn", "laps", "raamat", "inimene", "sellel", "palju", "kuidas", "miks", "siis", "veel",
+    ];
+    const ENGLISH_WORDS: [&str; 20] = [
+        "the",
+        "only",
+        "organizations",
+        "refers",
+        "hello",
+        "window",
+        "house",
+        "water",
+        "people",
+        "green",
+        "small",
+        "letter",
+        "simple",
+        "world",
+        "friend",
+        "should",
+        "would",
+        "about",
+        "there",
+        "their",
+    ];
+
+    /// Desktop acceptance of words two Latin layouts type alike on the test VM, with the field
+    /// routed by `route`: twenty Estonian words in the English layout and twenty English words in
+    /// the Estonian one change neither the text nor the layout, a word that needs a letter of the
+    /// other layout is converted, and a word typed in Russian goes to the Latin layout the field
+    /// used last, whichever that is.
+    fn desktop_words_two_layouts_type_alike(route: &str) {
+        const ENGLISH: usize = 0x0409_0409;
+        const RUSSIAN: usize = 0x0419_0419;
+        const ESTONIAN: usize = 0x0425_0425;
+        let _estonian = LoadedLayout::new(w!("00000425"));
+        on_the_desktop_with_conversion_on_enter(route, |typing| {
+            let layout_now = || current_foreground_context().map(|context| context.layout);
+            let mut outcomes: Vec<(String, String, String)> = Vec::new();
+            for (case, layout, words) in [
+                ("estonian in english", ENGLISH, ESTONIAN_WORDS),
+                ("english in estonian", ESTONIAN, ENGLISH_WORDS),
+            ] {
+                typing.field.set_text("");
+                typing.to_layout(layout);
+                let mut changes = 0;
+                let mut expected = String::new();
+                for word in words {
+                    typing.type_keys(&keys_of_letters(word));
+                    typing.type_keys(&[VK_SPACE]);
+                    let before = expected.clone();
+                    expected.push_str(word);
+                    expected.push(' ');
+                    // An edit would change the text and the layout within this wait.
+                    typing.text(&before);
+                    if layout_now() != Some(layout) {
+                        changes += 1;
+                        typing.to_layout(layout);
+                    }
+                }
+                let text = typing.text("");
+                eprintln!(
+                    "alike: case={case} words={} layout_changes={changes}",
+                    words.len()
+                );
+                outcomes.push((case.to_owned(), text, expected));
+                outcomes.push((
+                    format!("{case}: layout changes"),
+                    changes.to_string(),
+                    "0".to_owned(),
+                ));
+            }
+            // A letter of the other layout: "köök" and "tütar" typed in the English layout.
+            let semicolon = VIRTUAL_KEY(0xBA);
+            let bracket = VIRTUAL_KEY(0xDB);
+            let [k, t, a, r] = [0x4B, 0x54, 0x41, 0x52].map(VIRTUAL_KEY);
+            for (keys, typed, expected) in [
+                (vec![k, semicolon, semicolon, k], "k;;k ", "köök "),
+                (vec![t, bracket, t, a, r], "t[tar ", "tütar "),
+            ] {
+                typing.field.set_text("");
+                typing.to_english();
+                typing.type_keys(&keys);
+                typing.type_keys(&[VK_SPACE]);
+                let text = typing.text(typed);
+                eprintln!("letter: converted={}", text == expected);
+                outcomes.push((expected.to_owned(), text, expected.to_owned()));
+                outcomes.push((
+                    format!("{expected}: layout"),
+                    format!("{:x?}", layout_now()),
+                    format!("{:x?}", Some(ESTONIAN)),
+                ));
+            }
+            // "just" typed in Russian stays in the Latin layout this field used last.
+            for (case, latin, word) in [
+                ("after english", ENGLISH, "people"),
+                ("after estonian", ESTONIAN, "kindel"),
+            ] {
+                typing.field.set_text("");
+                typing.to_layout(latin);
+                typing.type_keys(&keys_of_letters(word));
+                typing.type_keys(&[VK_SPACE]);
+                let before = format!("{word} ");
+                typing.text("");
+                typing.to_layout(RUSSIAN);
+                typing.type_keys(&keys_of_letters("just"));
+                typing.type_keys(&[VK_SPACE]);
+                let typed = format!("{before}огые ");
+                let text = typing.text(&typed);
+                eprintln!(
+                    "russian: case={case} converted={}",
+                    text == format!("{before}just ")
+                );
+                outcomes.push((case.to_owned(), text, format!("{before}just ")));
+                outcomes.push((
+                    format!("{case}: layout"),
+                    format!("{:x?}", layout_now()),
+                    format!("{:x?}", Some(latin)),
+                ));
+            }
+            outcomes
+        });
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_keeps_the_layout_of_words_two_layouts_type_alike_by_paste() {
+        desktop_words_two_layouts_type_alike("protected-paste");
+    }
+
+    #[test]
+    #[ignore = "types into a window on the desktop: run it alone in an interactive session on the test VM"]
+    fn the_agent_on_the_desktop_keeps_the_layout_of_words_two_layouts_type_alike_by_replay() {
+        desktop_words_two_layouts_type_alike("physical-replay");
     }
 
     // Tray acceptance on the desktop of the test VM: the real notification area and Explorer.
@@ -26719,6 +31543,9 @@ public class AklPrivacyForm : Form {
                     "event=input ",
                     "event=word ",
                     "event=word_discard ",
+                    "event=word_left ",
+                    "event=word_lost ",
+                    "chars=",
                     "event=candidate ",
                     "event=hotkey ",
                     "event=privacy_probe ",

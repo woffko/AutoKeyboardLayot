@@ -78,6 +78,7 @@
     "general.recheck_erased": "Erstes Wort nach vollständigem Löschen erneut prüfen",
     "general.single_letter_words": "Einzelbuchstaben-Wörter automatisch umwandeln (zum Beispiel z → я)",
     "general.layout_model": "Experimentelles Layoutmodell für EN/RU/ET-Wörter, die in den Wörterbüchern fehlen",
+    "general.convert_on_enter": "Das Wort auch vor Enter umwandeln (Enter wartet, bis es umgewandelt ist)",
     "general.conversion_sound": "Leisen, sanften Ton abspielen, wenn ein Wort umgewandelt wird",
     "general.offer_exclusion": "Nach dem Rückgängigmachen eine Wortausnahme anbieten",
     "general.offer_dictionary": "Nach erzwungener Umwandlung einen Wörterbucheintrag anbieten",

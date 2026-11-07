@@ -14,7 +14,21 @@ signing with the release key, and replacing a published release asset. Nothing i
 this repository, no script and no agent does either on its own. The commands
 below are what the owner runs; reading them authorizes nothing.
 
-## Last catalog: revision 8, 2026-10-25 (a package release)
+## Last catalog: revision 9, 2026-11-03
+
+A renewal of revision 8 with the owner's approval, following the steps below.
+
+| | |
+|---|---|
+| Candidate | `catalog-r9.unsigned.json`, SHA-256 `2fd54a03f7d585244570bca9d998f6a7c45c3320bdad1d11fd8cfa6a27ee4ec3` |
+| Content | the 13 package records of revision 8, unchanged; revision 9 |
+| Window | 21 days: `issued_at` 2026-11-03 16:11:56 UTC, `expires_at` 2026-11-24 16:11:56 UTC |
+| Signer | `sign-language-package.exe` built from `6a874c8`, SHA-256 `7bde53ee3ec3ffcd3f4f6e2daf34246193bfb89f15d73d3ab6c13a3af141765a` |
+| Published | `catalog.aklc`, SHA-256 `e954faef8108ec8ddad5e29226f8cc2af93e2dd53e4eb8ce024ecbfdf90ea8a6`, signed by `pkg-20260912-01`, in the release `v0.1.2` (the Latest release), whose notes record it |
+| Checked | offline (`verify_release_catalog`: 13 packages; `check_catalog_expiry`: 502 hours left; `check_catalog_candidate.py` against revision 8), then without credentials from the Latest URL: same bytes, and all 13 package URLs match the catalog |
+| Replaced | revision 8, SHA-256 `733f6a4c93bf69bceeb4c90f994e14093db15508b3fd9cab67a1e976e17e3815` (valid until 2026-11-15 03:58:38 UTC) |
+
+## Package release before it: revision 8, 2026-10-25
 
 Revision 8 is not a renewal: it lists 13 new package revisions (`ru-RU` 5, `et-EE` 3, the other
 eleven 2) and came with the 0.1.2 release, so `check_catalog_candidate.py` rejected it as expected
@@ -47,9 +61,9 @@ Done with the owner's approval, following the steps below.
 Revision 5, SHA-256 `b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503`, is kept as
 `tests/fixtures/mutation-seed-catalog.aklc`.
 
-**The next renewal is due before about 2026-11-05**, when the daily check starts to
+**The next renewal is due before about 2026-11-14**, when the daily check starts to
 report fewer than 10 days — once its workflow is on `main` (see
-[When to renew](#when-to-renew)). Revision 9 is the next revision number.
+[When to renew](#when-to-renew)). Revision 10 is the next revision number.
 
 The window starts when the candidate is made, not when it is signed. Every day
 between the two shortens what the signed catalog is good for, so **make the

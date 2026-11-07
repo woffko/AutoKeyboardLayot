@@ -14,17 +14,16 @@ pub enum PrivacyBlockReason {
     InspectionUnavailable,
 }
 
-/// The opt-in exception is only for a known terminal's field-inspection failure.
-/// Transport, process and context failures remain denied even for manual input.
+/// Manual conversion (Pause/Break) is allowed in a field that passed its check and, by the
+/// owner's decision (2026-10-25), in any program's field that cannot be inspected, which is no
+/// confirmed password field, when the process itself passed its checks. Password fields and
+/// transport, process and context failures remain denied even for manual input.
 pub fn manual_conversion_allowed(
     reason: Option<PrivacyBlockReason>,
-    terminal_opt_in: bool,
-    verified_terminal: bool,
+    verified_process: bool,
 ) -> bool {
     reason.is_none()
-        || (reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
-            && terminal_opt_in
-            && verified_terminal)
+        || (reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) && verified_process)
 }
 
 /// Case-insensitive executable-name exclusion policy.
@@ -144,26 +143,23 @@ mod tests {
     }
 
     #[test]
-    fn terminal_exception_never_authorizes_transport_or_process_failures() {
-        for opt_in in [false, true] {
-            for terminal in [false, true] {
-                assert!(manual_conversion_allowed(None, opt_in, terminal));
-                assert_eq!(
-                    manual_conversion_allowed(
-                        Some(PrivacyBlockReason::FieldInspectionUnavailable),
-                        opt_in,
-                        terminal
-                    ),
-                    opt_in && terminal
-                );
-                for reason in [
-                    PrivacyBlockReason::PasswordField,
-                    PrivacyBlockReason::ExcludedProcess,
-                    PrivacyBlockReason::ElevatedProcess,
-                    PrivacyBlockReason::InspectionUnavailable,
-                ] {
-                    assert!(!manual_conversion_allowed(Some(reason), opt_in, terminal));
-                }
+    fn manual_exception_never_authorizes_passwords_or_transport_or_process_failures() {
+        for verified_process in [false, true] {
+            assert!(manual_conversion_allowed(None, verified_process));
+            assert_eq!(
+                manual_conversion_allowed(
+                    Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                    verified_process
+                ),
+                verified_process
+            );
+            for reason in [
+                PrivacyBlockReason::PasswordField,
+                PrivacyBlockReason::ExcludedProcess,
+                PrivacyBlockReason::ElevatedProcess,
+                PrivacyBlockReason::InspectionUnavailable,
+            ] {
+                assert!(!manual_conversion_allowed(Some(reason), verified_process));
             }
         }
     }

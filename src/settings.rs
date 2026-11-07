@@ -33,10 +33,11 @@ pub struct Settings {
     pub layout_model: bool,
     /// Explicitly permit manual conversion in verified terminals when only the
     /// focused field's UIA inspection is unavailable.
-    pub manual_terminal_uia_fallback: bool,
     /// A short, quiet sound after each conversion and a lower one after an undo.
     pub conversion_sound: bool,
     pub diagnostics_enabled: bool,
+    /// The word before an Enter is converted too, the Enter held until it is (off by default).
+    pub convert_on_enter: bool,
     pub suppress_after_backspace: bool,
     pub suppress_after_delete: bool,
     pub suppress_after_left: bool,
@@ -86,9 +87,9 @@ impl Default for Settings {
             physical_fallback_for_unsupported_apps: true,
             single_letter_words: false,
             layout_model: false,
-            manual_terminal_uia_fallback: false,
             conversion_sound: false,
             diagnostics_enabled: false,
+            convert_on_enter: false,
             suppress_after_backspace: true,
             suppress_after_delete: true,
             suppress_after_left: true,
@@ -218,9 +219,9 @@ impl Settings {
                 }
                 "single_letter_words" => &mut settings.single_letter_words,
                 "layout_model" => &mut settings.layout_model,
-                "manual_terminal_uia_fallback" => &mut settings.manual_terminal_uia_fallback,
                 "conversion_sound" => &mut settings.conversion_sound,
                 "diagnostics_enabled" => &mut settings.diagnostics_enabled,
+                "convert_on_enter" => &mut settings.convert_on_enter,
                 "suppress_after_backspace" => &mut settings.suppress_after_backspace,
                 "suppress_after_delete" => &mut settings.suppress_after_delete,
                 "suppress_after_left" => &mut settings.suppress_after_left,
@@ -277,9 +278,9 @@ impl Settings {
              physical_fallback_for_unsupported_apps={}\n\
              single_letter_words={}\n\
              layout_model={}\n\
-             manual_terminal_uia_fallback={}\n\
              conversion_sound={}\n\
              diagnostics_enabled={}\n\
+             convert_on_enter={}\n\
              suppress_after_backspace={}\n\
              suppress_after_delete={}\n\
              suppress_after_left={}\n\
@@ -299,9 +300,9 @@ impl Settings {
             self.physical_fallback_for_unsupported_apps,
             self.single_letter_words,
             self.layout_model,
-            self.manual_terminal_uia_fallback,
             self.conversion_sound,
             self.diagnostics_enabled,
+            self.convert_on_enter,
             self.suppress_after_backspace,
             self.suppress_after_delete,
             self.suppress_after_left,
@@ -354,9 +355,9 @@ fn is_known_key(key: &str) -> bool {
             | "physical_fallback_for_unsupported_apps"
             | "single_letter_words"
             | "layout_model"
-            | "manual_terminal_uia_fallback"
             | "conversion_sound"
             | "diagnostics_enabled"
+            | "convert_on_enter"
             | "suppress_after_backspace"
             | "suppress_after_delete"
             | "suppress_after_left"
@@ -583,6 +584,15 @@ mod tests {
     }
 
     #[test]
+    fn conversion_on_enter_is_off_by_default_and_round_trips() {
+        assert!(!Settings::default().convert_on_enter);
+        let parsed = Settings::try_from_text("convert_on_enter=yes").unwrap();
+        assert!(parsed.convert_on_enter);
+        assert!(parsed.to_text().contains("convert_on_enter=true\n"));
+        assert_eq!(Settings::from_text(&parsed.to_text()), parsed);
+    }
+
+    #[test]
     fn strict_parser_preserves_valid_roundtrips_partial_hotkeys_and_unknown_keys() {
         for text in [
             Settings::default().to_text(),
@@ -650,7 +660,10 @@ mod tests {
         assert!(!parsed.recheck_first_word_after_erasing);
         assert!(parsed.physical_fallback_for_unsupported_apps);
         assert!(parsed.single_letter_words);
-        assert!(parsed.manual_terminal_uia_fallback);
+        // No longer a setting (Pause works where a field cannot be inspected in every program,
+        // the owner's decision of 2026-10-25): an older file still loads, and the key is not
+        // written again.
+        assert!(!parsed.to_text().contains("manual_terminal_uia_fallback"));
         assert!(parsed.diagnostics_enabled);
         assert!(!parsed.suppress_after_backspace);
         assert!(!parsed.suppress_after_delete);

@@ -181,6 +181,55 @@ layouts: the keypad's `.` prints `,` in Russian, so it ends the word. A valid wo
 the current layout is a hard veto; automatic correction does not override it
 even when another pack also contains a plausible word.
 
+Two dictionary targets that differ in text are ambiguous and the word stays as
+typed. Two that give the same text are not: a word typed in the Russian layout
+that reads the same Latin letters in English and Estonian (`огые` is `just`,
+`зщду` is `pole`) is converted. It goes to the layout of the two that the field
+used last. A field that has used neither takes the layout from the layout model
+when it is on and sure, as it knows the words before this one, and otherwise from
+the target whose word scores best. On the layout model's 200 000 evaluation cases
+this converts 278 more words with the layout model and single-letter words on
+(651 with the dictionaries alone), makes no case worse and adds no false
+conversion.
+
+A word the layout in use already types is left alone: `kindel` in the English
+layout and `people` in the Estonian one need no edit, so the layout stays, and the
+words after them still count as Estonian and English for the layout model. The
+layout moves between English and Estonian only when a word needs a letter the
+current one lacks: `k;;k` becomes `köök` and leaves the Estonian layout on.
+Replaying the same 200 000 cases as typing, with the layout model and single-letter
+words on, this cuts the switches between the two from 10 717 to 989 and removes all
+9 706 edits that changed no text, and 53 fewer words end up wrong.
+
+Punctuation right after a word that the other layouts read as punctuation too
+stays with the word until the Space, and the word is converted with it:
+`gjnjv/` → `потом.` and `gjnjv?` → `потом,` (the `/` key prints a full stop in
+Russian). Earlier such a key ended the word, which was then neither converted
+nor available to Pause/Break. The word is judged without its marks, and a
+known word before them still vetoes the conversion; a letter or digit after the
+marks starts a new word as before (`src/main.rs`), and a target that reads the
+letters alike (Latin Estonian) is not used, as it would change only the marks.
+No English word of the token corpora followed by such a mark is converted
+(`tests/dev_tokens.rs`).
+
+`convert_on_enter` (off by default, "Also convert the word before Enter" in the
+settings) converts the word before a plain Enter as before a Space. The Enter
+arms the decision gate and the gate holds the Enter itself: the word is replaced
+with no delimiter after it, and only then does the Enter reach the program, so a
+messenger sends and a terminal runs the converted text. The Enter waits for the
+conversion (usually 100–300 ms, at most the gate's 1.2 s deadline); without a
+word to convert it goes on at once. A failed conversion or a gate that breaks,
+for any reason, does not keep the Enter: it reaches the program as soon as the
+edit has ended, and keys typed meanwhile wait behind it, in their order. A word
+the edit may have left selected is unselected first with a Right arrow, which
+deletes nothing, so the Enter cannot replace it. The one exception is
+a change of window or field: the Enter is never typed there, nor after coming
+back; it waits for recovery with Pause and is deleted after a minute. An Enter
+that may already have reached the program is not sent again without being asked.
+The same goes for an Enter held behind a Space; other held keys keep the rules
+below. Shift+Enter and Ctrl+Enter are left alone: Shift, held by the gate, would
+turn the edit's letters into capitals and its paste into Ctrl+Shift+V.
+
 After a successful Pause/Break undo, the original source-layout word may be
 held in memory for at most two minutes. A passive tray notification enables an
 explicit "Do not correct the last undone word" action. The word is not
@@ -208,7 +257,15 @@ also re-arm the first word when its setting is enabled. An additional Backspace
 on an already empty line still invalidates the context because it joins the
 line with preceding text. Pause/Break is reserved when its setting is enabled:
 it triggers undo when available, otherwise it forces the current buffered word
-through the same replacement pipeline even when automatic mode is off. Repeated
+through the same replacement pipeline even when automatic mode is off. What it
+converts is everything typed since the last Space, Tab or Enter in the field,
+whatever it is: letters, digits, punctuation between or after words
+(`gjnjv/ghbdtn` → `потом.привет`), a word that automatic conversion skipped for
+any reason. Delete keeps it (it removes text after the caret) and Backspace
+erases its last key; a key that moves the caret, a click, a shortcut and a field
+change end it, because the text before the caret is then unknown. Readings are
+ranked by their runs of letters, so punctuation inside the token does not decide
+the first layout. Repeated
 presses walk the word through every enabled layout: the first goes to the
 language in which the word reads best (a dictionary word first), the next ones to
 the remaining languages, and the last one back to the original; without a clear
@@ -299,7 +356,9 @@ Held keys that are not handed back (the gate ended at a click, physical or injec
 by another program, a focus change, injected input, a failed submission or an
 internal fault after the field changed, or the hand-back was refused) wait in memory
 for an explicit recovery from the tray menu for at most one minute, or one
-minute from preparing that recovery, and are then deleted. None of this is
+minute from preparing that recovery, and are then deleted. Held keys with an Enter
+among them come back on all of these paths except a change of window or field, as
+described for `convert_on_enter`. None of this is
 written to logs, configuration, diagnostics, or network services. Unsupported
 input, editing, navigation, focus changes, layout changes, and queue overflow
 clear or suppress the current context.
@@ -428,12 +487,15 @@ one-character words, but only against the pack's short-word tier or the user
 dictionary; it is off by default and every other single-letter word stays
 opt-in through the user dictionary.
 
-`manual_terminal_uia_fallback` is a separate, default-off permission for manual
-conversion in Windows Terminal, OpenConsole and Conhost when only the focused
-field's UIA inspection is unavailable. The process and integrity checks, current
-input epoch and target identity still have to succeed. A transport timeout,
-changed target, unreadable process or confirmed password field does not qualify.
-Routing an application to `physical-replay` alone never grants this permission.
+Manual conversion (Pause/Break) works in every program when only the focused
+field's UIA inspection is unavailable; such a word is never converted
+automatically, and its keys are kept in memory for Pause only, never written to
+the log. Until 2026-10-25 this was the default-off `manual_terminal_uia_fallback`
+permission for Windows Terminal, OpenConsole and Conhost; the setting is gone (an
+older configuration file still loads, and the key is not written again). The
+process and integrity checks, current input epoch and target identity still have
+to succeed. A transport timeout, changed target, unreadable process or confirmed
+password field does not qualify.
 
 The field check asks the focused field's program once, for its process and its
 password property together, and waits for it up to 250 ms (other UI Automation
@@ -454,7 +516,7 @@ before 2026-10-24). A password field,
 an excluded or unreadable process, a changed context and every transport failure
 stand as before, and recovery of held keys and manual conversion always take a
 failure at face value. A word that met a standing failure of the field check in
-a terminal (kept for Pause by `manual_terminal_uia_fallback`) becomes automatic
+a field (kept for Pause) becomes automatic
 again when a check of the same field passes before the word ends; a softened
 failure is no such check. A word resumed by erasing its delimiter stays
 manual-only whatever the checks say.
@@ -471,12 +533,30 @@ the reasons that blocked a shutdown, and one result for every typed word that wa
 not converted (`event=word result=` `no-candidate`, `manual-only`,
 `suppressed`, `no-language`, or `not-attempted` for a candidate with `reason=`
 `boundary` when Tab or Enter ended it, `automatic-off`, `shift`, `caps-lock` or
-`keys`), never the word. While privacy blocks the field (a
+`keys`), never the word. A word dropped on the way leaves `event=word_discard` with
+its category and length, and a candidate that does not start, or stops before its
+edit, leaves `event=word_left reason=` `stale-boundary`, `automatic-off`, `privacy`,
+`profiles`, `guard`, `source-settle`, `observe-only`, `enter-context`, `given-up`,
+`capability-mismatch` or `capability-unsupported`. Keys typed since the last boundary that
+left no word at it write `event=word_lost` with what last reset the word (`reset=`), whether
+the layout had a language, whether a letter key reached the worker at all (`keys=`), whether
+keyboard events the hook counted never reached its key handling (`gap=`, with their number in
+`missing=`), and why the worker dropped such events itself (`dropped=` `configuration` while a
+configuration loads, `epoch` for input of an older queue epoch, or `none`); a token of marks or
+digits alone writes nothing. A typed Space that arms no
+correction gate in a field the privacy check let through writes `event=gate phase=not_armed
+reason=` `configuration`, `retained-input`, `gate-active`, `modifiers` or `automatic-off`,
+once until the reason changes or a gate is armed; in a field not let through yet the hook cannot
+tell a check that failed from one still running, so it writes nothing. While privacy blocks the field (a
 password field, or an excluded, elevated or uninspectable program or field),
 nothing about the typing there is written at all: no key, word, candidate, Pause,
 queue or field-check line, and switching to a blocked program leaves no line
 either, because even a counter or a timestamp per key would tell a secret's length
-and rhythm. An excluded or elevated program is blocked from its first key there,
+and rhythm. The one exception is a field that merely could not be inspected, where
+nothing is known to be secret and a word would otherwise vanish unexplained: the
+start of such a block is written once (`event=privacy_state`), and a word lost to it
+leaves its category alone, with no length and at most one line a word
+(`event=word_reset reason=`). A positive finding writes neither. An excluded or elevated program is blocked from its first key there,
 whatever key it is (a shortcut, Space, Backspace), and from a configuration reload
 that excludes it; a Space there arms no correction gate, also before the worker has
 seen the program; a shortcut is written only once its field was checked (Tab may
@@ -571,6 +651,10 @@ recovery instead of being replayed over the word, automatic conversion pauses
 input, a click, another field) leaves what is selected alone, as it may be the
 user's own selection now, and keeps the held keys the same way. Keys kept like
 this never come back automatically; only an explicit recovery brings them back.
+Only keys with an Enter among them go on, after a Right arrow that takes the
+selection away and deletes nothing. It is a key in the input stream, not a
+selection set through UI Automation: a busy field would apply that later, among
+the keys it has queued, and they would land elsewhere.
 When the text edit is
 confirmed but the previous clipboard contents cannot be put back (restoring
 waits up to 60 ms for the clipboard), the conversion still counts as done:
@@ -594,7 +678,8 @@ abandoned and replaced by a fresh one on a new thread, at most three times; the
 diagnostics log records `event=probe respawned=N`, and the hung thread is never
 joined. The text barrier's reads (whether the text before the caret is the word an
 edit is about to replace) also run on a provider thread of their own: the worker waits
-for an answer no longer than the barrier's deadline, at most 150 ms per read, a read left
+for an answer no longer than the barrier's deadline, 150 ms unless a field that does not
+answer gets more (below), a read left
 behind changes nothing in the field, the barrier report then names `stage=Provider`, and a
 provider that keeps the queue busy for 2 seconds is replaced, at most three times. Each
 check reads the field afresh: the late answer of a read left behind describes the field as
@@ -605,7 +690,19 @@ answers UI Automation only once it has handled it): the check goes on reading it
 from the gate's time only what the steps after it need at the least (the layout switch, a
 50 ms second check and a margin): the restore of the user's clipboard then waits only for
 what is left and otherwise finishes on its own, and so does the second check. A field that
-answers without the replacement is not waited for longer.
+answers without the replacement is not waited for longer. A second check that gets no answer
+leaves a paste the first check confirmed done; only other text in the field fails it. When the check has given up and
+the collapse of the selection finds it gone, the field answers again, and one more read
+settles it: the replacement in the field is proof that the paste went through, so the edit
+counts as done and automatic conversion stays on. Before an edit, the read that waits for
+the field to show the word (`event=source_settle`, also the capability route's own read)
+treats a field that does not answer the same way: it may go on for as long as the edit can
+spare of the gate, up to 350 ms from the gate's start in all, as one slow read would
+otherwise cost the word. A field too busy to name its focus to UI Automation
+(`FocusUnavailable`) has not answered either. A field that answers with other text is
+refused at once. An edit also goes on with only what must fit after its Ctrl+V in hand
+(the commit's poll, the layout switch, the second check's least and a margin, 550 ms):
+the restore of the clipboard and the rest of the second check take only what is left.
 Selecting the word and collapsing that selection again run on the worker itself: they
 change the field, and a call abandoned at a deadline could still take effect later, under
 keys typed meanwhile. This is deliberate (audit finding E-new-3, kept as it is): if a
@@ -623,7 +720,11 @@ password field or excluded or elevated program was found, and the worker is not
 inside an edit that may have selected or typed text (`phase=recovery_handed_back`).
 The worker then finishes that recovery as if it had sent the keys itself: the word at the
 caret is not converted until the next boundary, a prepared recovery is cancelled, and
-automatic conversion resumes when every key went out (policy above).
+automatic conversion resumes when every key went out (policy above). Keys with an
+Enter among them need only the same input target, a released modifier and a worker
+outside an edit: what was typed since waits behind them, a left selection gets a
+Right arrow first, and at the end of their minute they are handed back the same way
+instead of being deleted.
 
 The tray icon's tooltip shows the mode (or the safety pause and its reason), the
 layout code and the counters. The icon uses version 4 of the notification-area protocol,

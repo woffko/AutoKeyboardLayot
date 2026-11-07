@@ -24,8 +24,8 @@ mod token_measure;
 use autokeyboardlayot::{DictionaryRegistry, Language};
 use std::sync::Arc;
 use token_measure::{
-    CORPUS, LAYOUTS, Layouts, PUNCTUATED, TECHNICAL, detectors, measure, parse_punctuated_tokens,
-    parse_technical_tokens, parse_tokens,
+    CORPUS, LAYOUTS, Layouts, PUNCTUATED, TECHNICAL, detectors, measure, measure_trailing_marks,
+    parse_punctuated_tokens, parse_technical_tokens, parse_tokens,
 };
 
 /// A smaller corpus would make the percentages meaningless.
@@ -116,6 +116,87 @@ fn technical_tokens_false_positive_budget() {
         &tokens,
         TECHNICAL_DICTIONARY_BUDGET,
         TECHNICAL_MODEL_EXTRA_BUDGET,
+    );
+}
+
+#[test]
+fn no_token_is_converted_with_its_trailing_marks() {
+    // Punctuation right after a word stays with it until the Space ("gjnjv/" is "потом."). Typed
+    // correctly in the English layout, no token of the corpora may become a conversion that way.
+    let layouts = layouts();
+    let (dictionary_only, with_model) = bundled();
+    for (name, tokens) in [
+        ("dev-tokens", parse_tokens(CORPUS)),
+        ("punctuated-english", parse_punctuated_tokens(PUNCTUATED)),
+        ("technical-tokens", parse_technical_tokens(TECHNICAL)),
+    ] {
+        let tokens = tokens.expect(name);
+        let (result, already_converted) =
+            measure_trailing_marks(&tokens, &layouts, &dictionary_only, &with_model);
+        println!(
+            "{name}: {} of {} tokens end with trailing marks, {already_converted} converted \
+             without them too, {} more converted by the dictionaries, {} more by the layout model",
+            result.tokens,
+            tokens.len(),
+            result.dictionary.len(),
+            result.model_extra.len()
+        );
+        assert!(
+            result.dictionary.is_empty() && result.model_extra.is_empty(),
+            "{name}: tokens converted with their trailing marks:{}{}",
+            listed(&result.dictionary),
+            listed(&result.model_extra)
+        );
+    }
+}
+
+#[test]
+fn no_english_word_followed_by_a_mark_is_converted() {
+    // The corpora hold only the punctuation keys that print letters in Russian or Estonian. Every
+    // other punctuation key after a word is a trailing mark: each command name and each word of
+    // the punctuated corpus, typed correctly in the English layout and followed by one of them,
+    // must stay as typed.
+    const MARKS: &str = "!?)/-%*&@#$^_=+\\|~";
+    let layouts = layouts();
+    let (dictionary_only, with_model) = bundled();
+    let mut words = parse_tokens(CORPUS).expect("corpus");
+    words.extend(
+        parse_punctuated_tokens(PUNCTUATED)
+            .expect("punctuated corpus")
+            .iter()
+            .map(|token| {
+                token
+                    .trim_matches(|c: char| !c.is_ascii_alphabetic())
+                    .to_owned()
+            })
+            .filter(|word| word.len() >= 3 && word.chars().all(|c| c.is_ascii_alphabetic())),
+    );
+    words.sort();
+    words.dedup();
+    let tokens: Vec<String> = words
+        .iter()
+        .flat_map(|word| MARKS.chars().map(move |mark| format!("{word}{mark}")))
+        .collect();
+    let (result, already_converted) =
+        measure_trailing_marks(&tokens, &layouts, &dictionary_only, &with_model);
+    println!(
+        "{} words x {} marks: {} tokens end with trailing marks, {already_converted} converted \
+         without them too, {} more converted by the dictionaries, {} more by the layout model",
+        words.len(),
+        MARKS.chars().count(),
+        result.tokens,
+        result.dictionary.len(),
+        result.model_extra.len()
+    );
+    assert!(
+        result.tokens >= tokens.len() / 2,
+        "most marks must count as trailing marks"
+    );
+    assert!(
+        result.dictionary.is_empty() && result.model_extra.is_empty(),
+        "words converted with a trailing mark:{}{}",
+        listed(&result.dictionary),
+        listed(&result.model_extra)
     );
 }
 

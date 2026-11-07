@@ -61,6 +61,25 @@ pub struct Detection {
 }
 
 impl Detection {
+    /// Whether the conversion changes the text. Latin layouts read most keys alike, so a word of
+    /// another language may need no edit at all: all that is left of it would flip the layout.
+    pub fn changes_text(&self) -> bool {
+        self.original != self.replacement
+    }
+
+    /// Moves the target to the newest of the `recent` layouts of the field that gives the same
+    /// text: the word does not need any other, and the user stays in the one they were using.
+    pub fn prefer_layouts(&mut self, readings: &[(Language, String)], recent: &[Language]) {
+        let same_text = |language: &&Language| {
+            readings
+                .iter()
+                .any(|(reader, text)| reader == *language && *text == self.replacement)
+        };
+        if let Some(&language) = recent.iter().find(same_text) {
+            self.target_language = language;
+        }
+    }
+
     pub fn score_margin(&self) -> f32 {
         self.target_score - self.source_score
     }
@@ -238,9 +257,10 @@ impl Detector {
         self.layout_model.is_some()
     }
 
-    /// Dictionary detection first; when it leaves the word unchanged, the
-    /// optional layout model may still pick another layout. `previous` holds
-    /// the languages of recent words, never their text.
+    /// Dictionary detection first; when it leaves the word unchanged, or two targets with the same
+    /// text leave the layout open, the optional layout model may still pick the layout: it knows
+    /// the words before this one. `previous` holds the languages of recent words, never their
+    /// text.
     pub fn detect_mapped_candidates_in_context(
         &self,
         word: &str,
@@ -248,8 +268,75 @@ impl Detector {
         candidates: &[(Language, String)],
         previous: &[Language],
     ) -> Option<Detection> {
-        self.detect_mapped_candidates(word, current_language, candidates)
-            .or_else(|| self.detect_with_layout_model(word, current_language, candidates, previous))
+        match self.dictionary_stage(word, current_language, candidates) {
+            Some((detection, false)) => Some(detection),
+            found => self
+                .detect_with_layout_model(word, current_language, candidates, previous)
+                .or(found.map(|(detection, _)| detection)),
+        }
+    }
+
+    /// As `detect_mapped_candidates_in_context` (`detect_mapped_candidates` without `previous`)
+    /// for a word whose last `marks` characters are trailing marks (`InputEvent::TrailingMark`):
+    /// the word and its candidates are judged without the marks, and the replacement gets them
+    /// as the target layout reads the same keys, which must not be letters there ("gjnjv/" is
+    /// "потом.").
+    pub fn detect_with_trailing_marks(
+        &self,
+        word: &str,
+        marks: usize,
+        current_language: Language,
+        candidates: &[(Language, String)],
+        previous: Option<&[Language]>,
+    ) -> Option<Detection> {
+        let detect = |word: &str, candidates: &[(Language, String)]| match previous {
+            Some(previous) => self.detect_mapped_candidates_in_context(
+                word,
+                current_language,
+                candidates,
+                previous,
+            ),
+            None => self.detect_mapped_candidates(word, current_language, candidates),
+        };
+        if marks == 0 {
+            return detect(word, candidates);
+        }
+        let length = word.chars().count();
+        let core_length = length.checked_sub(marks).filter(|&core| core > 0)?;
+        let split = |text: &str| {
+            (text.chars().count() == length).then(|| {
+                (
+                    text.chars().take(core_length).collect::<String>(),
+                    text.chars().skip(core_length).collect::<String>(),
+                )
+            })
+        };
+        let (core, _) = split(word)?;
+        let mut cores = Vec::new();
+        let mut tails = Vec::new();
+        for (language, text) in self.resolve_candidates(word, current_language, candidates) {
+            if let Some((candidate_core, tail)) = split(&text) {
+                cores.push((language, candidate_core));
+                tails.push((language, tail));
+            }
+        }
+        let mut detection = detect(&core, &cores)?;
+        // A target that reads the letters alike ("endi" in Estonian) would change only the marks.
+        if detection.replacement == core {
+            return None;
+        }
+        let (_, tail) = tails
+            .into_iter()
+            .find(|(language, _)| *language == detection.target_language)?;
+        if tail
+            .chars()
+            .any(|character| self.accepts_character(detection.target_language, character))
+        {
+            return None;
+        }
+        detection.original = word.to_owned();
+        detection.replacement.push_str(&tail);
+        Some(detection)
     }
 
     /// Second stage. It keeps every hard rule of the dictionary detector: the
@@ -495,13 +582,27 @@ impl Detector {
         current_language: Language,
         candidates: &[(Language, String)],
     ) -> Option<Detection> {
+        self.dictionary_stage(word, current_language, candidates)
+            .map(|(detection, _)| detection)
+    }
+
+    /// `detect_mapped_candidates`, and whether two dictionary targets gave the text of the
+    /// detection, so that its target is only the one that reads best.
+    fn dictionary_stage(
+        &self,
+        word: &str,
+        current_language: Language,
+        candidates: &[(Language, String)],
+    ) -> Option<(Detection, bool)> {
         self.dictionaries.active_language(current_language)?;
         let character_count = word.chars().count();
         if character_count == 1 {
             if !self.config.single_letter_words {
                 return None;
             }
-            return self.detect_single_letter(word, current_language, candidates);
+            return self
+                .detect_single_letter(word, current_language, candidates)
+                .map(|detection| (detection, false));
         }
         if character_count < self.config.minimum_word_characters {
             return None;
@@ -538,7 +639,8 @@ impl Detector {
             // A general-list abbreviation is not as strong as a common word.
             source_score -= DICTIONARY_SCORE_BONUS;
         }
-        let mut dictionary_candidate = None;
+        let mut dictionary_candidate: Option<Detection> = None;
+        let mut same_text_targets = false;
         let mut statistical_candidate = None;
 
         let resolved_candidates = self.resolve_candidates(word, current_language, candidates);
@@ -594,10 +696,18 @@ impl Detector {
             }
 
             if target_in_dictionary {
-                if dictionary_candidate.is_some() {
-                    return None;
+                match &mut dictionary_candidate {
+                    // Two targets that give the same text (Latin letters that read alike in
+                    // English and Estonian) are no ambiguity: the one that reads best stays.
+                    Some(kept) if kept.replacement == detection.replacement => {
+                        same_text_targets = true;
+                        if detection.target_score > kept.target_score {
+                            *kept = detection;
+                        }
+                    }
+                    Some(_) => return None,
+                    None => dictionary_candidate = Some(detection),
                 }
-                dictionary_candidate = Some(detection);
             } else {
                 if statistical_candidate.is_some() {
                     return None;
@@ -606,7 +716,9 @@ impl Detector {
             }
         }
 
-        dictionary_candidate.or(statistical_candidate)
+        dictionary_candidate
+            .map(|detection| (detection, same_text_targets))
+            .or(statistical_candidate.map(|detection| (detection, false)))
     }
 
     /// List-only policy for one-character words. A single letter has no
@@ -671,20 +783,28 @@ impl Detector {
         chosen
     }
 
-    /// The languages of `readings` (one word read in several layouts) from the most to the least
-    /// plausible reading. The word score decides, which includes the dictionary bonus; equal
-    /// scores keep the given order. The hotkey sends a word to the first of them.
+    /// The languages of `readings` (one word or token read in several layouts) from the most to
+    /// the least plausible reading. The word scores of the reading's runs of letters decide,
+    /// summed (punctuation between or around them, such as in "потом.привет", is not scored),
+    /// which includes the dictionary bonus; equal scores keep the given order. The hotkey sends a
+    /// word to the first of them.
     pub fn rank_candidates(&self, readings: &[(Language, String)]) -> Vec<Language> {
         let mut scored: Vec<(Language, f32)> = readings
             .iter()
             .map(|(language, reading)| {
-                let score = score_word(
-                    reading,
-                    *language,
-                    &self.user_dictionary,
-                    &self.dictionaries,
-                );
-                (*language, score)
+                let score = |text: &str| {
+                    score_word(text, *language, &self.user_dictionary, &self.dictionaries)
+                };
+                let runs: Vec<&str> = reading
+                    .split(|character| !self.accepts_character(*language, character))
+                    .filter(|run| !run.is_empty())
+                    .collect();
+                let total = if runs.is_empty() {
+                    score(reading)
+                } else {
+                    runs.into_iter().map(score).sum()
+                };
+                (*language, total)
             })
             .collect();
         scored.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -905,6 +1025,274 @@ mod tests {
             [Language::Estonian, Language::Russian]
         );
         assert!(detector.rank_candidates(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_hotkey_ranks_a_reading_by_its_letters_without_edge_punctuation() {
+        let detector = crate::test_support::detector();
+        // `gjnjv/` typed in the English layout: Russian reads "потом." (a word and a full stop),
+        // Estonian "gjnjv-".
+        assert_eq!(
+            detector.rank_candidates(&mapped(&[
+                (Language::Estonian, "gjnjv-"),
+                (Language::Russian, "потом."),
+            ])),
+            [Language::Russian, Language::Estonian]
+        );
+        // Pause converts a whole token: `gjnjv/ghbdtn` reads "потом.привет", two Russian words.
+        assert_eq!(
+            detector.rank_candidates(&mapped(&[
+                (Language::Estonian, "gjnjv-ghbdtn"),
+                (Language::Russian, "потом.привет"),
+            ])),
+            [Language::Russian, Language::Estonian]
+        );
+    }
+
+    #[test]
+    fn a_word_with_trailing_marks_is_judged_by_its_letters() {
+        let detector = crate::test_support::detector();
+        let candidates = mapped(&[
+            (Language::Russian, "потом."),
+            (Language::Estonian, "gjnjv-"),
+        ]);
+        let detection = detector
+            .detect_with_trailing_marks("gjnjv/", 1, Language::English, &candidates, None)
+            .expect("converted");
+        assert_eq!(detection.original, "gjnjv/");
+        assert_eq!(detection.replacement, "потом.");
+        // Without its mark the word is judged as before.
+        assert_eq!(
+            detector.detect_with_trailing_marks("gjnjv/", 0, Language::English, &candidates, None),
+            detector.detect_mapped_candidates("gjnjv/", Language::English, &candidates)
+        );
+        // A known word before the mark stays ("key." is no "луню").
+        assert!(
+            detector
+                .detect_with_trailing_marks(
+                    "key/",
+                    1,
+                    Language::English,
+                    &mapped(&[(Language::Russian, "лун.")]),
+                    None
+                )
+                .is_none()
+        );
+        // A mark the target reads as a letter is no trailing mark.
+        assert!(
+            detector
+                .detect_with_trailing_marks(
+                    "gjnjv/",
+                    1,
+                    Language::English,
+                    &mapped(&[(Language::Russian, "потомж")]),
+                    None
+                )
+                .is_none()
+        );
+        // The Estonian layout reads "endi" as the same letters: converting it would only turn the
+        // question mark into "_".
+        assert!(
+            detector
+                .detect_mapped_candidates(
+                    "endi",
+                    Language::English,
+                    &mapped(&[(Language::Estonian, "endi")])
+                )
+                .is_some(),
+            "the premise: the word alone is converted to Estonian"
+        );
+        assert!(
+            detector
+                .detect_with_trailing_marks(
+                    "endi?",
+                    1,
+                    Language::English,
+                    &mapped(&[(Language::Estonian, "endi_")]),
+                    None
+                )
+                .is_none()
+        );
+        // Only marks, or more marks than characters, are nothing to convert.
+        assert!(
+            detector
+                .detect_with_trailing_marks("//", 2, Language::English, &[], None)
+                .is_none()
+        );
+        assert!(
+            detector
+                .detect_with_trailing_marks("gj", 3, Language::English, &[], None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_word_with_trailing_marks_reaches_the_layout_model_with_a_context() {
+        let detector = model_detector();
+        let candidates = mapped(&[
+            (Language::Russian, "лхышьгыуду!"),
+            (Language::Estonian, "küsimusele!"),
+        ]);
+        assert!(
+            detector
+                .detect_with_trailing_marks("k[simusele!", 1, Language::English, &candidates, None)
+                .is_none(),
+            "the dictionaries alone do not convert it"
+        );
+        let detection = detector
+            .detect_with_trailing_marks(
+                "k[simusele!",
+                1,
+                Language::English,
+                &candidates,
+                Some(&[Language::English]),
+            )
+            .expect("the model converts it");
+        assert_eq!(detection.replacement, "küsimusele!");
+    }
+
+    fn detection_of(original: &str, replacement: &str, target_language: Language) -> Detection {
+        Detection {
+            source_language: Language::Russian,
+            target_language,
+            original: original.to_owned(),
+            replacement: replacement.to_owned(),
+            source_score: 0.0,
+            target_score: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_detection_changes_the_text_unless_both_layouts_type_the_word_alike() {
+        assert!(detection_of("огые", "just", Language::English).changes_text());
+        assert!(!detection_of("kindel", "kindel", Language::Estonian).changes_text());
+        assert!(detection_of("Kindel", "kindel", Language::Estonian).changes_text());
+    }
+
+    #[test]
+    fn the_layout_a_field_used_last_takes_a_word_it_reads_alike() {
+        let alike = mapped(&[(Language::English, "just"), (Language::Estonian, "just")]);
+        let recent = [Language::Russian, Language::Estonian, Language::English];
+        let mut detection = detection_of("огые", "just", Language::English);
+        detection.prefer_layouts(&alike, &recent);
+        assert_eq!(detection.target_language, Language::Estonian);
+        // The newest of them wins, whichever the target was.
+        let recent = [Language::Russian, Language::English, Language::Estonian];
+        let mut detection = detection_of("огые", "just", Language::Estonian);
+        detection.prefer_layouts(&alike, &recent);
+        assert_eq!(detection.target_language, Language::English);
+    }
+
+    #[test]
+    fn a_layout_that_reads_the_word_otherwise_does_not_take_it() {
+        let different = mapped(&[(Language::English, "k;;k"), (Language::Estonian, "köök")]);
+        let mut detection = detection_of("л;;л", "köök", Language::Estonian);
+        detection.prefer_layouts(&different, &[Language::English, Language::Estonian]);
+        assert_eq!(detection.target_language, Language::Estonian);
+    }
+
+    #[test]
+    fn a_field_without_a_layout_of_the_word_leaves_the_target() {
+        let alike = mapped(&[(Language::English, "just"), (Language::Estonian, "just")]);
+        let mut detection = detection_of("огые", "just", Language::Estonian);
+        detection.prefer_layouts(&alike, &[]);
+        assert_eq!(detection.target_language, Language::Estonian);
+        detection.prefer_layouts(&alike, &[Language::Russian]);
+        assert_eq!(detection.target_language, Language::Estonian);
+        // The target itself came first: an older layout does not take the word from it.
+        detection.prefer_layouts(&alike, &[Language::Estonian, Language::English]);
+        assert_eq!(detection.target_language, Language::Estonian);
+    }
+
+    #[test]
+    fn two_dictionary_targets_with_the_same_text_are_no_ambiguity() {
+        // "just" typed in the Russian layout reads the same letters in English and in Estonian, and
+        // both dictionaries know them: the text is the same whichever target is taken.
+        let detector = crate::test_support::detector();
+        let same = mapped(&[(Language::English, "just"), (Language::Estonian, "just")]);
+        let detection = detector
+            .detect_mapped_candidates("огые", Language::Russian, &same)
+            .expect("converted");
+        assert_eq!(detection.original, "огые");
+        assert_eq!(detection.replacement, "just");
+        assert_eq!(detection.target_language, Language::English);
+        // The target whose word scores best stays, in either order.
+        let reversed = mapped(&[(Language::Estonian, "just"), (Language::English, "just")]);
+        assert_eq!(
+            detector.detect_mapped_candidates("огые", Language::Russian, &reversed),
+            Some(detection)
+        );
+    }
+
+    #[test]
+    fn the_layout_model_chooses_between_two_targets_with_the_same_text() {
+        // "selle" typed in the Russian layout after Estonian words: the text is the same in
+        // English and Estonian, and the layout to switch to is the one the words before say.
+        let detector = model_detector();
+        let same = mapped(&[(Language::English, "selle"), (Language::Estonian, "selle")]);
+        let previous = [Language::Estonian; 3];
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context("ыудду", Language::Russian, &same, &previous)
+                .map(|detection| detection.target_language),
+            Some(Language::Estonian)
+        );
+        // Without the model the target that reads best stays, and where the model has no opinion
+        // (a word too short for it) as well.
+        assert_eq!(
+            crate::test_support::detector()
+                .detect_mapped_candidates_in_context("ыудду", Language::Russian, &same, &previous)
+                .map(|detection| detection.target_language),
+            Some(Language::English)
+        );
+        let short = mapped(&[(Language::English, "on"), (Language::Estonian, "on")]);
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context("щт", Language::Russian, &short, &previous)
+                .map(|detection| detection.replacement),
+            Some("on".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_layout_model_is_asked_only_about_two_dictionary_targets() {
+        // One dictionary target: only the English dictionary knows "and", though the Estonian
+        // layout reads the same letters. It stays what the dictionary stage found, as before.
+        let detector = model_detector();
+        let one = mapped(&[(Language::English, "and"), (Language::Estonian, "and")]);
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context("фтв", Language::Russian, &one, &[])
+                .map(|detection| detection.target_language),
+            Some(Language::English)
+        );
+        // A statistical target: neither dictionary knows the word.
+        let statistical = mapped(&[
+            (Language::English, "sellest"),
+            (Language::Estonian, "sellest"),
+        ]);
+        assert_eq!(
+            detector
+                .detect_mapped_candidates_in_context(
+                    "ыуддуые",
+                    Language::Russian,
+                    &statistical,
+                    &[Language::Russian]
+                )
+                .map(|detection| detection.target_language),
+            Some(Language::English)
+        );
+    }
+
+    #[test]
+    fn two_dictionary_targets_with_different_texts_stay_ambiguous() {
+        let detector = crate::test_support::detector();
+        let different = mapped(&[(Language::English, "just"), (Language::Estonian, "maja")]);
+        assert!(
+            detector
+                .detect_mapped_candidates("огые", Language::Russian, &different)
+                .is_none()
+        );
     }
 
     #[test]

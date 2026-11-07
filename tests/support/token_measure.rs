@@ -186,6 +186,114 @@ impl Layouts {
     }
 }
 
+/// The word the agent holds when `token` ends, and how many trailing marks end it, split as the
+/// agent splits typing (`process_key`): a character that the English layout takes as a letter
+/// or a target layout reads as one continues the word; punctuation right after a word is a
+/// trailing mark; anything after trailing marks starts a new word; any other punctuation or
+/// whitespace ends the word; any other character (a digit) ends it and suppresses the rest of
+/// the token. `None` when the token does not end with trailing marks.
+fn word_with_trailing_marks(
+    token: &str,
+    layouts: &Layouts,
+    detector: &Detector,
+) -> Option<(String, usize)> {
+    let (mut word, mut marks, mut suppressed) = (String::new(), 0, false);
+    for character in token.chars() {
+        let readings: Vec<(Language, char)> = layouts
+            .readings(&character.to_string())?
+            .into_iter()
+            .filter_map(|(language, reading)| Some((language, reading.chars().next()?)))
+            .collect();
+        if detector.can_extend_word_with_readings(character, Language::English, &readings) {
+            if marks > 0 {
+                word.clear();
+                marks = 0;
+            }
+            if !suppressed {
+                word.push(character);
+            }
+        } else if character.is_ascii_punctuation() && !character.is_whitespace() {
+            if !suppressed && !word.is_empty() {
+                word.push(character);
+                marks += 1;
+            } else {
+                word.clear();
+                marks = 0;
+                suppressed = false;
+            }
+        } else if character.is_whitespace() {
+            word.clear();
+            marks = 0;
+            suppressed = false;
+        } else {
+            word.clear();
+            marks = 0;
+            suppressed = true;
+        }
+    }
+    (marks > 0 && !word.is_empty()).then_some((word, marks))
+}
+
+/// As `measure`, for the tokens that end with trailing marks: the word before them is judged
+/// with its marks (`Detector::detect_with_trailing_marks`), as the agent does at the Space after
+/// the token. Only the conversions the marks add count: a word the detector converts without
+/// them too (a budgeted command name) is counted in `already_converted` instead. `tokens` in the
+/// result counts the tokens that end with trailing marks.
+#[allow(dead_code)] // tests/dev_tokens.rs uses it, examples/measure_token_false_positives.rs does not
+pub fn measure_trailing_marks(
+    tokens: &[String],
+    layouts: &Layouts,
+    dictionary_only: &Detector,
+    with_model: &Detector,
+) -> (Measurement, usize) {
+    let mut result = Measurement::default();
+    let mut already_converted = 0;
+    for token in tokens {
+        let Some((word, marks)) = word_with_trailing_marks(token, layouts, with_model) else {
+            continue;
+        };
+        let Some(mapped) = layouts.readings(&word) else {
+            continue;
+        };
+        result.tokens += 1;
+        let core: String = word.chars().take(word.chars().count() - marks).collect();
+        if let Some(core_mapped) = layouts.readings(&core)
+            && (dictionary_only
+                .detect_mapped_candidates(&core, Language::English, &core_mapped)
+                .is_some()
+                || with_model
+                    .detect_mapped_candidates_in_context(
+                        &core,
+                        Language::English,
+                        &core_mapped,
+                        &[],
+                    )
+                    .is_some())
+        {
+            already_converted += 1;
+            continue;
+        }
+        if let Some(detection) = dictionary_only.detect_with_trailing_marks(
+            &word,
+            marks,
+            Language::English,
+            &mapped,
+            None,
+        ) {
+            result.dictionary.push(Conversion::new(token, &detection));
+        } else if let Some(detection) = with_model.detect_with_trailing_marks(
+            &word,
+            marks,
+            Language::English,
+            &mapped,
+            Some(&[]),
+        ) {
+            result.model_extra.push(Conversion::new(token, &detection));
+        }
+    }
+    (result, already_converted)
+}
+
 /// A platform that reports the three layouts as loaded, with English active.
 struct LoadedLayouts(usize);
 
