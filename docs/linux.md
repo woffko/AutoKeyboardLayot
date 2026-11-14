@@ -108,11 +108,19 @@ modular base". Move `~/.config/autokeyboardlayot/config.ini` aside to start fres
 ## Use
 
 - Type. When a word typed in the wrong layout ends with Space, the engine replaces it and switches
-  to the layout of the replacement.
+  to the layout of the replacement. Punctuation typed right after the word goes with it: `gjnjv/`
+  becomes `потом.`. A word the layout in use already types (an Estonian word without its own
+  letters in the English layout) is left alone, and the layout stays; when several layouts give
+  the same text, the one this field used last is chosen.
+- With "Convert the word before Enter" switched on in Settings, a plain Enter ends a word like a
+  Space: the word is converted first and the Enter is sent after the replacement, so a messenger
+  sends and a terminal runs the converted text. Shift+Enter is never held up.
 - Alt+Shift switches EN → RU → ET.
 - Pause (the hotkey is configurable in Settings) undoes the last conversion. Without one, it
-  converts the word at the caret, or the last word, to the most plausible other layout. Pressing it
-  again tries the next one.
+  converts everything typed since the last Space, Tab or Enter (`gjnjv/ghbdtn` becomes
+  `потом.привет`), or else the last word, to the most plausible other layout. Pressing it again
+  tries the next one. Backspace shortens what Pause converts; a key that moves the caret, a
+  shortcut or another field ends it.
 - A setting changed in the settings window takes effect when the next text field takes the focus.
 
 How a word is replaced: if the application reports the text around the caret and that text ends
@@ -123,7 +131,8 @@ forwarded keys with its next frame and the application takes them with its own, 
 text arrives at once; without the wait the replacement would come first and the BackSpaces would
 erase it. Inside a terminal program that gives BackSpace another meaning, switch automatic
 conversion off. The diagnostics log names the way (`strategy=`) and what the field reported
-(`surrounding=`: `verified`, `none`, `mismatch`, `selection` or `terminal`).
+(`surrounding=`: `verified`, `none`, `mismatch`, `selection` or `terminal`) and what ended the
+word (`boundary=space` or `boundary=enter`).
 
 Password and PIN fields, as the application reports them to IBus, and fields marked private are
 typed normally but never tracked.
@@ -136,7 +145,8 @@ does not tell the engine which program a field belongs to, and one IBus path ser
 
 The same boundary as on Windows (see the README's privacy section):
 
-- The current word is kept in memory only. For Pause, the last word and the last conversion are
+- The current word, and for Pause the keys typed since the last Space, are kept in memory only
+  (at most 64 keys). For Pause, the last word and the last conversion are
   kept in memory until the field loses the focus or the application resets its input (a click, a
   caret move).
 - Nothing typed is written to disk. Diagnostics are off by default. When switched on, they record

@@ -61,6 +61,13 @@ pub mod keysym {
 
 // evdev key codes.
 const KEY_BACKSPACE: u32 = 14;
+/// Keys Pause converts at most: everything typed since the last Space, Tab or Enter.
+const TOKEN_MAX_KEYS: usize = 64;
+/// evdev codes of the numeric keypad. Its "." prints "," in Russian, which is not what a full stop
+/// typed there meant, so a keypad key is never a mark that stays with a word.
+const KEYPAD_KEYS: [u32; 18] = [
+    55, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 96, 98, 117, 121,
+];
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTSHIFT: u32 = 54;
@@ -459,6 +466,13 @@ pub struct Engine {
     session: InputSession,
     word: Vec<TypedKey>,
     word_layout: Option<Language>,
+    /// What Pause converts: every key typed since the last Space, Tab or Enter, whatever it
+    /// printed, in `token_layout`. The automatic detection follows only `word`, its last word.
+    token: Vec<TypedKey>,
+    token_layout: Option<Language>,
+    /// The layouts this field used, newest first: a word several layouts read alike goes to the
+    /// one the field used last.
+    field_layouts: Vec<Language>,
     manual_only: bool,
     last_word: Option<LastWord>,
     undo: Option<Undo>,
@@ -481,6 +495,9 @@ impl Engine {
             session,
             word: Vec::new(),
             word_layout: None,
+            token: Vec::new(),
+            token_layout: None,
+            field_layouts: Vec::new(),
             manual_only: false,
             last_word: None,
             undo: None,
@@ -560,6 +577,8 @@ impl Engine {
     fn forget_word_state(&mut self) {
         self.word.clear();
         self.word_layout = None;
+        self.token.clear();
+        self.token_layout = None;
         self.manual_only = false;
         self.last_word = None;
         self.undo = None;
@@ -585,6 +604,7 @@ impl Engine {
             return Outcome::pass();
         }
         self.modifiers.other_key();
+        self.note_field_layout(layout);
         let levels = Levels {
             shift: state & SHIFT_MASK != 0,
             caps_lock: state & LOCK_MASK != 0,
@@ -605,9 +625,15 @@ impl Engine {
         let rule = match keyval {
             keysym::BACKSPACE => return self.backspace(shared),
             keysym::RETURN | keysym::KP_ENTER => {
+                // A plain Enter only: Shift+Enter starts a new line in a messenger instead.
+                let converted = if settings.convert_on_enter && !levels.shift {
+                    self.convert_before_enter(shared, keyval, keycode)
+                } else {
+                    None
+                };
                 self.forget();
                 self.session.mark_line_start();
-                return Outcome::pass();
+                return converted.unwrap_or_else(Outcome::pass);
             }
             keysym::TAB | keysym::ISO_LEFT_TAB | keysym::ESCAPE => {
                 self.forget();
@@ -667,11 +693,16 @@ impl Engine {
         let next = shared.layouts[(position + 1) % shared.layouts.len()];
         let word = std::mem::take(&mut self.word);
         let word_layout = self.word_layout.take();
+        let token = std::mem::take(&mut self.token);
+        let token_layout = self.token_layout.take();
         let last_word = self.last_word.take();
         self.forget();
-        self.last_word = match (word.is_empty(), word_layout) {
-            (false, Some(layout)) => Some(LastWord {
-                keys: word,
+        self.last_word = match (
+            (token.is_empty(), token_layout),
+            (word.is_empty(), word_layout),
+        ) {
+            ((false, Some(layout)), _) | (_, (false, Some(layout))) => Some(LastWord {
+                keys: if token.is_empty() { word } else { token },
                 delimiter: None,
                 layout,
             }),
@@ -709,6 +740,10 @@ impl Engine {
     }
 
     fn switching_rule(&mut self, shared: &Shared, event: InputEvent, suppress: bool) {
+        if event != InputEvent::Delete {
+            self.token.clear();
+            self.token_layout = None;
+        }
         self.last_word = None;
         self.undo = None;
         self.cycle = None;
@@ -734,6 +769,7 @@ impl Engine {
         if self.private() {
             return Outcome::pass();
         }
+        self.erase_token_key(shared);
         if shared.settings.suppress_after_backspace || !self.erase_or_resume(shared) {
             self.last_word = None;
             self.word.clear();
@@ -801,8 +837,13 @@ impl Engine {
             return outcome;
         }
         match typed {
-            Some(character) => self.track(shared, character, key),
+            Some(character) => {
+                self.extend_token(character, key, layout);
+                self.track(shared, character, key);
+            }
             None => {
+                self.token.clear();
+                self.token_layout = None;
                 self.session
                     .handle(InputEvent::UnsupportedInput, Some(layout), &shared.detector);
                 self.word.clear();
@@ -858,14 +899,44 @@ impl Engine {
             self.word.clear();
             self.session.clear();
         }
+        let readings = self.key_readings(shared, key, layout);
+        let event = if shared
+            .detector
+            .can_extend_word_with_readings(character, layout, &readings)
+        {
+            InputEvent::Printable(character)
+        } else if character.is_whitespace() || character.is_ascii_punctuation() {
+            // Punctuation right after a word stays with it until the Space ("gjnjv/" is "потом."):
+            // the other layouts read the key as no letter either, or it would continue the word.
+            if !character.is_whitespace()
+                && !KEYPAD_KEYS.contains(&key.keycode)
+                && self.session.buffered_character_count() != 0
+                && !self.session.is_suppressed()
+            {
+                InputEvent::TrailingMark(character)
+            } else {
+                InputEvent::Boundary
+            }
+        } else {
+            InputEvent::UnsupportedInput
+        };
+        if self.session.ends_with_marks() && !matches!(event, InputEvent::TrailingMark(_)) {
+            // Anything else after the marks ends the word unconverted.
+            shared.log("word_discard", "reason=punctuation");
+            self.session
+                .handle(InputEvent::Boundary, Some(layout), &shared.detector);
+            self.word.clear();
+            self.word_layout = None;
+        }
         let before = self.session.buffered_character_count();
-        self.session.handle(
-            InputEvent::Printable(character),
-            Some(layout),
-            &shared.detector,
-        );
+        self.session
+            .handle_with_readings(event, Some(layout), &shared.detector, &readings);
         let after = self.session.buffered_character_count();
-        if after == before + 1 {
+        if matches!(
+            event,
+            InputEvent::Printable(_) | InputEvent::TrailingMark(_)
+        ) && after == before + 1
+        {
             self.word.push(key);
             self.word_layout = Some(layout);
         } else if after == 0 {
@@ -873,6 +944,68 @@ impl Engine {
             self.word_layout = None;
         }
         self.last_word = None;
+    }
+
+    /// What `key` prints in the other enabled layouts. It decides whether the key continues a
+    /// word: "[" typed for "ü" does, and so does the comma key typed for the Russian "б".
+    fn key_readings(
+        &self,
+        shared: &Shared,
+        key: TypedKey,
+        source: Language,
+    ) -> Vec<(Language, char)> {
+        shared
+            .layouts
+            .iter()
+            .copied()
+            .filter(|language| *language != source)
+            .filter_map(|language| match shared.keymaps.key(language, key) {
+                KeyOutput::Text { text, .. } => Some((language, text.chars().next()?)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Adds a key that typed `character` to the token Pause converts. Whitespace or one more key
+    /// than a token may hold ends it, and a key typed in another layout starts it again, since the
+    /// token's keys are read back in one layout.
+    fn extend_token(&mut self, character: char, key: TypedKey, layout: Language) {
+        if character.is_whitespace() || self.token.len() >= TOKEN_MAX_KEYS {
+            self.token.clear();
+            self.token_layout = None;
+            return;
+        }
+        if self.token_layout != Some(layout) {
+            self.token.clear();
+            self.token_layout = Some(layout);
+        }
+        self.token.push(key);
+    }
+
+    /// Backspace erases the last key of the token; right after the Space that ended a token in
+    /// this field, erasing the Space returns to that token.
+    fn erase_token_key(&mut self, shared: &Shared) {
+        if self.token.pop().is_some() {
+            if self.token.is_empty() {
+                self.token_layout = None;
+            }
+            return;
+        }
+        if let Some(last) = self
+            .last_word
+            .as_ref()
+            .filter(|last| last.delimiter.is_some() && last.layout == shared.layout)
+        {
+            self.token = last.keys.clone();
+            self.token_layout = Some(last.layout);
+        }
+    }
+
+    fn note_field_layout(&mut self, layout: Language) {
+        if self.field_layouts.first() != Some(&layout) {
+            self.field_layouts.retain(|known| *known != layout);
+            self.field_layouts.insert(0, layout);
+        }
     }
 
     /// Keeps the release of a key whose press the engine handled from the program; a held key
@@ -906,16 +1039,61 @@ impl Engine {
     }
 
     fn space(&mut self, shared: &mut Shared) -> Outcome {
+        self.end_word(shared, Some(' '))
+            .unwrap_or_else(Outcome::pass)
+    }
+
+    /// `convert_on_enter`: a plain Enter ends the word like a Space. The word is converted with no
+    /// delimiter and the Enter is sent after the replacement, so a messenger sends and a terminal
+    /// runs the converted text; passed on at once it would overtake a terminal edit's Backspaces.
+    /// Without a conversion the Enter passes untouched.
+    fn convert_before_enter(
+        &mut self,
+        shared: &mut Shared,
+        keyval: u32,
+        keycode: u32,
+    ) -> Option<Outcome> {
+        let mut outcome = self.end_word(shared, None)?;
+        for state in [0, RELEASE_MASK] {
+            outcome.actions.push(Action::ForwardKey {
+                keyval,
+                keycode,
+                state,
+            });
+        }
+        self.consume(keycode);
+        Some(outcome)
+    }
+
+    /// Ends the word at a Space (`delimiter`) or an Enter (none) and converts it when it must be;
+    /// the outcome of the conversion, if one is applied. Pause afterwards converts the whole
+    /// token, the automatic conversion only its last word.
+    fn end_word(&mut self, shared: &mut Shared, delimiter: Option<char>) -> Option<Outcome> {
         self.undo = None;
         self.cycle = None;
         let keys = std::mem::take(&mut self.word);
         let layout = self.word_layout.take().unwrap_or(shared.layout);
         let manual_only = std::mem::take(&mut self.manual_only);
+        let token = std::mem::take(&mut self.token);
+        let token_layout = self.token_layout.take();
+        let for_pause = match (token.is_empty(), token_layout) {
+            (false, Some(token_layout)) => Some(LastWord {
+                keys: token,
+                delimiter,
+                layout: token_layout,
+            }),
+            _ if !keys.is_empty() => Some(LastWord {
+                keys: keys.clone(),
+                delimiter,
+                layout,
+            }),
+            _ => None,
+        };
         if self.private() || keys.is_empty() {
             self.session
                 .handle(InputEvent::Boundary, Some(shared.layout), &shared.detector);
-            self.last_word = None;
-            return Outcome::pass();
+            self.last_word = if self.private() { None } else { for_pause };
+            return None;
         }
         let candidates = self.readings(shared, &keys, layout);
         let action = self.session.finish_boundary_in_context(
@@ -924,12 +1102,15 @@ impl Engine {
             &candidates,
             &self.recent,
         );
-        self.last_word = Some(LastWord {
-            keys: keys.clone(),
-            delimiter: Some(' '),
-            layout,
-        });
-        let detection = match action {
+        self.last_word = for_pause;
+        let mut detection = match action {
+            SessionAction::Candidate(detection) if !detection.changes_text() => {
+                // The layout in use already types this word: nothing to edit and no reason to
+                // leave the layout. The following words still see its language.
+                shared.log("word", "result=same-text");
+                self.remember_language(detection.target_language);
+                return None;
+            }
             SessionAction::Candidate(detection) if shared.automatic && !manual_only => detection,
             SessionAction::Candidate(_) => {
                 let reason = if manual_only {
@@ -939,30 +1120,40 @@ impl Engine {
                 };
                 shared.log("word", &format!("result={reason}"));
                 self.remember_language(layout);
-                return Outcome::pass();
+                return None;
             }
             _ => {
                 shared.log("word", "result=no-candidate");
                 self.remember_language(layout);
-                return Outcome::pass();
+                return None;
             }
         };
-        let Some(outcome) = self.convert_word(shared, &keys, &detection) else {
+        let word_language = detection.target_language;
+        detection.prefer_layouts(&candidates, &self.field_layouts);
+        let outcome = self.convert_word(shared, &keys, &detection, delimiter, word_language);
+        if outcome.is_none() {
             self.remember_language(layout);
-            return Outcome::pass();
-        };
+        }
         outcome
     }
 
-    /// The automatic conversion of the word just ended by a Space: the space is typed with the
-    /// replacement, and the layout switches to the target.
+    /// The automatic conversion of the word just ended: the delimiter, if any, is typed with the
+    /// replacement, and the layout switches to the target. `word_language` is the language the
+    /// word is in, which the following words see; the target may be another layout that reads
+    /// the same text.
     fn convert_word(
         &mut self,
         shared: &mut Shared,
         keys: &[TypedKey],
         detection: &Detection,
+        delimiter: Option<char>,
+        word_language: Language,
     ) -> Option<Outcome> {
-        let Some(transaction) = ConversionTransaction::new(detection, ' ') else {
+        let transaction = match delimiter {
+            Some(delimiter) => ConversionTransaction::new(detection, delimiter),
+            None => ConversionTransaction::without_delimiter(detection),
+        };
+        let Some(transaction) = transaction else {
             shared.log("conversion", "result=refused reason=edit-unit");
             return None;
         };
@@ -970,27 +1161,32 @@ impl Engine {
             self.edit(&detection.original, transaction.forward.insert_text.clone());
         actions.push(Action::Layout(detection.target_language));
         shared.layout = detection.target_language;
-        self.remember_language(detection.target_language);
+        self.remember_language(word_language);
         self.undo = Some(Undo {
             keys: keys.to_vec(),
             typed: transaction.forward.insert_text,
             original: detection.original.clone(),
-            delimiter: Some(' '),
+            delimiter,
             source: detection.source_language,
             target: detection.target_language,
         });
         self.last_word = Some(LastWord {
             keys: keys.to_vec(),
-            delimiter: Some(' '),
+            delimiter,
             layout: detection.target_language,
         });
         shared.log(
             "conversion",
             &format!(
                 "result=applied strategy={strategy} source={} target={} forced=false \
-                 surrounding={reported}",
+                 boundary={} surrounding={reported}",
                 detection.source_language.id(),
-                detection.target_language.id()
+                detection.target_language.id(),
+                if delimiter.is_some() {
+                    "space"
+                } else {
+                    "enter"
+                },
             ),
         );
         Some(Outcome::consumed(actions))
@@ -1086,6 +1282,10 @@ impl Engine {
                 cycle.language,
                 Some(cycle.order),
             )
+        } else if let (false, Some(layout)) = (self.token.is_empty(), self.token_layout) {
+            // Everything typed since the last Space, not only the word the detection follows.
+            self.token_layout = None;
+            (std::mem::take(&mut self.token), None, layout, None)
         } else if let (false, Some(layout)) = (self.word.is_empty(), self.word_layout) {
             (std::mem::take(&mut self.word), None, layout, None)
         } else if let Some(last) = self.last_word.take() {
@@ -1097,6 +1297,9 @@ impl Engine {
         self.session.clear();
         self.word.clear();
         self.word_layout = None;
+        // A forced conversion starts a new token.
+        self.token.clear();
+        self.token_layout = None;
         self.manual_only = false;
         let enabled = shared.layouts.clone();
         let Some(current_text) = shared.keymaps.replay(language, &keys) else {
@@ -1175,20 +1378,24 @@ mod tests {
     const KEY_W: u32 = 17;
     const KEY_E: u32 = 18;
     const KEY_T: u32 = 20;
+    const KEY_U: u32 = 22;
     const KEY_I: u32 = 23;
     const KEY_O: u32 = 24;
     const KEY_LEFTBRACE: u32 = 26;
+    const KEY_ENTER: u32 = 28;
     const KEY_S: u32 = 31;
     const KEY_D: u32 = 32;
     const KEY_G: u32 = 34;
     const KEY_H: u32 = 35;
     const KEY_J: u32 = 36;
+    const KEY_K: u32 = 37;
     const KEY_L: u32 = 38;
     const KEY_GRAVE: u32 = 41;
     const KEY_C: u32 = 46;
     const KEY_V: u32 = 47;
     const KEY_B: u32 = 48;
     const KEY_N: u32 = 49;
+    const KEY_SLASH: u32 = 53;
     const KEY_PAUSE: u32 = 119;
     const KEY_LEFT: u32 = 105;
 
@@ -1219,6 +1426,7 @@ mod tests {
     fn keysym_of(shared: &Shared, keycode: u32, state: u32) -> u32 {
         match keycode {
             KEY_SPACE => keysym::SPACE,
+            KEY_ENTER => keysym::RETURN,
             KEY_BACKSPACE => keysym::BACKSPACE,
             KEY_PAUSE => keysym::PAUSE,
             KEY_LEFT => keysym::LEFT,
@@ -1355,7 +1563,7 @@ mod tests {
         assert!(
             records.iter().any(|record| record.contains(
                 "event=conversion result=applied strategy=backspace source=en-US target=ru-RU \
-                 forced=false surrounding=none"
+                 forced=false boundary=space surrounding=none"
             )),
             "{records:?}"
         );
@@ -1726,6 +1934,201 @@ mod tests {
                 .actions
                 .is_empty()
         );
+    }
+
+    fn with_convert_on_enter() -> (Shared, std::sync::mpsc::Receiver<String>) {
+        shared_with(Settings {
+            convert_on_enter: true,
+            ..Settings::default()
+        })
+    }
+
+    #[test]
+    fn enter_converts_the_word_before_it_and_follows_the_replacement() {
+        let (mut shared, log) = with_convert_on_enter();
+        let mut engine = Engine::new(&shared);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        let outcome = tap(&mut engine, &mut shared, KEY_ENTER, 0);
+        assert!(outcome.handled);
+        assert_eq!(backspaces(&outcome), 6);
+        assert_eq!(commits(std::slice::from_ref(&outcome)), "привет");
+        // The Enter reaches the application after the replacement: passed on at once it would
+        // overtake the Backspaces, and a terminal would run the word unconverted.
+        let position = |wanted: &dyn Fn(&Action) -> bool| outcome.actions.iter().position(wanted);
+        let commit = position(&|action| matches!(action, Action::Commit(_)));
+        let enter_down = position(&|action| {
+            matches!(
+                action,
+                Action::ForwardKey {
+                    keyval: keysym::RETURN,
+                    state: 0,
+                    ..
+                }
+            )
+        });
+        let enter_up = position(&|action| {
+            matches!(
+                action,
+                Action::ForwardKey {
+                    keyval: keysym::RETURN,
+                    state: RELEASE_MASK,
+                    ..
+                }
+            )
+        });
+        assert!(
+            commit < enter_down && enter_down < enter_up,
+            "{:?}",
+            outcome.actions
+        );
+        assert_eq!(shared.layout(), Language::Russian);
+        let records: Vec<String> = log.try_iter().collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.contains("forced=false boundary=enter")),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn enter_passes_untouched_without_the_setting_with_shift_and_after_a_correct_word() {
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        let outcome = tap(&mut engine, &mut shared, KEY_ENTER, 0);
+        assert!(!outcome.handled);
+        assert!(outcome.actions.is_empty(), "{:?}", outcome.actions);
+
+        let (mut shared, _log) = with_convert_on_enter();
+        let mut engine = Engine::new(&shared);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        // Shift+Enter starts a new line in a messenger: nothing is converted before it.
+        let outcome = tap(&mut engine, &mut shared, KEY_ENTER, SHIFT_MASK);
+        assert!(!outcome.handled);
+        assert!(outcome.actions.is_empty(), "{:?}", outcome.actions);
+
+        let (mut shared, _log) = with_convert_on_enter();
+        let mut engine = Engine::new(&shared);
+        // "hello" needs no conversion.
+        type_keys(
+            &mut engine,
+            &mut shared,
+            &[KEY_H, KEY_E, KEY_L, KEY_L, KEY_O],
+        );
+        let outcome = tap(&mut engine, &mut shared, KEY_ENTER, 0);
+        assert!(!outcome.handled);
+        assert!(outcome.actions.is_empty(), "{:?}", outcome.actions);
+    }
+
+    #[test]
+    fn punctuation_typed_right_after_a_word_is_converted_with_it() {
+        // "gjnjv/" is "потом." typed in the English layout: "/" is the Russian full stop.
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(
+            &mut engine,
+            &mut shared,
+            &[KEY_G, KEY_J, KEY_N, KEY_J, KEY_V, KEY_SLASH],
+        );
+        let outcome = tap(&mut engine, &mut shared, KEY_SPACE, 0);
+        assert!(outcome.handled);
+        assert_eq!(backspaces(&outcome), 6);
+        assert_eq!(commits(std::slice::from_ref(&outcome)), "потом. ");
+    }
+
+    #[test]
+    fn a_word_typed_right_after_punctuation_is_still_converted() {
+        // A mark with no word before it is a boundary, not a reason to stop until the Space.
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(&mut engine, &mut shared, &[KEY_SLASH]);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        let outcome = tap(&mut engine, &mut shared, KEY_SPACE, 0);
+        assert!(outcome.handled);
+        assert_eq!(backspaces(&outcome), 6);
+        assert_eq!(commits(std::slice::from_ref(&outcome)), "привет ");
+    }
+
+    #[test]
+    fn pause_converts_everything_typed_since_the_last_space() {
+        // "gjnjv/ghbdtn" is "потом.привет": the whole token, not only the word after the mark.
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(
+            &mut engine,
+            &mut shared,
+            &[KEY_G, KEY_J, KEY_N, KEY_J, KEY_V, KEY_SLASH],
+        );
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        let outcome = tap(&mut engine, &mut shared, KEY_PAUSE, 0);
+        assert!(outcome.handled);
+        assert_eq!(backspaces(&outcome), 12);
+        assert_eq!(commits(std::slice::from_ref(&outcome)), "потом.привет");
+    }
+
+    #[test]
+    fn backspace_shortens_the_pause_token_and_a_caret_move_ends_it() {
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        tap(&mut engine, &mut shared, KEY_BACKSPACE, 0);
+        let outcome = tap(&mut engine, &mut shared, KEY_PAUSE, 0);
+        assert_eq!(backspaces(&outcome), 5);
+        assert_eq!(commits(std::slice::from_ref(&outcome)), "приве");
+
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(&mut engine, &mut shared, &GHBDTN);
+        tap(&mut engine, &mut shared, KEY_LEFT, 0);
+        let outcome = tap(&mut engine, &mut shared, KEY_PAUSE, 0);
+        assert!(commits(std::slice::from_ref(&outcome)).is_empty());
+        assert_eq!(backspaces(&outcome), 0);
+    }
+
+    #[test]
+    fn a_word_the_layout_in_use_already_types_keeps_the_layout() {
+        // "kindel" is Estonian and has no letter of its own: the English layout types it already,
+        // so there is nothing to edit and no reason to leave English for the next word.
+        let (mut shared, log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        type_keys(
+            &mut engine,
+            &mut shared,
+            &[KEY_K, KEY_I, KEY_N, KEY_D, KEY_E, KEY_L],
+        );
+        let outcome = tap(&mut engine, &mut shared, KEY_SPACE, 0);
+        assert!(!outcome.handled);
+        assert!(commits(std::slice::from_ref(&outcome)).is_empty());
+        assert_eq!(shared.layout(), Language::English);
+        let records: Vec<String> = log.try_iter().collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.contains("event=word result=same-text")),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_two_latin_layouts_read_alike_goes_to_the_latin_layout_of_its_field() {
+        // "just" typed in the Russian layout scores best in English, but this field was typed in
+        // with Estonian before, which types it alike: the layout goes back to Estonian.
+        let (mut shared, _log) = default_shared();
+        let mut engine = Engine::new(&shared);
+        shared.choose_layout(Language::Estonian);
+        type_keys(&mut engine, &mut shared, &[KEY_T, KEY_H, KEY_E]);
+        tap(&mut engine, &mut shared, KEY_SPACE, 0);
+        assert_eq!(
+            shared.layout(),
+            Language::Estonian,
+            "\"the\" needs no other"
+        );
+        shared.choose_layout(Language::Russian);
+        type_keys(&mut engine, &mut shared, &[KEY_J, KEY_U, KEY_S, KEY_T]);
+        let outcome = tap(&mut engine, &mut shared, KEY_SPACE, 0);
+        assert_eq!(commits(std::slice::from_ref(&outcome)), "just ");
+        assert_eq!(shared.layout(), Language::Estonian);
     }
 
     #[test]
