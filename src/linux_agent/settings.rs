@@ -154,7 +154,7 @@ fn populate(ui: &SettingsWindow, document: &ConfigurationDocument, registry: &Di
     ui.set_recheck_first_word_after_erasing(settings.recheck_first_word_after_erasing);
     ui.set_single_letter_words(settings.single_letter_words);
     ui.set_layout_model(settings.layout_model);
-    ui.set_manual_terminal_uia_fallback(settings.manual_terminal_uia_fallback);
+    ui.set_convert_on_enter(settings.convert_on_enter);
     ui.set_conversion_sound(settings.conversion_sound);
     ui.set_physical_fallback(settings.physical_fallback_for_unsupported_apps);
     ui.set_diagnostics_enabled(settings.diagnostics_enabled);
@@ -309,6 +309,7 @@ fn document_from_ui(
     settings.recheck_first_word_after_erasing = ui.get_recheck_first_word_after_erasing();
     settings.single_letter_words = ui.get_single_letter_words();
     settings.layout_model = ui.get_layout_model();
+    settings.convert_on_enter = ui.get_convert_on_enter();
     settings.conversion_sound = ui.get_conversion_sound();
     settings.diagnostics_enabled = ui.get_diagnostics_enabled();
     settings.suppress_after_backspace = ui.get_suppress_after_backspace();
@@ -425,12 +426,16 @@ fn notify_agent() -> bool {
 }
 
 fn save_configuration_if_unchanged(
+    config_dir: &Path,
     document: &ConfigurationDocument,
     original: &ConfigurationDocument,
 ) -> io::Result<()> {
-    let config_dir = paths::config_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    save_if_unchanged(&config_dir, document, original)
+    save_if_unchanged(config_dir, document, original)
+}
+
+/// The shared package pages pass the owner of their file dialogs; the Linux chooser finds its own.
+fn own_settings_window() -> package_import::DialogOwner {
+    package_import::DialogOwner
 }
 
 fn refresh_ui_language(

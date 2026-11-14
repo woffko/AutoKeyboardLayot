@@ -27,8 +27,9 @@ class DeployHostScriptTests(unittest.TestCase):
         for parameter in ('$Source', '$ExpectedSha256', '$BackupSuffix'):
             self.assertRegex(text, r'Mandatory = \$true\)\][^\n]*' + re.escape(parameter))
         self.assertRegex(text, r'\[int\]\$KeepBackups = 3')
+        self.assertRegex(text, r'\[int\]\$CloseGraceSeconds = 60')
         document = DOCUMENT.read_text(encoding='utf-8')
-        for name in ('-Source', '-ExpectedSha256', '-BackupSuffix', '-KeepBackups', '-WhatIf'):
+        for name in ('-Source', '-ExpectedSha256', '-BackupSuffix', '-KeepBackups', '-CloseGraceSeconds', '-WhatIf'):
             self.assertIn(name, document)
 
     def test_nothing_changes_before_the_dry_run_gate(self):
@@ -48,13 +49,28 @@ class DeployHostScriptTests(unittest.TestCase):
         # input and, as on 2026-10-11, leave no agent running.
         text = SCRIPT.read_text(encoding='utf-8')
         body = text[text.index('if ($dryRun) {'):]
-        close = body.index('if (-not (Close-Agent $process)) {')
+        close = body.index('$closing = Close-Agent $process')
         replacement = body.index('try {')
         self.assertLess(close, replacement)
         self.assertLess(close, body.index('Copy-Item -LiteralPath'))
         declined = body[close:replacement]
         self.assertIn('nothing was changed', declined)
         self.assertNotIn('Stop-Process', declined)
+        # An agent that closes late is started again from the executable nothing has replaced.
+        late = declined.index('$process.WaitForExit($CloseGraceSeconds * 1000)')
+        self.assertLess(late, declined.index('Start-Process -FilePath $destination'))
+        self.assertIn('nothing was replaced', declined)
+
+    def test_confirm_asks_only_the_question_before_the_first_change(self):
+        text = SCRIPT.read_text(encoding='utf-8')
+        quiet = text.index("$ConfirmPreference = 'None'")
+        self.assertLess(quiet, text.index('Get-FileHash -LiteralPath'))
+        ask = text.index('$ConfirmPreference = $askFirst')
+        decision = text.index('$PSCmdlet.ShouldProcess(')
+        again = text.index("$ConfirmPreference = 'None'", decision)
+        self.assertLess(ask, decision)
+        self.assertLess(decision, again)
+        self.assertLess(again, text.index('Copy-Item -LiteralPath'))
 
     def test_rollback_waits_for_the_agent_and_restores_only_a_replaced_executable(self):
         text = SCRIPT.read_text(encoding='utf-8')
@@ -63,12 +79,20 @@ class DeployHostScriptTests(unittest.TestCase):
         self.assertLess(attempt.index('Copy-Item -LiteralPath $destination -Destination $backup'), marked)
         self.assertLess(marked, attempt.index('Copy-Item -LiteralPath $Source -Destination $destination -Force'))
         catch = text[text.index('} catch {'):]
-        stop = catch.index('Stop-Process -Id $process.Id -Force')
+        stop = catch.index('Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue')
         wait = catch.index('$process.WaitForExit(')
-        restore = catch.index('if ($replaced) { Copy-Item -LiteralPath $backup -Destination $destination -Force }')
+        restore = catch.index('Copy-Item -LiteralPath $backup -Destination $destination -Force')
+        verified = catch.index('$restored = (Get-Sha256 $destination) -eq (Get-Sha256 $backup)')
+        refused = catch.index('if (-not $restored) {\n            throw')
+        restart = catch.index('if ($running.Count -gt 0) { Start-Process -FilePath $destination')
         self.assertLess(stop, wait)
         self.assertLess(wait, restore)
-        self.assertIn('if ($running.Count -gt 0) { Start-Process -FilePath $destination }', catch)
+        self.assertLess(restore, verified)
+        # The previous agent comes back only after a verified restore; a failed one names both.
+        self.assertLess(verified, refused)
+        self.assertLess(refused, restart)
+        self.assertIn('$failure', catch[refused:restart])
+        self.assertIn('$backup', catch[refused:restart])
         self.assertIn('Deployment failed and was rolled back', catch)
 
 

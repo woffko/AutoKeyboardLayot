@@ -1,6 +1,6 @@
 {
   "package_id": "ar-SA",
-  "revision": 1,
+  "revision": 2,
   "ui_locale": "ar",
   "components": {
     "ui": "../../package-locales/ar.json",

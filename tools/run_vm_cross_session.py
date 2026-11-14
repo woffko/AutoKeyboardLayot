@@ -1,11 +1,14 @@
-"""Stage the app and candidate3 on the VM and run the cross-session exclusion test.
+"""Stage an installer build on the VM and run the cross-session exclusion test.
 
+Usage: run_vm_cross_session.py OUTPUT_DIRECTORY BUILD_DIRECTORY < identity-path
+
+BUILD_DIRECTORY is an output of tools/build_experimental_installer.py, relative to the repository.
 Needs AKL_VM_HOST, AKL_VM_USER and AKL_VM_COMPUTER_NAME in the environment (see vm_config.py).
 """
 import base64, json, os, stat, subprocess, sys
 from pathlib import Path
 
-from vm_config import VmSettings, VmSettingsError, sftp_path
+from vm_config import VmSettings, VmSettingsError, build_artifacts, sftp_path
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE_NAME = 'akl-cross-session'
@@ -16,8 +19,12 @@ def main():
     except VmSettingsError as error:
         print(error, file=sys.stderr)
         return 2
+    if len(sys.argv) != 3:
+        print(__doc__, file=sys.stderr)
+        return 2
     output = Path(sys.argv[1]).resolve()
     output.mkdir()
+    build_directory = (ROOT / sys.argv[2]).resolve()
     raw = bytearray(sys.stdin.buffer.read(4097))
     result = {'state': 'failed_before_execution', 'execution_requested': False}
     try:
@@ -42,10 +49,8 @@ def main():
                     result['remote_stderr'] = run.stderr.decode('utf-8', 'replace')[-2000:]
                     raise ValueError('remote command')
                 return run.stdout.decode('utf-8', 'replace')
-            setup = ROOT / 'target/installer-vm-candidate-20260913-03/AutoKeyboardLayot-0.1.0-setup-experimental.exe'
             script = ROOT / 'tools/test-vm-cross-session.ps1'
-            build = json.loads((ROOT / 'target/installer-vm-candidate-20260913-03/build.json').read_text())
-            setup_sha = next(a['sha256'] for a in build['artifacts'] if a['file'].endswith('setup-experimental.exe'))
+            setup, setup_sha, _ = build_artifacts(build_directory)
             preflight = remote(vm.preflight_script())
             result['preflight'] = preflight.strip().splitlines()
             if not vm.preflight_ok(preflight):

@@ -14,7 +14,37 @@ signing with the release key, and replacing a published release asset. Nothing i
 this repository, no script and no agent does either on its own. The commands
 below are what the owner runs; reading them authorizes nothing.
 
-## Last renewal: revision 7, 2026-10-11
+## Last catalog: revision 9, 2026-11-03
+
+A renewal of revision 8 with the owner's approval, following the steps below.
+
+| | |
+|---|---|
+| Candidate | `catalog-r9.unsigned.json`, SHA-256 `2fd54a03f7d585244570bca9d998f6a7c45c3320bdad1d11fd8cfa6a27ee4ec3` |
+| Content | the 13 package records of revision 8, unchanged; revision 9 |
+| Window | 21 days: `issued_at` 2026-11-03 16:11:56 UTC, `expires_at` 2026-11-24 16:11:56 UTC |
+| Signer | `sign-language-package.exe` built from `6a874c8`, SHA-256 `7bde53ee3ec3ffcd3f4f6e2daf34246193bfb89f15d73d3ab6c13a3af141765a` |
+| Published | `catalog.aklc`, SHA-256 `e954faef8108ec8ddad5e29226f8cc2af93e2dd53e4eb8ce024ecbfdf90ea8a6`, signed by `pkg-20260912-01`, in the release `v0.1.2` (the Latest release), whose notes record it |
+| Checked | offline (`verify_release_catalog`: 13 packages; `check_catalog_expiry`: 502 hours left; `check_catalog_candidate.py` against revision 8), then without credentials from the Latest URL: same bytes, and all 13 package URLs match the catalog |
+| Replaced | revision 8, SHA-256 `733f6a4c93bf69bceeb4c90f994e14093db15508b3fd9cab67a1e976e17e3815` (valid until 2026-11-15 03:58:38 UTC) |
+
+## Package release before it: revision 8, 2026-10-25
+
+Revision 8 is not a renewal: it lists 13 new package revisions (`ru-RU` 5, `et-EE` 3, the other
+eleven 2) and came with the 0.1.2 release, so `check_catalog_candidate.py` rejected it as expected
+for its changed package records; the revision, the 21-day window and every record against the
+signed files were checked instead ([`release-0.1.2.md`](release-0.1.2.md)).
+
+| | |
+|---|---|
+| Candidate | `catalog-r8.unsigned.json`, SHA-256 `138ad2ea21cf44448f6f9b89baff55fa169c32f84ef9ce9abf21a6a0e5f277bb` |
+| Window | 21 days: `issued_at` 2026-10-25 03:58:38 UTC, `expires_at` 2026-11-15 03:58:38 UTC |
+| Signer | `sign-language-package.exe` built from `59b4257`, SHA-256 `93ccbcbeef5dd69eb686e9380e7775ce167cb3acbdc96902d2ca68ce6ad6f4ca` |
+| Published | `catalog.aklc`, SHA-256 `733f6a4c93bf69bceeb4c90f994e14093db15508b3fd9cab67a1e976e17e3815`, signed by `pkg-20260912-01`, in the release `v0.1.2` (the Latest release) with the 13 packages |
+| Checked | offline (`verify_release_catalog`: 13 packages; `check_catalog_expiry`: 502 hours left), then without credentials from the Latest URL: same bytes, and all 13 package URLs match the catalog |
+| Replaced | revision 7, SHA-256 `5556daaab37f4c6ca7a8fa177c58cfcc55bd579d043f46bf1e69f5d5bdf3508d` (in the release `lang-r5-20260919`, valid until 2026-11-01 15:19:48 UTC) |
+
+## Renewal before it: revision 7, 2026-10-11
 
 Done with the owner's approval, following the steps below.
 
@@ -31,8 +61,9 @@ Done with the owner's approval, following the steps below.
 Revision 5, SHA-256 `b0e1d636bd7057e6bdb0393cf77d3f8d1cbf7d9ebffd478ea70d0c340c1ea503`, is kept as
 `tests/fixtures/mutation-seed-catalog.aklc`.
 
-**The next renewal is due before about 2026-10-22**, when the daily check starts to
-report fewer than 10 days. Revision 8 is the next revision number.
+**The next renewal is due before about 2026-11-14**, when the daily check starts to
+report fewer than 10 days — once its workflow is on `main` (see
+[When to renew](#when-to-renew)). Revision 10 is the next revision number.
 
 The window starts when the candidate is made, not when it is signed. Every day
 between the two shortens what the signed catalog is good for, so **make the
@@ -49,9 +80,9 @@ client that accepted the earlier one. Download the catalog that is published now
 first (step 6): steps 2 and 5 compare the candidate with it.
 
 ```sh
-TAG=lang-r5-20260919                # the release that holds the package files
-REVISION=8
-PACKAGES=target/catalog-candidates-20260919-05   # the 13 package files
+TAG=v0.1.2                          # the release that holds the package files
+REVISION=9
+PACKAGES=target/release-0.1.2/signed             # the 13 package files
 WORK=target/catalog-candidates-$(date -u +%Y%m%d)-0$REVISION
 PREVIOUS="$WORK/rollback/catalog.aklc"           # the catalog published now (step 6)
 ```
@@ -183,3 +214,11 @@ catalog, and check that the installer's language page lists Russian and Estonian
 10 days (240 hours) of validity are left. A 21-day window therefore gives about
 11 days of margin; renew as soon as the issue appears. Each renewal needs the key
 owner, so put the next date in a calendar when you publish.
+
+GitHub runs scheduled workflows from the default branch (`main`) only. The
+10-day threshold and the alert issue above are on `main` since PR #1 was merged on
+2026-10-24. With revision 8 (valid until 2026-11-15 03:58 UTC) the issue appears
+around 2026-11-05.
+
+Changing the workflow on a feature branch has no effect on the schedule; check
+the schedule's runs in the Actions tab, which name the branch they ran from.

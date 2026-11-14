@@ -18,12 +18,20 @@ OUTPUT="${OUTPUT:-$WORK/model.aklm}"
 cd "$TOOLS"
 
 "$PYTHON" prepare_vocab.py "$WORK/layouts.json" "$WORK/sources" "$WORK/vocab"
+"$PYTHON" notice.py "$WORK/vocab/provenance.json" "$(basename "$OUTPUT")" > "$WORK/NOTICE.md"
+generators=()
 for shard in 0 1 2 3 4 5 6 7; do
     "$PYTHON" generate_cases.py "$WORK/layouts.json" "$WORK/vocab" "$WORK/train.$shard.jsonl" 500000 train $((100 + shard)) &
+    generators+=($!)
 done
 "$PYTHON" generate_cases.py "$WORK/layouts.json" "$WORK/vocab" "$WORK/test.jsonl" 200000 test 2 &
+generators+=($!)
 "$PYTHON" generate_cases.py "$WORK/layouts.json" "$WORK/vocab" "$WORK/uniform.jsonl" 100000 uniform 3 &
-wait
+generators+=($!)
+# A bare `wait` returns 0 whatever the generators did; each one's status counts.
+for generator in "${generators[@]}"; do
+    wait "$generator" || { echo "a case generator failed; nothing is trained" >&2; exit 1; }
+done
 cat "$WORK"/train.[0-7].jsonl | awk '{ sub(/"id": [0-9]+/, "\"id\": " NR - 1); print }' > "$WORK/train.jsonl"
 rm -f "$WORK"/train.[0-7].jsonl
 
@@ -34,12 +42,17 @@ done
 "$PYTHON" export.py "$WORK/model.pt" "$OUTPUT"
 "$PYTHON" export.py check "$OUTPUT" "$WORK/dicts" "$WORK/test.jsonl" "$WORK/test.model.jsonl" "$THRESHOLD" "$WORK/fixture.json"
 
+# With the default settings and with single-letter words converted (the published table's setting).
 if [ -d "$WORK/store-copy" ]; then
     for set in test uniform; do
-        (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
-            "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.baseline.jsonl")
-        (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
-            "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.agent.jsonl" --model "$OUTPUT")
-        "$PYTHON" score.py "$WORK/$set.jsonl" "$WORK/$set.baseline.jsonl" "$WORK/$set.agent.jsonl"
+        for setting in default single-letter-words; do
+            flag=()
+            [ "$setting" = default ] || flag=(--single-letter-words)
+            (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
+                "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.baseline.$setting.jsonl" ${flag[@]+"${flag[@]}"})
+            (cd "$ROOT" && cargo run -q --release --example evaluate_layout_detection -- \
+                "$WORK/store-copy" "$WORK/$set.jsonl" "$WORK/$set.agent.$setting.jsonl" --model "$OUTPUT" ${flag[@]+"${flag[@]}"})
+        done
+        "$PYTHON" score.py "$WORK/$set.jsonl" "$WORK/$set".{baseline,agent}.{default,single-letter-words}.jsonl
     done
 fi

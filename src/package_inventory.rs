@@ -3,7 +3,7 @@
 
 use crate::{
     DictionaryRegistry, PackId,
-    language_package::{VerifiedLanguagePackage, decode_hex},
+    language_package::{PackageTrust, VerifiedLanguagePackage, decode_hex},
     localization::CatalogRegistry,
     package_catalog::{CatalogCheckpoint, DownloadPlan, ReleaseError, repository_id},
 };
@@ -165,7 +165,9 @@ impl PackageInventory {
             if plan.checkpoint().revision() < previous.revision() {
                 return Err(InventoryError::Plan(ReleaseError::Rollback));
             }
-            if plan.checkpoint().revision() == previous.revision() && plan.checkpoint() != previous
+            // The same revision must be the same signed document; another trusted key may sign it.
+            if plan.checkpoint().revision() == previous.revision()
+                && plan.checkpoint().document_sha256() != previous.document_sha256()
             {
                 return Err(InventoryError::Plan(ReleaseError::RevisionConflict));
             }
@@ -314,6 +316,7 @@ impl PackageInventory {
             catalog: self.catalog.map(|c| CheckpointDocument {
                 revision: c.revision(),
                 sha256: hex(&c.document_sha256()),
+                signer_sha256: Some(hex(&c.signer_sha256())),
             }),
             installed: self.receipts().map(ReceiptDocument::from_receipt).collect(),
             highest_seen: self
@@ -341,6 +344,7 @@ impl PackageInventory {
     pub fn restore(
         bytes: &[u8],
         packages: &[Arc<VerifiedLanguagePackage>],
+        trust: &PackageTrust,
     ) -> Result<Self, InventoryError> {
         let state = ParsedState::parse(bytes)?;
         if state.installed.len() != packages.len() {
@@ -362,13 +366,24 @@ impl PackageInventory {
             }
             installed.insert(receipt.id, package.clone());
         }
+        // A checkpoint holds back older catalogs only while the key that signed its catalog is
+        // trusted. Once an application release withdraws a key (after a compromise), a catalog
+        // that key signed with a huge revision must not lock out the catalogs of the remaining
+        // keys forever, so its checkpoint and repository binding are forgotten; so is a
+        // checkpoint saved before signing keys were recorded, whose key is unknown.
+        let (repository, catalog) = match state.catalog {
+            Some(checkpoint) if trust.trusts_key(&checkpoint.signer_sha256()) => {
+                (state.repository, Some(checkpoint))
+            }
+            _ => (None, None),
+        };
         let inventory = Self {
             generation: state.generation,
             packages: installed,
             highest_seen: state.highest_seen,
             rollback_targets: state.rollback_targets,
-            repository: state.repository,
-            catalog: state.catalog,
+            repository,
+            catalog,
         };
         inventory.validate()?;
         Ok(inventory)
@@ -433,7 +448,9 @@ impl PackageInventory {
             if current.revision() < previous.revision() {
                 return Err(InventoryError::Rollback);
             }
-            if current.revision() == previous.revision() && current != previous {
+            if current.revision() == previous.revision()
+                && current.document_sha256() != previous.document_sha256()
+            {
                 return Err(InventoryError::RevisionConflict);
             }
         }
@@ -535,22 +552,16 @@ impl ParsedState {
             installed.push(receipt);
         }
         validate_receipt_history(&installed, &highest_seen, &rollback_targets)?;
-        let (repository, catalog) = match (state.repository, state.catalog) {
-            (Some(repo), Some(checkpoint)) => (
-                Some(repository_id(&repo)?),
-                Some(CatalogCheckpoint::from_persisted(
-                    checkpoint.revision,
-                    decode_hex(&checkpoint.sha256).map_err(|_| InventoryError::InvalidState)?,
-                )?),
-            ),
-            (None, None) => (None, None),
-            _ => return Err(InventoryError::InvalidState),
-        };
         if state.generation == 0
-            && (!installed.is_empty() || !highest_seen.is_empty() || catalog.is_some())
+            && (!installed.is_empty() || !highest_seen.is_empty() || state.catalog.is_some())
         {
             return Err(InventoryError::InvalidState);
         }
+        let (repository, catalog) = match (state.repository, state.catalog) {
+            (Some(repo), Some(checkpoint)) => (Some(repository_id(&repo)?), checkpoint.parse()?),
+            (None, None) => (None, None),
+            _ => return Err(InventoryError::InvalidState),
+        };
         Ok(Self {
             generation: state.generation,
             installed,
@@ -578,6 +589,23 @@ struct StateDocument {
 struct CheckpointDocument {
     revision: u64,
     sha256: String,
+    // Absent in states saved before signing keys were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signer_sha256: Option<String>,
+}
+impl CheckpointDocument {
+    /// None for a checkpoint without a recorded signing key.
+    fn parse(self) -> Result<Option<CatalogCheckpoint>, InventoryError> {
+        let Some(signer) = self.signer_sha256 else {
+            return Ok(None);
+        };
+        let invalid = |_| InventoryError::InvalidState;
+        Ok(Some(CatalogCheckpoint::from_persisted(
+            self.revision,
+            decode_hex(&self.sha256).map_err(invalid)?,
+            decode_hex(&signer).map_err(invalid)?,
+        )?))
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -658,13 +686,23 @@ mod tests {
         revision: u64,
         selected: bool,
     ) -> DownloadPlan {
+        signed_plan(&key(), "test-only", &trust(), packages, revision, selected)
+    }
+    fn signed_plan(
+        signing: &SigningKey,
+        signer: &str,
+        trust: &PackageTrust,
+        packages: &[Arc<VerifiedLanguagePackage>],
+        revision: u64,
+        selected: bool,
+    ) -> DownloadPlan {
         let entries: Vec<_> = packages.iter().map(|p| json!({"package_id":p.id().as_str(),"revision":p.revision(),"bytes":p.envelope_bytes(),"sha256":hex(&p.envelope_sha256()),"tag":"v1","asset":format!("{}.aklp",p.id()),"runtime_api":1,"input":p.input().is_some(),"ui_locale":p.ui_locale()})).collect();
         let document = serde_json::to_string(&json!({"format":1,"repository":"example/packs","revision":revision,"issued_at":100,"expires_at":200,"packages":entries})).unwrap();
         let mut signed = b"AutoKeyboardLayot.release-catalog.v1\0".to_vec();
         signed.extend_from_slice(document.as_bytes());
-        let bytes = serde_json::to_vec(&json!({"format":1,"signer":"test-only","catalog":document,"signature":hex(&key().sign(&signed).to_bytes())})).unwrap();
+        let bytes = serde_json::to_vec(&json!({"format":1,"signer":signer,"catalog":document,"signature":hex(&signing.sign(&signed).to_bytes())})).unwrap();
         let catalog =
-            VerifiedReleaseCatalog::verify(&bytes, &trust(), "example/packs", None, 100).unwrap();
+            VerifiedReleaseCatalog::verify(&bytes, trust, "example/packs", None, 100).unwrap();
         let ids = if selected {
             packages.iter().map(|p| p.id()).collect()
         } else {
@@ -737,9 +775,12 @@ mod tests {
                 .stage_rollback(package("custom-test", 2, None, &[], "unseen"))
                 .is_err()
         );
-        let restored =
-            PackageInventory::restore(&rolled.state_bytes().unwrap(), std::slice::from_ref(&old))
-                .unwrap();
+        let restored = PackageInventory::restore(
+            &rolled.state_bytes().unwrap(),
+            std::slice::from_ref(&old),
+            &trust(),
+        )
+        .unwrap();
         assert_eq!(
             restored.state_bytes().unwrap(),
             rolled.state_bytes().unwrap()
@@ -783,6 +824,7 @@ mod tests {
         let forged = PackageInventory::restore(
             &forged.state_bytes().unwrap(),
             &forged.packages().cloned().collect::<Vec<_>>(),
+            &trust(),
         )
         .unwrap();
         assert!(
@@ -852,17 +894,23 @@ mod tests {
             PackageInventory::required_artifacts(&bytes).unwrap(),
             inventory.receipts().collect::<Vec<_>>()
         );
-        let restored = PackageInventory::restore(&bytes, std::slice::from_ref(&pack)).unwrap();
+        let restored =
+            PackageInventory::restore(&bytes, std::slice::from_ref(&pack), &trust()).unwrap();
         assert_eq!(restored.state_bytes().unwrap(), bytes);
-        assert!(PackageInventory::restore(&bytes, &[]).is_err());
+        assert!(PackageInventory::restore(&bytes, &[], &trust()).is_err());
         assert!(
-            PackageInventory::restore(&bytes, &[package("custom-test", 2, None, &[], "world")])
-                .is_err()
+            PackageInventory::restore(
+                &bytes,
+                &[package("custom-test", 2, None, &[], "world")],
+                &trust()
+            )
+            .is_err()
         );
         let removed = inventory
             .stage_remove(&BTreeSet::from([pack.id()]))
             .unwrap();
-        let restored = PackageInventory::restore(&removed.state_bytes().unwrap(), &[]).unwrap();
+        let restored =
+            PackageInventory::restore(&removed.state_bytes().unwrap(), &[], &trust()).unwrap();
         assert_eq!(
             restored.highest_seen(&pack.id()),
             inventory.highest_seen(&pack.id())
@@ -895,7 +943,8 @@ mod tests {
             assert!(
                 PackageInventory::restore(
                     &serde_json::to_vec(&changed).unwrap(),
-                    std::slice::from_ref(&pack)
+                    std::slice::from_ref(&pack),
+                    &trust(),
                 )
                 .is_err()
             );
@@ -908,7 +957,8 @@ mod tests {
         assert!(
             PackageInventory::restore(
                 &serde_json::to_vec(&changed).unwrap(),
-                std::slice::from_ref(&pack)
+                std::slice::from_ref(&pack),
+                &trust(),
             )
             .is_err()
         );
@@ -964,9 +1014,90 @@ mod tests {
         let restored = PackageInventory::restore(
             &refreshed.state_bytes().unwrap(),
             &refreshed.packages().cloned().collect::<Vec<_>>(),
+            &trust(),
         )
         .unwrap();
         assert_eq!(restored.catalog_checkpoint(), Some(empty.checkpoint()));
+    }
+    #[test]
+    fn a_catalog_checkpoint_counts_only_while_its_signing_key_is_trusted() {
+        // Public synthetic keys: "withdrawn" stands for a release key that an application
+        // update stopped trusting, for example after it was stolen.
+        let withdrawn = SigningKey::from_bytes(&[45; 32]);
+        let both = PackageTrust::from_public_keys([
+            ("test-only".into(), key().verifying_key().to_bytes()),
+            ("withdrawn".into(), withdrawn.verifying_key().to_bytes()),
+        ])
+        .unwrap();
+        let pack = package("custom-test", 1, None, &[], "hello");
+        let packages = std::slice::from_ref(&pack);
+        let stolen = signed_plan(&withdrawn, "withdrawn", &both, packages, u64::MAX, true);
+        assert_eq!(
+            stolen.checkpoint().signer_sha256(),
+            <[u8; 32]>::from(Sha256::digest(withdrawn.verifying_key().as_bytes()))
+        );
+        let accepted = PackageInventory::default()
+            .stage_plan(&stolen, packages, 100)
+            .unwrap();
+        let state = accepted.state_bytes().unwrap();
+        let legitimate = signed_plan(&key(), "test-only", &both, packages, 2, true);
+
+        // While the key is trusted, its checkpoint survives a restart and refuses older catalogs.
+        let kept = PackageInventory::restore(&state, packages, &both).unwrap();
+        assert_eq!(kept.catalog_checkpoint(), Some(stolen.checkpoint()));
+        assert_eq!(kept.repository(), Some("example/packs"));
+        assert_eq!(
+            kept.stage_plan(&legitimate, packages, 100).unwrap_err(),
+            InventoryError::Plan(ReleaseError::Rollback)
+        );
+
+        // Without the key the checkpoint is forgotten, and the remaining key's catalog installs.
+        let forgotten = PackageInventory::restore(&state, packages, &trust()).unwrap();
+        assert_eq!(forgotten.catalog_checkpoint(), None);
+        assert_eq!(forgotten.repository(), None);
+        let recovered = forgotten.stage_plan(&legitimate, packages, 100).unwrap();
+        assert_eq!(
+            recovered.catalog_checkpoint(),
+            Some(legitimate.checkpoint())
+        );
+        forgotten.check_successor(&recovered).unwrap();
+
+        // A checkpoint saved before signing keys were recorded names no key and is forgotten too.
+        let mut legacy: Value = serde_json::from_slice(&state).unwrap();
+        legacy["catalog"]
+            .as_object_mut()
+            .unwrap()
+            .remove("signer_sha256")
+            .unwrap();
+        let legacy =
+            PackageInventory::restore(&serde_json::to_vec(&legacy).unwrap(), packages, &both)
+                .unwrap();
+        assert_eq!(legacy.catalog_checkpoint(), None);
+        assert_eq!(legacy.repository(), None);
+    }
+    #[test]
+    fn the_same_catalog_signed_by_another_trusted_key_is_no_revision_conflict() {
+        let other = SigningKey::from_bytes(&[46; 32]);
+        let both = PackageTrust::from_public_keys([
+            ("test-only".into(), key().verifying_key().to_bytes()),
+            ("recovery".into(), other.verifying_key().to_bytes()),
+        ])
+        .unwrap();
+        let pack = package("custom-test", 1, None, &[], "hello");
+        let packages = std::slice::from_ref(&pack);
+        let release = signed_plan(&key(), "test-only", &both, packages, 3, true);
+        let recovery = signed_plan(&other, "recovery", &both, packages, 3, true);
+        assert_eq!(
+            release.checkpoint().document_sha256(),
+            recovery.checkpoint().document_sha256()
+        );
+        assert_ne!(release.checkpoint(), recovery.checkpoint());
+        let current = PackageInventory::default()
+            .stage_plan(&release, packages, 100)
+            .unwrap();
+        let next = current.stage_plan(&recovery, packages, 100).unwrap();
+        assert_eq!(next.catalog_checkpoint(), Some(recovery.checkpoint()));
+        current.check_successor(&next).unwrap();
     }
     #[test]
     fn dictionary_snapshots_keep_explicit_missing_selections_without_enabling_installs() {

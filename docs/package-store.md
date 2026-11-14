@@ -32,7 +32,11 @@ Package names, components and archive paths cannot select filesystem paths.
   must match a candidate receipt. Missing, extra, duplicated, changed or untrusted
   bytes fail. Existing exact cached bytes can be reused. Artifacts are processed
   sequentially, but compiled inventories coexist: the 512 MiB artifact limit is
-  not a bound on peak memory. No-op commits create no files.
+  not a bound on peak memory. No-op commits create no files, also when the loaded
+  state forgot a catalog checkpoint that its file still holds (one saved before
+  signing keys were recorded, or of a withdrawn key): re-importing an installed
+  package then leaves the state, and the generation a running agent follows, as
+  they are.
 
 ## Publication and recovery boundary
 

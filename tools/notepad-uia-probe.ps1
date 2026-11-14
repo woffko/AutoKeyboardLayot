@@ -2,6 +2,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ResultPath
 )
+# Opens a fixture in Notepad and checks through UI Automation that the caret can be placed at its end
+# and the seven characters before it read back. Run it in an interactive session; it writes the
+# result to -ResultPath and prints it. A probe that fails records the step it failed in and exits 1.
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
@@ -16,9 +19,14 @@ if (@(Get-Process notepad -ErrorAction SilentlyContinue | Where-Object {
 $fixture = Join-Path $env:TEMP 'AutoKeyboardLayot-uia-probe.txt'
 [System.IO.File]::WriteAllText($fixture, 'ghbdtn ')
 $started = $null
+# The step that runs, recorded with a failure; $editor tells whether TextPattern was found.
+$step = 'start Notepad'
+$editor = $null
+$failed = $false
 
 try {
     $started = Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $fixture + '"') -PassThru
+    $step = 'find the probe window'
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     $windowProcess = $null
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -35,6 +43,7 @@ try {
         throw 'Notepad probe window was not found.'
     }
 
+    $step = 'find the TextPattern element'
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($windowProcess.MainWindowHandle)
     $condition = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty,
@@ -45,6 +54,7 @@ try {
         throw 'Notepad exposes no TextPattern element.'
     }
 
+    $step = 'place the caret at the end'
     $editor.SetFocus()
     $pattern = [System.Windows.Automation.TextPattern]$editor.GetCurrentPattern(
         [System.Windows.Automation.TextPattern]::Pattern
@@ -59,6 +69,7 @@ try {
     $caret.Select()
     Start-Sleep -Milliseconds 100
 
+    $step = 'read the text before the caret'
     $selection = $pattern.GetSelection()
     $singleSelection = $selection.Count -eq 1
     $isCaret = $false
@@ -82,6 +93,7 @@ try {
         }
     }
 
+    $step = 'write the result'
     [pscustomobject]@{
         ProcessId = $windowProcess.Id
         TextPattern = $true
@@ -92,9 +104,11 @@ try {
     } | ConvertTo-Json | Set-Content -LiteralPath $ResultPath -Encoding UTF8
 }
 catch {
+    $failed = $true
     [pscustomobject]@{
         Error = $_.Exception.Message
-        TextPattern = $false
+        FailedStep = $step
+        TextPattern = ($null -ne $editor)
         ExactTailMatch = $false
     } | ConvertTo-Json | Set-Content -LiteralPath $ResultPath -Encoding UTF8
 }
@@ -108,3 +122,5 @@ finally {
     }
     Remove-Item -LiteralPath $fixture -Force -ErrorAction SilentlyContinue
 }
+Get-Content -LiteralPath $ResultPath
+if ($failed) { exit 1 }

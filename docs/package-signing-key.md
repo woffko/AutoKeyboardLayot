@@ -144,6 +144,26 @@ every catalog and package the old key signed. If the recovery key may be stolen,
 treat it the same way and create a new one. A key that is lost but not stolen
 needs no announcement; replace it at the next release.
 
+What the update repairs by itself, and what it does not. A store remembers the
+catalog it last accepted together with the fingerprint of the key that signed it.
+When the updated application loads the store and that key is no longer trusted,
+it forgets the checkpoint (and the repository binding that came with it), so a
+catalog the attacker signed with a huge revision does not lock out the catalogs of
+the remaining keys. A checkpoint saved by a version from before this rule names no
+key and is forgotten the same way. Packages are different: a package that the
+stolen key signed and that a user installed makes the whole store unreadable for
+the updated application, which then cannot load that profile's configuration, and
+the highest package revisions the store recorded would keep refusing lower ones.
+Tell those users to reset the store:
+
+1. Exit AutoKeyboardLayot from the tray and close its settings.
+2. Rename `%LOCALAPPDATA%\AutoKeyboardLayot` to `AutoKeyboardLayot.before-reset`.
+   Nothing is deleted; the old `config.ini` stays there for reference.
+3. Run the current installer. Finding no profile, it creates a new English-only
+   one with an empty package store.
+4. Install the languages again, on the installer's language page or in Settings,
+   and copy any preferences over from the old `config.ini` by hand.
+
 ## Limits and recovery
 
 This is encryption at rest, not protection from malware executing as the same

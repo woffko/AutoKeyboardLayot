@@ -4,7 +4,7 @@ Offline tool. Nothing here is shipped or read by the agent.
 
 Usage:
   train.py featurize DICT_DIR CASES.jsonl OUTPUT.npz [BUCKETS]
-  train.py fit TRAIN.npz OUTPUT.pt [--dim N] [--epochs N]
+  train.py fit TRAIN.npz OUTPUT.pt [--dim N] [--epochs N] [--seed N] [--device cpu|cuda]
   train.py predict MODEL.pt CASES.npz CASES.jsonl OUTPUT_PREFIX THRESHOLD [...]
 
 Languages come from languages.json (N of them, in model order). For every
@@ -21,15 +21,27 @@ predict mirrors the agent: a word known in the typed layout is never
 converted, and a conversion needs probability >= THRESHOLD.
 Hashing uses CRC-32 of (layout index + 1 as one byte, UTF-8 n-gram), which the
 agent reproduces without dependencies.
+
+fit seeds every random source (weights, batch order) and makes torch use deterministic
+algorithms, so the same inputs, seed, versions and device give the same model. It writes
+OUTPUT.pt.json beside the model: the seed, the versions, the device and the SHA-256 of the
+cases, of languages.json and of the model.
 """
+import hashlib
 import json
+import os
+import platform
+import random
 import sys
 import zlib
 from multiprocessing import Pool
+from pathlib import Path
 
 import numpy as np
 
-from common import layout_ids, load_config, load_dictionaries
+from common import CONFIG, layout_ids, load_config, load_dictionaries
+
+SEED = 1
 
 MAX_NGRAMS = 80
 MAX_N = 4
@@ -134,13 +146,31 @@ def build_model(torch, buckets, dim, layouts):
     return LayoutModel()
 
 
-def fit(train_path, output, dim=16, epochs=4):
+def seed_everything(torch, seed):
+    """Seeds the random sources of a training run and makes torch choose deterministic algorithms;
+    returns the generator of the batch order. cuBLAS needs its workspace fixed before the first
+    CUDA call to be deterministic."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    return torch.Generator().manual_seed(seed)
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def fit(train_path, output, dim=16, epochs=4, seed=SEED, device=None):
     import torch
 
+    order_generator = seed_everything(torch, seed)
     data = np.load(train_path)
     buckets = int(data["buckets"])
     layouts = layout_ids(load_config())
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     tensors = [torch.from_numpy(data[name]) for name in ("ngrams", "dense", "present", "target")]
     if tensors[0].shape[1] != len(layouts):
         raise SystemExit("features were built for another languages.json")
@@ -148,7 +178,7 @@ def fit(train_path, output, dim=16, epochs=4):
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
     total, batch = tensors[0].shape[0], 4096
     for epoch in range(epochs):
-        order = torch.randperm(total)
+        order = torch.randperm(total, generator=order_generator)
         running, steps = 0.0, 0
         for start in range(0, total, batch):
             index = order[start : start + batch]
@@ -163,6 +193,12 @@ def fit(train_path, output, dim=16, epochs=4):
             group["lr"] *= 0.5
         print(f"epoch {epoch + 1}: loss {running / steps:.5f}")
     torch.save({"state": model.state_dict(), "buckets": buckets, "dim": dim, "layouts": layouts}, output)
+    receipt = {
+        "format": 1, "seed": seed, "epochs": epochs, "dim": dim, "device": device.type, "deterministic": True,
+        "python": platform.python_version(), "torch": torch.__version__, "numpy": np.__version__,
+        "train_sha256": sha256(train_path), "languages_json_sha256": sha256(CONFIG), "model_sha256": sha256(output),
+    }
+    Path(f"{output}.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
 
 
 def predict(model_path, cases_npz, cases_jsonl, prefix, thresholds):
@@ -206,7 +242,8 @@ def main():
         featurize(*args[:3], buckets=int(args[3]) if len(args) > 3 else DEFAULT_BUCKETS)
     elif command == "fit":
         options = dict(zip(args[2::2], args[3::2]))
-        fit(args[0], args[1], dim=int(options.get("--dim", 16)), epochs=int(options.get("--epochs", 4)))
+        fit(args[0], args[1], dim=int(options.get("--dim", 16)), epochs=int(options.get("--epochs", 4)),
+            seed=int(options.get("--seed", SEED)), device=options.get("--device"))
     elif command == "predict":
         predict(*args[:4], [float(t) for t in args[4:]])
     else:

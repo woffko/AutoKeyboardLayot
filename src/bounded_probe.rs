@@ -76,7 +76,7 @@ pub struct BoundedProbe<K, V> {
     respawns: u32,
 }
 
-impl<K: Copy + Eq + Send + 'static, V: Send + 'static> BoundedProbe<K, V> {
+impl<K: Clone + Eq + Send + 'static, V: Send + 'static> BoundedProbe<K, V> {
     pub fn spawn<Factory, Provider>(name: &str, factory: Factory) -> io::Result<Self>
     where
         Factory: FnOnce() -> Provider + Send + 'static,
@@ -171,9 +171,18 @@ impl<K: Copy + Eq + Send + 'static, V: Send + 'static> BoundedProbe<K, V> {
         }
         if self.pending.is_none() {
             let (reply, receiver) = sync_channel(1);
-            let request = Request { key, reply };
+            let request = Request {
+                key: key.clone(),
+                reply,
+            };
             let request = match self.sender.try_send(request) {
-                Ok(()) => None,
+                Ok(()) => {
+                    // The provider took the previous request, so it is alive, however slow.
+                    if let Some(healing) = self.healing.as_mut() {
+                        healing.busy_since = None;
+                    }
+                    None
+                }
                 Err(TrySendError::Full(request)) => Some(request),
                 Err(TrySendError::Disconnected(_)) => return Err(ProbeFailure::Disconnected),
             };
@@ -554,5 +563,45 @@ mod tests {
             first_gone.load(Ordering::SeqCst),
             "the abandoned thread must exit"
         );
+    }
+
+    #[test]
+    fn a_slow_provider_that_takes_requests_is_never_counted_as_stuck() {
+        use std::sync::mpsc::channel;
+        let (taken_sender, taken) = channel::<u32>();
+        let (gate_sender, gate) = channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(gate));
+        let stuck_after = Duration::from_millis(150);
+        let mut probe = BoundedProbe::<u32, u32>::spawn_resilient(
+            "probe-slow",
+            move || {
+                let taken = taken_sender.clone();
+                let gate = Arc::clone(&gate);
+                move |key: u32| {
+                    let _ = taken.send(key);
+                    let _ = gate.lock().unwrap().recv();
+                    key
+                }
+            },
+            stuck_after,
+            3,
+        )
+        .unwrap();
+        let wait = Duration::from_millis(5);
+        let age = Duration::from_secs(5);
+        // Request 1 is taken, request 2 waits in the queue, request 3 finds the queue full.
+        assert_eq!(probe.query_result(1, wait, age), Err(ProbeFailure::Timeout));
+        assert_eq!(taken.recv_timeout(age), Ok(1));
+        assert_eq!(probe.query_result(2, wait, age), Err(ProbeFailure::Timeout));
+        assert_eq!(probe.query_result(3, wait, age), Err(ProbeFailure::Busy));
+        // The provider answers request 1 late and takes request 2: it makes progress.
+        gate_sender.send(()).unwrap();
+        assert_eq!(taken.recv_timeout(age), Ok(2));
+        assert_eq!(probe.query_result(4, wait, age), Err(ProbeFailure::Timeout));
+        thread::sleep(stuck_after + Duration::from_millis(50));
+        // A full queue now is a fresh observation, not the continuation of the first one.
+        assert_eq!(probe.query_result(5, wait, age), Err(ProbeFailure::Busy));
+        assert_eq!(probe.respawn_count(), 0, "a live provider was replaced");
+        drop(gate_sender);
     }
 }

@@ -67,9 +67,9 @@ class CompiledArtifacts(unittest.TestCase):
 class PackageTexts(unittest.TestCase):
     def test_desktop_entry_quotes_unusual_paths(self):
         self.assertEqual(desktop_exec('/usr/bin/autokeyboardlayot'), '/usr/bin/autokeyboardlayot')
-        self.assertEqual(desktop_exec('/home/a b/.local/bin/x'), '"/home/a b/.local/bin/x"')
-        self.assertEqual(desktop_exec('/home/a$b/x'), '"/home/a\\\\$b/x"')
-        self.assertEqual(desktop_exec('/home/100%/x'), '"/home/100%%/x"')
+        self.assertEqual(desktop_exec('/srv/a b/.local/bin/x'), '"/srv/a b/.local/bin/x"')
+        self.assertEqual(desktop_exec('/srv/a$b/x'), '"/srv/a\\\\$b/x"')
+        self.assertEqual(desktop_exec('/srv/100%/x'), '"/srv/100%%/x"')
         entry = desktop_entry('/usr/bin/autokeyboardlayot')
         self.assertIn('Exec=/usr/bin/autokeyboardlayot --settings\n', entry)
         self.assertIn(f'Icon={COMMAND}\n', entry)
@@ -78,7 +78,7 @@ class PackageTexts(unittest.TestCase):
     def test_desktop_entry_passes_the_validator(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / f'{COMMAND}.desktop'
-            path.write_text(desktop_entry('/home/a b/.local/bin/autokeyboardlayot'), encoding='utf-8')
+            path.write_text(desktop_entry('/srv/a b/.local/bin/autokeyboardlayot'), encoding='utf-8')
             result = subprocess.run(['desktop-file-validate', str(path)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(result.stdout, '')
@@ -218,8 +218,8 @@ class UserInstallation(unittest.TestCase):
                       dropin_text(layout))
 
     def test_percent_signs_are_escaped_in_the_unit_file(self):
-        self.environment['HOME'] = '/home/100%'
-        self.assertIn('/home/100%%/.local/share/ibus/component"', dropin_text(user_layout(self.environment)))
+        self.environment['HOME'] = '/srv/100%'
+        self.assertIn('/srv/100%%/.local/share/ibus/component"', dropin_text(user_layout(self.environment)))
 
     def test_without_gnome_ibus_nothing_is_installed(self):
         (self.units / GNOME_IBUS_UNIT).unlink()

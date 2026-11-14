@@ -1,12 +1,13 @@
 //! Shared by `tests/dev_tokens.rs` and `examples/measure_token_false_positives.rs`
 //! so the ratchet test and the measuring tool count exactly the same thing.
 //!
-//! Every token of the corpus is a command, tool or package name typed correctly
-//! in the English layout. The question is how often the detector would wrongly
-//! rewrite it as the same physical keys read in another layout (Russian or
-//! Estonian), first with the dictionary detector alone and then with the layout
-//! model switched on. Each token is judged as the first word of a sentence
-//! (empty context), which is the least favorable case for the model.
+//! Every token of a corpus is typed correctly in the English layout: a command,
+//! tool or package name, or an English word with punctuation next to it. The
+//! question is how often the detector would wrongly rewrite it as the same
+//! physical keys read in another layout (Russian or Estonian), first with the
+//! dictionary detector alone and then with the layout model switched on. Each
+//! token is judged as the first word of a sentence (empty context), which is
+//! the least favorable case for the model.
 
 use autokeyboardlayot::{
     Detection, Detector, DetectorConfig, DictionaryRegistry, Language,
@@ -16,7 +17,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 /// The shipped corpus, see its header for the sources.
 pub const CORPUS: &str = include_str!("../fixtures/dev-tokens.txt");
-/// The US, Russian and Estonian layouts the corpus is read through.
+/// English words with punctuation next to them, see its header for the sources.
+pub const PUNCTUATED: &str = include_str!("../fixtures/punctuated-english.txt");
+/// Code paths, file names and identifiers, see its header for the sources.
+pub const TECHNICAL: &str = include_str!("../fixtures/technical-tokens.txt");
+/// The punctuation keys that print letters in the Russian or Estonian layout.
+pub const LETTER_PUNCTUATION: &str = "[];',.{}:\"<>";
+/// The US, Russian and Estonian layouts the corpora are read through.
 pub const LAYOUTS: &str = include_str!("../fixtures/layouts-en-ru-et.json");
 
 const MINIMUM_LETTERS: usize = 3;
@@ -30,6 +37,60 @@ const LOADED: [(usize, &str); 3] = [
 /// Lowercase tokens of `MINIMUM_LETTERS` or more letters, one per line, sorted
 /// and unique. Blank lines and lines that start with `#` are skipped.
 pub fn parse_tokens(text: &str) -> Result<Vec<String>, String> {
+    parse_sorted(
+        text,
+        |line| line.len() >= MINIMUM_LETTERS && line.bytes().all(|byte| byte.is_ascii_lowercase()),
+        &format!("a token of {MINIMUM_LETTERS} or more lowercase letters"),
+    )
+}
+
+/// Tokens of two or more lowercase letters and at least one key of
+/// `LETTER_PUNCTUATION`, one per line, sorted and unique, as `parse_tokens`.
+pub fn parse_punctuated_tokens(text: &str) -> Result<Vec<String>, String> {
+    let punctuation = |byte: &u8| LETTER_PUNCTUATION.as_bytes().contains(byte);
+    parse_sorted(
+        text,
+        |line| {
+            line.bytes().filter(u8::is_ascii_lowercase).count() >= 2
+                && line.bytes().any(|byte| punctuation(&byte))
+                && line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || punctuation(&byte))
+        },
+        "two or more lowercase letters with a punctuation key that prints a letter elsewhere",
+    )
+}
+
+/// Letters joined by `.`, `:` or `::`, two or more letters in every part, one
+/// per line, sorted and unique, as `parse_tokens`.
+pub fn parse_technical_tokens(text: &str) -> Result<Vec<String>, String> {
+    parse_sorted(
+        text,
+        |line| {
+            let parts: Vec<&str> = line
+                .split([':', '.'])
+                .filter(|part| !part.is_empty())
+                .collect();
+            parts.len() >= 2
+                && parts.iter().all(|part| {
+                    part.len() >= 2 && part.bytes().all(|byte| byte.is_ascii_alphabetic())
+                })
+                && !line.starts_with([':', '.'])
+                && !line.ends_with([':', '.'])
+                && !line.contains(".:")
+                && !line.contains(":.")
+                && !line.contains("..")
+                && !line.contains(":::")
+        },
+        "letters joined by \".\", \":\" or \"::\", two or more in every part",
+    )
+}
+
+fn parse_sorted(
+    text: &str,
+    valid: impl Fn(&str) -> bool,
+    expected: &str,
+) -> Result<Vec<String>, String> {
     let mut tokens: Vec<String> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim_end();
@@ -37,10 +98,8 @@ pub fn parse_tokens(text: &str) -> Result<Vec<String>, String> {
             continue;
         }
         let number = index + 1;
-        if line.len() < MINIMUM_LETTERS || !line.bytes().all(|byte| byte.is_ascii_lowercase()) {
-            return Err(format!(
-                "line {number}: {line:?} is not a token of {MINIMUM_LETTERS} or more lowercase letters"
-            ));
+        if !valid(line) {
+            return Err(format!("line {number}: {line:?} is not {expected}"));
         }
         if tokens
             .last()
@@ -125,6 +184,114 @@ impl Layouts {
             (Language::Estonian, self.estonian.read(&keys)?),
         ])
     }
+}
+
+/// The word the agent holds when `token` ends, and how many trailing marks end it, split as the
+/// agent splits typing (`process_key`): a character that the English layout takes as a letter
+/// or a target layout reads as one continues the word; punctuation right after a word is a
+/// trailing mark; anything after trailing marks starts a new word; any other punctuation or
+/// whitespace ends the word; any other character (a digit) ends it and suppresses the rest of
+/// the token. `None` when the token does not end with trailing marks.
+fn word_with_trailing_marks(
+    token: &str,
+    layouts: &Layouts,
+    detector: &Detector,
+) -> Option<(String, usize)> {
+    let (mut word, mut marks, mut suppressed) = (String::new(), 0, false);
+    for character in token.chars() {
+        let readings: Vec<(Language, char)> = layouts
+            .readings(&character.to_string())?
+            .into_iter()
+            .filter_map(|(language, reading)| Some((language, reading.chars().next()?)))
+            .collect();
+        if detector.can_extend_word_with_readings(character, Language::English, &readings) {
+            if marks > 0 {
+                word.clear();
+                marks = 0;
+            }
+            if !suppressed {
+                word.push(character);
+            }
+        } else if character.is_ascii_punctuation() && !character.is_whitespace() {
+            if !suppressed && !word.is_empty() {
+                word.push(character);
+                marks += 1;
+            } else {
+                word.clear();
+                marks = 0;
+                suppressed = false;
+            }
+        } else if character.is_whitespace() {
+            word.clear();
+            marks = 0;
+            suppressed = false;
+        } else {
+            word.clear();
+            marks = 0;
+            suppressed = true;
+        }
+    }
+    (marks > 0 && !word.is_empty()).then_some((word, marks))
+}
+
+/// As `measure`, for the tokens that end with trailing marks: the word before them is judged
+/// with its marks (`Detector::detect_with_trailing_marks`), as the agent does at the Space after
+/// the token. Only the conversions the marks add count: a word the detector converts without
+/// them too (a budgeted command name) is counted in `already_converted` instead. `tokens` in the
+/// result counts the tokens that end with trailing marks.
+#[allow(dead_code)] // tests/dev_tokens.rs uses it, examples/measure_token_false_positives.rs does not
+pub fn measure_trailing_marks(
+    tokens: &[String],
+    layouts: &Layouts,
+    dictionary_only: &Detector,
+    with_model: &Detector,
+) -> (Measurement, usize) {
+    let mut result = Measurement::default();
+    let mut already_converted = 0;
+    for token in tokens {
+        let Some((word, marks)) = word_with_trailing_marks(token, layouts, with_model) else {
+            continue;
+        };
+        let Some(mapped) = layouts.readings(&word) else {
+            continue;
+        };
+        result.tokens += 1;
+        let core: String = word.chars().take(word.chars().count() - marks).collect();
+        if let Some(core_mapped) = layouts.readings(&core)
+            && (dictionary_only
+                .detect_mapped_candidates(&core, Language::English, &core_mapped)
+                .is_some()
+                || with_model
+                    .detect_mapped_candidates_in_context(
+                        &core,
+                        Language::English,
+                        &core_mapped,
+                        &[],
+                    )
+                    .is_some())
+        {
+            already_converted += 1;
+            continue;
+        }
+        if let Some(detection) = dictionary_only.detect_with_trailing_marks(
+            &word,
+            marks,
+            Language::English,
+            &mapped,
+            None,
+        ) {
+            result.dictionary.push(Conversion::new(token, &detection));
+        } else if let Some(detection) = with_model.detect_with_trailing_marks(
+            &word,
+            marks,
+            Language::English,
+            &mapped,
+            Some(&[]),
+        ) {
+            result.model_extra.push(Conversion::new(token, &detection));
+        }
+    }
+    (result, already_converted)
 }
 
 /// A platform that reports the three layouts as loaded, with English active.

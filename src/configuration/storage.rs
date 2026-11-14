@@ -75,6 +75,20 @@ pub fn backup_before_schema_upgrade(path: &Path) -> io::Result<()> {
 }
 
 fn write_exact_backup(backup: &Path, original: &str) -> io::Result<()> {
+    write_exact_backup_with(backup, original, |file, contents| {
+        file.write_all(contents)?;
+        file.sync_all()
+    })
+}
+
+/// The backup is written to a temporary file of a unique name and appears under its own name
+/// only whole: a backup cut short by a failed write or a crash would otherwise block every
+/// later save as "a different migration backup". `write` fills the temporary file.
+fn write_exact_backup_with(
+    backup: &Path,
+    original: &str,
+    write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(existing) = read_optional_file(backup)? {
         return if existing == original {
             Ok(())
@@ -85,12 +99,28 @@ fn write_exact_backup(backup: &Path, original: &str) -> io::Result<()> {
             ))
         };
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(backup)?;
-    file.write_all(original.as_bytes())?;
-    file.sync_all()
+    let directory = backup
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "backup path has no parent"))?;
+    let mut prefix = backup
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "backup path has no name"))?
+        .to_os_string();
+    prefix.push(".tmp");
+    remove_stale_temporaries(directory, &prefix, SystemTime::now(), STALE_TEMPORARY_AGE);
+    static NEXT_SERIAL: AtomicU64 = AtomicU64::new(0);
+    let (mut file, temporary) = create_unique_temporary(directory, &prefix, &NEXT_SERIAL)?;
+    if let Err(error) = write(&mut file, original.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    // Under the writer lock the backup is still absent; a hard link never replaces one that
+    // appeared meanwhile.
+    let published = std::fs::hard_link(&temporary, backup);
+    let _ = std::fs::remove_file(&temporary);
+    published
 }
 
 /// An explicit legacy-to-managed transition also needs an exact backup when
@@ -329,7 +359,12 @@ fn load_with_sources(
     let settings = settings_text
         .map(|text| Settings::try_from_text(&text))
         .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                super::ConfigurationError::at(error.line, error.message).in_file("settings.ini"),
+            )
+        })?
         .unwrap_or_default();
     ConfigurationDocument::try_from_legacy(
         settings,
@@ -749,6 +784,34 @@ mod tests {
     }
 
     #[test]
+    fn a_migration_backup_that_failed_to_write_leaves_nothing_behind_and_the_next_save_works() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup = directory.path().join("config.schema-3.bak");
+        let error = write_exact_backup_with(&backup, "schema_version=3\n", |file, contents| {
+            file.write_all(&contents[..4])?;
+            Err(io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "disk full");
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        // The next save writes the backup whole, and a repeated one finds it exact.
+        write_exact_backup(&backup, "schema_version=3\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "schema_version=3\n"
+        );
+        write_exact_backup(&backup, "schema_version=3\n").unwrap();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            write_exact_backup(&backup, "schema_version=2\n")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
     fn readable_malformed_legacy_values_and_rows_are_not_silently_discarded() {
         for (failed, contents) in [
             ("settings.ini", "pause_break_undo=bad"),
@@ -757,12 +820,27 @@ mod tests {
             ("exclusions.txt", "\"\""),
         ] {
             let result = load_with_reader(|name| Ok((name == failed).then(|| contents.to_owned())));
-            assert_eq!(
-                result.unwrap_err().kind(),
-                io::ErrorKind::InvalidData,
-                "{failed}"
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{failed}");
+            // The error names the older file it is in, not config.ini.
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("{failed}, line 1: ")),
+                "{error}"
             );
         }
+        let error = load_with_reader(|name| {
+            Ok((name == "user_dictionary.txt")
+                .then(|| "# mine\n\nen-US: firefox\nhello world\n".to_owned()))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("user_dictionary.txt, line 4: "),
+            "{error}"
+        );
     }
 
     #[test]

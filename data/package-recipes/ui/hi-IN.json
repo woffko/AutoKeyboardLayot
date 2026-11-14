@@ -1,6 +1,6 @@
 {
   "package_id": "hi-IN",
-  "revision": 1,
+  "revision": 2,
   "ui_locale": "hi",
   "components": {
     "ui": "../../package-locales/hi.json",

@@ -134,20 +134,42 @@ that nobody has reviewed.
 
 1. **Review the third-party notices.** The regenerated file includes the layout-model notice
    and the dictionary license, and is bound to the exact `Cargo.toml` and `Cargo.lock` below.
-   Read it, then take its SHA-256 as the reviewed value. The owner reviewed and accepted it on
-   2026-10-11. A different `Cargo.toml` or
-   `Cargo.lock`, or any dependency change, makes it stale and the pipeline has to run again.
+   Read it, then take its SHA-256 as the reviewed value. A different `Cargo.toml` or
+   `Cargo.lock`, any dependency change or a changed bundled data notice makes it stale and the
+   pipeline has to run again.
+
+   **Awaiting review:** the notices regenerated on 2026-10-19, after the layout model's
+   `data/layout-model/NOTICE.md` began to credit SUBTLEX and to name the versions of its sources.
+   The installer build compares the bundled data notices with the checkout, so it refuses the
+   notices accepted earlier (below) until these are reviewed.
+
+   | | |
+   |---|---|
+   | `THIRD-PARTY-NOTICES.txt` | `85fc4575582918abffabb4e91b3cf5734624cb16a2bf944fcd7c2f919205a9d3` |
+   | `notices-report.json` | `3de30e10e48e1c76b4917e0c54911a7db0464324afb60cee6ec996b3e574ba03` |
+   | files | `target/base-notices-complete-20261019-01/` |
+
+   Only the "Bundled layout model" section differs from the accepted file (41 changed lines:
+   the SUBTLEX credits with their citations and the wordfreq and Estonian source versions);
+   `diff target/base-notices-complete-20261018-01/THIRD-PARTY-NOTICES.txt target/base-notices-complete-20261019-01/THIRD-PARTY-NOTICES.txt`
+   shows it. The build receipt, `Cargo.toml` and `Cargo.lock` are the ones in the table below.
+
+   **Accepted earlier (now stale):** the owner reviewed and accepted these on 2026-10-11.
 
    | | |
    |---|---|
    | `THIRD-PARTY-NOTICES.txt` | `4c62f14d32631cc6f16051201ec7bf83cb8a9fbe6e2403cf307e9c35f1568ae1` |
-   | `notices-report.json` | `83d23861b676235c3d5026c7ddf0278d55ce0071c693f07c12c3177ff28552b4` |
+   | `notices-report.json` | `876e883cf54bd0cdc644c13a1c039f7d723f4eb1b1b141c40072f34715454291` |
    | build receipt | `1d3799ef53a07499f7c7eeddda65fa1b6cc6eba29e3144c2234cdcb4fee2aa2f` |
    | `Cargo.toml` | `a401b5b767fbf0c984f0f119243ff04b3ce00cb012860c937206d98673322bb1` |
    | `Cargo.lock` | `2c251fec8048fadbfe737220fad2f01de0eac9713fce82b8d1f5fe2b3aa0a3b6` |
 
-   Files: `target/base-notices-complete-20261003-01/` and
-   `target/base-build-receipt-20261003-01.json` (not tracked; `target/` is local). The 339
+   Files: `target/base-notices-complete-20261018-01/` and
+   `target/base-build-receipt-20261003-01.json` (not tracked; `target/` is local). The notices were
+   regenerated on 2026-10-18 because the report now also records the SHA-256 of the bundled data
+   notices, which the installer build compares with the checkout; `THIRD-PARTY-NOTICES.txt` came out
+   byte for byte the reviewed file, and the earlier report (`target/base-notices-complete-20261003-01/`,
+   SHA-256 `83d23861…`) lacks that record, so the build refuses it. The 339
    third-party packages all have license text, and `missing` is empty.
 
    What changed since the notices of the previous installer (SHA-256
@@ -164,7 +186,7 @@ that nobody has reviewed.
 
    ```sh
    python3 tools/build_experimental_installer.py --output target/installer-0.1.1 \
-     --notice-directory target/base-notices-complete-20261003-01 \
+     --notice-directory target/base-notices-complete-20261019-01 \
      --build-receipt target/base-build-receipt-20261003-01.json \
      --notice-sha256 REVIEWED_NOTICE_SHA256 \
      --iscc PATH_TO_ISCC.exe

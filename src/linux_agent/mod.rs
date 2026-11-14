@@ -22,6 +22,11 @@ fn package_root() -> Option<PathBuf> {
     paths::data_dir()
 }
 
+/// The directory that holds `config.ini`: the XDG configuration directory.
+fn configuration_directory() -> Option<PathBuf> {
+    paths::config_dir()
+}
+
 fn try_load_configuration_document() -> std::io::Result<autokeyboardlayot::ConfigurationDocument> {
     let directory = paths::config_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;

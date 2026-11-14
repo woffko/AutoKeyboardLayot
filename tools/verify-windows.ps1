@@ -27,7 +27,18 @@ $receipt = [ordered]@{
 function Write-Receipt {
     $temporary = Join-Path $LogDirectory 'result.tmp'
     $receipt | ConvertTo-Json | Set-Content -LiteralPath $temporary -Encoding UTF8
-    Move-Item -LiteralPath $temporary -Destination (Join-Path $LogDirectory 'result.json') -Force
+    # The monitor reads result.json every few seconds; replacing it while it is open fails with a
+    # sharing violation, so the replacement is retried for up to ten seconds.
+    $destination = Join-Path $LogDirectory 'result.json'
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            Move-Item -LiteralPath $temporary -Destination $destination -Force
+            return
+        } catch {
+            if ($attempt -ge 50) { throw }
+            Start-Sleep -Milliseconds 200
+        }
+    }
 }
 
 function Invoke-CargoStage([string]$Stage, [string[]]$CargoArguments) {

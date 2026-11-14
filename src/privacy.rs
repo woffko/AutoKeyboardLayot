@@ -14,17 +14,16 @@ pub enum PrivacyBlockReason {
     InspectionUnavailable,
 }
 
-/// The opt-in exception is only for a known terminal's field-inspection failure.
-/// Transport, process and context failures remain denied even for manual input.
+/// Manual conversion (Pause/Break) is allowed in a field that passed its check and, by the
+/// owner's decision (2026-10-25), in any program's field that cannot be inspected, which is no
+/// confirmed password field, when the process itself passed its checks. Password fields and
+/// transport, process and context failures remain denied even for manual input.
 pub fn manual_conversion_allowed(
     reason: Option<PrivacyBlockReason>,
-    terminal_opt_in: bool,
-    verified_terminal: bool,
+    verified_process: bool,
 ) -> bool {
     reason.is_none()
-        || (reason == Some(PrivacyBlockReason::FieldInspectionUnavailable)
-            && terminal_opt_in
-            && verified_terminal)
+        || (reason == Some(PrivacyBlockReason::FieldInspectionUnavailable) && verified_process)
 }
 
 /// Case-insensitive executable-name exclusion policy.
@@ -77,9 +76,15 @@ impl ExclusionPolicy {
         }
     }
 
+    /// An entry without an extension ("Signal", "KeePass") names the program by its file stem:
+    /// a Windows image name always has an extension, so the entry alone would never match.
     pub fn is_excluded(&self, path_or_name: &str) -> bool {
-        normalize_executable_name(path_or_name)
-            .is_some_and(|name| self.executable_names.contains(&name))
+        normalize_executable_name(path_or_name).is_some_and(|name| {
+            self.executable_names.contains(&name)
+                || name.rsplit_once('.').is_some_and(|(stem, _)| {
+                    !stem.is_empty() && self.executable_names.contains(stem)
+                })
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -97,8 +102,17 @@ impl ExclusionPolicy {
 
 fn normalize_executable_name(path_or_name: &str) -> Option<String> {
     let trimmed = path_or_name.trim().trim_matches('"');
+    if trimmed.chars().any(forbidden_in_windows_path) {
+        return None;
+    }
     let name = trimmed.rsplit(['/', '\\']).next()?.trim();
     (!name.is_empty()).then(|| name.to_lowercase())
+}
+
+/// A character no Windows file name or path holds (`"`, `<`, `>`, `|`, `?`, `*` and control
+/// characters): a program entry with one could never match, and might not read back.
+pub(crate) fn forbidden_in_windows_path(character: char) -> bool {
+    character.is_control() || matches!(character, '"' | '<' | '>' | '|' | '?' | '*')
 }
 
 #[cfg(test)]
@@ -106,28 +120,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_exception_never_authorizes_transport_or_process_failures() {
-        for opt_in in [false, true] {
-            for terminal in [false, true] {
-                assert!(manual_conversion_allowed(None, opt_in, terminal));
-                assert_eq!(
-                    manual_conversion_allowed(
-                        Some(PrivacyBlockReason::FieldInspectionUnavailable),
-                        opt_in,
-                        terminal
-                    ),
-                    opt_in && terminal
-                );
-                for reason in [
-                    PrivacyBlockReason::PasswordField,
-                    PrivacyBlockReason::ExcludedProcess,
-                    PrivacyBlockReason::ElevatedProcess,
-                    PrivacyBlockReason::InspectionUnavailable,
-                ] {
-                    assert!(!manual_conversion_allowed(Some(reason), opt_in, terminal));
-                }
+    fn a_quoted_program_loses_its_inner_spaces_and_characters_windows_forbids_are_refused() {
+        assert_eq!(
+            ExclusionPolicy::normalize_entry(r#"" C:\Vault\Vault.exe ""#).as_deref(),
+            Some("vault.exe")
+        );
+        assert_eq!(
+            ExclusionPolicy::normalize_entry(r#"" Vault.exe ""#).as_deref(),
+            Some("vault.exe")
+        );
+        for entry in [
+            "va|ult.exe",
+            "va<ult.exe",
+            "va>ult.exe",
+            "va\"ult.exe",
+            "va?ult.exe",
+            "va*ult.exe",
+            "va\u{7}ult.exe",
+        ] {
+            assert_eq!(ExclusionPolicy::normalize_entry(entry), None, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn manual_exception_never_authorizes_passwords_or_transport_or_process_failures() {
+        for verified_process in [false, true] {
+            assert!(manual_conversion_allowed(None, verified_process));
+            assert_eq!(
+                manual_conversion_allowed(
+                    Some(PrivacyBlockReason::FieldInspectionUnavailable),
+                    verified_process
+                ),
+                verified_process
+            );
+            for reason in [
+                PrivacyBlockReason::PasswordField,
+                PrivacyBlockReason::ExcludedProcess,
+                PrivacyBlockReason::ElevatedProcess,
+                PrivacyBlockReason::InspectionUnavailable,
+            ] {
+                assert!(!manual_conversion_allowed(Some(reason), verified_process));
             }
         }
+    }
+
+    #[test]
+    fn an_entry_without_an_extension_matches_the_program_by_its_stem() {
+        let policy = ExclusionPolicy::from_lines(["Signal", "keepass.exe", "my.app"]);
+        assert!(policy.is_excluded(r"D:\Apps\signal-desktop\Signal.exe"));
+        assert!(policy.is_excluded("KeePass.exe"));
+        assert!(policy.is_excluded("my.app.exe"));
+        assert!(!policy.is_excluded("SignalR.exe"));
+        assert!(!policy.is_excluded("keepass"));
+        assert!(!policy.is_excluded(".exe"));
     }
 
     #[test]

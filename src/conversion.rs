@@ -15,6 +15,9 @@ pub struct TextEdit {
 pub struct ConversionTransaction {
     pub source_language: Language,
     pub target_language: Language,
+    /// The language the word reads in, for the words after it. It differs from the target when
+    /// several layouts give the text and the field stays in the one it used.
+    pub word_language: Language,
     pub original: String,
     pub replacement: String,
     pub delimiter: Option<char>,
@@ -59,6 +62,7 @@ impl ConversionTransaction {
         Some(Self {
             source_language: detection.source_language,
             target_language: detection.target_language,
+            word_language: detection.target_language,
             original: detection.original.clone(),
             replacement: detection.replacement.clone(),
             delimiter,
@@ -100,6 +104,12 @@ mod tests {
             source_score: 0.0,
             target_score: 20.0,
         }
+    }
+
+    #[test]
+    fn a_conversion_counts_in_the_language_of_its_target_until_told_otherwise() {
+        let transaction = ConversionTransaction::new(&detection("ghbdtn", "привет"), ' ').unwrap();
+        assert_eq!(transaction.word_language, transaction.target_language);
     }
 
     #[test]

@@ -76,6 +76,8 @@ Name: "{userprograms}\AutoKeyboardLayot\{cm:AkSettingsShortcut}"; Filename: "{ap
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "AutoKeyboardLayot"; ValueData: """{app}\AutoKeyboardLayot.exe"""; Tasks: startup; Flags: uninsdeletevalue
+; Unchecking the task on a reinstall or upgrade removes the value an earlier run wrote.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "AutoKeyboardLayot"; Tasks: not startup; Flags: deletevalue
 
 ; No [Run], [InstallDelete], or [UninstallDelete]: setup never starts conversion
 ; and never enrolls the separate user-data directory for recursive deletion.
@@ -85,8 +87,12 @@ const
   AgentMutexName = 'Local\AutoKeyboardLayot.Agent';
   SettingsMutexName = 'Local\AutoKeyboardLayot.Settings.Singleton';
   AlreadyExists = 183;
+  SharingViolation = 32;
+  NotModularBase = 23;
 var
   AgentLease, SettingsLease, InstallationFence: THandle;
+  // What setup undoes when it ends without installing (RestoreAfterAbandonedSetup).
+  DataFolderExisted, AgentClosedBySetup, SetupInstalled: Boolean;
 
 function NativeCreateMutex(Attributes, InitialOwner: LongWord; Name: String): THandle;
   external 'CreateMutexW@kernel32.dll stdcall';
@@ -104,6 +110,7 @@ function NativeFenceAttributes(Name: String): LongWord;
   external 'GetFileAttributesW@kernel32.dll stdcall';
 
 function PrepareToInstall(var NeedsRestart: Boolean): String; forward;
+procedure ReleaseLeases; forward;
 #include "package-pages.iss"
 
 procedure ReleaseLeases;
@@ -125,25 +132,38 @@ begin
   end;
 end;
 
-function AcquireInstallationFence: Boolean;
-var Name: String; HighSize, Attributes: LongWord;
+function InstallationFenceName: String;
 begin
-  Name := ExpandConstant('{localappdata}\AutoKeyboardLayot.installation.lock');
+  Result := ExpandConstant('{localappdata}\AutoKeyboardLayot.installation.lock');
+end;
+
+// Returns '' once the fence is held, otherwise the reason. A sharing violation means
+// another setup, uninstall, agent or settings of this user holds the file (possibly in
+// another session); any other failure means the file cannot serve as the fence.
+function AcquireInstallationFence: String;
+var HighSize, Attributes, ErrorCode: LongWord;
+begin
+  Result := '';
   // OPEN_ALWAYS without truncation, GENERIC_READ|WRITE, no sharing. New agents
   // and settings retain read-only sharing handles for their complete lifetime.
-  InstallationFence := NativeCreateFence(Name, $C0000000, 0, 0, 4, $00200080, 0);
+  InstallationFence := NativeCreateFence(InstallationFenceName, $C0000000, 0, 0, 4, $00200080, 0);
+  ErrorCode := DLLGetLastError;
   if InstallationFence = THandle($FFFFFFFF) then begin
     InstallationFence := 0;
-    Result := False;
+    if ErrorCode = SharingViolation then
+      Result := CustomMessage('AkFenceBusy')
+    else
+      Result := FmtMessage(CustomMessage('AkFenceInvalid'), [InstallationFenceName, IntToStr(ErrorCode)]);
     Exit;
   end;
   HighSize := 0;
-  Attributes := NativeFenceAttributes(Name);
-  Result := (InstallationFence <> 0) and (NativeFenceType(InstallationFence) = 1) and
-    ((Attributes and $410) = 0) and (NativeFenceSize(InstallationFence, HighSize) = 0) and (HighSize = 0);
-  if not Result then begin
-    NativeCloseHandle(InstallationFence);
+  Attributes := NativeFenceAttributes(InstallationFenceName);
+  if (InstallationFence = 0) or (NativeFenceType(InstallationFence) <> 1) or
+      ((Attributes and $410) <> 0) or (NativeFenceSize(InstallationFence, HighSize) <> 0) or (HighSize <> 0) then begin
+    if InstallationFence <> 0 then
+      NativeCloseHandle(InstallationFence);
     InstallationFence := 0;
+    Result := FmtMessage(CustomMessage('AkFenceInvalid'), [InstallationFenceName, '0']);
   end;
 end;
 
@@ -159,20 +179,31 @@ end;
 function StopAndLease(Helper: String): String;
 var
   ExitCode: Integer;
+  AgentRunning: Boolean;
 begin
   Result := '';
   if (AgentLease <> 0) and (SettingsLease <> 0) and (InstallationFence <> 0) then
     Exit;
   ReleaseLeases;
-  if not Exec(Helper, '--prepare-upgrade "' + ExpandConstant('{app}') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
-    Result := CustomMessage('AkCloseHelperFailed');
-    Exit;
-  end;
-  if ExitCode <> 0 then begin
-    Result := FmtMessage(CustomMessage('AkCloseBusy'), [IntToStr(ExitCode)]);
-    Exit;
-  end;
+  // Without the installed program (quarantined, deleted, or an interrupted upgrade) nothing
+  // can run from it, so there is nothing to close; the leases and the fence below still
+  // keep a program from elsewhere and other setups out.
+  if FileExists(Helper) then begin
+    AgentRunning := CheckForMutexes(AgentMutexName);
+    if not Exec(Helper, '--prepare-upgrade "' + ExpandConstant('{app}') + '"',
+        '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
+      Result := CustomMessage('AkCloseHelperFailed');
+      Exit;
+    end;
+    if ExitCode <> 0 then begin
+      Result := FmtMessage(CustomMessage('AkCloseBusy'), [IntToStr(ExitCode)]);
+      Exit;
+    end;
+    // The agent of this session ran and is closed now: setup starts it again if it ends
+    // without installing.
+    if AgentRunning then AgentClosedBySetup := True;
+  end else
+    Log('The installed program is missing; no running instance needs to be closed.');
   if not AcquireLease(AgentMutexName, AgentLease) then begin
     ReleaseLeases;
     Result := CustomMessage('AkAgentRestarted');
@@ -183,10 +214,9 @@ begin
     Result := CustomMessage('AkSettingsRestarted');
     Exit;
   end;
-  if not AcquireInstallationFence then begin
+  Result := AcquireInstallationFence;
+  if Result <> '' then
     ReleaseLeases;
-    Result := FmtMessage(CustomMessage('AkCloseBusy'), ['12']);
-  end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -206,8 +236,12 @@ begin
     Result := CustomMessage('AkBaseProbeFailed');
     Exit;
   end;
-  if ExitCode <> 0 then begin
+  if ExitCode = NotModularBase then begin
     Result := CustomMessage('AkNotModularBase');
+    Exit;
+  end;
+  if ExitCode <> 0 then begin
+    Result := FmtMessage(CustomMessage('AkBaseProbeCode'), [IntToStr(ExitCode)]);
     Exit;
   end;
   Result := StopAndLease(Helper);
@@ -224,20 +258,85 @@ begin
     ReleaseLeases;
 end;
 
+function InitializeSetup: Boolean;
+begin
+  DataFolderExisted := DirExists(ExpandConstant('{localappdata}\AutoKeyboardLayot'));
+  Result := True;
+end;
+
+// The files are in place: from here on the new shortcuts must be able to start the
+// program, also while the Finished page is still open.
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then begin
+    SetupInstalled := True;
+    StopPackageHelper;
+    ReleaseLeases;
+  end;
+end;
+
+// Only what profile initialization and the package store create.
+function OnlyInitializedProfile(Folder: String): Boolean;
+var
+  Find: TFindRec;
+  Name: String;
+begin
+  Result := True;
+  if not FindFirst(Folder + '\*', Find) then
+    Exit;
+  try
+    repeat
+      Name := Lowercase(Find.Name);
+      if (Name <> '.') and (Name <> '..') and (Name <> 'config.ini') and (Name <> 'packages') then
+        Result := False;
+    until not Result or not FindNext(Find);
+  finally
+    FindClose(Find);
+  end;
+end;
+
+// Setup ends without installing (cancelled, or failed before the files were replaced): the
+// languages chosen with Next may already have initialized the profile and closed the program.
+// A profile folder that did not exist when setup started and holds only what initialization
+// created goes; the agent of this session that setup closed starts again.
+procedure RestoreAfterAbandonedSetup;
+var
+  Folder: String;
+  ExitCode: Integer;
+begin
+  Folder := ExpandConstant('{localappdata}\AutoKeyboardLayot');
+  if not DataFolderExisted and DirExists(Folder) and OnlyInitializedProfile(Folder) then
+    if not DelTree(Folder, True, True, True) then
+      Log('The profile folder setup created could not be removed.');
+  if AgentClosedBySetup then
+    if FileExists(ExpandConstant('{app}\AutoKeyboardLayot.exe')) then
+      if not Exec(ExpandConstant('{app}\AutoKeyboardLayot.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ExitCode) then
+        Log('The program setup closed could not be started again.');
+end;
+
 procedure DeinitializeSetup;
 begin
   StopPackageHelper;
   ReleaseLeases;
+  if not SetupInstalled then
+    RestoreAfterAbandonedSetup;
 end;
 
-function InitializeUninstall: Boolean;
+// Close the program only once the user has confirmed the removal: declining must leave
+// it running. usUninstall follows the confirmation, and Abort ends the uninstall there.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ErrorText: String;
 begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
   ErrorText := StopAndLease(ExpandConstant('{app}\AutoKeyboardLayot.exe'));
-  Result := ErrorText = '';
-  if not Result then
-    MsgBox(ErrorText, mbError, MB_OK);
+  if ErrorText <> '' then begin
+    Log(ErrorText);
+    if not UninstallSilent then
+      MsgBox(ErrorText, mbError, MB_OK);
+    Abort;
+  end;
 end;
 
 procedure DeinitializeUninstall;

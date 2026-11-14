@@ -7,7 +7,9 @@ directory and expected computer reach the VM. Nothing here contacts a machine.
 import base64
 import contextlib
 import io
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,11 +24,25 @@ sys.path.insert(0, str(TOOLS))
 import vm_config  # noqa: E402
 from vm_config import VmSettings, VmSettingsError, sftp_path  # noqa: E402
 
-DRIVERS = ['run_vm_cross_session.py', 'run_vm_ui_offline_session.py', 'run_vm_upgrade.py']
-SCRIPTS = DRIVERS + ['test-vm-cross-session.ps1', 'test-vm-upgrade.ps1']
+DRIVERS = ['run_vm_cross_session.py', 'run_vm_installer_ui.py', 'run_vm_upgrade.py']
+SCRIPTS = DRIVERS + ['test-vm-cross-session.ps1', 'test-vm-upgrade.ps1', 'test-installer-ui.ps1']
+# The build directory (and scenarios) the drivers that take them get in these tests.
+BUILD = 'target/installer-build-a'
+# A build whose program was signed: the receipt names it below signed-inputs/.
+SIGNED_BUILD = 'target/installer-build-b'
+DRIVER_ARGUMENTS = {'run_vm_cross_session.py': (SIGNED_BUILD,), 'run_vm_installer_ui.py': (BUILD, 'retry', 'missing-exe'),
+                    'run_vm_upgrade.py': (BUILD, SIGNED_BUILD)}
+# The receipts' digests: setup and program of BUILD, then of SIGNED_BUILD.
+DIGESTS = {'a-setup': 'a' * 64, 'a-program': 'b' * 64, 'b-setup': 'c' * 64, 'b-program': 'd' * 64}
 # Values that tie a script to one machine or one person. Written in pieces so that a scan for
 # these values does not flag this file.
-MACHINE_LOCAL = ['192' + '.168.', 'C:\\Users\\', '/home/', 'root' + '@', 'DESKTOP-', 'w0' + 'w']
+MACHINE_LOCAL = ['192' + '.168.', 'C:\\Users\\', '/ho' + 'me/', 'root' + '@', 'DESK' + 'TOP-', 'w0' + 'w']
+# Tracked tools that may hold one of them, with the reason. Every other tracked file below tools/
+# must hold none.
+MACHINE_LOCAL_EXCEPTIONS = {
+    ('test_deploy_host_script.py', '/ho' + 'me/'): "the deploy script's own hygiene pattern",
+}
+ROOT = TOOLS.parent
 
 ENVIRONMENT = {
     'AKL_VM_HOST': 'vm.test.invalid',
@@ -55,6 +71,19 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.host_key_option(), ['-o', 'HostKeyAlias=pinned-name'])
         self.assertEqual(settings.scheduled_task_user, 'TESTGUEST01\\console')
         self.assertEqual(settings.stage_directory('akl-upgrade', ''), 'D:\\Stage\\akl')
+
+    def test_another_tested_user_needs_its_profile_and_a_stage_from_the_settings(self):
+        other = dict(ENVIRONMENT, AKL_VM_TEST_USER='console')
+        complete = dict(other, AKL_VM_LOCALAPPDATA='D:\\Profiles\\console\\AppData\\Local',
+                        AKL_VM_STAGE='D:\\Stage\\akl')
+        for missing in ['AKL_VM_LOCALAPPDATA', 'AKL_VM_STAGE']:
+            env = {key: value for key, value in complete.items() if key != missing}
+            with self.assertRaises(VmSettingsError) as caught:
+                VmSettings.from_environment(env)
+            self.assertIn(missing, str(caught.exception))
+        self.assertEqual(VmSettings.from_environment(complete).test_user, 'console')
+        # The same account in another case is the same Windows user.
+        self.assertEqual(VmSettings.from_environment(dict(ENVIRONMENT, AKL_VM_TEST_USER='TESTER')).test_user, 'TESTER')
 
     def test_unusable_values_are_refused_before_they_can_reach_a_command_line(self):
         bad = {
@@ -101,11 +130,43 @@ class SettingsTests(unittest.TestCase):
 
 
 class HygieneTests(unittest.TestCase):
-    def test_no_machine_or_person_is_named_in_the_scripts_or_the_settings_module(self):
-        for name in SCRIPTS + ['vm_config.py']:
-            text = (TOOLS / name).read_text(encoding='utf-8')
+    def test_no_tracked_tool_names_a_machine_or_a_person(self):
+        found = set()
+        for name in tracked_tools():
+            text = (TOOLS / name).read_bytes().decode('utf-8', 'replace')
             for marker in MACHINE_LOCAL:
-                self.assertNotIn(marker, text, f'{name} mentions {marker!r}')
+                if marker in text:
+                    found.add((name, marker))
+        unexpected = sorted(found - MACHINE_LOCAL_EXCEPTIONS.keys())
+        self.assertEqual(unexpected, [], 'tracked tools name a machine or a person')
+        self.assertEqual(sorted(MACHINE_LOCAL_EXCEPTIONS.keys() - found), [], 'stale exceptions')
+
+    def test_the_ui_probe_builder_checks_its_compiler_and_notices_before_building(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            # A cargo that records being started: nothing may be built with a wrong argument.
+            stub = Path(scratch) / 'bin'
+            stub.mkdir()
+            started = Path(scratch) / 'cargo-started'
+            (stub / 'cargo').write_text(f'#!/bin/sh\ntouch {started}\nexit 1\n')
+            (stub / 'cargo').chmod(0o755)
+            env = dict(os.environ, PATH=f'{stub}{os.pathsep}{os.environ.get("PATH", "")}')
+            output = f'target/ui-probe-argument-test-{os.getpid()}'
+            self.addCleanup(shutil.rmtree, ROOT / output, ignore_errors=True)
+            missing = str(Path(scratch) / 'missing' / 'ISCC.exe')
+            notices = Path(scratch) / 'NOTICES.txt'
+            notices.write_text('notices')
+            runs = {
+                'no compiler': ['--output', output, '--notices', str(notices)],
+                'missing compiler': ['--output', output, '--iscc', missing, '--notices', str(notices)],
+                'missing notices': ['--output', output, '--iscc', str(notices),
+                                    '--notices', str(Path(scratch) / 'missing.txt')],
+            }
+            for case, arguments in runs.items():
+                run = subprocess.run([sys.executable, str(TOOLS / 'build_installer_ui_probe.py'), *arguments],
+                                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(run.returncode, 0, case)
+                self.assertFalse(started.exists(), f'{case}: cargo was started')
+                self.assertFalse((ROOT / output).exists(), f'{case}: the output was created')
 
     def test_every_script_still_compiles(self):
         for name in DRIVERS + ['vm_config.py']:
@@ -117,6 +178,20 @@ class HygieneTests(unittest.TestCase):
             self.assertIn('[Parameter(Mandatory=$true)][string]$ExpectedComputer', text, name)
             self.assertIn('[Parameter(Mandatory=$true)][string]$LocalAppData', text, name)
             self.assertIn('$env:COMPUTERNAME -ne $ExpectedComputer', text, name)
+
+
+def tracked_tools():
+    """The names below tools/ that git tracks (every file there outside a checkout)."""
+    try:
+        listed = subprocess.run(['git', '-C', str(ROOT), 'ls-files', '-z', '--', 'tools'],
+                                capture_output=True, check=True).stdout.decode('utf-8')
+        names = [path[len('tools/'):] for path in listed.split('\0') if path]
+    except (OSError, subprocess.CalledProcessError):
+        names = [str(path.relative_to(TOOLS)) for path in TOOLS.rglob('*')
+                 if path.is_file() and '__pycache__' not in path.parts]
+    if not names:
+        raise AssertionError('no tracked tools found')
+    return names
 
 
 class FakeVm:
@@ -145,23 +220,34 @@ class FakeVm:
         if "'COMPUTER='" in script:
             return (f'COMPUTER={self.computer}\nLOCALAPPDATA={self.local_app_data}\nAPP_PROC=0\nPROFILE=False\n'
                     'SESSIONS=console 1 Active\n')
-        for marker in ('STAGE_READY', 'VM_UPGRADE_RETURNED', 'VM_CROSS_SESSION_RETURNED', 'VM_UI_OFFLINE_RETURNED'):
+        for marker in ('STAGE_READY', 'VM_UPGRADE_RETURNED', 'VM_CROSS_SESSION_RETURNED', 'VM_INSTALLER_UI_RETURNED'):
             if marker in script:
                 return marker + '\n'
         return ''
 
 
+def receipt(setup, setup_digest, program, program_digest):
+    return json.dumps({'artifacts': [{'file': program, 'sha256': program_digest},
+                                     {'file': 'target/release/installer-package-helper.exe', 'sha256': 'e' * 64},
+                                     {'file': setup, 'sha256': setup_digest}]})
+
+
 def artifacts(root):
-    for candidate in ('20260913-01', '20260913-03'):
-        folder = root / 'target' / f'installer-vm-candidate-{candidate}'
-        folder.mkdir(parents=True)
-        (folder / 'build.json').write_text(
-            '{"artifacts": [{"file": "AutoKeyboardLayot-0.1.0-setup-experimental.exe", "sha256": "%s"},'
-            ' {"file": "target/release/AutoKeyboardLayot.exe", "sha256": "%s"}]}' % ('a' * 64, 'b' * 64))
+    builds = {
+        BUILD: receipt(f'{BUILD}/AutoKeyboardLayot-0.1.1-setup-experimental.exe', DIGESTS['a-setup'],
+                       'target/xwin-hotkeys/x86_64-pc-windows-msvc/release/AutoKeyboardLayot.exe', DIGESTS['a-program']),
+        SIGNED_BUILD: receipt(f'{SIGNED_BUILD}/AutoKeyboardLayot-0.1.2-setup-experimental.exe', DIGESTS['b-setup'],
+                              f'{SIGNED_BUILD}/signed-inputs/AutoKeyboardLayot.exe', DIGESTS['b-program']),
+    }
+    for folder, text in builds.items():
+        (root / folder).mkdir(parents=True)
+        (root / folder / 'build.json').write_text(text)
 
 
-def run_driver(name, environment, fake, arguments=()):
+def run_driver(name, environment, fake, arguments=None):
     """Runs one driver's main() against the fake VM and returns (exit code, output directory)."""
+    if arguments is None:
+        arguments = DRIVER_ARGUMENTS.get(name, ())
     module = types.ModuleType(name)
     module.__file__ = str(TOOLS / name)
     source = (TOOLS / name).read_text(encoding='utf-8')
@@ -209,7 +295,7 @@ class DriverTests(unittest.TestCase):
 
     def test_drivers_use_the_login_host_key_name_and_staging_from_the_environment(self):
         environment = dict(ENVIRONMENT, AKL_VM_HOST_KEY_ALIAS='pinned-name')
-        stages = {'run_vm_cross_session.py': 'akl-cross-session', 'run_vm_ui_offline_session.py': 'akl-ui-offline',
+        stages = {'run_vm_cross_session.py': 'akl-cross-session', 'run_vm_installer_ui.py': 'akl-installer-ui',
                   'run_vm_upgrade.py': 'akl-upgrade'}
         for name in DRIVERS:
             fake = FakeVm()
@@ -248,11 +334,67 @@ class DriverTests(unittest.TestCase):
             self.assertIn("-LocalAppData 'E:\\Users\\console\\AppData\\Local'", invocation, name)
 
     def test_the_interactive_task_runs_as_the_configured_user(self):
-        environment = dict(ENVIRONMENT, AKL_VM_TEST_USER='console')
+        environment = dict(ENVIRONMENT, AKL_VM_TEST_USER='console',
+                           AKL_VM_LOCALAPPDATA='D:\\Profiles\\console\\AppData\\Local',
+                           AKL_VM_STAGE='D:\\Stage\\akl')
         fake = FakeVm()
-        run_driver('run_vm_ui_offline_session.py', environment, fake)
-        task = next(script for _, script in fake.ssh if 'Register-ScheduledTask' in script)
-        self.assertIn("-UserId 'TESTGUEST01\\console'", task)
+        run_driver('run_vm_installer_ui.py', environment, fake)
+        tasks = [script for _, script in fake.ssh if 'Register-ScheduledTask' in script]
+        self.assertEqual(len(tasks), 2)
+        for task in tasks:
+            self.assertIn("-UserId 'TESTGUEST01\\console'", task)
+
+    def test_the_installer_ui_driver_runs_each_named_scenario_of_the_build(self):
+        fake = FakeVm()
+        _, controller = run_driver('run_vm_installer_ui.py', ENVIRONMENT, fake)
+        uploads = ''.join(batch for _, batch in fake.sftp)
+        self.assertIn('installer-build-a/AutoKeyboardLayot-0.1.1-setup-experimental.exe', uploads)
+        self.assertIn('run-retry.cmd', uploads)
+        self.assertIn('run-missing-exe.cmd', uploads)
+        self.assertEqual(set(json.loads(controller)['scenarios']), {'retry', 'missing-exe'})
+
+    def test_the_upgrade_driver_installs_the_named_old_build_then_the_new_one(self):
+        fake = FakeVm()
+        _, controller = run_driver('run_vm_upgrade.py', ENVIRONMENT, fake)
+        uploads = ''.join(batch for _, batch in fake.sftp)
+        self.assertIn('installer-build-a/AutoKeyboardLayot-0.1.1-setup-experimental.exe" "', uploads)
+        self.assertIn('/old-setup.exe', uploads)
+        self.assertIn('installer-build-b/AutoKeyboardLayot-0.1.2-setup-experimental.exe" "', uploads)
+        self.assertIn('/new-setup.exe', uploads)
+        invocation = next(script for _, script in fake.ssh if '-OldAppSha256' in script)
+        for parameter, digest in (('-OldSetupSha256', 'a-setup'), ('-OldAppSha256', 'a-program'),
+                                  ('-NewSetupSha256', 'b-setup'), ('-NewAppSha256', 'b-program')):
+            self.assertIn(f"{parameter} '{DIGESTS[digest]}'", invocation)
+
+    def test_the_upgrade_driver_needs_both_builds(self):
+        fake = FakeVm()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, _ = run_driver('run_vm_upgrade.py', ENVIRONMENT, fake, (BUILD,))
+        self.assertEqual(code, 2)
+        self.assertEqual(fake.ssh + fake.sftp, [])
+
+    def test_a_receipt_without_one_setup_and_one_program_is_refused(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            program = 'target/release/AutoKeyboardLayot.exe'
+            setup = 'AutoKeyboardLayot-0.1.1-setup-experimental.exe'
+            for text in (json.dumps({'artifacts': [{'file': program, 'sha256': 'b' * 64}]}),
+                         json.dumps({'artifacts': [{'file': setup, 'sha256': 'a' * 64}]}),
+                         receipt(setup, 'a' * 64, program, 'not a digest')):
+                (folder / 'build.json').write_text(text)
+                with self.assertRaises(ValueError, msg=text):
+                    vm_config.build_artifacts(folder)
+            (folder / 'build.json').write_text(receipt(setup, 'a' * 64, 'out/signed-inputs/AutoKeyboardLayot.exe', 'b' * 64))
+            self.assertEqual(vm_config.build_artifacts(folder), (folder / setup, 'a' * 64, 'b' * 64))
+
+    def test_an_unknown_scenario_or_a_missing_build_stops_before_anything_runs(self):
+        for arguments in [(BUILD,), (BUILD, 'probe'), (BUILD, 'retry', 'unknown')]:
+            fake = FakeVm()
+            message = io.StringIO()
+            with contextlib.redirect_stderr(message):
+                code, _ = run_driver('run_vm_installer_ui.py', ENVIRONMENT, fake, arguments)
+            self.assertEqual(code, 2, arguments)
+            self.assertEqual(fake.ssh + fake.sftp, [], arguments)
 
 
 if __name__ == '__main__':

@@ -4,7 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 from collect_dependency_notices import (
-    license_paths, upstream_texts, packages_from_receipt, curated_texts, bundled_data_sections)
+    license_paths, upstream_texts, packages_from_receipt, curated_texts, bundled_data_sections,
+    bundled_data_hashes, bundled_data_notices_current)
 
 
 class LicensePathsTests(unittest.TestCase):
@@ -28,6 +29,40 @@ class LicensePathsTests(unittest.TestCase):
             (root / 'data/language-packs/en-US/LICENSE.words.md').write_text('dictionary', encoding='utf-8')
             with self.assertRaises(OSError):
                 bundled_data_sections(root)
+
+    def test_the_report_binds_each_bundled_data_notice_by_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'data/language-packs/en-US').mkdir(parents=True)
+            (root / 'data/layout-model').mkdir(parents=True)
+            (root / 'data/language-packs/en-US/LICENSE.words.md').write_bytes(b'dictionary')
+            (root / 'data/layout-model/NOTICE.md').write_bytes(b'model')
+            recorded = bundled_data_hashes(root)
+            self.assertEqual(recorded, [
+                {'title': 'Bundled English dictionary', 'file': 'data/language-packs/en-US/LICENSE.words.md',
+                 'sha256': hashlib.sha256(b'dictionary').hexdigest()},
+                {'title': 'Bundled layout model', 'file': 'data/layout-model/NOTICE.md',
+                 'sha256': hashlib.sha256(b'model').hexdigest()},
+            ])
+            report = {'bundled_data_notices': recorded}
+            self.assertTrue(bundled_data_notices_current(root, report))
+            # A report made before the hashes were recorded is stale, as is one missing a notice.
+            self.assertFalse(bundled_data_notices_current(root, {}))
+            self.assertFalse(bundled_data_notices_current(root, {'bundled_data_notices': recorded[:1]}))
+            (root / 'data/layout-model/NOTICE.md').write_bytes(b'model, retrained')
+            self.assertFalse(bundled_data_notices_current(root, report))
+
+    def test_the_notice_report_records_the_bundled_data_hashes(self):
+        source = (Path(__file__).resolve().parent / 'collect_dependency_notices.py').read_text(encoding='utf-8')
+        self.assertEqual(source.count("'bundled_data_notices': bundled_data_hashes(root),"), 1)
+
+    def test_changed_bundled_data_notices_make_the_installer_build_refuse_the_notices(self):
+        # The installer build cannot run here; its text is checked like in test_authenticode_hook.
+        source = (Path(__file__).resolve().parent / 'build_experimental_installer.py').read_text(encoding='utf-8')
+        check = source.index('or not collect_dependency_notices.bundled_data_notices_current(root, report)')
+        refusal = source.index("raise SystemExit('Notice inputs are incomplete, changed or stale.')")
+        self.assertLess(check, refusal)
+        self.assertLess(refusal, source.index('output.mkdir()'))
 
     def test_curated_license_only_commit_requires_exact_source_identity(self):
         with tempfile.TemporaryDirectory() as directory:

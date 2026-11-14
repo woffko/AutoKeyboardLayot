@@ -119,6 +119,18 @@ def bundled_data_sections(root):
             for title, path in BUNDLED_DATA_NOTICES]
 
 
+def bundled_data_hashes(root):
+    """SHA-256 of each bundled data notice, recorded in the report. The Cargo hashes do not
+    cover these files, so only this record tells a later installer build that one changed."""
+    return [{'title': title, 'file': path, 'sha256': hashlib.sha256((root / path).read_bytes()).hexdigest()}
+            for title, path in BUNDLED_DATA_NOTICES]
+
+
+def bundled_data_notices_current(root, report):
+    """True when the report records exactly the bundled data notices in the checkout now."""
+    return report.get('bundled_data_notices') == bundled_data_hashes(root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path, help='new output directory')
@@ -198,6 +210,7 @@ def main():
               'scope': ('compiled base ' + ('package' if package_build else 'test') + ' graph (host and target)'
                         if receipt_hash else ('Windows' if args.platform == WINDOWS else graph) + ' metadata projection'),
               'build_receipt_sha256': receipt_hash,
+              'bundled_data_notices': bundled_data_hashes(root),
               'packages': records, 'missing': missing}
     (args.output / 'notices-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({'packages': len(records), 'missing': missing, 'output': str(args.output / filename)}))

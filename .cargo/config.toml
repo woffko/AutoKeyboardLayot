@@ -1,0 +1,12 @@
+# Link the C runtime statically into every Windows executable (the agent, the installer's package
+# helper and the test executables), so that they start on a Windows without the Visual C++
+# redistributable. Setup neither ships nor checks that runtime (audit I-3). The setting lives here,
+# not in Cargo.toml, because the accepted third-party notices are bound to the Cargo.toml hash.
+#
+# The static C runtime libraries reference PDB files that are not distributed; /ignore:4099 drops
+# the linker's warning about each of them.
+#
+# RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS in the environment replaces this list instead of adding to
+# it: tools/release_rustflags.py repeats it for the release builds.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/ignore:4099"]

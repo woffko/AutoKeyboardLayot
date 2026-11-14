@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
-    Win32::Networking::WinHttp::*,
+    Win32::{Foundation::ERROR_INVALID_PARAMETER, Networking::WinHttp::*},
     core::{HSTRING, PCWSTR, w},
 };
 
@@ -44,6 +44,20 @@ impl Drop for Handle {
 }
 fn network(error: windows::core::Error) -> DownloadError {
     DownloadError::Network(error.code().0)
+}
+
+/// TLS 1.2 or newer. A WinHTTP that does not know the TLS 1.3 flag rejects the pair with
+/// ERROR_INVALID_PARAMETER (reported for some Windows 10 builds); TLS 1.2 alone still meets the
+/// policy then, while every other failure stops the request.
+fn require_modern_tls(
+    set_protocols: impl Fn(u32) -> Result<(), DownloadError>,
+) -> Result<(), DownloadError> {
+    match set_protocols(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3) {
+        Err(DownloadError::Network(code)) if code == ERROR_INVALID_PARAMETER.to_hresult().0 => {
+            set_protocols(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2)
+        }
+        other => other,
+    }
 }
 fn now() -> Result<u64, DownloadError> {
     SystemTime::now()
@@ -144,10 +158,7 @@ fn get(url: &str, body_size: BodySize, budget: &Budget<'_>) -> Result<Vec<u8>, D
             0,
         )
     })?;
-    session.option(
-        WINHTTP_OPTION_SECURE_PROTOCOLS,
-        WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3,
-    )?;
+    require_modern_tls(|protocols| session.option(WINHTTP_OPTION_SECURE_PROTOCOLS, protocols))?;
     session.option(WINHTTP_OPTION_CONNECT_RETRIES, 2)?;
     session.option(WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE, 16 * 1024)?;
     session.option(WINHTTP_OPTION_MAX_HTTP_STATUS_CONTINUE, 3)?;
@@ -264,4 +275,43 @@ fn location(request: &Handle) -> Result<String, DownloadError> {
     let units = &text[..bytes as usize / 2];
     let units = units.strip_suffix(&[0]).unwrap_or(units);
     String::from_utf16(units).map_err(|_| DownloadError::Header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn tls_1_2_alone_is_required_only_when_the_tls_1_3_flag_is_refused() {
+        let invalid = DownloadError::Network(ERROR_INVALID_PARAMETER.to_hresult().0);
+        let other = DownloadError::Network(windows::Win32::Foundation::E_ACCESSDENIED.0);
+        let both = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+        for (replies, outcome, requested) in [
+            (vec![Ok(())], Ok(()), vec![both]),
+            (
+                vec![Err(invalid), Ok(())],
+                Ok(()),
+                vec![both, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2],
+            ),
+            (
+                vec![Err(invalid), Err(invalid)],
+                Err(invalid),
+                vec![both, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2],
+            ),
+            (vec![Err(other)], Err(other), vec![both]),
+        ] {
+            let replies = RefCell::new(replies.into_iter());
+            let calls = RefCell::new(Vec::new());
+            let result = require_modern_tls(|protocols| {
+                calls.borrow_mut().push(protocols);
+                replies
+                    .borrow_mut()
+                    .next()
+                    .expect("an unexpected extra attempt")
+            });
+            assert_eq!(result, outcome);
+            assert_eq!(calls.into_inner(), requested);
+        }
+    }
 }

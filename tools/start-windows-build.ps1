@@ -9,7 +9,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot -Parent
 $verification = Join-Path $PSScriptRoot 'verify-windows.ps1'
-$cargoExecutable = (Get-Command cargo.exe -ErrorAction Stop).Source
 $powershellExecutable = Join-Path $PSHOME 'powershell.exe'
 
 # WMI creates the build independently of the SSH/Longrun process tree. A
@@ -22,6 +21,8 @@ if ($MonitorOnly) {
         throw 'Use a fresh log directory for each build; previous evidence is retained.'
     }
     New-Item -ItemType Directory -Path $LogDirectory | Out-Null
+    # Only the build needs cargo; monitoring an earlier launch does not.
+    $cargoExecutable = (Get-Command cargo.exe -ErrorAction Stop).Source
     $commandLine = '"{0}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}" -TargetDirectory "{2}" -LogDirectory "{3}" -CargoExecutable "{4}"' -f `
         $powershellExecutable, $verification, $TargetDirectory, $LogDirectory, $cargoExecutable
     if ($ProbeOnly) { $commandLine += ' -ProbeOnly' }
@@ -41,14 +42,25 @@ $deadline = [DateTime]::UtcNow.AddMinutes(50)
 $lastStage = ''
 while ([DateTime]::UtcNow -lt $deadline) {
     $resultPath = Join-Path $LogDirectory 'result.json'
+    # The build replaces the receipt while this loop reads it: a failed or partial read is tried
+    # again on the next tick.
+    $text = $null
+    $receipt = $null
     if (Test-Path -LiteralPath $resultPath) {
-        $receipt = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+        try {
+            $text = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop
+            $receipt = $text | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            $receipt = $null
+        }
+    }
+    if ($null -ne $receipt) {
         if ($receipt.stage -ne $lastStage) {
             $lastStage = $receipt.stage
             Write-Output ('Stage: ' + $lastStage)
         }
         if ($receipt.state -ne 'running') {
-            Get-Content -LiteralPath $resultPath
+            Write-Output $text
             if ($receipt.state -eq 'succeeded') {
                 if ($ProbeOnly) {
                     Get-Content -LiteralPath (Join-Path $LogDirectory 'probe.stdout.log')

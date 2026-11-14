@@ -1742,16 +1742,26 @@ mod tests {
         );
         assert!(control_f9.matches(keysym::F1 + 8, CONTROL_MASK));
         assert!(!control_f9.matches(keysym::F1 + 8, 0));
-        let control_alt_k = HotkeyMatch::new(
+        // Ctrl+Alt with a letter types text (AltGr) and is refused as a hotkey since 0.1.2.
+        assert!(
             Hotkey::new(
                 0x4b,
                 autokeyboardlayot::hotkey::HOTKEY_MOD_CONTROL
                     | autokeyboardlayot::hotkey::HOTKEY_MOD_ALT,
             )
+            .is_err()
+        );
+        let control_shift_k = HotkeyMatch::new(
+            Hotkey::new(
+                0x4b,
+                autokeyboardlayot::hotkey::HOTKEY_MOD_CONTROL
+                    | autokeyboardlayot::hotkey::HOTKEY_MOD_SHIFT,
+            )
             .unwrap(),
         );
-        assert!(control_alt_k.matches(0x6b, CONTROL_MASK | MOD1_MASK));
-        assert!(control_alt_k.matches(0x4b, CONTROL_MASK | MOD1_MASK));
+        assert!(control_shift_k.matches(0x6b, CONTROL_MASK | SHIFT_MASK));
+        assert!(control_shift_k.matches(0x4b, CONTROL_MASK | SHIFT_MASK));
+        assert!(!control_shift_k.matches(0x4b, CONTROL_MASK));
         let control_pause = HotkeyMatch::new(
             Hotkey::new(0x13, autokeyboardlayot::hotkey::HOTKEY_MOD_CONTROL).unwrap(),
         );

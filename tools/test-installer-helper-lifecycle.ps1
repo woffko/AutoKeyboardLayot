@@ -27,7 +27,8 @@ function Start-Native([string]$Path, [string]$Arguments) {
     $info.UseShellExecute = $false; $info.CreateNoWindow = $true
     return [Diagnostics.Process]::Start($info)
 }
-function Wait-File([string]$Path, [int]$Seconds = 8) {
+# A reply can take long on a slow machine (a scanner reads every package the helper touches).
+function Wait-File([string]$Path, [int]$Seconds = 60) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     while (-not (Test-Path -LiteralPath $Path)) {
         if ([DateTime]::UtcNow -ge $deadline) { throw ('Reply timeout: ' + $Path) }
@@ -56,7 +57,7 @@ function Send-Request($Command, [bool]$Wait = $true) {
     return $reply
 }
 function Wait-Idle($Reply) {
-    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    $deadline = [DateTime]::UtcNow.AddSeconds(300)
     while ($Reply['helper.busy'] -eq '1') {
         if ([DateTime]::UtcNow -ge $deadline) { throw 'Worker timeout.' }
         Start-Sleep -Milliseconds 25
@@ -83,7 +84,13 @@ Copy-Item -LiteralPath $Initializer -Destination $localInitializer
 $init = Start-Native $localInitializer ('"' + $store + '"')
 if (-not $init.WaitForExit(8000) -or $init.ExitCode -ne 0) { throw 'Fixture initialization failed.' }
 $initialCurrent = (Get-FileHash -LiteralPath (Join-Path $store 'CURRENT') -Algorithm SHA256).Hash
-$ruAsset = Join-Path $catalogDir 'ru-RU-r1.aklp'; $etAsset = Join-Path $catalogDir 'et-EE-r1.aklp'; $frAsset = Join-Path $catalogDir 'fr-FR-r1.aklp'; $deAsset = Join-Path $catalogDir 'de-DE-r1.aklp'
+# The package files of the catalog's current revisions, whichever they are (ru-RU-r4.aklp, for one).
+function Asset([string]$Id) {
+    $found = @(Get-ChildItem -LiteralPath $catalogDir -Filter ($Id + '-r*.aklp'))
+    if ($found.Count -ne 1) { throw ('Expected exactly one package file for ' + $Id + ' in ' + $PackagesDirectory) }
+    return $found[0].FullName
+}
+$ruAsset = Asset 'ru-RU'; $etAsset = Asset 'et-EE'; $frAsset = Asset 'fr-FR'; $deAsset = Asset 'de-DE'
 $ruBlob = BlobName $ruAsset; $etBlob = BlobName $etAsset; $frBlob = BlobName $frAsset; $deBlob = BlobName $deAsset
 $result = [ordered]@{state='failed'; fixture_root=$fixtureRoot; helper_sha256=$HelperSha256; initializer_sha256=$InitializerSha256; checks=[ordered]@{}; network_used=$false; live_profile_modified=$false}
 $script:taskIdentity = [guid]::NewGuid().ToString('N'); $script:taskRequestNumber = 1
@@ -111,13 +118,17 @@ try {
         (Test-Path -LiteralPath (Join-Path $store $ruBlob)) -and (Test-Path -LiteralPath (Join-Path $store $etBlob)) -and
         (-not (Test-Path -LiteralPath (Join-Path $store $deBlob)))
     if (-not $result.checks.multiple_install) { throw 'Multiple install did not commit exactly the selected packages.' }
-    # 3. Cancel revokes the selection without any install.
+    # 3. Cancel during the review revokes the downloaded package: its install is refused and nothing
+    # is installed. (Cancelled before the download, the install would be refused anyway.)
     $r = Start-Catalog; $view = [long]$r['helper.view']
     $r = Send-Request @{action='select';view=$view;ids=@('de-DE')}
     $view = [long]$r['helper.view']
+    $r = Send-Request @{action='confirm_download';view=$view}; $r = Wait-Idle $r
+    if ($r['helper.result'] -ne 'ok' -or $r['helper.state'] -ne 'reviewing') { throw ('Download before the cancel failed: ' + $r['helper.result'] + '/' + $r['helper.reason']) }
+    $view = [long]$r['helper.view']
     $r = Send-Request @{action='cancel'}
     $result.checks.cancel_revokes = ($r['helper.state'] -eq 'idle')
-    $r = Send-Request @{action='confirm_install';view=$view}
+    $r = Send-Request @{action='confirm_install';view=$view}; $r = Wait-Idle $r
     $result.checks.cancel_revokes = $result.checks.cancel_revokes -and ($r['helper.operation'] -eq 'rejected') -and (-not (Test-Path -LiteralPath (Join-Path $store $deBlob)))
     if (-not $result.checks.cancel_revokes) { throw 'Cancel did not revoke the selection.' }
     # 4. A tampered local artifact fails with a specific reason and leaves no blob.

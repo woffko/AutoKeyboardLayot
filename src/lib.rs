@@ -64,9 +64,7 @@ pub use hotkey::{
 pub use input_profile::{
     InputDescriptorError, InputPackDescriptor, InputProfileRequirements, WindowsKeyboardProfile,
 };
-pub use language::{
-    AutomaticCorrection, Language, LanguagePack, PackKind, language_packs, transpose_word,
-};
+pub use language::{Language, transpose_word};
 pub use privacy::{ExclusionPolicy, PrivacyBlockReason};
 pub use scoring_model::{ScoringModel, ScoringModelError};
 pub use session::{InputEvent, InputSession, ResetReason, SessionAction};

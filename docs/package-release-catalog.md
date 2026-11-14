@@ -5,10 +5,10 @@ HTTP requests, install packages, persist receipts or change settings. The separa
 language-pack project's existing `pack-index.json` is a development source list,
 not this signed release format. The selected source is the main
 `woffko/AutoKeyboardLayot` repository; release trust now embeds the public key
-`pkg-20260912-01`. A local revision-1 candidate now exists at
-`target/ui-package-candidates-20260912-01/catalog.aklc`; its signature and all
-13 referenced local artifacts passed offline verification. No signed catalog
-has yet been published, and its planned GitHub URLs were not contacted.
+`pkg-20260912-01`. Signed catalogs are published as `catalog.aklc` on the Latest
+release `lang-r5-20260919`, which also holds the 13 packages: revision 5 on
+2026-09-19, revision 6 on 2026-10-03 and revision 7 on 2026-10-11 (valid until
+2026-11-01 15:19 UTC). Every renewal follows [`catalog-renewal.md`](catalog-renewal.md).
 
 ## Signed envelope and source policy
 
@@ -44,10 +44,13 @@ validation instead of triggering undisclosed downloads.
 
 ## Freshness and receipts
 
-A `CatalogCheckpoint` contains the previously authenticated catalog revision and
-SHA-256 of its exact signed document. Lower revisions fail; an equal revision
-with a different document hash also fails. Re-reading the identical generation
-is allowed. Renewing expiry or otherwise changing metadata requires a new
+A `CatalogCheckpoint` contains the previously authenticated catalog revision,
+SHA-256 of its exact signed document and SHA-256 of the public key that signed
+it. Lower revisions fail; an equal revision with a different document hash also
+fails. Re-reading the identical generation is allowed, also when another trusted
+key signed it. A store forgets a checkpoint whose key it no longer trusts, and a
+checkpoint saved before the key was recorded, when it loads (see the compromise
+response in [`package-signing-key.md`](package-signing-key.md)). Renewing expiry or otherwise changing metadata requires a new
 generation. The manager must persist and supply this checkpoint under its writer
 lock. Passing no prior checkpoint establishes no historical rollback protection.
 The current module does not implement durable storage or protect the system

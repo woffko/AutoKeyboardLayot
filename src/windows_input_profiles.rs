@@ -6,8 +6,9 @@ use crate::WindowsKeyboardProfile;
 use crate::{
     bounded_probe::{BoundedProbe, ProbeFailure},
     profile_resolver::{
-        KeyboardProfileProbe, MAX_LOADED_KEYBOARD_LAYOUTS, ProfileResolutionError,
-        ProfileSnapshotCache, ResolvedKeyboardProfiles, resolve_keyboard_profiles,
+        KeyboardProfileProbe, MAX_LOADED_KEYBOARD_LAYOUTS, PROFILE_MAX_AGE,
+        PROFILE_REFRESH_INTERVAL, PROFILE_RETRY_INTERVAL, ProfileResolutionError,
+        ProfileSnapshotCache, ProfileUpdate, ResolvedKeyboardProfiles, resolve_keyboard_profiles,
     },
 };
 use std::time::{Duration, Instant};
@@ -85,10 +86,6 @@ pub fn spawn_keyboard_profile_resolver() -> std::io::Result<KeyboardProfileResol
     })
 }
 
-const PROFILE_MAX_AGE: Duration = Duration::from_secs(6);
-const PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const PROFILE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-
 /// Persistent single-provider cache. Call `poll` outside hooks; it never waits
 /// for the provider. A timeout cannot start an additional provider thread.
 pub struct KeyboardProfileCache {
@@ -106,34 +103,45 @@ impl Default for KeyboardProfileCache {
     }
 }
 impl KeyboardProfileCache {
-    /// Returns true only when bindings or availability changed, not on every
-    /// identical periodic refresh. Consumers must invalidate buffered state then.
-    pub fn poll(&mut self) -> bool {
+    /// A cache that asks `resolver` instead of a provider of its own; tests give one that
+    /// answers with a fixed snapshot.
+    pub fn with_resolver(resolver: KeyboardProfileResolver) -> Self {
+        Self {
+            resolver: Some(resolver),
+            cache: ProfileSnapshotCache::default(),
+            next_refresh: Instant::now(),
+        }
+    }
+
+    /// What changed, if anything, since the last poll; an identical periodic refresh changes
+    /// nothing. Consumers take up a change of availability and invalidate buffered state only
+    /// for changed bindings.
+    pub fn poll(&mut self) -> ProfileUpdate {
         let now = Instant::now();
         if now < self.next_refresh {
-            return false;
+            return ProfileUpdate::Unchanged;
         }
         let Some(resolver) = self.resolver.as_mut() else {
             return self.cache.expire(now, PROFILE_MAX_AGE);
         };
         match resolver.query_result((), Duration::ZERO, PROFILE_MAX_AGE) {
             Ok(Ok(snapshot)) => {
-                let changed = self.cache.accept(snapshot, now, PROFILE_MAX_AGE);
+                let update = self.cache.accept(snapshot, now, PROFILE_MAX_AGE);
                 self.next_refresh = now + PROFILE_REFRESH_INTERVAL;
-                changed
+                update
             }
             // A transient resolution failure does not prove the bindings changed;
             // keep the last snapshot until it is actually too old.
             Ok(Err(_)) => {
-                let changed = self.cache.expire(now, PROFILE_MAX_AGE);
+                let update = self.cache.expire(now, PROFILE_MAX_AGE);
                 self.next_refresh = now + PROFILE_RETRY_INTERVAL;
-                changed
+                update
             }
             Err(ProbeFailure::Disconnected) => {
-                let changed = self.cache.invalidate();
+                let update = self.cache.invalidate();
                 self.next_refresh = now + PROFILE_RETRY_INTERVAL;
                 self.resolver = None;
-                changed
+                update
             }
             // Busy/timeout/expired are transient: keep the last snapshot until it
             // is actually too old, so a brief provider hiccup does not clear the
